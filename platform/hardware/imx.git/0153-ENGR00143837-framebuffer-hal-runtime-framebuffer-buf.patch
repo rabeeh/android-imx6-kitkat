@@ -1,0 +1,259 @@
+From fc7bbed119806a900e18d3ab381dfaae1b61146b Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Mon, 23 May 2011 11:24:52 +0800
+Subject: [PATCH 153/486] ENGR00143837 framebuffer hal: runtime framebuffer
+ buffer number detect
+
+On MX508, the LCD display is handle by elcdif but not IPU.
+So we must avoid framebuffer hal to call any IPU specific ioctl.
+Also elcdif default supports double but not triple buffer pandisplay,
+we need runtime framebuffer number dectection, and let FramebufferNativeWindow
+known about it.
+
+EPDC support is still controlled by the build option.
+
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ libgralloc/framebuffer.cpp | 127 +++++++++++++++++++++++----------------------
+ 1 file changed, 65 insertions(+), 62 deletions(-)
+
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index ede6c63..e85b848 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -58,11 +58,7 @@ extern "C" {
+ /*****************************************************************************/
+ 
+ // numbers of buffers for page flipping
+-#ifndef FSL_EPDC_FB
+ #define NUM_BUFFERS 3
+-#else
+-#define NUM_BUFFERS 2
+-#endif
+ 
+ enum {
+     PAGE_FLIP = 0x00000001,
+@@ -104,6 +100,9 @@ struct fb_context_t {
+ #endif
+ };
+ 
++static int nr_framebuffers;
++static int no_ipu = 0;
++
+ #ifdef SECOND_DISPLAY_SUPPORT
+ #define MAX_SEC_DISP_WIDTH (1024)
+ #define MAX_SEC_DISP_HEIGHT (1024)
+@@ -292,7 +291,7 @@ static int fb_setSecRotation(struct framebuffer_device_t* dev,int secRotation)
+     fb_context_t* ctx = (fb_context_t*)dev;
+     //LOGI("fb_setSecRotation %d",secRotation);
+     if((ctx->sec_rotation != secRotation)&&(ctx->sec_disp_base != 0))      
+-       memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*NUM_BUFFERS);
++       memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*nr_framebuffers);
+     ctx->sec_rotation = secRotation;
+     switch(secRotation)
+     {
+@@ -390,9 +389,9 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+                 LOGI("Switch back to display 0");
+                 LOGI("sys.SECOND_DISPLAY_ENABLED Set to 0");
+                 property_set("sys.SECOND_DISPLAY_ENABLED", "0");
+-                memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*NUM_BUFFERS);
++                memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*nr_framebuffers);
+                 //unmap the sec_disp_base
+-                munmap((void *)ctx->sec_disp_base, ctx->sec_frame_size*NUM_BUFFERS);
++                munmap((void *)ctx->sec_disp_base, ctx->sec_frame_size*nr_framebuffers);
+                 ctx->sec_disp_base = 0;
+                 //DeInit the second display
+                 if(ctx->sec_fp) {
+@@ -692,46 +691,40 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         info.transp.offset  = 0;
+         info.transp.length  = 0;
+ 
+-#ifndef FSL_EPDC_FB
+-        /* for the 16bit case, only involke the glb alpha */
+-        struct mxcfb_gbl_alpha gbl_alpha;
++        if (!no_ipu) {
++            /* for the 16bit case, only involke the glb alpha */
++            struct mxcfb_gbl_alpha gbl_alpha;
+ 
+-        gbl_alpha.alpha = 255;
+-        gbl_alpha.enable = 1;
+-        int ret = ioctl(fd, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
+-        if(ret <0)
+-        {
+-            LOGE("Error!MXCFB_SET_GBL_ALPHA failed!");
+-            return -1;
+-        }
++            gbl_alpha.alpha = 255;
++            gbl_alpha.enable = 1;
++            int ret = ioctl(fd, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
++            if(ret <0) {
++	        LOGE("Error!MXCFB_SET_GBL_ALPHA failed!");
++	        return -1;
++            }
+ 
+-        struct mxcfb_color_key key;
+-        key.enable = 1;
+-        key.color_key = 0x00000000; // Black
+-        ret = ioctl(fd, MXCFB_SET_CLR_KEY, &key);
+-        if(ret <0)
+-        {
+-            LOGE("Error!Colorkey setting failed for dev ");
+-            return -1;
++            struct mxcfb_color_key key;
++            key.enable = 1;
++            key.color_key = 0x00000000; // Black
++            ret = ioctl(fd, MXCFB_SET_CLR_KEY, &key);
++            if(ret <0) {
++	        LOGE("Error!Colorkey setting failed for dev ");
++	        return -1;
++            }
+         }
+-#endif
+-
+     }
+ 
+-
+     /*
+-     * Request NUM_BUFFERS screens (at lest 2 for page flipping)
++     * Request nr_framebuffers screens (at lest 2 for page flipping)
+      */
+-    info.yres_virtual = ALIGN_PIXEL_128(info.yres) * NUM_BUFFERS;
+-	info.xres_virtual = ALIGN_PIXEL(info.xres);
++    info.yres_virtual = ALIGN_PIXEL_128(info.yres) * nr_framebuffers;
++    info.xres_virtual = ALIGN_PIXEL(info.xres);
+     
+-    #ifdef FSL_EPDC_FB
+-//    info.yres_virtual = ALIGN_PIXEL_128(info.yres);
+-	info.bits_per_pixel = 16;
+-	info.grayscale = 0;
+-	info.yoffset = 0;
+-//	info.rotate = FB_ROTATE_UR;
+-    #endif
++#ifdef FSL_EPDC_FB
++    info.bits_per_pixel = 16;
++    info.grayscale = 0;
++    info.yoffset = 0;
++#endif
+ 
+     uint32_t flags = PAGE_FLIP;
+     if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1) {
+@@ -752,21 +745,19 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         return -errno;
+ 
+ #ifdef FSL_EPDC_FB
+-	int auto_update_mode = AUTO_UPDATE_MODE_REGION_MODE;
+-	int retval = ioctl(fd, MXCFB_SET_AUTO_UPDATE_MODE, &auto_update_mode);
+-	if (retval < 0)
+-	{
+-	    LOGE("Error! set auto update mode error!\n");
+-		return -errno;
+-	}
+-	
+-	int scheme_mode = UPDATE_SCHEME_QUEUE_AND_MERGE;
+-	retval = ioctl(fd, MXCFB_SET_UPDATE_SCHEME, &scheme_mode);
+-	if (retval < 0)
+-	{
+-	    LOGE("Error! set update scheme error!\n");
+-		return -errno;
+-	}	
++    int auto_update_mode = AUTO_UPDATE_MODE_REGION_MODE;
++    int retval = ioctl(fd, MXCFB_SET_AUTO_UPDATE_MODE, &auto_update_mode);
++    if (retval < 0) {
++	LOGE("Error! set auto update mode error!\n");
++	return -errno;
++    }
++
++    int scheme_mode = UPDATE_SCHEME_QUEUE_AND_MERGE;
++    retval = ioctl(fd, MXCFB_SET_UPDATE_SCHEME, &scheme_mode);
++    if (retval < 0) {
++	LOGE("Error! set update scheme error!\n");
++	return -errno;
++    }
+ #endif
+     int refreshRate = 1000000000000000LLU /
+     (
+@@ -970,7 +961,7 @@ static int mapSecFrameBuffer(fb_context_t* ctx)
+     info.blue.length    = 5;
+     info.transp.offset  = 0;
+     info.transp.length  = 0;
+-    info.yres_virtual = ALIGN_PIXEL_128(info.yres) * NUM_BUFFERS;
++    info.yres_virtual = ALIGN_PIXEL_128(info.yres) * nr_framebuffers;
+     info.xres_virtual = ALIGN_PIXEL(info.xres);
+                         
+     if (ioctl(sec_fp, FBIOPUT_VSCREENINFO, &info) == -1) {
+@@ -1023,7 +1014,7 @@ static int mapSecFrameBuffer(fb_context_t* ctx)
+     ctx->sec_fp = sec_fp;
+     ctx->sec_disp_w = info.xres;
+     ctx->sec_disp_h = info.yres;
+-    ctx->sec_frame_size = fbSize/NUM_BUFFERS;
++    ctx->sec_frame_size = fbSize/nr_framebuffers;
+     ctx->sec_disp_next_buf = info.yoffset ? 0 : 1;
+     ctx->sec_info = info;
+     ctx->sec_finfo = finfo;
+@@ -1060,7 +1051,7 @@ static int mapSecFrameBuffer(fb_context_t* ctx)
+     fb0_info.blue.length    = 5;
+     fb0_info.transp.offset  = 0;
+     fb0_info.transp.length  = 0;
+-    fb0_info.yres_virtual = ALIGN_PIXEL_128(fb0_info.yres) * NUM_BUFFERS;
++    fb0_info.yres_virtual = ALIGN_PIXEL_128(fb0_info.yres) * nr_framebuffers;
+ 	fb0_info.xres_virtual = fb0_info.xres;
+ #endif
+     if (ioctl(m->framebuffer->fd, FBIOPUT_VSCREENINFO, &m->info) == -1) {
+@@ -1319,7 +1310,7 @@ void * secDispShowFrames(void * arg)
+             }
+ 
+             ctx->cleancount++;
+-            memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*NUM_BUFFERS);
++            memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*nr_framebuffers);
+         }
+         else
+         {
+@@ -1351,7 +1342,7 @@ void * secDispShowFrames(void * arg)
+             ctx->sec_info.yoffset = 0; 
+         }
+         else{
+-            ctx->sec_info.yoffset = ctx->sec_info.yres_virtual/NUM_BUFFERS;
++            ctx->sec_info.yoffset = ctx->sec_info.yres_virtual/nr_framebuffers;
+         }
+ 
+         ctx->sec_disp_next_buf = !ctx->sec_disp_next_buf;  
+@@ -1380,8 +1371,19 @@ int fb_device_open(hw_module_t const* module, const char* name,
+         hw_device_t** device)
+ {
+     int status = -EINVAL;
++    char value[PROPERTY_VALUE_MAX];
++
+     if (!strcmp(name, GRALLOC_HARDWARE_FB0)) {
+         alloc_device_t* gralloc_device;
++        framebuffer_device_t *fbdev;
++
++        nr_framebuffers = NUM_BUFFERS;
++        property_get("ro.product.device", value, "");
++        if (0 == strcmp(value, "imx50_rdp")) {
++            nr_framebuffers = 2;
++            no_ipu = 1;
++        }
++
+         status = gralloc_open(module, &gralloc_device);
+         if (status < 0)
+             return status;
+@@ -1427,12 +1429,13 @@ int fb_device_open(hw_module_t const* module, const char* name,
+             const_cast<int&>(dev->device.minSwapInterval) = 1;
+             const_cast<int&>(dev->device.maxSwapInterval) = 1;
+             *device = &dev->device.common;
++            fbdev = (framebuffer_device_t*) *device;
++            fbdev->reserved[0] = nr_framebuffers;
+         }
+ 
+-#ifndef FSL_EPDC_FB
+ 	/* initialize the IPU lib IPC */
+-	mxc_ipu_lib_ipc_init();
+-#endif
++        if (!no_ipu)
++            mxc_ipu_lib_ipc_init();
+     }
+     return status;
+ }
+-- 
+1.8.0
+

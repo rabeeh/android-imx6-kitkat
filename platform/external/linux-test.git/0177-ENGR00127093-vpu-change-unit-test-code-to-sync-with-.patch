@@ -1,0 +1,305 @@
+From cecc6197729e3119932b7985264065a1ebfeaf6d Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Sat, 4 Sep 2010 01:25:08 +0800
+Subject: [PATCH 177/435] ENGR00127093 vpu: change unit test code to sync with
+ v1.4.14 fw
+
+change unit test code to sync with v1.4.14 fw, give sample code
+to support resolution change feature.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 25 +++++++++++++++
+ test/mxc_vpu_test/enc.c      | 72 +++++++++++++++++++++++++++++---------------
+ test/mxc_vpu_test/fb.c       |  3 ++
+ test/mxc_vpu_test/loopback.c |  6 ++--
+ test/mxc_vpu_test/vpu_test.h |  8 +++--
+ 5 files changed, 85 insertions(+), 29 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 8cb4de5..13c4fd0 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -39,6 +39,11 @@ static FILE *fpUserDataLogfile = NULL;
+ #define FN_MV_DATA "dec_mv.log"
+ #define FN_USER_DATA "dec_user_data.log"
+ 
++#ifdef COMBINED_VIDEO_SUPPORT
++#define MAX_FRAME_WIDTH 720
++#define MAX_FRAME_HEIGHT 576
++#endif
++
+ void SaveFrameBufStat(u8 *frmStatusBuf, int size, int DecNum)
+ {
+ 
+@@ -1380,6 +1385,10 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	bufinfo.avcSliceBufInfo.sliceSaveBuffer = dec->phy_slice_buf;
+ 	bufinfo.avcSliceBufInfo.sliceSaveBufferSize = dec->phy_slicebuf_size;
+ 
++	/* User needs to fill max suported macro block value of frame as following*/
++	bufinfo.maxDecFrmInfo.maxMbX = dec->stride / 16;
++	bufinfo.maxDecFrmInfo.maxMbY = dec->picheight / 16;
++	bufinfo.maxDecFrmInfo.maxMbNum = dec->stride * dec->picheight / 256;
+ 	ret = vpu_DecRegisterFrameBuffer(handle, fb, fbcount, stride, &bufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+@@ -1633,6 +1642,12 @@ decoder_parse(struct decode *dec)
+ 					initinfo.picCropRect.right,
+ 					initinfo.picCropRect.bottom);
+ 
++#ifdef COMBINED_VIDEO_SUPPORT
++	/* Following lines are sample code to support minFrameBuffer counter
++	   changed in combined video stream. */
++	if (dec->cmdl->format == STD_AVC)
++		initinfo.minFrameBufferCount = 19;
++#endif
+ 	/*
+ 	 * We suggest to add two more buffers than minFrameBufferCount:
+ 	 *
+@@ -1661,6 +1676,16 @@ decoder_parse(struct decode *dec)
+ 
+ 	dec->picheight = ((initinfo.picHeight + align - 1) & ~(align - 1));
+ 
++#ifdef COMBINED_VIDEO_SUPPORT
++	/* Following lines are sample code to support resolution change
++	   from small to large in combined video stream. MAX_FRAME_WIDTH
++           and MAX_FRAME_HEIGHT must be defined per user requirement. */
++	if (dec->picwidth < MAX_FRAME_WIDTH)
++		dec->picwidth = MAX_FRAME_WIDTH;
++	if (dec->picheight < MAX_FRAME_HEIGHT)
++		dec->picheight =  MAX_FRAME_HEIGHT;
++#endif
++
+ 	if ((dec->picwidth == 0) || (dec->picheight == 0))
+ 		return -1;
+ 
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 02cc249..952dfd1 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -190,21 +190,21 @@ encoder_fill_headers(struct encode *enc)
+ 		 * sample of how to work when userProfileLevelEnable is 1.
+ 		 */
+ 		enchdr_param.userProfileLevelEnable = 1;
+-		mbPicNum = ((enc->picwidth + 15) / 16) *((enc->picheight + 15) / 16);
+-		if (enc->picwidth <= 176 && enc->picheight <= 144 &&
++		mbPicNum = ((enc->enc_picwidth + 15) / 16) *((enc->enc_picheight + 15) / 16);
++		if (enc->enc_picwidth <= 176 && enc->enc_picheight <= 144 &&
+ 		    mbPicNum * frameRateInfo <= 1485)
+ 			enchdr_param.userProfileLevelIndication = 8; /* L1 */
+ 		/* Please set userProfileLevelIndication to 8 if L0 is needed */
+-		else if (enc->picwidth <= 352 && enc->picheight <= 288 &&
++		else if (enc->enc_picwidth <= 352 && enc->enc_picheight <= 288 &&
+ 			 mbPicNum * frameRateInfo <= 5940)
+ 			enchdr_param.userProfileLevelIndication = 2; /* L2 */
+-		else if (enc->picwidth <= 352 && enc->picheight <= 288 &&
++		else if (enc->enc_picwidth <= 352 && enc->enc_picheight <= 288 &&
+ 			 mbPicNum * frameRateInfo <= 11880)
+ 			enchdr_param.userProfileLevelIndication = 3; /* L3 */
+-		else if (enc->picwidth <= 640 && enc->picheight <= 480 &&
++		else if (enc->enc_picwidth <= 640 && enc->enc_picheight <= 480 &&
+ 			 mbPicNum * frameRateInfo <= 36000)
+ 			enchdr_param.userProfileLevelIndication = 4; /* L4a */
+-		else if (enc->picwidth <= 720 && enc->picheight <= 576 &&
++		else if (enc->enc_picwidth <= 720 && enc->enc_picheight <= 576 &&
+ 			 mbPicNum * frameRateInfo <= 40500)
+ 			enchdr_param.userProfileLevelIndication = 5; /* L5 */
+ 		else
+@@ -283,7 +283,7 @@ int
+ encoder_allocate_framebuffer(struct encode *enc)
+ {
+ 	EncHandle handle = enc->handle;
+-	int i, stride, src_fbid = enc->src_fbid, fbcount = enc->fbcount;
++	int i, enc_stride, src_stride, src_fbid = enc->src_fbid, fbcount = enc->fbcount;
+ 	RetCode ret;
+ 	FrameBuffer *fb;
+ 	struct frame_buf **pfbpool;
+@@ -303,7 +303,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	for (i = 0; i < fbcount; i++) {
+-		pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420, (enc->picwidth + 15) & ~15,  (enc->picheight + 15) & ~15);
++		pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420, (enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
+ 		if (pfbpool[i] == NULL) {
+ 			fbcount = i;
+ 			goto err1;
+@@ -312,29 +312,34 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		fb[i].bufY = pfbpool[i]->addrY;
+ 		fb[i].bufCb = pfbpool[i]->addrCb;
+ 		fb[i].bufCr = pfbpool[i]->addrCr;
++		fb[i].strideY = pfbpool[i]->strideY;
++		fb[i].strideC = pfbpool[i]->strideC;
+ 	}
+ 
+ 	/* Must be a multiple of 16 */
+-	if (enc->cmdl->rot_angle == 90 || enc->cmdl->rot_angle == 270)
+-		stride = (enc->picheight + 15 ) & ~15;
+-	else
+-		stride = (enc->picwidth + 15) & ~15;
++	if (enc->cmdl->rot_angle == 90 || enc->cmdl->rot_angle == 270) {
++		enc_stride = (enc->enc_picheight + 15 ) & ~15;
++		src_stride = (enc->src_picheight + 15 ) & ~15;
++	} else {
++		enc_stride = (enc->enc_picwidth + 15) & ~15;
++		src_stride = (enc->src_picwidth + 15 ) & ~15;
++	}
+ 
+-	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, stride);
++	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, enc_stride, src_stride);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+ 	}
+ 
+ 	if (enc->cmdl->src_scheme == PATH_V4L2) {
+-		ret = v4l_capture_setup(enc, enc->picwidth, enc->picheight, 30);
++		ret = v4l_capture_setup(enc, enc->src_picwidth, enc->src_picheight, 30);
+ 		if (ret < 0) {
+ 			goto err1;
+ 		}
+ 	} else {
+ 		/* Allocate a single frame buffer for source frame */
+-		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, MODE420, enc->picwidth,
+-						   enc->picheight);
++		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, MODE420, enc->src_picwidth,
++						   enc->src_picheight);
+ 		if (pfbpool[src_fbid] == NULL) {
+ 			err_msg("failed to allocate single framebuf\n");
+ 			goto err1;
+@@ -343,6 +348,8 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		fb[src_fbid].bufY = pfbpool[src_fbid]->addrY;
+ 		fb[src_fbid].bufCb = pfbpool[src_fbid]->addrCb;
+ 		fb[src_fbid].bufCr = pfbpool[src_fbid]->addrCr;
++		fb[src_fbid].strideY = pfbpool[src_fbid]->strideY;
++		fb[src_fbid].strideC = pfbpool[src_fbid]->strideC;
+ 		enc->fbcount++;
+ 	}
+ 
+@@ -400,6 +407,17 @@ encoder_start(struct encode *enc)
+ 	enc_param.skipPicture = 0;
+ 	enc_param.enableAutoSkip = 1;
+ 
++	enc_param.encLeftOffset = 0;
++	enc_param.encTopOffset = 0;
++	if ((enc_param.encLeftOffset + enc->enc_picwidth) > enc->src_picwidth) {
++		err_msg("Configure is failure for width and left offset\n");
++		return -1;
++	}
++	if ((enc_param.encTopOffset + enc->enc_picheight) > enc->src_picheight) {
++		err_msg("Configure is failure for height and top offset\n");
++		return -1;
++	}
++
+ 	/* Set report info flag */
+ 	if (enc->mbInfo.enable) {
+ 		ret = vpu_EncGiveCommand(handle, ENC_SET_REPORT_MBINFO, &enc->mbInfo);
+@@ -428,9 +446,9 @@ encoder_start(struct encode *enc)
+ 			return -1;
+ 		}
+ 
+-		img_size = enc->picwidth * enc->picheight;
++		img_size = enc->src_picwidth * enc->src_picheight;
+ 	} else {
+-		img_size = enc->picwidth * enc->picheight * 3 / 2;
++		img_size = enc->src_picwidth * enc->src_picheight * 3 / 2;
+ 	}
+ 
+ 	gettimeofday(&total_start, NULL);
+@@ -694,18 +712,24 @@ encoder_open(struct encode *enc)
+ 	encop.bitstreamBufferSize = STREAM_BUF_SIZE;
+ 	encop.bitstreamFormat = enc->cmdl->format;
+ 
++	/* width and height in command line means source image size */
+ 	if (enc->cmdl->width && enc->cmdl->height) {
+-		enc->picwidth = enc->cmdl->width;
+-		enc->picheight = enc->cmdl->height;
++		enc->src_picwidth = enc->cmdl->width;
++		enc->src_picheight = enc->cmdl->height;
+ 	}
+ 
++	/* Please change encoded picture width and height per your needs
++           it is same as source picture image normally */
++	enc->enc_picwidth = enc->src_picwidth;
++	enc->enc_picheight = enc->src_picheight;
++
+ 	/* If rotation angle is 90 or 270, pic width and height are swapped */
+ 	if (enc->cmdl->rot_angle == 90 || enc->cmdl->rot_angle == 270) {
+-		encop.picWidth = enc->picheight;
+-		encop.picHeight = enc->picwidth;
++		encop.picWidth = enc->enc_picheight;
++		encop.picHeight = enc->enc_picwidth;
+ 	} else {
+-		encop.picWidth = enc->picwidth;
+-		encop.picHeight = enc->picheight;
++		encop.picWidth = enc->enc_picwidth;
++		encop.picHeight = enc->enc_picheight;
+ 	}
+ 
+ 	/*Note: Frame rate cannot be less than 15fps per H.263 spec */
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index 602edd6..5abab1d 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -91,6 +91,9 @@ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int heigh
+ 	fb->addrY = fb->desc.phy_addr;
+ 	fb->addrCb = fb->addrY + strideY * height;
+ 	fb->addrCr = fb->addrCb + strideY / divX * height / divY;
++	fb->strideY = strideY;
++	fb->strideC =  strideY / divX;
++
+ 	if (cpu_is_mx37() || cpu_is_mx5x()) {
+ 		if (stdMode==STD_MJPG)
+ 			fb->mvColBuf = fb->addrCr;
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 1a4e5f2..4157783 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -234,7 +234,7 @@ encode(void)
+ 		return -1;
+ 	}
+ 
+-	img_size = enc->picwidth * enc->picheight;
++	img_size = enc->src_picwidth * enc->src_picheight;
+ 	fb[src_fbid].bufY = cap_buffers[v4l2_buf.index].offset;
+ 	fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size;
+ 	fb[src_fbid].bufCr = fb[src_fbid].bufCb + (img_size >> 2);
+@@ -322,8 +322,8 @@ encdec_test(void *arg)
+ 
+ 	enc->phy_bsbuf_addr = enc_mem_desc.phy_addr;
+ 	enc->cmdl = cmdl;
+-	enc->picwidth = 176;
+-	enc->picheight = 144;
++	enc->src_picwidth = 176;
++	enc->src_picheight = 144;
+ 
+ 	dec = (struct decode *)calloc(1, sizeof(struct decode));
+ 	if (dec == NULL) {
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index bd1e7cf..52cc560 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -81,6 +81,8 @@ struct frame_buf {
+ 	int addrY;
+ 	int addrCb;
+ 	int addrCr;
++	int strideY;
++	int strideC;
+ 	int mvColBuf;
+ 	vpu_mem_desc desc;
+ };
+@@ -204,8 +206,10 @@ struct encode {
+ 	EncHandle handle;		/* Encoder handle */
+ 	PhysicalAddress phy_bsbuf_addr; /* Physical bitstream buffer */
+ 	u32 virt_bsbuf_addr;		/* Virtual bitstream buffer */
+-	int picwidth;	/* Picture width */
+-	int picheight;	/* Picture height */
++	int enc_picwidth;	/* Encoded Picture width */
++	int enc_picheight;	/* Encoded Picture height */
++	int src_picwidth;        /* Source Picture width */
++	int src_picheight;       /* Source Picture height */
+ 	int fbcount;	/* Total number of framebuffers allocated */
+ 	int src_fbid;	/* Index of frame buffer that contains YUV image */
+ 	FrameBuffer *fb; /* frame buffer base given to encoder */
+-- 
+1.8.0
+

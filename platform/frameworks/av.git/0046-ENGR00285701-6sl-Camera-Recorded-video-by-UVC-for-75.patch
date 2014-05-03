@@ -1,0 +1,90 @@
+From c2e4be0ed612fc17b4575c689ce7e201f3ea82f5 Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Wed, 4 Dec 2013 15:31:47 +0800
+Subject: [PATCH 46/50] ENGR00285701 - 6sl Camera: Recorded video by UVC for
+ 75s, video stamp drift
+
+mDecodingTimeList should drop stamp when frame is dropped by h264 encoder.
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ include/media/stagefright/MediaDefs.h                  |  6 ++++++
+ media/libstagefright/OMXCodec.cpp                      | 10 +++++++++-
+ media/libstagefright/codecs/avc/enc/SoftAVCEncoder.cpp |  3 +++
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/include/media/stagefright/MediaDefs.h b/include/media/stagefright/MediaDefs.h
+index 85693d4..a4211cc 100644
+--- a/include/media/stagefright/MediaDefs.h
++++ b/include/media/stagefright/MediaDefs.h
+@@ -14,6 +14,10 @@
+  * limitations under the License.
+  */
+ 
++/*
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ */
++
+ #ifndef MEDIA_DEFS_H_
+ 
+ #define MEDIA_DEFS_H_
+@@ -58,6 +62,8 @@ extern const char *MEDIA_MIMETYPE_CONTAINER_WVM;
+ extern const char *MEDIA_MIMETYPE_TEXT_3GPP;
+ extern const char *MEDIA_MIMETYPE_TEXT_SUBRIP;
+ 
++#define OMX_BUFFERFLAG_FRAMEDROP 0xbeafdeed
++
+ }  // namespace android
+ 
+ #endif  // MEDIA_DEFS_H_
+diff --git a/media/libstagefright/OMXCodec.cpp b/media/libstagefright/OMXCodec.cpp
+index 646c93a..e0ce4e7 100644
+--- a/media/libstagefright/OMXCodec.cpp
++++ b/media/libstagefright/OMXCodec.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2009 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -2119,6 +2119,14 @@ void OMXCodec::on_message(const omx_message &msg) {
+         {
+             IOMX::buffer_id buffer = msg.u.extended_buffer_data.buffer;
+ 
++			//If the frame is dropped by avcEncoder, need drop stamp in mDecodingTimeList
++            OMX_BUFFERHEADERTYPE *head = (OMX_BUFFERHEADERTYPE *)buffer;
++             if( mIsEncoder && mIsVideo && (!strcasecmp(MEDIA_MIMETYPE_VIDEO_AVC, mMIME)) &&
++                (head->nFlags == OMX_BUFFERFLAG_FRAMEDROP) ) {
++                CODEC_LOGV("drop time stamp %lld us", head->nTimeStamp);
++                getDecodingTimeUs();
++             }
++
+             CODEC_LOGV("EMPTY_BUFFER_DONE(buffer: %p)", buffer);
+ 
+             Vector<BufferInfo> *buffers = &mPortBuffers[kPortIndexInput];
+diff --git a/media/libstagefright/codecs/avc/enc/SoftAVCEncoder.cpp b/media/libstagefright/codecs/avc/enc/SoftAVCEncoder.cpp
+index 5b43bab..658fc65 100755
+--- a/media/libstagefright/codecs/avc/enc/SoftAVCEncoder.cpp
++++ b/media/libstagefright/codecs/avc/enc/SoftAVCEncoder.cpp
+@@ -870,6 +870,8 @@ void SoftAVCEncoder::onQueueFilled(OMX_U32 portIndex) {
+                         inQueue.erase(inQueue.begin());
+                         inInfo->mOwnedByUs = false;
+                         releaseGrallocData(srcBuffer);
++
++                        inHeader->nFlags = OMX_BUFFERFLAG_FRAMEDROP;
+                         notifyEmptyBufferDone(inHeader);
+                         return;
+                     }
+@@ -914,6 +916,7 @@ void SoftAVCEncoder::onQueueFilled(OMX_U32 portIndex) {
+         inQueue.erase(inQueue.begin());
+         inInfo->mOwnedByUs = false;
+         releaseGrallocData(srcBuffer);
++        inHeader->nFlags = 0;
+         notifyEmptyBufferDone(inHeader);
+ 
+         outQueue.erase(outQueue.begin());
+-- 
+1.8.0
+

@@ -1,0 +1,239 @@
+From 622d11d3028f2482421622fe471c8ef24b53e3d8 Mon Sep 17 00:00:00 2001
+From: Terry Lv <r65388@freescale.com>
+Date: Wed, 27 Oct 2010 04:23:05 +0800
+Subject: [PATCH 193/435] ENGR00132603: Add sense and fuse to mxc_iim
+
+Add sense and fuse to mxc_iim.
+This is for test program.
+
+This test can read iim value from a bank or
+fuse a value to a bank
+
+    Options :
+        ./mxc_iim_test.out read [-d bank_addr]
+        ./mxc_iim_test.out fuse [-d bank_addr] [-v value]
+
+	<bank_addr> - bank address in fuse map file
+	<value> - Value to be writen to a bank
+	read - Indicate that this is a read operation
+	fuse - Indicate that this is a write operation
+
+Examples:
+./mxc_iim_test.out read -d 0xc30
+./mxc_iim_test.out fuse 0xc30 -v 0x40
+
+Signed-off-by: Terry Lv <r65388@freescale.com>
+---
+ test/mxc_iim_test/Makefile       |  19 ++++++
+ test/mxc_iim_test/mxc_iim_test.c | 142 +++++++++++++++++++++++++++++++++++++++
+ test/mxc_iim_test/readme.txt     |  23 +++++++
+ 3 files changed, 184 insertions(+)
+ create mode 100644 test/mxc_iim_test/Makefile
+ create mode 100644 test/mxc_iim_test/mxc_iim_test.c
+ create mode 100644 test/mxc_iim_test/readme.txt
+
+diff --git a/test/mxc_iim_test/Makefile b/test/mxc_iim_test/Makefile
+new file mode 100644
+index 0000000..33705a7
+--- /dev/null
++++ b/test/mxc_iim_test/Makefile
+@@ -0,0 +1,19 @@
++# list of platforms which did not want this test case
++EXCLUDE_LIST:=IMX233 IMX28 IMX50
++
++ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
++OBJS = 	$(OBJDIR)/mxc_iim_test.out
++else
++OBJS =
++endif
++
++all : $(OBJS)
++
++.PHONY: clean
++clean :
++	rm -f $(OBJS)
++
++#
++# include the Rules
++#
++include ../make.rules
+diff --git a/test/mxc_iim_test/mxc_iim_test.c b/test/mxc_iim_test/mxc_iim_test.c
+new file mode 100644
+index 0000000..1774f30
+--- /dev/null
++++ b/test/mxc_iim_test/mxc_iim_test.c
+@@ -0,0 +1,142 @@
++/*
++ * Copyright (C) 2010 Freescale Semiconductor, Inc.
++ * Terry Lv <r65388@freescale.com>
++ *
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++#include <string.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++static void print_usage()
++{
++	printf("Usage:\n"
++		"Read iim: mxc_iim_test read -d <addr>\n"
++		"Write iim: mxc_iim_test fuse -d <addr> -v <value>\n"
++		"Note: All value are in hex format!\n");
++}
++
++int main(int argc, char *argv[])
++{
++	int fd, ch;
++	int is_read = -1;
++	unsigned int bankaddr;
++	unsigned int value;
++	char ch_val;
++	char *end_char = NULL;
++
++	if (argc < 4 || argc > 6)
++		goto invalid_param_out;
++
++	if (strcmp(argv[1], "read") == 0) {
++		if (argc != 4)
++			goto invalid_param_out;
++		is_read = 1;
++	} else if (strcmp(argv[1], "blow") == 0) {
++		if (argc != 6)
++			goto invalid_param_out;
++		is_read = 0;
++	} else {
++		printf("Unsupported option: %s!\n", argv[1]);
++		goto invalid_param_out;
++	}
++
++	while (-1 != (ch = getopt(argc - 1, &argv[1], "d:v:"))) {
++		switch (ch) {
++		case 'd':
++			bankaddr = strtoul(optarg, &end_char, 16);
++			if (*end_char)
++				goto invalid_param_out;
++			break;
++		case 'v':
++			value = strtoul(optarg, &end_char, 16);
++			if (*end_char)
++				goto invalid_param_out;
++			break;
++		default:
++			printf("Unsupported option: -%c!\n", ch);
++			goto invalid_param_out;
++			break;
++		}
++	}
++
++	if (-1 == is_read)
++		goto invalid_param_out;
++
++	fd = open("/dev/mxc_iim", O_RDWR);
++	if (-1 == fd) {
++		printf("Can't open /dev/mxc_iim!\n");
++		return -1;
++	}
++
++	if (bankaddr) {
++		if (-1 == lseek(fd, bankaddr, SEEK_SET)) {
++			printf("lseek failed at bank addr 0x%08x\n",
++				bankaddr);
++			goto op_err_out;
++		}
++	}
++
++	ch_val = (char)value;
++
++	if (is_read) {
++		if (-1 == read(fd, &ch_val, sizeof(char))) {
++			printf("Read failed at bank addr 0x%08x\n",
++				bankaddr);
++			goto op_err_out;
++		}
++		printf("Value at bank addr 0x%08x: 0x%x\n",
++			bankaddr, ch_val);
++	} else {
++		if (-1 == write(fd, &ch_val, sizeof(char))) {
++			printf("Write failed at bank addr 0x%08x, "
++				"value: 0x%08x\n",
++				bankaddr, ch_val);
++			goto op_err_out;
++		}
++		printf("Writting 0x%08x to bank addr 0x%08x\n",
++			ch_val, bankaddr);
++		if (-1 == lseek(fd, bankaddr, SEEK_SET)) {
++			printf("lseek failed at bank addr 0x%08x\n",
++				bankaddr);
++			goto op_err_out;
++		}
++		if (-1 == read(fd, &ch_val, sizeof(char))) {
++			printf("Read failed at bank addr 0x%08x\n",
++				bankaddr);
++			goto op_err_out;
++		}
++		printf("Value at bank addr 0x%08x: 0x%08x\n",
++			bankaddr, ch_val);
++	}
++
++	close(fd);
++
++	return 0;
++op_err_out:
++	return -2;
++invalid_param_out:
++	printf("Invalid parameters!\n");
++	print_usage();
++	return -1;
++}
++
+diff --git a/test/mxc_iim_test/readme.txt b/test/mxc_iim_test/readme.txt
+new file mode 100644
+index 0000000..6beb90c
+--- /dev/null
++++ b/test/mxc_iim_test/readme.txt
+@@ -0,0 +1,23 @@
++*******************************************************
++*******    Test Application for IIM driver    *********
++*******************************************************
++*    This test can read iim value from a bank or      *
++*    fuse a value to a bank                           *
++*                                                     *
++*    Options :
++	Read from fuse:
++		./mxc_iim_test.out
++                 read [-d bank_addr]
++		./mxc_iim_test.out
++		 fuse [-d bank_addr] [-v value]
++*                                                     *
++*    <bank_addr> - bank address in fuse map file      *
++*    <value> - Value to be writen to a bank.          *
++*    read - Indicate that this is a read operation.     *
++*    fuse - Indicate that this is a write operation.    *
++*******************************************************
++
++Examples:
++./mxc_iim_test.out read -d 0xc30
++./mxc_iim_test.out fuse 0xc30 -v 0x40
++
+-- 
+1.8.0
+

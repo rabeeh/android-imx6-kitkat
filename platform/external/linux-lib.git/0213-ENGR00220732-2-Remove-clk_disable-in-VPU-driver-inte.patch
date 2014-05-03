@@ -1,0 +1,138 @@
+From 6cc059fe6a21b3eb4880a9d02980b635e6ad42f6 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Mon, 20 Aug 2012 16:29:58 +0800
+Subject: [PATCH 213/249] ENGR00220732-2 Remove clk_disable in VPU driver
+ interrupt handling
+
+VPU lib v5.4.5
+
+Original design is VPU lib API StartOneFrame() enables clock, and VPU
+driver disables clock after codec done interrupt has been received.
+However there are known issues of interrupt handling as below:
+- VPU interrupt handling callback is not scheduled in time causing work
+  queue overflow
+- JPU done interrupt is not received because JPU issues it while JPU
+  buffer empty interrupt is still being served
+- VPU finishes a frame (!vpu_IsBusy) but VPU done interrupt is not
+  received
+
+All above will cause clk_disable in interrupt handling not called,
+thus VPU clock count increases by 1.
+So I plan to resolve clock unbalance issue first by removing
+clk_disable from VPU driver interrupt handling. Interrupt problem
+will not affect clock issue any longer.
+
+1.    Driver: remove clk_disable from vpu_worker_callback
+2.1.  Lib: remove clk_enable from API GetOutputInfo
+2.2.  Lib: avoid disabling VPU clock when VPU is busy in SWReset
+3.    Test: replace GetOutputInfo with SWReset in decoder_close /
+      encoder_close
+
+Additionally, check valid address before freeing memory in API Close
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c | 35 +++++++++++++++--------------------
+ vpu/vpu_lib.h |  2 +-
+ 2 files changed, 16 insertions(+), 21 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 6d04c66..e07b942 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -355,14 +355,12 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 	if (*ppendingInst && (pCodecInst != *ppendingInst))
+ 		return RETCODE_FAILURE;
+ 	else if (*ppendingInst) {
+-		/* Need to unlock VPU since mutex is locked when StartOneFrame */
+-		UnlockVpu(vpu_semap);
+ 		*ppendingInst = 0;
++	} else {
++		if (!LockVpu(vpu_semap))
++			return RETCODE_FAILURE_TIMEOUT;
+ 	}
+ 
+-	if (!LockVpu(vpu_semap))
+-		return RETCODE_FAILURE_TIMEOUT;
+-
+ 	if (cpu_is_mx6x()) {
+ 		vpu_mx6_hwreset();
+ 
+@@ -710,8 +708,10 @@ RetCode vpu_EncClose(EncHandle handle)
+ 
+ enc_out:
+ 	/* Free memory allocated for data report functions */
+-	IOFreeVirtMem(&pEncInfo->picParaBaseMem);
+-	IOFreePhyMem(&pEncInfo->picParaBaseMem);
++	if (pEncInfo->picParaBaseMem.phy_addr) {
++		IOFreeVirtMem(&pEncInfo->picParaBaseMem);
++		IOFreePhyMem(&pEncInfo->picParaBaseMem);
++	}
+ 
+ 	/* Free searchRam if searchRam doesn't use IRAM */
+ 	if ((pEncInfo->secAxiUse.useHostMeEnable == 0) &&
+@@ -1751,9 +1751,6 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 		return RETCODE_INVALID_HANDLE;
+ 	}
+ 
+-	/* Clock is gated off when received interrupt in driver, so need to gate on here. */
+-	IOClkGateSet(true);
+-
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+ 		val = VpuReadReg(MJPEG_PIC_STATUS_REG);
+ 		if ((val & 0x4) >> 2) {
+@@ -2666,10 +2663,14 @@ RetCode vpu_DecClose(DecHandle handle)
+ 
+ dec_out:
+ 	/* Free memory allocated for data report functions */
+-	IOFreeVirtMem(&pDecInfo->picParaBaseMem);
+-	IOFreePhyMem(&pDecInfo->picParaBaseMem);
+-	IOFreeVirtMem(&pDecInfo->userDataBufMem);
+-	IOFreePhyMem(&pDecInfo->userDataBufMem);
++	if (pDecInfo->picParaBaseMem.phy_addr) {
++		IOFreeVirtMem(&pDecInfo->picParaBaseMem);
++		IOFreePhyMem(&pDecInfo->picParaBaseMem);
++	}
++	if (pDecInfo->userDataBufMem.phy_addr) {
++		IOFreeVirtMem(&pDecInfo->userDataBufMem);
++		IOFreePhyMem(&pDecInfo->userDataBufMem);
++	}
+ 	/* Free context buf Mem */
+ 	IOFreePhyMem(&pCodecInst->contextBufMem);
+ 
+@@ -4043,9 +4044,6 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			return RETCODE_SUCCESS;
+ 		}
+ 
+-		/* Clock is gated off when received interrupt in driver, so need to gate on here. */
+-		IOClkGateSet(true);
+-
+ 		info->decPicWidth = pDecInfo->jpgInfo.alignedWidth;
+ 		info->decPicHeight = pDecInfo->jpgInfo.alignedHeight;
+ 		info->indexFrameDecoded = 0;
+@@ -4078,9 +4076,6 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		return RETCODE_SUCCESS;
+ 	}
+ 
+-	/* Clock is gated off when received interrupt in driver, so need to gate on here. */
+-	IOClkGateSet(true);
+-
+ 	val = VpuReadReg(RET_DEC_PIC_SUCCESS);
+ 	info->decodingSuccess = (val & 0x01);
+ 
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 25266f2..66e98a5 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -667,7 +667,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 4)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 5)
+ 
+ extern unsigned int system_rev;
+ 
+-- 
+1.8.0
+

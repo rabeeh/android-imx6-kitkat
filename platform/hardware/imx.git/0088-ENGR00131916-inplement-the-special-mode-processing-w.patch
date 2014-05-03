@@ -1,0 +1,209 @@
+From 9309ea15be61089ee04e5fdb857f3f61c70e7062 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Mon, 18 Oct 2010 09:28:13 +0000
+Subject: [PATCH 088/486] ENGR00131916 inplement the special mode processing
+ within surfaceflinger
+
+tranfer several rect to the framebuffer and update them
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ libgralloc/framebuffer.cpp | 102 ++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 73 insertions(+), 29 deletions(-)
+
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index 5ba636a..1d9d34a 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -51,7 +51,7 @@ extern "C" {
+ 
+ #include "gralloc_priv.h"
+ #include "gr.h"
+-
++#define  MAX_RECT_NUM   20
+ /*****************************************************************************/
+ 
+ // numbers of buffers for page flipping
+@@ -68,13 +68,14 @@ struct fb_context_t {
+ #ifdef FSL_EPDC_FB
+     //Partial udate feature
+     bool rect_update;
+-    int updatemode;
+-    int partial_left;
+-    int partial_top;
+-    int partial_width;
+-    int partial_height;
+-    #endif
+-    #ifdef SECOND_DISPLAY_SUPPORT
++    int count;      //count need less than MAX_RECT_NUM ;
++    int updatemode[20];
++    int partial_left[20];
++    int partial_top[20];
++    int partial_width[20];
++    int partial_height[20];
++#endif
++#ifdef SECOND_DISPLAY_SUPPORT
+     bool sec_display_inited;
+     int sec_fp;
+     int sec_disp_w;
+@@ -85,7 +86,7 @@ struct fb_context_t {
+     int sec_disp_next_buf;
+     struct fb_var_screeninfo sec_info;
+     struct fb_fix_screeninfo sec_finfo;
+-    #endif
++#endif
+ };
+ 
+ #ifdef SECOND_DISPLAY_SUPPORT
+@@ -131,7 +132,7 @@ static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx);
+ #define EINK_CONVERT_MODE_CONVERT    0x00000400
+ #define EINK_CONVERT_MODE_MASK       0x00000400
+ 
+-
++#define EINK_DEFAULT_MODE            0x00000044
+ 
+ __u32 marker_val = 1;
+ static void update_to_display(int left, int top, int width, int height, int updatemode, int fb_dev)
+@@ -140,9 +141,10 @@ static void update_to_display(int left, int top, int width, int height, int upda
+ 	int retval;
+ 	bool wait_for_complete;
+ 	int auto_update_mode = AUTO_UPDATE_MODE_REGION_MODE;
++	bool invertenable=false;
+ 	memset(&upd_data, 0, sizeof(mxcfb_update_data));
+ 
+-//    LOGI("left=%d, top=%d, width=%d, height=%d updatemode=%d\n", left, top, width, height,updatemode);
++    LOGI("update_to_display:left=%d, top=%d, width=%d, height=%d updatemode=%d\n", left, top, width, height,updatemode);
+ 
+ 
+     if((updatemode & EINK_WAVEFORM_MODE_MASK) == EINK_WAVEFORM_MODE_DU)
+@@ -182,9 +184,15 @@ static void update_to_display(int left, int top, int width, int height, int upda
+         LOGE("Error!FBIOGET_VSCREENINFO failed");
+         
+     if((updatemode & EINK_INVERT_MODE_MASK) == EINK_INVERT_MODE_NOINVERT)
++    {
+ 	   info.grayscale = 0;
++	   invertenable = false;
++	}
+ 	else if((updatemode & EINK_INVERT_MODE_MASK) == EINK_INVERT_MODE_INVERT)
++	{
+ 	   info.grayscale = 2;
++	   invertenable   = true;
++    }
+     else
+         LOGI("invert mode wrong\n");
+     if (ioctl(fb_dev, FBIOPUT_VSCREENINFO, &info) == -1) {
+@@ -225,6 +233,14 @@ static void update_to_display(int left, int top, int width, int height, int upda
+ 			LOGI("Wait for update complete failed.  Error = 0x%x", retval);
+ 		}
+ 	}
++
++	if(invertenable)
++	{
++	   info.grayscale = 0;
++        if (ioctl(fb_dev, FBIOPUT_VSCREENINFO, &info) == -1) {
++            LOGE("Error!FBIOPUT_VSCREENINFO failed");
++        }
++    }
+ }
+ #endif
+ 
+@@ -240,22 +256,42 @@ static int fb_setSwapInterval(struct framebuffer_device_t* dev,
+     return 0;
+ }
+ 
++#ifdef FSL_EPDC_FB
+ static int fb_setUpdateRect(struct framebuffer_device_t* dev,
+-        int l, int t, int w, int h,int updatemode)
++        int* left, int* top, int* width, int* height, int* updatemode, int count)
+ {
+-    if (((w|h) <= 0) || ((l|t)<0))
+-        return -EINVAL;
+-#ifdef FSL_EPDC_FB
+     fb_context_t* ctx = (fb_context_t*)dev;
++    if(count > MAX_RECT_NUM)
++    {
++        LOGE("count > MAX_RECT_NUM in fb_setUpdateRect\n");
++        return -EINVAL;
++    }
++
+     ctx->rect_update      = true;
+-    ctx->updatemode       = updatemode;
+-    ctx->partial_left     = l;
+-    ctx->partial_top      = t;
+-    ctx->partial_width    = w;
+-    ctx->partial_height   = h;    
+-#endif
++    ctx->count            = 0;
++    for(int i=0; i < count; i++)
++    {
++        if (((width[i]|height[i]) <= 0) || ((left[i]|top[i])<0))  return -EINVAL;
++        ctx->updatemode[i]       = updatemode[i];
++        ctx->partial_left[i]     = left[i];
++        ctx->partial_top[i]      = top[i];
++        ctx->partial_width[i]    = width[i];
++        ctx->partial_height[i]   = height[i];
++    }
++    ctx->count            = count;
++    return 0;
++}
++#else
++static int fb_setUpdateRect(struct framebuffer_device_t* dev,
++        int l, int t, int w, int h)
++{
++    if (((w|h) <= 0) || ((l|t)<0))
++        return -EINVAL;
+     return 0;
+ }
++#endif
++
++
+ 
+ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ {
+@@ -384,13 +420,17 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ 
+ #ifdef FSL_EPDC_FB
+         if(ctx->rect_update) {
+-            update_to_display(ctx->partial_left,ctx->partial_top,
+-                              ctx->partial_width,ctx->partial_height,
+-                              ctx->updatemode,m->framebuffer->fd);
++            for(int i=0; i < ctx->count; i++)
++            {
++                update_to_display(ctx->partial_left[i],ctx->partial_top[i],
++                              ctx->partial_width[i],ctx->partial_height[i],
++                              ctx->updatemode[i],m->framebuffer->fd);
++            }
++
+             ctx->rect_update = false;
+         }
+         else{
+-            update_to_display(0,0,m->info.xres,m->info.yres,ctx->updatemode,m->framebuffer->fd);
++            update_to_display(0,0,m->info.xres,m->info.yres,EINK_DEFAULT_MODE,m->framebuffer->fd);
+         }
+ #endif
+ 
+@@ -417,13 +457,17 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ 
+ #ifdef FSL_EPDC_FB
+         if(ctx->rect_update) {
+-            update_to_display(ctx->partial_left,ctx->partial_top,
+-                              ctx->partial_width,ctx->partial_height,
+-                              ctx->updatemode,m->framebuffer->fd);
++            for(int i=0; i < ctx->count; i++)
++            {
++                update_to_display(ctx->partial_left[i],ctx->partial_top[i],
++                              ctx->partial_width[i],ctx->partial_height[i],
++                              ctx->updatemode[i],m->framebuffer->fd);
++            }
++
+             ctx->rect_update = false;
+         }
+         else{
+-            update_to_display(0,0,m->info.xres,m->info.yres, ctx->updatemode ,m->framebuffer->fd);
++            update_to_display(0,0,m->info.xres,m->info.yres, EINK_DEFAULT_MODE ,m->framebuffer->fd);
+         }
+ #endif
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,78 @@
+From 36dc925ef9d131e8660277de16a4b4b66e7f5bea Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Sat, 12 Oct 2013 16:50:16 +0800
+Subject: [PATCH 23/32] ENGR00283354 Ethernet:add always on support
+
+Now using single hdmi display, http streaming over ethernet will have issue
+for some media type after resume from suspend. In this case,Ethernet will
+keep IP uncleared for 120ms and then spend about 2s to switch from link down
+to up. If html5 finished parser in 120ms phase, it will smoothly resume to
+play. But for the above case, for some media type which not have 44.1k audio
+will spend over time to prepare audio data, so will trigger network not reach
+error. Considering most ethernet users like tv box will not care for power
+consumption. Here give out one way to keep ethernet always on in such case.
+And default to use always on mode. If you want it to sleep. Just add
+"setprop ro.ethernet.alwayson.mode no" in init.rc.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ core/java/android/net/EthernetDataTracker.java | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/core/java/android/net/EthernetDataTracker.java b/core/java/android/net/EthernetDataTracker.java
+index 338db1b..6988b5e 100644
+--- a/core/java/android/net/EthernetDataTracker.java
++++ b/core/java/android/net/EthernetDataTracker.java
+@@ -28,6 +28,7 @@ import android.os.RemoteException;
+ import android.os.ServiceManager;
+ import android.os.SystemProperties;
+ import android.util.Log;
++import android.os.PowerManager;
+ 
+ import com.android.server.net.BaseNetworkObserver;
+ 
+@@ -51,11 +52,13 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
+ 
+     private static boolean mLinkUp;
+     private static boolean mNfsmode;
++    private static boolean mAlwayson;
+     private LinkProperties mLinkProperties;
+     private LinkCapabilities mLinkCapabilities;
+     private NetworkInfo mNetworkInfo;
+     private InterfaceObserver mInterfaceObserver;
+     private String mHwAddr;
++    private static PowerManager.WakeLock mEthernetWakeLock;
+ 
+     /* For sending events to connectivity service handler */
+     private Handler mCsHandler;
+@@ -85,12 +88,17 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
+                 Log.d(TAG, "Interface " + iface + " link " + (up ? "up" : "down"));
+                 mLinkUp = up;
+                 mNfsmode = "yes".equals(SystemProperties.get("ro.nfs.mode", "no"));
++                mAlwayson = "yes".equals(SystemProperties.get("ro.ethernet.alwayson.mode", "yes"));
+                 mTracker.mNetworkInfo.setIsAvailable(up);
+ 
+                 // use DHCP
+                 if (up) {
++                    if (mAlwayson)
++                        mEthernetWakeLock.acquire();
+                     mTracker.reconnect();
+                 } else {
++                    if (mAlwayson)
++                        mEthernetWakeLock.release();
+                     mTracker.disconnect();
+                 }
+             }
+@@ -214,6 +222,9 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
+         mContext = context;
+         mCsHandler = target;
+ 
++        final PowerManager powerManager = (PowerManager)context.getSystemService(
++                Context.POWER_SERVICE);
++        mEthernetWakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+         // register for notifications from NetworkManagement Service
+         IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
+         mNMService = INetworkManagementService.Stub.asInterface(b);
+-- 
+1.8.0
+

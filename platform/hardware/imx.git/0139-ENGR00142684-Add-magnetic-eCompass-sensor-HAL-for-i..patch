@@ -1,0 +1,385 @@
+From 0d2f6b0acad1799c976f2b9f2cb01d1019784e89 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 3 May 2011 15:30:46 +0800
+Subject: [PATCH 139/486] ENGR00142684 Add magnetic eCompass sensor HAL for
+ i.mx53 smd
+
+Add magnetic eCompass sensor HAL for i.mx53 smd. This HAL will
+get mag and orientation data from eCompass input device, not raw
+mag3110 input device in driver. And it needs one daemon to co-work
+with this HAL for calibration.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ libsensors/Android.mk    |   3 +-
+ libsensors/MagSensor.cpp | 165 +++++++++++++++++++++++++++++++++++++++++++++++
+ libsensors/MagSensor.h   |  59 +++++++++++++++++
+ libsensors/sensors.cpp   |  22 ++++++-
+ libsensors/sensors.h     |  22 +++++++
+ 5 files changed, 267 insertions(+), 4 deletions(-)
+ create mode 100755 libsensors/MagSensor.cpp
+ create mode 100755 libsensors/MagSensor.h
+
+diff --git a/libsensors/Android.mk b/libsensors/Android.mk
+index 38b1395..155a9a0 100755
+--- a/libsensors/Android.mk
++++ b/libsensors/Android.mk
+@@ -38,7 +38,8 @@ LOCAL_SRC_FILES := 						\
+ 				sensors.cpp 			\
+ 				SensorBase.cpp			\
+ 				LightSensor.cpp			\
+-				AccelSensor.cpp                   \
++				AccelSensor.cpp			\
++				MagSensor.cpp			\
+                                 InputEventReader.cpp
+ 
+ LOCAL_SHARED_LIBRARIES := liblog libcutils libdl
+diff --git a/libsensors/MagSensor.cpp b/libsensors/MagSensor.cpp
+new file mode 100755
+index 0000000..c217183
+--- /dev/null
++++ b/libsensors/MagSensor.cpp
+@@ -0,0 +1,165 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <fcntl.h>
++#include <errno.h>
++#include <math.h>
++#include <stdlib.h>
++#include <poll.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <sys/select.h>
++#include <dlfcn.h>
++#include <cutils/log.h>
++
++#include "MagSensor.h"
++
++/*
++ * This is eCompass HAL, it will report Magnetic and orientation event to
++ * sensor manager. The input device is eCompass input device, not raw mag3110
++ * input device of driver. One mag daemon service is needed to inject calibrated
++ * mag data and orientation data to the input device.
++ */
++MagSensor::MagSensor()
++: SensorBase(NULL, "eCompass"),
++      mEnabled(0),
++      mPendingMask(0),
++      mInputReader(32)
++{
++    memset(mPendingEvents, 0, sizeof(mPendingEvents));
++
++    mPendingEvents[MagneticField].version = sizeof(sensors_event_t);
++    mPendingEvents[MagneticField].sensor = ID_M;
++    mPendingEvents[MagneticField].type = SENSOR_TYPE_MAGNETIC_FIELD;
++    mPendingEvents[MagneticField].magnetic.status = SENSOR_STATUS_ACCURACY_HIGH;
++
++    mPendingEvents[Orientation  ].version = sizeof(sensors_event_t);
++    mPendingEvents[Orientation  ].sensor = ID_O;
++    mPendingEvents[Orientation  ].type = SENSOR_TYPE_ORIENTATION;
++    mPendingEvents[Orientation  ].orientation.status = SENSOR_STATUS_ACCURACY_HIGH;
++
++}
++
++MagSensor::~MagSensor()
++{
++}
++
++int MagSensor::enable(int32_t handle, int en)
++{
++    int what = -1;
++    int flags = en ? 1 : 0;
++
++    switch (handle) {
++        case ID_M: what = MagneticField; break;
++        case ID_O: what = Orientation;   break;
++    }
++
++    if (uint32_t(what) >= numSensors)
++        return -EINVAL;
++
++    mEnabled &= ~(1<<what);
++    mEnabled |= (uint32_t(flags)<<what);
++
++    return 0;
++}
++
++int MagSensor::setDelay(int32_t handle, int64_t ns)
++{
++    /* Dummy now...This delay will be related to g-sensor and mag-sensor
++       polling delay time. Fix me later */
++    return 0;
++}
++
++int MagSensor::readEvents(sensors_event_t* data, int count)
++{
++    if (count < 1)
++        return -EINVAL;
++
++    ssize_t n = mInputReader.fill(data_fd);
++    if (n < 0)
++        return n;
++
++    int numEventReceived = 0;
++    input_event const* event;
++
++    while (count && mInputReader.readEvent(&event)) {
++        int type = event->type;
++        if (type == EV_ABS) {
++            processEvent(event->code, event->value);
++            mInputReader.next();
++        } else if (type == EV_SYN) {
++            int64_t time = timevalToNano(event->time);
++     
++            for (int j=0 ; count && mPendingMask && j<numSensors ; j++) {
++
++                if (mPendingMask & (1<<j)) {
++                    mPendingMask &= ~(1<<j);
++                    mPendingEvents[j].timestamp = time;
++                    if (mEnabled & (1<<j)) {
++                        *data++ = mPendingEvents[j];
++                        count--;
++                        numEventReceived++;
++                    }
++                }
++            }
++            if (!mPendingMask) {
++                mInputReader.next();
++            }
++        } else {
++            LOGE("MagSensor: unknown event (type=%d, code=%d)",
++                    type, event->code);
++            mInputReader.next();
++        }
++    }
++
++    return numEventReceived;
++}
++
++void MagSensor::processEvent(int code, int value)
++{
++    switch (code) {
++        case EVENT_TYPE_MAGV_X:
++            mPendingMask |= 1 << MagneticField;
++            mPendingEvents[MagneticField].magnetic.x = value * CONVERT_M_X;
++            break;
++        case EVENT_TYPE_MAGV_Y:
++            mPendingMask |= 1 << MagneticField;
++            mPendingEvents[MagneticField].magnetic.y = value * CONVERT_M_Y;
++            break;
++        case EVENT_TYPE_MAGV_Z:
++            mPendingMask |= 1 << MagneticField;
++            mPendingEvents[MagneticField].magnetic.z = value * CONVERT_M_Z;
++            break;
++	case EVENT_TYPE_YAW:
++            mPendingMask |= 1<<Orientation;
++            mPendingEvents[Orientation].orientation.azimuth = value * CONVERT_O_Y;
++            break;
++        case EVENT_TYPE_PITCH:
++            mPendingMask |= 1<<Orientation;
++            mPendingEvents[Orientation].orientation.pitch = value * CONVERT_O_P;
++            break;
++        case EVENT_TYPE_ROLL:
++            mPendingMask |= 1<<Orientation;
++            mPendingEvents[Orientation].orientation.roll = value * CONVERT_O_R;
++            break;
++        case EVENT_TYPE_ORIENT_STATUS:
++            mPendingMask |= 1<<Orientation;
++            mPendingEvents[Orientation].orientation.status =
++                    uint8_t(value & SENSOR_STATE_MASK);
++            break;
++    }
++}
+diff --git a/libsensors/MagSensor.h b/libsensors/MagSensor.h
+new file mode 100755
+index 0000000..0a582e2
+--- /dev/null
++++ b/libsensors/MagSensor.h
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_MAG_SENSOR_H
++#define ANDROID_MAG_SENSOR_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++#include "sensors.h"
++#include "SensorBase.h"
++#include "InputEventReader.h"
++
++/*****************************************************************************/
++
++struct input_event;
++
++class MagSensor : public SensorBase {
++public:
++            MagSensor();
++    virtual ~MagSensor();
++
++    enum {
++        MagneticField   = 0,
++	Orientation = 1,
++        numSensors
++    };
++
++    virtual int setDelay(int32_t handle, int64_t ns);
++    virtual int enable(int32_t handle, int enabled);
++    virtual int readEvents(sensors_event_t* data, int count);
++    void processEvent(int code, int value);
++
++private:
++    uint32_t mEnabled;
++    uint32_t mPendingMask;
++    InputEventCircularReader mInputReader;
++    sensors_event_t mPendingEvents[numSensors];
++};
++
++/*****************************************************************************/
++
++#endif  // ANDROID_MAG_SENSOR_H
+diff --git a/libsensors/sensors.cpp b/libsensors/sensors.cpp
+index 20e72a6..cc69a64 100755
+--- a/libsensors/sensors.cpp
++++ b/libsensors/sensors.cpp
+@@ -35,6 +35,7 @@
+ 
+ #include "LightSensor.h"
+ #include "AccelSensor.h"
++#include "MagSensor.h"
+ 
+ /*****************************************************************************/
+ 
+@@ -65,6 +66,14 @@ static const struct sensor_t sSensorList[] = {
+           "Freescale Semiconductor Inc.",
+           1, SENSORS_ACCELERATION_HANDLE,
+           SENSOR_TYPE_ACCELEROMETER, RANGE_A, CONVERT_A, 0.30f, 20000, { } },
++        { "MAG3110 3-axis Magnetic field sensor",
++          "Freescale Semiconductor Inc.",
++          1, SENSORS_MAGNETIC_FIELD_HANDLE,
++          SENSOR_TYPE_MAGNETIC_FIELD, 1500.0f, CONVERT_M, 0.50f, 100000, { } },
++        { "MAG3110 Orientation sensor",
++          "Freescale Semiconductor Inc.",
++          1, SENSORS_ORIENTATION_HANDLE,
++          SENSOR_TYPE_ORIENTATION, 360.0f, CONVERT_O, 0.50f, 100000, { } },
+         { "ISL29023 Light sensor",
+           "Intersil",
+           1, SENSORS_LIGHT_HANDLE,
+@@ -91,7 +100,7 @@ struct sensors_module_t HAL_MODULE_INFO_SYM = {
+         common: {
+                 tag: HARDWARE_MODULE_TAG,
+                 version_major: 1,
+-                version_minor: 0,
++                version_minor: 1,
+                 id: SENSORS_HARDWARE_MODULE_ID,
+                 name: "Freescale Sensor module",
+                 author: "Freescale Semiconductor Inc.",
+@@ -112,7 +121,8 @@ struct sensors_poll_context_t {
+ private:
+     enum {
+         light           = 0,
+-        accel             = 1,
++        accel           = 1,
++        mag 		= 2,
+         numSensorDrivers,
+         numFds,
+     };
+@@ -126,9 +136,10 @@ private:
+     int handleToDriver(int handle) const {
+         switch (handle) {
+             case ID_A:
++                return accel;
+             case ID_M:
+             case ID_O:
+-                return accel;
++                return mag;
+             case ID_L:
+                 return light;
+         }
+@@ -150,6 +161,11 @@ sensors_poll_context_t::sensors_poll_context_t()
+     mPollFds[accel].events = POLLIN;
+     mPollFds[accel].revents = 0;
+ 
++    mSensors[mag] = new MagSensor();
++    mPollFds[mag].fd = mSensors[mag]->getFd();
++    mPollFds[mag].events = POLLIN;
++    mPollFds[mag].revents = 0;
++
+     int wakeFds[2];
+     int result = pipe(wakeFds);
+     LOGE_IF(result<0, "error creating wake pipe (%s)", strerror(errno));
+diff --git a/libsensors/sensors.h b/libsensors/sensors.h
+index 1bf1728..212bf09 100755
+--- a/libsensors/sensors.h
++++ b/libsensors/sensors.h
+@@ -52,6 +52,16 @@ __BEGIN_DECLS
+ #define EVENT_TYPE_ACCEL_X          ABS_X
+ #define EVENT_TYPE_ACCEL_Y          ABS_Y
+ #define EVENT_TYPE_ACCEL_Z          ABS_Z
++
++#define EVENT_TYPE_YAW              ABS_RX
++#define EVENT_TYPE_PITCH            ABS_RY
++#define EVENT_TYPE_ROLL             ABS_RZ
++#define EVENT_TYPE_ORIENT_STATUS    ABS_WHEEL
++
++#define EVENT_TYPE_MAGV_X           ABS_X
++#define EVENT_TYPE_MAGV_Y           ABS_Y
++#define EVENT_TYPE_MAGV_Z           ABS_Z
++
+ #define EVENT_TYPE_LIGHT            ABS_MISC
+ 
+ #if defined(ACCELEROMETER_SENSOR_MMA8451)
+@@ -69,6 +79,18 @@ __BEGIN_DECLS
+ #define CONVERT_A_Y                 (CONVERT_A)
+ #define CONVERT_A_Z                 (-CONVERT_A)
+ 
++// conversion of magnetic data to uT units
++#define CONVERT_M                   (1.0f/20.0f)
++#define CONVERT_M_X                 (-CONVERT_M)
++#define CONVERT_M_Y                 (CONVERT_M)
++#define CONVERT_M_Z                 (-CONVERT_M)
++
++/* conversion of orientation data to degree units */
++#define CONVERT_O                   (1.0f/100.0f)
++#define CONVERT_O_Y                 (CONVERT_O)
++#define CONVERT_O_P                 (-CONVERT_O)
++#define CONVERT_O_R                 (CONVERT_O)
++
+ #define SENSOR_STATE_MASK           (0x7FFF)
+ 
+ /*****************************************************************************/
+-- 
+1.8.0
+

@@ -1,0 +1,312 @@
+From 48e5980f3741029b6af1e6e43042160596eef0f1 Mon Sep 17 00:00:00 2001
+From: Danny Nold <dannynold@freescale.com>
+Date: Tue, 22 Feb 2011 10:14:33 -0600
+Subject: [PATCH 209/435] ENGR00139320 - EPDC fb unit test: Additional panning
+ & inversion tests needed
+
+- Added tests to use pan API for rapid buffer flipping
+- Added tests to toggle between pixel inversion on/off during rapid update
+sequence
+- Fixed bug in overlay test - needed to add new virtual address parameter.
+
+Signed-off-by: Danny Nold <dannynold@freescale.com>
+---
+ test/mxc_fb_test/mxc_epdc_fb_test.c | 142 ++++++++++++++++++++++++++++--------
+ 1 file changed, 110 insertions(+), 32 deletions(-)
+
+diff --git a/test/mxc_fb_test/mxc_epdc_fb_test.c b/test/mxc_fb_test/mxc_epdc_fb_test.c
+index e8b466c..74a03e5 100644
+--- a/test/mxc_fb_test/mxc_epdc_fb_test.c
++++ b/test/mxc_fb_test/mxc_epdc_fb_test.c
+@@ -82,7 +82,7 @@ extern "C"{
+ __u32 pwrdown_delay = 0;
+ __u32 scheme = UPDATE_SCHEME_SNAPSHOT;
+ int test_map[NUM_TESTS];
+-typedef int (*testfunc)();
++typedef int (*testfunc)(void);
+ testfunc testfunc_array[NUM_TESTS] = {NULL};
+ 
+ int fd_fb;
+@@ -467,10 +467,11 @@ static void draw_square_outline(int x, int y, int side, int thickness, __u16 col
+ 	}
+ }
+ 
+-static void draw_rectangle(int x, int y, int width, int height, __u16 color)
++static void draw_rectangle(unsigned short *fb_ptr, int x, int y, int width,
++						int height, __u16 color)
+ {
+ 	int i, j;
+-	int *fbp = (int *)fb;
++	int *fbp = (int *)fb_ptr;
+ 	__u32 colorval = color | (color << 16);
+ 
+ 	for (i = y; i < y + height; i++)
+@@ -802,7 +803,7 @@ static int test_auto_waveform(void)
+ 
+ 	/* Test PxP 8x8 alignment handling */
+ 	printf("Draw gray junk at (18,0)\n");
+-	draw_rectangle(18, 0, 2, 18, 0xE71C);
++	draw_rectangle(fb, 18, 0, 2, 18, 0xE71C);
+ 
+ 	waveform_used = update_to_display(0, 0, 17, 18, WAVEFORM_MODE_AUTO, 0, 0);
+ 	printf("Waveform used = %d\n", waveform_used);
+@@ -816,7 +817,7 @@ static int test_auto_waveform(void)
+ 
+ 	/* Test PxP input alignment */
+ 	printf("Draw gray junk at (1,0)\n");
+-	draw_rectangle(1, 0, 2, 18, 0xE71C);
++	draw_rectangle(fb, 1, 0, 2, 18, 0xE71C);
+ 
+ 	waveform_used = update_to_display(4, 0, 10, 18, WAVEFORM_MODE_AUTO, 0, 0);
+ 	printf("Waveform used = %d\n", waveform_used);
+@@ -920,8 +921,9 @@ static int test_auto_update(void)
+ 
+ static int test_pan(void)
+ {
+-	int y;
++	int y, i;
+ 	int retval;
++	uint backbuf_offs;
+ 
+ 	printf("Draw to offscreen region.\n");
+ 	copy_image_to_buffer(0, 0, 800, 600, colorbar_rgb_800x600,
+@@ -932,7 +934,8 @@ static int test_pan(void)
+ 		&screen_info);
+ 	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, TRUE, 0);
+ 
+-	for (y = 0; y + screen_info.yres <= screen_info.yres_virtual; y+=50) {
++	for (y = 0; (y + screen_info.yres <= screen_info.yres * 2) &&
++		(y + screen_info.yres <= screen_info.yres_virtual); y+=50) {
+ 		screen_info.yoffset = y;
+ 		retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
+ 		if (retval < 0) {
+@@ -942,17 +945,94 @@ static int test_pan(void)
+ 		update_to_display(0, 0, screen_info.xres, screen_info.yres,
+ 			WAVEFORM_MODE_AUTO, TRUE, 0);
+ 	}
+-	printf("Pan test done.\n");
+ 
+ 	screen_info.yoffset = 0;
+ 	retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
+ 	if (retval < 0)
+ 		printf("Pan fail!\n");
+ 
+-	printf("Returned to original position.\n");
++	printf("Returned to original panning offset.\n");
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*screen_info.bits_per_pixel/8);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_DU, TRUE, 0);
++
++	backbuf_offs = screen_info.xres_virtual*screen_info.yres;
++
++	printf("Use pan to flip between black & white buttons\n");
++	for (i = 1; i <= 6; i++) {
++		/* draw black */
++		draw_rectangle(fb, 100*i, 100, 80, 80, 0);
++		draw_rectangle(fb + backbuf_offs, 100*i, 100, 80, 80, 0);
++		screen_info.yoffset = 0;
++		retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++		if (retval < 0)
++			printf("Pan fail!\n");
++		update_to_display(100*i, 100, 80, 80, WAVEFORM_MODE_GC16, FALSE, 0);
++
++		usleep(100000);
++
++		/* draw white */
++		draw_rectangle(fb, 100*i, 100, 80, 80, 0xFFFF);
++		draw_rectangle(fb + backbuf_offs, 100*i, 100, 80, 80, 0xFFFF);
++		screen_info.yoffset = screen_info.yres;
++		retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++		if (retval < 0)
++			printf("Pan fail!\n");
++		update_to_display(100*i, 100, 80, 80, WAVEFORM_MODE_GC16, FALSE, 0);
++
++		usleep(100000);
++	}
++	printf("Done panning sequence - display should be white\n");
+ 
+ 	sleep(1);
+ 
++	printf("Flash button using pixel inversion\n");
++	draw_rectangle(fb, 100, 200, 80, 80, 0xFFFF);
++	draw_rectangle(fb + backbuf_offs, 100, 200, 80, 80, 0xFFFF);
++	for (i = 0; i < 4; i++) {
++		update_to_display(100, 200, 80, 80, WAVEFORM_MODE_GC16, FALSE, EPDC_FLAG_ENABLE_INVERSION);
++		update_to_display(100, 200, 80, 80, WAVEFORM_MODE_GC16, FALSE, 0);
++	}
++	printf("Done inversion sequence - display should be white\n");
++
++	sleep(2);
++
++	printf("Flash button using panning\n");
++	for (i = 0; i < 4; i++) {
++		/* Draw black button */
++		draw_rectangle(fb, 0, 0, 80, 80, 0x0);
++		draw_rectangle(fb + backbuf_offs, 0, 0, 80, 80, 0x0);
++		screen_info.yoffset = 0;
++		retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++		if (retval < 0)
++			printf("Pan fail!\n");
++		update_to_display(0, 0, 80, 80, WAVEFORM_MODE_GC16, FALSE, 0);
++		usleep(100);
++
++		/* Draw white button */
++		draw_rectangle(fb, 0, 0, 80, 80, 0xFFFF);
++		draw_rectangle(fb + backbuf_offs, 0, 0, 80, 80, 0xFFFF);
++		screen_info.yoffset = screen_info.yres;
++		retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++		if (retval < 0)
++			printf("Pan fail!\n");
++		update_to_display(0, 0, 80, 80, WAVEFORM_MODE_GC16, FALSE, 0);
++		usleep(100);
++	}
++	printf("Done button panning sequence - display should be white\n");
++
++	sleep(5);
++	printf("Pan test done.\n");
++
++	screen_info.yoffset = 0;
++	retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++	if (retval < 0)
++		printf("Pan fail!\n");
++
++	printf("Returned to original panning offset.\n");
++	sleep(1);
+ 	return TPASS;
+ }
+ 
+@@ -962,7 +1042,7 @@ static int test_overlay(void)
+ 	struct mxcfb_update_data upd_data;
+ 	int retval;
+ 	struct fb_fix_screeninfo fix_screen_info;
+-	__u32 ol_phys_addr;
++	__u32 ol_phys_addr, ol_virt_addr;
+ 
+ 	printf("Ginger update\n");
+ 	copy_image_to_buffer(0, 0, 800, 600, ginger_rgb_800x600, BUFFER_FB,
+@@ -982,6 +1062,9 @@ static int test_overlay(void)
+ 	ol_phys_addr = fix_screen_info.smem_start +
+ 		screen_info.xres_virtual*ALIGN_PIXEL_128(screen_info.yres)*screen_info.bits_per_pixel/8;
+ 
++	ol_virt_addr = (__u32)fb +
++		screen_info.xres_virtual*ALIGN_PIXEL_128(screen_info.yres)*screen_info.bits_per_pixel/8;
++
+ 	upd_data.update_mode = UPDATE_MODE_FULL;
+ 	upd_data.waveform_mode = WAVEFORM_MODE_AUTO;
+ 	upd_data.update_region.left = 0;
+@@ -994,6 +1077,7 @@ static int test_overlay(void)
+ 	upd_data.flags = EPDC_FLAG_USE_ALT_BUFFER;
+ 	/* Overlay buffer data */
+ 	upd_data.alt_buffer_data.phys_addr = ol_phys_addr;
++	upd_data.alt_buffer_data.virt_addr = (void *)ol_virt_addr;
+ 	upd_data.alt_buffer_data.width = screen_info.xres_virtual;
+ 	upd_data.alt_buffer_data.height = screen_info.yres;
+ 	upd_data.alt_buffer_data.alt_update_region.left = 0;
+@@ -1142,7 +1226,10 @@ static int test_overlay(void)
+ 
+ 	ol_phys_addr = fix_screen_info.smem_start +
+ 		screen_info.xres_virtual*ALIGN_PIXEL_128(screen_info.yres)*screen_info.bits_per_pixel/8;
++	ol_virt_addr = (__u32)fb +
++		screen_info.xres_virtual*ALIGN_PIXEL_128(screen_info.yres)*screen_info.bits_per_pixel/8;
+ 	upd_data.alt_buffer_data.phys_addr = ol_phys_addr;
++	upd_data.alt_buffer_data.virt_addr = (void *)ol_virt_addr;
+ 	upd_data.alt_buffer_data.width = screen_info.xres_virtual;
+ 	upd_data.alt_buffer_data.height = screen_info.yres;
+ 
+@@ -1284,17 +1371,6 @@ static int test_animation_mode(void)
+ 	return retval;
+ }
+ 
+-static void draw_square(int x, int y, int side, __u16 color)
+-{
+-	int i, j;
+-	int *fbp = (int *)fb;
+-	__u32 colorval = color | (color << 16);
+-
+-	for (i = y; i < y + side; i++)
+-		for (j = x; j < x + side; j += 2)
+-			fbp[(i*screen_info.xres+j)*2/4] = colorval;
+-}
+-
+ static int test_fast_square(void)
+ {
+ 	int retval = TPASS;
+@@ -1324,10 +1400,11 @@ static int test_fast_square(void)
+ 	{
+ 		/* Clear last square (set area to white) */
+ 		if (!first_go)
+-			draw_square(last_pos, ypos, side_len, 0xFFFF);
++			draw_rectangle(fb, last_pos, ypos, side_len, side_len,
++					0xFFFF);
+ 
+ 		/* Draw new black square */
+-		draw_square(xpos, ypos, side_len, 0x0000);
++		draw_rectangle(fb, xpos, ypos, side_len, side_len, 0x0000);
+ 
+ 		/* Send to display */
+ 		if (first_go) {
+@@ -1336,8 +1413,8 @@ static int test_fast_square(void)
+ 			first_go = 0;
+ 		}
+ 		else
+-			update_to_display(last_pos, ypos, side_len + increment, side_len,
+-				wave_mode, wait_upd_compl, 0);
++			update_to_display(last_pos, ypos, side_len + increment,
++				side_len, wave_mode, wait_upd_compl, 0);
+ 
+ 		last_pos = xpos;
+ 		xpos += increment;
+@@ -1346,7 +1423,7 @@ static int test_fast_square(void)
+ 	}
+ 
+ 	/* Clear last square (set area to white) */
+-	draw_square(last_pos, ypos, side_len, 0xFFFF);
++	draw_rectangle(fb, last_pos, ypos, side_len, side_len, 0xFFFF);
+ 
+ 	xpos = 700;
+ 	ypos = 150;
+@@ -1357,16 +1434,17 @@ static int test_fast_square(void)
+ 	{
+ 		/* Clear last square (set area to white) */
+ 		if (!first_go)
+-			draw_square(xpos, last_pos, side_len, 0xFFFF);
++			draw_rectangle(fb, xpos, last_pos, side_len, side_len,
++					0xFFFF);
+ 		else
+ 			first_go = 0;
+ 
+ 		/* Draw new black square */
+-		draw_square(xpos, ypos, side_len, 0x0000);
++		draw_rectangle(fb, xpos, ypos, side_len, side_len, 0x0000);
+ 
+ 		/* Send to display */
+-		update_to_display(xpos, last_pos, side_len, side_len + increment,
+-			wave_mode, wait_upd_compl, 0);
++		update_to_display(xpos, last_pos, side_len,
++			side_len + increment, wave_mode, wait_upd_compl, 0);
+ 
+ 		last_pos = ypos;
+ 		ypos += increment;
+@@ -1475,7 +1553,7 @@ main(int argc, char **argv)
+ 				scheme = UPDATE_SCHEME_QUEUE_AND_MERGE;
+ 			} else {
+ 				printf("%s: -d Requires either an "
+-					"'s', 'q', or 'm' argument\n");
++					"'s', 'q', or 'm' argument\n", argv[0]);
+ 				usage(argv[0]);
+ 			}
+ 			break;
+@@ -1612,7 +1690,7 @@ main(int argc, char **argv)
+ 	for (i = 0; i < NUM_TESTS; i++)
+ 		if (test_map[i])
+ 			if ((*testfunc_array[i])()) {
+-				printf("\nError: Test # failed.\n", i);
++				printf("\nError: Test #%d failed.\n", i);
+ 				goto err2;
+ 			}
+ 
+-- 
+1.8.0
+

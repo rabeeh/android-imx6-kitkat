@@ -1,0 +1,704 @@
+From 2396df8ba5af2ca4bd512dbfffeaaa8d5b5028bd Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 26 Aug 2011 22:05:03 +0800
+Subject: [PATCH 234/435] ENGR00155155 vpu: Change unit test to sync with
+ v2.1.2 on mx6q
+
+This change is based on v2.1.2 f/w release and corresponding
+vpu API.
+
+Note: Fileplay and prescan mode isn't supported from v2.1.2 on mx6q.
+Normal mode and rollback mode can be supported in stream mode,
+parameter "-s" is for the mode selection on i.mx6 platform
+in the test.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      |  82 +++++++++++++++++-------
+ test/mxc_vpu_test/enc.c      | 148 +++++++++++++++++++++++--------------------
+ test/mxc_vpu_test/fb.c       |   2 +-
+ test/mxc_vpu_test/main.c     |  26 +++++---
+ test/mxc_vpu_test/utils.c    |  17 ++++-
+ test/mxc_vpu_test/vpu_test.h |  11 +++-
+ 6 files changed, 179 insertions(+), 107 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 3386d04..4d30cb1 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -910,20 +910,18 @@ decoder_start(struct decode *dec)
+ 			 * Please take care of this for network case since vpu
+ 			 * interrupt also cannot be received if no enough data.
+ 			 */
+-			if (loop_id == 10) {
++			if (loop_id == 50) {
+ 				err = vpu_SWReset(handle, 0);
+ 				return -1;
+-				}
+-
+-			if (!err) {
+-				vpu_WaitForInt(500);
+-				is_waited_int = 1;
+-				loop_id ++;
+ 			}
++
++			vpu_WaitForInt(100);
++			is_waited_int = 1;
++			loop_id ++;
+ 		}
+ 
+ 		if (!is_waited_int)
+-			vpu_WaitForInt(500);
++			vpu_WaitForInt(100);
+ 
+ 		gettimeofday(&tdec_end, NULL);
+ 		sec = tdec_end.tv_sec - tdec_begin.tv_sec;
+@@ -953,7 +951,19 @@ decoder_start(struct decode *dec)
+ 		if (outinfo.decodingSuccess == 0) {
+ 			warn_msg("Incomplete finish of decoding process.\n"
+ 				"\tframe_id = %d\n", (int)frame_id);
+-			continue;
++			if (quitflag)
++				break;
++			else
++				continue;
++		}
++
++		if (cpu_is_mx6q() && (outinfo.decodingSuccess & 0x10)) {
++			warn_msg("vpu needs more bitstream in rollback mode\n"
++				"\tframe_id = %d\n", (int)frame_id);
++			if (quitflag)
++				break;
++			else
++				continue;
+ 		}
+ 
+ 		if (outinfo.notSufficientPsBuffer) {
+@@ -1049,14 +1059,14 @@ decoder_start(struct decode *dec)
+ 		if (outinfo.indexFrameDisplay == -1)
+ 			decodefinish = 1;
+ 		else if ((outinfo.indexFrameDisplay > dec->fbcount) &&
+-				(outinfo.prescanresult != 0))
++			 (outinfo.prescanresult != 0) && !cpu_is_mx6q())
+ 			decodefinish = 1;
+ 
+ 		if (decodefinish)
+ 			break;
+ 
+-		if ((outinfo.prescanresult == 0) &&
+-					(decparam.prescanEnable == 1)) {
++		if (!cpu_is_mx6q() && (outinfo.prescanresult == 0) &&
++		    (decparam.prescanEnable == 1)) {
+ 			if (eos) {
+ 				break;
+ 			} else {
+@@ -1262,7 +1272,8 @@ decoder_free_framebuffer(struct decode *dec)
+ 			(((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU))
+ 			 && deblock_en)) {
+ 		for (i = 0; i < totalfb; i++) {
+-			framebuf_free(dec->pfbpool[i]);
++			if (dec->pfbpool)
++				framebuf_free(dec->pfbpool[i]);
+ 		}
+ 	}
+ 
+@@ -1473,8 +1484,8 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 		bufinfo.avcSliceBufInfo.bufferBase = dec->phy_slice_buf;
+ 		bufinfo.avcSliceBufInfo.bufferSize = dec->phy_slicebuf_size;
+ 	} else if (dec->cmdl->format == STD_VP8) {
+-		bufinfo.vp8MbDataBufInfo.bufferBase = dec->phy_slice_buf;
+-		bufinfo.vp8MbDataBufInfo.bufferSize = dec->phy_slicebuf_size;
++		bufinfo.vp8MbDataBufInfo.bufferBase = dec->phy_vp8_mbparam_buf;
++		bufinfo.vp8MbDataBufInfo.bufferSize = dec->phy_vp8_mbparam_size;
+ 	}
+ 
+ 	/* User needs to fill max suported macro block value of frame as following*/
+@@ -1591,9 +1602,9 @@ decoder_parse(struct decode *dec)
+ 					aspect_ratio_idc = (initinfo.aspectRateInfo & 0xFF);
+ 					info_msg("aspect_ratio_idc: %d\n", aspect_ratio_idc);
+ 				} else {
+-					sar_width = (initinfo.aspectRateInfo >> 16);
++					sar_width = (initinfo.aspectRateInfo >> 16) & 0xFFFF;
+ 					sar_height = (initinfo.aspectRateInfo & 0xFFFF);
+-					info_msg("sar_width: %d\nsar_height: %d",
++					info_msg("sar_width: %d, sar_height: %d\n",
+ 						sar_width, sar_height);
+ 				}
+ 			} else {
+@@ -1715,6 +1726,9 @@ decoder_parse(struct decode *dec)
+ 
+ 		case STD_VP8:
+ 			info_msg("VP8 Profile: %d Level: %d\n", initinfo.profile, initinfo.level);
++			info_msg("hScaleFactor: %d vScaleFactor:%d\n",
++				    initinfo.vp8ScaleInfo.hScaleFactor,
++				    initinfo.vp8ScaleInfo.vScaleFactor);
+ 			break;
+ 
+ 		default:
+@@ -1722,7 +1736,13 @@ decoder_parse(struct decode *dec)
+ 		}
+ 	}
+ 
+-	info_msg("Decoder: width = %d, height = %d, fps = %lu, count = %u\n",
++	if (cpu_is_mx6q())
++		info_msg("Decoder: width = %d, height = %d, frameRateRes = %d, frameRateDiv = %d, count = %u\n",
++			initinfo.picWidth, initinfo.picHeight,
++			initinfo.frameRateRes, initinfo.frameRateDiv,
++			initinfo.minFrameBufferCount);
++	else
++		info_msg("Decoder: width = %d, height = %d, fps = %lu, count = %u\n",
+ 			initinfo.picWidth, initinfo.picHeight,
+ 			initinfo.frameRateInfo,
+ 			initinfo.minFrameBufferCount);
+@@ -1763,7 +1783,8 @@ decoder_parse(struct decode *dec)
+ 	align = 16;
+ 	if ((dec->cmdl->format == STD_MPEG2 ||
+ 	    dec->cmdl->format == STD_VC1 ||
+-	    dec->cmdl->format == STD_AVC) && initinfo.interlace == 1)
++	    dec->cmdl->format == STD_AVC ||
++	    dec->cmdl->format == STD_VP8) && initinfo.interlace == 1)
+ 		align = 32;
+ 
+ 	dec->picheight = ((initinfo.picHeight + align - 1) & ~(align - 1));
+@@ -1861,10 +1882,13 @@ decoder_open(struct decode *dec)
+ 	oparam.reorderEnable = dec->reorderEnable;
+ 	oparam.mp4DeblkEnable = dec->cmdl->deblock_en;
+ 	oparam.chromaInterleave = dec->cmdl->chromaInterleave;
+-	oparam.mp4Class = dec->cmdl->mp4Class;
++	oparam.mp4Class = dec->cmdl->mp4_h264Class;
++	if (cpu_is_mx6q())
++		oparam.avcExtension = dec->cmdl->mp4_h264Class;
+ 	oparam.mjpg_thumbNailDecEnable = 0;
+ 	oparam.mapType = dec->cmdl->mapType;
+ 	oparam.tiled2LinearEnable = dec->tiled2LinearEnable;
++	oparam.bitstreamMode = dec->cmdl->bs_mode;
+ 
+ 	/*
+ 	 * mp4 deblocking filtering is optional out-loop filtering for image
+@@ -1919,6 +1943,7 @@ decode_test(void *arg)
+ 	vpu_mem_desc mem_desc = {0};
+ 	vpu_mem_desc ps_mem_desc = {0};
+ 	vpu_mem_desc slice_mem_desc = {0};
++	vpu_mem_desc vp8_mbparam_mem_desc = {0};
+ 	struct decode *dec;
+ 	int ret, eos = 0, fill_end_bs = 0, fillsize = 0;
+ 
+@@ -1999,17 +2024,26 @@ decode_test(void *arg)
+ 	}
+ 
+ 	/* allocate slice buf */
+-	if (cmdl->format == STD_AVC || cmdl->format == STD_VP8) {
++	if (cmdl->format == STD_AVC) {
+ 		slice_mem_desc.size = dec->phy_slicebuf_size;
+ 		ret = IOGetPhyMem(&slice_mem_desc);
+ 		if (ret) {
+ 			err_msg("Unable to obtain physical slice save mem\n");
+ 			goto err1;
+ 		}
+-
+ 		dec->phy_slice_buf = slice_mem_desc.phy_addr;
+ 	}
+ 
++	if (cmdl->format == STD_VP8) {
++		vp8_mbparam_mem_desc.size = 68 * (dec->stride * dec->picwidth / 256);
++		ret = IOGetPhyMem(&vp8_mbparam_mem_desc);
++		if (ret) {
++			err_msg("Unable to obtain physical vp8 mbparam mem\n");
++			goto err1;
++		}
++		dec->phy_vp8_mbparam_buf = vp8_mbparam_mem_desc.phy_addr;
++	}
++
+ 	/* allocate frame buffers */
+ 	ret = decoder_allocate_framebuffer(dec);
+ 	if (ret)
+@@ -2023,7 +2057,6 @@ decode_test(void *arg)
+ 	ret = decoder_start(dec);
+ err1:
+ 	decoder_close(dec);
+-
+ 	/* free the frame buffers */
+ 	decoder_free_framebuffer(dec);
+ err:
+@@ -2032,6 +2065,9 @@ err:
+ 		IOFreePhyMem(&ps_mem_desc);
+ 	}
+ 
++	if (cmdl->format == STD_VP8)
++		IOFreePhyMem(&vp8_mbparam_mem_desc);
++
+ 	IOFreeVirtMem(&mem_desc);
+ 	IOFreePhyMem(&mem_desc);
+ 	free(dec);
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 02cd118..23f3124 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -115,7 +115,15 @@ void SaveEncSliceInfo(u8 *SliceParaBuf, int size, int EncNum)
+ 	fflush(fpEncSliceInfo);
+ }
+ 
+-#if STREAM_ENC_PIC_RESET == 0
++static int
++enc_readbs_reset_buffer(struct encode *enc, PhysicalAddress paBsBufAddr, int bsBufsize)
++{
++	u32 vbuf;
++
++	vbuf = enc->virt_bsbuf_addr + paBsBufAddr - enc->phy_bsbuf_addr;
++	return vpu_write(enc->cmdl, (void *)vbuf, bsBufsize);
++}
++
+ static int
+ enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd,
+ 		u32 bs_va_startaddr, u32 bs_va_endaddr, u32 bs_pa_startaddr,
+@@ -165,7 +173,7 @@ enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd,
+ 
+ 	return space;
+ }
+-#endif
++
+ 
+ static int
+ encoder_fill_headers(struct encode *enc)
+@@ -175,15 +183,12 @@ encoder_fill_headers(struct encode *enc)
+ 	RetCode ret;
+ 	int mbPicNum;
+ 
+-#if STREAM_ENC_PIC_RESET == 1
+-	u32 vbuf;
+-	u32 phy_bsbuf  = enc->phy_bsbuf_addr;
+-	u32 virt_bsbuf = enc->virt_bsbuf_addr;
+-#endif
+-
+ 	/* Must put encode header before encoding */
+ 	if (enc->cmdl->format == STD_MPEG4) {
+ 		enchdr_param.headerType = VOS_HEADER;
++
++		if (cpu_is_mx6q())
++			goto put_mp4header;
+ 		/*
+ 		 * Please set userProfileLevelEnable to 0 if you need to generate
+ 	         * user profile and level automaticaly by resolution, here is one
+@@ -209,53 +214,46 @@ encoder_fill_headers(struct encode *enc)
+ 			enchdr_param.userProfileLevelIndication = 5; /* L5 */
+ 		else
+ 			enchdr_param.userProfileLevelIndication = 6; /* L6 */
+-		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+ 
+-#if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-		if (ret < 0)
+-			return -1;
+-#endif
++put_mp4header:
++		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
++		if (enc->ringBufferEnable == 0 ) {
++			ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++			if (ret < 0)
++				return -1;
++		}
+ 
+ 		enchdr_param.headerType = VIS_HEADER;
+ 		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+-
+-#if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-		if (ret < 0)
+-			return -1;
+-#endif
++		if (enc->ringBufferEnable == 0 ) {
++			ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++			if (ret < 0)
++				return -1;
++		}
+ 
+ 		enchdr_param.headerType = VOL_HEADER;
+ 		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+-
+-#if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-		if (ret < 0)
+-			return -1;
+-#endif
++		if (enc->ringBufferEnable == 0 ) {
++			ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++			if (ret < 0)
++				return -1;
++		}
+ 	} else if (enc->cmdl->format == STD_AVC) {
+ 		enchdr_param.headerType = SPS_RBSP;
+ 		vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
++		if (enc->ringBufferEnable == 0 ) {
++			ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++			if (ret < 0)
++				return -1;
++		}
+ 
+-#if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-		if (ret < 0)
+-			return -1;
+-#endif
+ 		enchdr_param.headerType = PPS_RBSP;
+ 		vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
+-
+-#if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-		if (ret < 0)
+-			return -1;
+-#endif
++		if (enc->ringBufferEnable == 0 ) {
++			ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++			if (ret < 0)
++				return -1;
++		}
+ 	} else if (enc->cmdl->format == STD_MJPG) {
+ 		if (enc->huffTable)
+ 			free(enc->huffTable);
+@@ -287,7 +285,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	int needFrameBufCount, fbcount = enc->fbcount;
+ 	RetCode ret;
+ 	FrameBuffer *fb;
+-	PhysicalAddress subSampBaseA = NULL, subSampBaseB = NULL;
++	PhysicalAddress subSampBaseA = 0, subSampBaseB = 0;
+ 	struct frame_buf **pfbpool;
+ 
+ 	if (cpu_is_mx6q())
+@@ -355,7 +353,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, enc_stride, src_stride,
+-					    subSampBaseA, subSampBaseB);
++					    subSampBaseA, subSampBaseB, &enc->scratchBuf);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+@@ -416,14 +414,9 @@ encoder_start(struct encode *enc)
+ 	struct timeval tenc_begin,tenc_end, total_start, total_end;
+ 	int sec, usec;
+ 	float tenc_time = 0, total_time=0;
+-
+-#if STREAM_ENC_PIC_RESET == 0
+ 	PhysicalAddress phy_bsbuf_start = enc->phy_bsbuf_addr;
+ 	u32 virt_bsbuf_start = enc->virt_bsbuf_addr;
+ 	u32 virt_bsbuf_end = virt_bsbuf_start + STREAM_BUF_SIZE;
+-#else
+-	u32 vbuf;
+-#endif
+ 
+ 	/* Must put encode header before encoding */
+ 	ret = encoder_fill_headers(enc);
+@@ -515,15 +508,15 @@ encoder_start(struct encode *enc)
+ 		}
+ 
+ 		while (vpu_IsBusy()) {
+-#if STREAM_ENC_PIC_RESET == 0
+-			ret = enc_readbs_ring_buffer(handle, enc->cmdl,
++			vpu_WaitForInt(200);
++			if (enc->ringBufferEnable == 1) {
++				ret = enc_readbs_ring_buffer(handle, enc->cmdl,
+ 					virt_bsbuf_start, virt_bsbuf_end,
+ 					phy_bsbuf_start, STREAM_READ_SIZE);
+-			if (ret < 0) {
+-				goto err2;
++				if (ret < 0) {
++					goto err2;
++				}
+ 			}
+-#endif
+-			vpu_WaitForInt(200);
+ 		}
+ 
+ 		gettimeofday(&tenc_end, NULL);
+@@ -570,25 +563,21 @@ encoder_start(struct encode *enc)
+ 		if (quitflag)
+ 			break;
+ 
+-#if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (enc->virt_bsbuf_addr + outinfo.bitstreamBuffer
+-					- enc->phy_bsbuf_addr);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, outinfo.bitstreamSize);
+-		if (ret < 0) {
+-			err_msg("writing bitstream buffer failed\n");
+-			goto err2;
+-		}
+-#endif
++		if (enc->ringBufferEnable == 0) {
++			ret = enc_readbs_reset_buffer(enc, outinfo.bitstreamBuffer, outinfo.bitstreamSize);
++			if (ret < 0) {
++				err_msg("writing bitstream buffer failed\n");
++				goto err2;
++			}
++		} else
++			enc_readbs_ring_buffer(handle, enc->cmdl, virt_bsbuf_start,
++						virt_bsbuf_end, phy_bsbuf_start, 0);
++
+ 		frame_id++;
+ 		if ((count != 0) && (frame_id >= count))
+ 			break;
+ 	}
+ 
+-#if STREAM_ENC_PIC_RESET == 0
+-	enc_readbs_ring_buffer(handle, enc->cmdl, virt_bsbuf_start,
+-			virt_bsbuf_end, phy_bsbuf_start, 0);
+-#endif
+-
+ 	gettimeofday(&total_end, NULL);
+ 	sec = total_end.tv_sec - total_start.tv_sec;
+ 	usec = total_end.tv_usec - total_start.tv_usec;
+@@ -797,7 +786,7 @@ encoder_open(struct encode *enc)
+ 	encop.MbInterval = 0;
+ 	encop.avcIntra16x16OnlyModeEnable = 0;
+ 
+-	encop.ringBufferEnable = 0;
++	encop.ringBufferEnable = enc->ringBufferEnable = 0;
+ 	encop.dynamicAllocEnable = 0;
+ 	encop.chromaInterleave = enc->cmdl->chromaInterleave;
+ 
+@@ -900,6 +889,8 @@ encoder_open(struct encode *enc)
+ 
+ 	if (enc->cmdl->format == STD_MPEG4) {
+ 		encop.EncStdParam.mp4Param.mp4_dataPartitionEnable = 0;
++		enc->mp4_dataPartitionEnable =
++			encop.EncStdParam.mp4Param.mp4_dataPartitionEnable;
+ 		encop.EncStdParam.mp4Param.mp4_reversibleVlcEnable = 0;
+ 		encop.EncStdParam.mp4Param.mp4_intraDcVlcThr = 0;
+ 		encop.EncStdParam.mp4Param.mp4_hecEnable = 0;
+@@ -970,6 +961,7 @@ encode_test(void *arg)
+ {
+ 	struct cmd_line *cmdl = (struct cmd_line *)arg;
+ 	vpu_mem_desc	mem_desc = {0};
++	vpu_mem_desc scratch_mem_desc = {0};
+ 	struct encode *enc;
+ 	int ret = 0;
+ 
+@@ -1016,6 +1008,18 @@ encode_test(void *arg)
+ 	if (ret)
+ 		goto err1;
+ 
++        /* allocate scratch buf */
++	if (cpu_is_mx6q() && (cmdl->format == STD_MPEG4) && enc->mp4_dataPartitionEnable) {
++		scratch_mem_desc.size = MPEG4_SCRATCH_SIZE;
++                ret = IOGetPhyMem(&scratch_mem_desc);
++                if (ret) {
++                        err_msg("Unable to obtain physical slice save mem\n");
++                        goto err1;
++                }
++		enc->scratchBuf.bufferBase = scratch_mem_desc.phy_addr;
++		enc->scratchBuf.bufferSize = scratch_mem_desc.size;
++        }
++
+ 	/* allocate memory for the frame buffers */
+ 	ret = encoder_allocate_framebuffer(enc);
+ 	if (ret)
+@@ -1030,6 +1034,10 @@ err1:
+ 	/* close the encoder */
+ 	encoder_close(enc);
+ err:
++	if (cpu_is_mx6q() && cmdl->format == STD_MPEG4 && enc->mp4_dataPartitionEnable) {
++		IOFreeVirtMem(&scratch_mem_desc);
++		IOFreePhyMem(&scratch_mem_desc);
++	}
+ 	/* free the physical memory */
+ 	IOFreeVirtMem(&mem_desc);
+ 	IOFreePhyMem(&mem_desc);
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index aee3220..8097352 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -131,7 +131,7 @@ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int
+ 	/*
+ 	 * The buffers is luma top, chroma top, luma bottom and chroma bottom for
+ 	 * tiled map type, and only 20bits for the address description, so we need
+-	 * to do 1K page align for each buffer.
++	 * to do 4K page align for each buffer.
+ 	 */
+ 	luma_aligned_size = (((strideY * height / 2 + 4095) >> 12) << 12) * 2;
+ 	chroma_aligned_size = ((strideY / divX * height / divY + 4095) >> 12) << 12;
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 9c53ba0..7c4c60a 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -40,9 +40,11 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	4 - MPEG2, 5 - DIV3, 6 - RV, 7 - MJPG, \n "\
+ 	       "        8 - AVS, 9 - VP8\n "\
+ 	       "	If no format specified, default is 0 (MPEG4) \n "\
+-	       "  -l <mp4Class> 0 - MPEG4, 1 - DIVX 5.0 or higher, 2 - XVID, \n "\
+-	       "        5 - DIVX4.0 \n "\
+-	       "        This flag is effective when 'f' flag is 0 (MPEG4).\n "\
++	       "  -l <mp4Class / h264 type> \n "\
++	       "        When 'f' flag is 0 (MPEG4), it is mp4 class type. \n "\
++	       "        0 - MPEG4, 1 - DIVX 5.0 or higher, 2 - XVID, 5 - DIVX4.0 \n "\
++	       "        When 'f' flag is 2 (H.264), it is h264 type. \n "\
++	       "        0 - normal H.264(AVC), 1 - MVC \n "\
+ 	       "  -p <port number> UDP port number to bind \n "\
+ 	       "	If no port number is secified, 5555 is used \n "\
+ 	       "  -c <count> Number of frames to decode \n "\
+@@ -71,8 +73,9 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	default is 30 \n "\
+ 	       "  -t <chromaInterleave> CbCr interleaved \n "\
+ 	       "        default is none-interleave(0). \n "\
+-	       "  -s <prescan> Enable prescan in decoding - 1. enabled \n "\
+-	       "        default is disabled. \n "\
++	       "  -s <prescan/bs_mode> Enable prescan in decoding on i.mx5x - 1. enabled \n "\
++	       "        default is disabled. Bitstream mode in decoding on i.mx6  \n "\
++	       "        0. Normal mode, 1. Rollback mode \n "\
+ 	       "  -y <maptype> Map type for GDI interface \n "\
+ 	       "        0 - Linear frame map, 1 - frame MB map, 2 - field MB map \n "\
+ 	       "        default is 0. \n "\
+@@ -126,7 +129,7 @@ struct input_argument {
+ sigset_t sigset;
+ int quitflag;
+ 
+-static struct input_argument input_arg[4];
++static struct input_argument input_arg[MAX_NUM_INSTANCE];
+ static int instance;
+ static int using_config_file;
+ 
+@@ -155,7 +158,7 @@ parse_config_file(char *file_name)
+ 	}
+ 
+ 	while (fgets(line, MAX_PATH, fp) != NULL) {
+-		if (instance > 3) {
++		if (instance > MAX_NUM_INSTANCE) {
+ 			err_msg("No more instances!!\n");
+ 			break;
+ 		}
+@@ -221,7 +224,7 @@ parse_main_args(int argc, char *argv[])
+ 			status = -1;
+ 			break;
+ 		}
+-	} while ((opt != -1) && (status == 0) && (instance < 4));
++	} while ((opt != -1) && (status == 0) && (instance < MAX_NUM_INSTANCE));
+ 
+ 	optind = 1;
+ 	return status;
+@@ -309,7 +312,10 @@ parse_args(int argc, char *argv[], int i)
+ 			input_arg[i].cmd.gop = atoi(optarg);
+ 			break;
+ 		case 's':
+-			input_arg[i].cmd.prescan = atoi(optarg);
++			if (cpu_is_mx6q())
++				input_arg[i].cmd.bs_mode = atoi(optarg);
++			else
++				input_arg[i].cmd.prescan = atoi(optarg);
+ 			break;
+ 		case 'b':
+ 			input_arg[i].cmd.bitrate = atoi(optarg);
+@@ -327,7 +333,7 @@ parse_args(int argc, char *argv[], int i)
+ 			input_arg[i].cmd.chromaInterleave = atoi(optarg);
+ 			break;
+ 		case 'l':
+-		 	input_arg[i].cmd.mp4Class = atoi(optarg);
++			input_arg[i].cmd.mp4_h264Class = atoi(optarg);
+ 			break;
+ 		case 'a':
+ 			input_arg[i].cmd.fps = atoi(optarg);
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index ac81297..c831822 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -434,7 +434,7 @@ check_params(struct cmd_line *cmd, int op)
+ 	switch (cmd->format) {
+ 	case STD_MPEG4:
+ 		info_msg("Format: STD_MPEG4\n");
+-		switch (cmd->mp4Class) {
++		switch (cmd->mp4_h264Class) {
+ 		case 0:
+ 			info_msg("MPEG4 class: MPEG4\n");
+ 			break;
+@@ -457,6 +457,17 @@ check_params(struct cmd_line *cmd, int op)
+ 		break;
+ 	case STD_AVC:
+ 		info_msg("Format: STD_AVC\n");
++		switch (cmd->mp4_h264Class) {
++		case 0:
++			info_msg("AVC\n");
++			break;
++		case 1:
++			info_msg("MVC\n");
++			break;
++		default:
++			err_msg("Unsupported H264 type\n");
++			break;
++		}
+ 		break;
+ 	case STD_VC1:
+ 		info_msg("Format: STD_VC1\n");
+@@ -731,7 +742,7 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode)
+ 		if (str != NULL) {
+ 			str++;
+ 			if (*str != '\0') {
+-				cmd->mp4Class = strtol(str, NULL, 10);
++				cmd->mp4_h264Class = strtol(str, NULL, 10);
+ 			}
+ 		}
+ 
+@@ -823,6 +834,8 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode)
+ 			str++;
+ 			if (*str != '\0') {
+ 				cmd->prescan = strtol(str, NULL, 10);
++				if (cpu_is_mx6q() && cmd->prescan)
++					warn_msg("Prescan cannot be enabled on mx6 platform.\n");
+ 			}
+ 		}
+ 
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 08275ed..93c03fd 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -51,6 +51,8 @@ typedef unsigned char u8;
+ #define STREAM_READ_SIZE	(512 * 8)
+ #define STREAM_END_SIZE		0
+ #define PS_SAVE_SIZE		0x080000
++#define VP8_MB_SAVE_SIZE	0x080000
++#define MPEG4_SCRATCH_SIZE	0x080000
+ 
+ #define STREAM_ENC_PIC_RESET 	1
+ 
+@@ -172,6 +174,7 @@ struct cmd_line {
+ 	int save_enc_hdr;
+ 	int count;
+ 	int prescan;
++	int bs_mode;
+ 	char *nbuf; /* network buffer */
+ 	int nlen; /* remaining data in network buffer */
+ 	int noffset; /* offset into network buffer */
+@@ -179,7 +182,7 @@ struct cmd_line {
+ 	u16 port; /* udp port number */
+ 	u16 complete; /* wait for the requested buf to be filled completely */
+ 	int iframe;
+-	int mp4Class;
++	int mp4_h264Class;
+ 	char vdi_motion;	/* VDI motion algorithm */
+ 	int fps;
+ 	int mapType;
+@@ -190,7 +193,10 @@ struct decode {
+ 	PhysicalAddress phy_bsbuf_addr;
+ 	PhysicalAddress phy_ps_buf;
+ 	PhysicalAddress phy_slice_buf;
++	PhysicalAddress phy_vp8_mbparam_buf;
++
+ 	int phy_slicebuf_size;
++	int phy_vp8_mbparam_size;
+ 	u32 virt_bsbuf_addr;
+ 	int picwidth;
+ 	int picheight;
+@@ -228,6 +234,9 @@ struct encode {
+ 	int src_fbid;	/* Index of frame buffer that contains YUV image */
+ 	FrameBuffer *fb; /* frame buffer base given to encoder */
+ 	struct frame_buf **pfbpool; /* allocated fb pointers are stored here */
++	ExtBufCfg scratchBuf;
++	int mp4_dataPartitionEnable;
++	int ringBufferEnable;
+ 
+         EncReportInfo mbInfo;
+         EncReportInfo mvInfo;
+-- 
+1.8.0
+

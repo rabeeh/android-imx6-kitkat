@@ -1,0 +1,95 @@
+From 7351b5c394361a094b058cd17c5c9d68124f2623 Mon Sep 17 00:00:00 2001
+From: "Yaoming.Qin" <B10945@freescale.com>
+Date: Fri, 13 May 2011 18:18:28 +0800
+Subject: [PATCH 143/486] ENGR00143383 The cts case testPreviewFpsRange failed
+
+1. The cts case itself has the bug, so need the patch.
+2. The camera hal is update to support both the framerate configure api.
+3. The fps range is not stable now, the issue is root in mxc v4l2 capture,
+   which will be fixed in another patch.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ libcamera/CameraHal.cpp | 31 +++++++++++++++++++++++--------
+ 1 file changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index eecc680..643c5b8 100755
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -283,12 +283,12 @@ namespace android {
+         pParam->set(CameraParameters::KEY_SUPPORTED_PICTURE_SIZES, supportedPictureSizes);
+         pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_SIZES, supportedPreviewSizes);
+         pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES, supportedFPS);
+-        pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE, "(15000,15000),(30000,30000)");
+-        pParam->set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "30000,30000");
++        pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE, "(1000,15000),(5000,30000)");
++        pParam->set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "5000,30000");
+ 
+         pParam->setPreviewSize(640, 480);
+         pParam->setPictureSize(640, 480);
+-        pParam->setPreviewFrameRate(30);
++        pParam->setPreviewFrameRate(5);
+ 
+         return CAMERA_HAL_ERR_NONE;
+ 
+@@ -530,9 +530,9 @@ namespace android {
+             return BAD_VALUE;
+         }
+ 
+-        params.getPreviewFpsRange(&max_fps, &min_fps);
++        params.getPreviewFpsRange(&min_fps, &max_fps);
+         CAMERA_HAL_LOG_INFO("###the fps is %d###", max_fps);
+-        if (max_fps < 15000 || min_fps < 15000){
++        if (max_fps < 1000 || min_fps < 1000 || max_fps > 30000 || min_fps > 30000){
+             CAMERA_HAL_ERR("The fps range from %d to %d is error", min_fps, max_fps);
+             return BAD_VALUE;
+         }
+@@ -714,6 +714,7 @@ namespace android {
+         DMA_BUFFER Buf_input, Buf_output;
+         sp<MemoryBase> JpegMemBase = NULL;
+         sp<MemoryHeapBase> JpegImageHeap = NULL;
++        int  max_fps, min_fps;
+ 
+         if (mJpegEncoder == NULL){
+             CAMERA_HAL_ERR("the jpeg encoder is NULL");
+@@ -721,7 +722,13 @@ namespace android {
+         }
+         mParameters.getPictureSize((int *)&(mCaptureDeviceCfg.width),(int *)&(mCaptureDeviceCfg.height));
+         mCaptureDeviceCfg.tv.numerator = 1;
+-        mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++        if (mParameters.getPreviewFrameRate() >= 15)
++            mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++        else{
++            mParameters.getPreviewFpsRange(&min_fps, &max_fps);
++            CAMERA_HAL_LOG_INFO("###the fps is %d###", max_fps);
++            mCaptureDeviceCfg.tv.denominator = max_fps/1000;
++        }
+         mCaptureBufNum = PICTURE_CAPTURE_BUFFER_NUM;
+         mPPbufNum = 1;
+         mTakePicFlag = true;
+@@ -1096,11 +1103,19 @@ Pic_out:
+     {
+         CAMERA_HAL_LOG_FUNC;
+         status_t ret = NO_ERROR;
+-
++        int  max_fps, min_fps;
+         mParameters.getPreviewSize((int *)&(mCaptureDeviceCfg.width),(int *)&(mCaptureDeviceCfg.height));
+         mCaptureDeviceCfg.fmt = mPreviewCapturedFormat;
+         mCaptureDeviceCfg.tv.numerator = 1;
+-        mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++        //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
++        // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
++        if (mParameters.getPreviewFrameRate() >= 15)
++            mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++        else{
++            mParameters.getPreviewFpsRange(&min_fps, &max_fps);
++            CAMERA_HAL_LOG_INFO("###start the preview the fps is %d###", max_fps);
++            mCaptureDeviceCfg.tv.denominator = max_fps/1000;
++        }
+         mCaptureBufNum = PREVIEW_CAPTURE_BUFFER_NUM;
+         mPPbufNum = POST_PROCESS_BUFFER_NUM;
+         mTakePicFlag = false;
+-- 
+1.8.0
+

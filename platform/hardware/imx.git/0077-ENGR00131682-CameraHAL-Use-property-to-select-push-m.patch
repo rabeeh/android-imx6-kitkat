@@ -1,0 +1,246 @@
+From c3a188d7da5ebe8f59dca3d4b569c5faef6fe849 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Sat, 18 Sep 2010 01:54:41 +0800
+Subject: [PATCH 077/486] ENGR00131682 CameraHAL: Use property to select push
+ mode
+
+1. use property to select push mode or not, default not use push mode
+   Command to enable: setprop camera.overlay.enable-pushmode 1
+2. Remove build warning
+3. In push mode, use last display index for buffer queue
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ libcamera/CameraHal.cpp | 61 ++++++++++++++++++++++++++++++-------------------
+ libcamera/CameraHal.h   |  5 ++--
+ 2 files changed, 39 insertions(+), 27 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index 5cfad48..80f7bbc 100755
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -28,6 +28,7 @@
+ *
+ */
+ #define LOG_TAG "CameraHal"
++#include <cutils/properties.h>
+ #include "CameraHal.h"
+ 
+ namespace android {
+@@ -52,25 +53,24 @@ const char CameraHal::PARAMS_DELIMITER []= ",";
+ 
+ CameraHal::CameraHal()
+                   : mParameters(),
++                    mPreviewHeap(0),
++                    mPreviewRunning(0),
+                     mRecordHeight(0),
+                     mRecordWidth(0),
+-                    mPictureHeight(0),
+-                    mPictureWidth(0),
+-                    fcount(6),
+                     mOverlay(NULL),
+-                    mPreviewRunning(0),
+-                    mPreviewHeap(0),
+-                    mRecordFrameSize(0),
+-                    mRecordRunning(0),
+-                    mCurrentRecordFrame(0),
+-                    mVideoHeap(0),
+                     mNotifyCb(0),
+                     mDataCb(0),
+                     mDataCbTimestamp(0),
+                     mCallbackCookie(0),
+                     mMsgEnabled(0),
++                    mCameraOpened(0),
++                    mPictureHeight(0),
++                    mPictureWidth(0),
++                    mRecordFrameSize(0),
++                    mRecordRunning(0),
++                    mCurrentRecordFrame(0),
+                     nCameraBuffersQueued(0),
+-                    mCameraOpened(0)
++                    mVideoHeap(0)
+ {
+     int i;
+ 
+@@ -231,7 +231,7 @@ int CameraHal::uvcGetDeviceAndCapability(char *sizes_buf)
+             if(strncmp(dir_entry->d_name, "video", 5)) /* Not video device */
+                 continue;
+                 sprintf(dev_node, "/dev/%s", dir_entry->d_name);
+-                if (fd = open(dev_node, O_RDWR, O_NONBLOCK) < 0)
++                if ((fd = open(dev_node, O_RDWR, O_NONBLOCK)) < 0)
+                     continue;
+                 /* Query the capability of device */
+                 if(ioctl(fd, VIDIOC_QUERYCAP, &v4l2_cap) < 0 ) {
+@@ -322,7 +322,7 @@ int CameraHal::cameraClose()
+         if (mCaptureBuffers[i].length && (mCaptureBuffers[i].virt_start > 0)) {
+ 	    munmap(mCaptureBuffers[i].virt_start, mCaptureBuffers[i].length);
+             mCaptureBuffers[i].length = 0;
+-	    LOGD("munmap buffers 0x%x\n", mCaptureBuffers[i].virt_start);
++	    LOGD("munmap buffers 0x%x\n", (unsigned int)(mCaptureBuffers[i].virt_start));
+         }
+     }
+     if (camera_device != -1) {
+@@ -387,8 +387,8 @@ int CameraHal::cameraTakePicConfig()
+         LOGD(" pixelformat = %d\n", fmt.fmt.pix.pixelformat);
+     }
+ 
+-    if ((mPictureWidth != fmt.fmt.pix.width) ||
+-        (mPictureHeight != fmt.fmt.pix.height)) {
++    if ((mPictureWidth != (int)fmt.fmt.pix.width) ||
++        (mPictureHeight != (int)fmt.fmt.pix.height)) {
+         LOGD("Hardware not support the width or height");
+         mPictureWidth = fmt.fmt.pix.width;
+         mPictureHeight = fmt.fmt.pix.height;
+@@ -531,7 +531,7 @@ int CameraHal::cameraPreviewStart()
+         memset(mCaptureBuffers[i].virt_start, 0xFF, mCaptureBuffers[i].length);
+         LOGE("capture buffers[%d].length = %d\n", i, mCaptureBuffers[i].length);
+         LOGE("capture buffers[%d].phy_offset = 0x%x\n", i, mCaptureBuffers[i].phy_offset);
+-        LOGE("capture buffers[%d].virt_start = 0x%x\n", i, mCaptureBuffers[i].virt_start);
++        LOGE("capture buffers[%d].virt_start = 0x%x\n", i, (unsigned int)(mCaptureBuffers[i].virt_start));
+     }
+ 
+     nCameraBuffersQueued = 0;
+@@ -622,7 +622,7 @@ void CameraHal::previewOneFrame()
+ 	return;
+ 
+     image_size = mRecordFrameSize;
+-    display_index = buffer_index_maps[queue_head];
++    display_index = buffer_index_maps[display_head];
+ 
+     if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+         nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+@@ -658,6 +658,7 @@ void CameraHal::previewOneFrame()
+ 	       be used for capturing next frame */
+ 	    if (is_first_buffer) {
+ 		is_first_buffer = 0;
++		last_display_index = display_index;
+ 		goto out;
+ 	    }
+ 	} else {
+@@ -676,7 +677,10 @@ void CameraHal::previewOneFrame()
+     memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
+     cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+     cfilledbuffer.memory = V4L2_MEMORY_MMAP;
+-    cfilledbuffer.index = display_index;
++    if (mOverlay != 0 && is_overlay_pushmode)
++        cfilledbuffer.index = last_display_index;
++    else
++        cfilledbuffer.index = display_index;
+ 
+ #ifdef UVC_CAMERA
+     ret = ioctl(camera_device, VIDIOC_QBUF, &cfilledbuffer);
+@@ -704,11 +708,12 @@ void CameraHal::previewOneFrame()
+ 
+ #endif
+     nCameraBuffersQueued++;
+-    queue_head ++;
+-    queue_head %= CAPTURE_BUFFER_NUM;
++    last_display_index = display_index;
+ 
+     sem_post(&avaible_dequeue_frame);
+ out:
++    display_head ++;
++    display_head %= CAPTURE_BUFFER_NUM;
+     return;
+ }
+ 
+@@ -724,17 +729,22 @@ int CameraHal::previewShowFrameThread()
+ status_t CameraHal::setOverlay(const sp<Overlay> &overlay)
+ {
+     LOG_FUNCTION_NAME
++    char  propBuf[PROPERTY_VALUE_MAX];
+ 
+     Mutex::Autolock lock(mLock);
+     if (overlay == NULL)
+         LOGE("Trying to set overlay, but overlay is null!");
+     mOverlay = overlay;
+ 
++    is_overlay_pushmode = 0;
++
+     if (mOverlay != 0) {
+ 	/* Not enable push mode for UVC camera case yet*/
+ #ifndef UVC_CAMERA
+-	mOverlay->setParameter(OVERLAY_MODE, OVERLAY_PUSH_MODE);
+-	is_overlay_pushmode = 1;
++    property_get("camera.overlay.enable-pushmode", propBuf, "");
++    is_overlay_pushmode = (propBuf[0] == '1');
++    if (is_overlay_pushmode)
++        mOverlay->setParameter(OVERLAY_MODE, OVERLAY_PUSH_MODE);
+ #endif
+     }
+ 
+@@ -813,9 +823,10 @@ status_t CameraHal::startPreview()
+     }
+ 
+     dequeue_head = 0;
+-    queue_head = 0;
++    display_head = 0;
+     error_status = 0;
+     is_first_buffer = 1;
++    last_display_index = 0;
+ 
+     for (i = 0; i < CAPTURE_BUFFER_NUM; i++) {
+         mCaptureBuffers[i].length = 0;
+@@ -898,6 +909,7 @@ void CameraHal::cameraPreviewStop()
+ 		usleep(30000);
+             }
+         }
++	mOverlay = 0;
+ 
+ /* no need to DQBUF before STREAMOFF for UVC camera to improve performance */
+ #if 0
+@@ -1350,7 +1362,7 @@ JPEG_ENC_UINT8 CameraHal::pushJpegOutput(JPEG_ENC_UINT8 ** out_buf_ptrptr,JPEG_E
+     {
+         /* Flush the buffer*/
+         g_JpegDataLen += *out_buf_len_ptr;
+-        LOGI("jpeg output data len %d",g_JpegDataLen);
++        LOGI("jpeg output data len %d",(int)g_JpegDataLen);
+     }
+     else
+     {
+@@ -1387,7 +1399,8 @@ sp<MemoryBase> CameraHal::encodeImage(void *buffer, uint32_t bufflen)
+     g_JpegDataLen = 0;//Valid data len of g_JpegData
+     g_JpegData = NULL;//Buffer to hold jpeg data
+     size = width * height * 3 / 2;
+-    LOGI("CameraHal::encodeImage:buffer 0x%x, bufflen %d,width %d,height %d",buffer,bufflen,width,height);
++    LOGI("CameraHal::encodeImage:buffer 0x%x, bufflen %d,width %d,height %d",
++         (unsigned int)buffer,bufflen,width,height);
+     sp<MemoryHeapBase> mJpegImageHeap = new MemoryHeapBase(size);
+ 
+     g_JpegData = (JPEG_ENC_UINT8 *)(mJpegImageHeap->getBase());
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index a957ee1..354f6b3 100644
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -197,7 +197,6 @@ private:
+     int cameraTakePicture();
+     void previewOneFrame();
+ 
+-    int fcount;
+     mutable Mutex       mLock;
+ 
+     CameraParameters    mParameters;
+@@ -208,7 +207,6 @@ private:
+     int                 mRecordHeight;
+     int                 mRecordWidth;
+     int                 mRecordFormat;
+-    int                 display_head;
+ 
+     // protected by mLock
+     sp<Overlay>         mOverlay;
+@@ -262,10 +260,11 @@ private:
+     static const char PARAMS_DELIMITER[];
+ 
+     int error_status;
+-    int queue_head;
++    int display_head;
+     int dequeue_head;
+     int is_first_buffer;
+     int is_overlay_pushmode;
++    int last_display_index;
+ 
+     sem_t avaiable_show_frame;
+     sem_t avaible_dequeue_frame;
+-- 
+1.8.0
+

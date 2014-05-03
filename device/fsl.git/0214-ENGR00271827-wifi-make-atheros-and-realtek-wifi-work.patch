@@ -1,0 +1,381 @@
+From 793a875ecff1daff1cee9de5a850f18713f430b1 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Fri, 19 Jul 2013 12:07:08 +0800
+Subject: [PATCH 214/281] ENGR00271827 wifi:make atheros and realtek wifi work
+ in one image
+
+Introduce one wlan device named UNITE to support both Atheros and Realtek
+wifi(AR6103 and rtl8723as).Involved all imx6 platform we support in release.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ evk_6sl/BoardConfig.mk      | 40 ++++++++++++++++++-------------------
+ evk_6sl/init.rc             | 13 ++++++++++++
+ imx53_smd/BoardConfig.mk    | 48 ++++++++++++++++-----------------------------
+ imx6/etc/init.rc            | 10 ++++++----
+ imx6/imx6.mk                |  1 +
+ sabreauto_6q/BoardConfig.mk | 45 ++++++++++++++++--------------------------
+ sabreauto_6q/init.rc        | 15 ++++++++++++++
+ sabresd_6dq/BoardConfig.mk  | 44 +++++++++++++++--------------------------
+ sabresd_6dq/init.rc         | 15 ++++++++++++++
+ 9 files changed, 120 insertions(+), 111 deletions(-)
+
+diff --git a/evk_6sl/BoardConfig.mk b/evk_6sl/BoardConfig.mk
+index e83909e..4d85b09 100644
+--- a/evk_6sl/BoardConfig.mk
++++ b/evk_6sl/BoardConfig.mk
+@@ -13,27 +13,27 @@ include device/fsl/imx6/imx6_target_fs.mk
+ TARGET_BOOTLOADER_BOARD_NAME := EVK
+ PRODUCT_MODEL := EVK_MX6SL
+ 
+-# Wifi
+-BOARD_WLAN_VENDOR 			 := ATHEROS
+-# for atheros vendor
+-ifeq ($(BOARD_WLAN_VENDOR),ATHEROS)
+-BOARD_WLAN_DEVICE			 := ar6003
+-BOARD_HAS_ATH_WLAN 			 := true
+-WPA_SUPPLICANT_VERSION			 := VER_0_8_ATHEROS
+-WIFI_DRIVER_MODULE_PATH          	 := "/system/lib/modules/ath6kl_sdio.ko"
+-WIFI_DRIVER_MODULE_NAME          	 := "ath6kl_sdio"
+-WIFI_DRIVER_MODULE_ARG           	 := "suspend_mode=3 wow_mode=2 ar6k_clock=26000000 ath6kl_p2p=1"
+-WIFI_DRIVER_P2P_MODULE_ARG       	 := "suspend_mode=3 wow_mode=2 ar6k_clock=26000000 ath6kl_p2p=1 debug_mask=0x2413"
+-WIFI_SDIO_IF_DRIVER_MODULE_PATH  	 := "/system/lib/modules/cfg80211.ko"
+-WIFI_SDIO_IF_DRIVER_MODULE_NAME  	 := "cfg80211"
+-WIFI_SDIO_IF_DRIVER_MODULE_ARG   	 := ""
+-WIFI_COMPAT_MODULE_PATH			 := "/system/lib/modules/compat.ko"
+-WIFI_COMPAT_MODULE_NAME			 := "compat"
+-WIFI_COMPAT_MODULE_ARG			 := ""
++
++# UNITE is a virtual device support both atheros and realtek wifi(ar6103 and rtl8723as)
++BOARD_WLAN_DEVICE            := UNITE
++WPA_SUPPLICANT_VERSION       := VER_0_8_UNITE
++TARGET_KERNEL_MODULES        := \
++                                kernel_imx/drivers/net/wireless/rtl8723as/8723as.ko:system/lib/modules/8723as.ko \
++                                kernel_imx/net/wireless/cfg80211.ko:system/lib/modules/cfg80211_realtek.ko
++BOARD_WPA_SUPPLICANT_DRIVER  := NL80211
++BOARD_HOSTAPD_DRIVER         := NL80211
++
++#for intel vendor
++ifeq ($(BOARD_WLAN_VENDOR),INTEL)
++BOARD_HOSTAPD_PRIVATE_LIB                ?= private_lib_driver_cmd
++BOARD_WPA_SUPPLICANT_PRIVATE_LIB         ?= private_lib_driver_cmd
++WPA_SUPPLICANT_VERSION                   := VER_0_8_X
++HOSTAPD_VERSION                          := VER_0_8_X
++BOARD_WPA_SUPPLICANT_PRIVATE_LIB         := private_lib_driver_cmd_intel
++WIFI_DRIVER_MODULE_PATH                  := "/system/lib/modules/iwlagn.ko"
++WIFI_DRIVER_MODULE_NAME                  := "iwlagn"
++WIFI_DRIVER_MODULE_PATH                  ?= auto
+ endif
+-BOARD_WPA_SUPPLICANT_DRIVER      	 := NL80211
+-BOARD_HOSTAPD_DRIVER             	 := NL80211
+-WIFI_TEST_INTERFACE			 := "sta"
+ 
+ BOARD_MODEM_VENDOR := AMAZON
+ 
+diff --git a/evk_6sl/init.rc b/evk_6sl/init.rc
+index e6df60d..8ecdef4 100644
+--- a/evk_6sl/init.rc
++++ b/evk_6sl/init.rc
+@@ -96,6 +96,19 @@ service p2p_supplicant /system/bin/wpa_supplicant \
+     disabled
+     oneshot
+ 
++service rtw_suppl_con /system/bin/rtl_wpa_supplicant \
++    -ip2p0 -Dnl80211 -c/data/misc/wifi/p2p_supplicant.conf -e/data/misc/wifi/entropy.bin -N \
++    -iwlan0 -Dnl80211 -c/data/misc/wifi/wpa_supplicant.conf
++    class late_start
++    socket wpa_wlan0 dgram 660 wifi wifi
++    disabled
++    oneshot
++
++service wpa_supplicant /system/bin/wpa_supplicant -iwlan0 -Dnl80211
++    -c/data/misc/wifi/wpa_supplicant.conf
++    socket wpa_wlan0 dgram 660 wifi wifi
++    class late_start
++    disabled
+     oneshot
+ 
+ service iprenew_wlan0 /system/bin/dhcpcd -n
+diff --git a/imx53_smd/BoardConfig.mk b/imx53_smd/BoardConfig.mk
+index 100520b..cca39d2 100755
+--- a/imx53_smd/BoardConfig.mk
++++ b/imx53_smd/BoardConfig.mk
+@@ -10,40 +10,26 @@ BOARD_SOC_CLASS := IMX5X
+ BOARD_SOC_TYPE := IMX53
+ PRODUCT_MODEL := IMX53-SMD
+ 
+-# Wifi
+-BOARD_WLAN_VENDOR			:= ATHEROS
+-# for atheros vendor
+-ifeq ($(BOARD_WLAN_VENDOR),ATHEROS)
+-BOARD_WLAN_DEVICE			:= ar6003
+-BOARD_HAS_ATH_WLAN 			:= true
+-WPA_SUPPLICANT_VERSION			:= VER_0_8_ATHEROS
+-WIFI_DRIVER_MODULE_PATH          	:= "/system/lib/modules/ath6kl_sdio.ko"
+-WIFI_DRIVER_MODULE_NAME          	:= "ath6kl_sdio"
+-WIFI_DRIVER_MODULE_ARG           	:= "suspend_mode=2 ar6k_clock=26000000 ath6kl_p2p=1"
+-WIFI_DRIVER_P2P_MODULE_ARG       	:= "suspend_mode=2 ar6k_clock=26000000 ath6kl_p2p=1 debug_mask=0x2413"
+-WIFI_SDIO_IF_DRIVER_MODULE_PATH  	:= "/system/lib/modules/cfg80211.ko"
+-WIFI_SDIO_IF_DRIVER_MODULE_NAME  	:= "cfg80211"
+-WIFI_SDIO_IF_DRIVER_MODULE_ARG   	:= ""
+-WIFI_COMPAT_MODULE_PATH			:= "/system/lib/modules/compat.ko"
+-WIFI_COMPAT_MODULE_NAME			:= "compat"
+-WIFI_COMPAT_MODULE_ARG			:= ""
+-endif
++# UNITE is a virtual device support both atheros and realtek wifi(ar6103 and rtl8723as)
++BOARD_WLAN_DEVICE            := UNITE
++WPA_SUPPLICANT_VERSION       := VER_0_8_UNITE
++TARGET_KERNEL_MODULES        := \
++                                kernel_imx/drivers/net/wireless/rtl8723as/8723as.ko:system/lib/modules/8723as.ko \
++                                kernel_imx/net/wireless/cfg80211.ko:system/lib/modules/cfg80211_realtek.ko
++BOARD_WPA_SUPPLICANT_DRIVER  := NL80211
++BOARD_HOSTAPD_DRIVER         := NL80211
++
+ #for intel vendor
+ ifeq ($(BOARD_WLAN_VENDOR),INTEL)
+-BOARD_HOSTAPD_PRIVATE_LIB		?= private_lib_driver_cmd
+-BOARD_WPA_SUPPLICANT_PRIVATE_LIB 	?= private_lib_driver_cmd
+-WPA_SUPPLICANT_VERSION			:= VER_0_7_X_INTEL
+-HOSTAPD_VERSION				:= VER_0_7_X_INTEL
+-WIFI_DRIVER_MODULE_PATH          	:= "/system/lib/modules/iwlagn.ko"
+-WIFI_DRIVER_MODULE_NAME          	:= "iwlagn"
+-WIFI_DRIVER_MODULE_PATH			?= auto
++BOARD_HOSTAPD_PRIVATE_LIB                ?= private_lib_driver_cmd
++BOARD_WPA_SUPPLICANT_PRIVATE_LIB         ?= private_lib_driver_cmd
++WPA_SUPPLICANT_VERSION                   := VER_0_8_X
++HOSTAPD_VERSION                          := VER_0_8_X
++BOARD_WPA_SUPPLICANT_PRIVATE_LIB         := private_lib_driver_cmd_intel
++WIFI_DRIVER_MODULE_PATH                  := "/system/lib/modules/iwlagn.ko"
++WIFI_DRIVER_MODULE_NAME                  := "iwlagn"
++WIFI_DRIVER_MODULE_PATH                  ?= auto
+ endif
+-BOARD_WPA_SUPPLICANT_DRIVER      	:= NL80211
+-BOARD_HOSTAPD_DRIVER             	:= NL80211
+-WIFI_TEST_INTERFACE			:= "sta"
+-WIFI_DRIVER_FW_PATH_STA			:= "sta"
+-WIFI_DRIVER_FW_PATH_AP			:= "ap"
+-WIFI_DRIVER_FW_PATH_P2P			:= "p2p"
+ 
+ BOARD_HAVE_VPU := true
+ HAVE_FSL_IMX_GPU2D := true
+diff --git a/imx6/etc/init.rc b/imx6/etc/init.rc
+index 951e70d..a241d6c 100755
+--- a/imx6/etc/init.rc
++++ b/imx6/etc/init.rc
+@@ -214,8 +214,12 @@ on post-fs-data
+     mkdir /data/misc/vpn 0770 system vpn
+     mkdir /data/misc/systemkeys 0700 system system
+     # give system access to wpa_supplicant.conf for backup and restore
+-    mkdir /data/misc/wifi 0770 wifi system
++    mkdir /data/misc/wifi 0770 wifi wifi
+     chmod 0770 /data/misc/wifi
++    mkdir /data/misc/wifi/sockets 0770 wifi wifi
++    mkdir /data/misc/wifi/wpa_supplicant 0770 wifi wifi
++    mkdir /data/misc/dhcp 0770 dhcp dhcp
++    chown dhcp dhcp /data/misc/dhcp
+     chmod 0660 /data/misc/wifi/wpa_supplicant.conf
+     chmod 0775 /data/misc/wifi/ipconfig.txt
+     chmod 0775 /system/etc/dhcpcd/dhcpcd-run-hooks
+@@ -236,6 +240,7 @@ on post-fs-data
+     mkdir /data/system 0775 system system
+     mkdir /data/system/wpa_supplicant 0771 wifi wifi
+     chmod 0771 /data/system/wpa_supplicant
++    symlink /data/misc/wifi/wpa_supplicant /data/system/wpa_supplicant
+ 
+     # create dalvik-cache, so as to enforce our permissions
+     mkdir /data/dalvik-cache 0771 system system
+@@ -367,9 +372,6 @@ on boot
+ # Prepare for wifi
+     setprop wifi.interface wlan0
+     setprop wifi.ap.interface wlan0
+-    mkdir /data/misc/wifi/sockets 0770 wifi system
+-    mkdir /data/misc/dhcp 0770 dhcp dhcp
+-    chown dhcp dhcp /data/misc/dhcp
+ 
+ # Prepare for bluetooth
+     chmod 665 /sys/class/rfkill/rfkill0/state
+diff --git a/imx6/imx6.mk b/imx6/imx6.mk
+index 2fdb7ce..7d885df 100644
+--- a/imx6/imx6.mk
++++ b/imx6/imx6.mk
+@@ -37,6 +37,7 @@ PRODUCT_PACKAGES += \
+ 	ip-up-ppp0				\
+ 	ip-down-ppp0				\
+ 	wpa_supplicant				\
++	rtl_wpa_supplicant			\
+ 	wpa_supplicant.conf			\
+ 	wpa_supplicant_p2p.conf			\
+ 	dispd					\
+diff --git a/sabreauto_6q/BoardConfig.mk b/sabreauto_6q/BoardConfig.mk
+index b118ec5..f7d43b5 100644
+--- a/sabreauto_6q/BoardConfig.mk
++++ b/sabreauto_6q/BoardConfig.mk
+@@ -19,37 +19,26 @@ PRODUCT_MODEL := SABREAUTO-MX6Q
+ USE_OPENGL_RENDERER := true
+ TARGET_CPU_SMP := true
+ 
+-# Wifi
+-BOARD_WLAN_VENDOR 			 := ATHEROS
+-# for atheros vendor
+-ifeq ($(BOARD_WLAN_VENDOR),ATHEROS)
+-BOARD_WLAN_DEVICE			 := ar6003
+-BOARD_HAS_ATH_WLAN 			 := true
+-WPA_SUPPLICANT_VERSION			 := VER_0_8_ATHEROS
+-WIFI_DRIVER_MODULE_PATH          	 := "/system/lib/modules/ath6kl_sdio.ko"
+-WIFI_DRIVER_MODULE_NAME          	 := "ath6kl_sdio"
+-WIFI_DRIVER_MODULE_ARG           	 := "suspend_mode=3 wow_mode=2 ar6k_clock=26000000 ath6kl_p2p=1"
+-WIFI_DRIVER_P2P_MODULE_ARG       	 := "suspend_mode=3 wow_mode=2 ar6k_clock=26000000 ath6kl_p2p=1 debug_mask=0x2413"
+-WIFI_SDIO_IF_DRIVER_MODULE_PATH  	 := "/system/lib/modules/cfg80211.ko"
+-WIFI_SDIO_IF_DRIVER_MODULE_NAME  	 := "cfg80211"
+-WIFI_SDIO_IF_DRIVER_MODULE_ARG   	 := ""
+-WIFI_COMPAT_MODULE_PATH			 := "/system/lib/modules/compat.ko"
+-WIFI_COMPAT_MODULE_NAME			 := "compat"
+-WIFI_COMPAT_MODULE_ARG			 := ""
+-endif
++# UNITE is a virtual device support both atheros and realtek wifi(ar6103 and rtl8723as)
++BOARD_WLAN_DEVICE            := UNITE
++WPA_SUPPLICANT_VERSION       := VER_0_8_UNITE
++TARGET_KERNEL_MODULES        := \
++                                kernel_imx/drivers/net/wireless/rtl8723as/8723as.ko:system/lib/modules/8723as.ko \
++                                kernel_imx/net/wireless/cfg80211.ko:system/lib/modules/cfg80211_realtek.ko
++BOARD_WPA_SUPPLICANT_DRIVER  := NL80211
++BOARD_HOSTAPD_DRIVER         := NL80211
++
+ #for intel vendor
+ ifeq ($(BOARD_WLAN_VENDOR),INTEL)
+-BOARD_HOSTAPD_PRIVATE_LIB		 ?= private_lib_driver_cmd
+-BOARD_WPA_SUPPLICANT_PRIVATE_LIB 	 ?= private_lib_driver_cmd
+-WPA_SUPPLICANT_VERSION			 := VER_0_7_X_INTEL
+-HOSTAPD_VERSION				 := VER_0_7_X_INTEL
+-WIFI_DRIVER_MODULE_PATH          	 := "/system/lib/modules/iwlagn.ko"
+-WIFI_DRIVER_MODULE_NAME          	 := "iwlagn"
+-WIFI_DRIVER_MODULE_PATH			 ?= auto
++BOARD_HOSTAPD_PRIVATE_LIB                ?= private_lib_driver_cmd
++BOARD_WPA_SUPPLICANT_PRIVATE_LIB         ?= private_lib_driver_cmd
++WPA_SUPPLICANT_VERSION                   := VER_0_8_X
++HOSTAPD_VERSION                          := VER_0_8_X
++BOARD_WPA_SUPPLICANT_PRIVATE_LIB         := private_lib_driver_cmd_intel
++WIFI_DRIVER_MODULE_PATH                  := "/system/lib/modules/iwlagn.ko"
++WIFI_DRIVER_MODULE_NAME                  := "iwlagn"
++WIFI_DRIVER_MODULE_PATH                  ?= auto
+ endif
+-BOARD_WPA_SUPPLICANT_DRIVER      	 := NL80211
+-BOARD_HOSTAPD_DRIVER             	 := NL80211
+-WIFI_TEST_INTERFACE			 := "sta"
+ 
+ BOARD_MODEM_VENDOR := AMAZON
+ 
+diff --git a/sabreauto_6q/init.rc b/sabreauto_6q/init.rc
+index 76a52d4..f6d4368 100644
+--- a/sabreauto_6q/init.rc
++++ b/sabreauto_6q/init.rc
+@@ -107,6 +107,21 @@ service p2p_supplicant /system/bin/wpa_supplicant \
+     disabled
+     oneshot
+ 
++service rtw_suppl_con /system/bin/rtl_wpa_supplicant \
++    -ip2p0 -Dnl80211 -c/data/misc/wifi/p2p_supplicant.conf -e/data/misc/wifi/entropy.bin -N \
++    -iwlan0 -Dnl80211 -c/data/misc/wifi/wpa_supplicant.conf
++    class late_start
++    socket wpa_wlan0 dgram 660 wifi wifi
++    disabled
++    oneshot
++
++service wpa_supplicant /system/bin/wpa_supplicant -iwlan0 -Dnl80211
++    -c/data/misc/wifi/wpa_supplicant.conf
++    socket wpa_wlan0 dgram 660 wifi wifi
++    class late_start
++    disabled
++    oneshot
++
+ # magd daemon
+ service magd /system/bin/magd
+     class main
+diff --git a/sabresd_6dq/BoardConfig.mk b/sabresd_6dq/BoardConfig.mk
+index cd5d35f..080aa9f 100755
+--- a/sabresd_6dq/BoardConfig.mk
++++ b/sabresd_6dq/BoardConfig.mk
+@@ -14,38 +14,26 @@ include device/fsl/imx6/imx6_target_fs.mk
+ TARGET_BOOTLOADER_BOARD_NAME := SABRESD
+ PRODUCT_MODEL := SABRESD-MX6DQ
+ 
+-# Wifi
+-BOARD_WLAN_VENDOR 			 := ATHEROS
+-# for atheros vendor
+-ifeq ($(BOARD_WLAN_VENDOR),ATHEROS)
+-BOARD_WLAN_DEVICE			 := ar6003
+-BOARD_HAS_ATH_WLAN 			 := true
+-WPA_SUPPLICANT_VERSION			 := VER_0_8_ATHEROS
+-WIFI_DRIVER_MODULE_PATH          	 := "/system/lib/modules/ath6kl_sdio.ko"
+-WIFI_DRIVER_MODULE_NAME          	 := "ath6kl_sdio"
+-WIFI_DRIVER_MODULE_ARG           	 := "suspend_mode=3 wow_mode=2 ar6k_clock=26000000 ath6kl_p2p=1"
+-WIFI_DRIVER_P2P_MODULE_ARG       	 := "suspend_mode=3 wow_mode=2 ar6k_clock=26000000 ath6kl_p2p=1 debug_mask=0x2413"
+-WIFI_SDIO_IF_DRIVER_MODULE_PATH  	 := "/system/lib/modules/cfg80211.ko"
+-WIFI_SDIO_IF_DRIVER_MODULE_NAME  	 := "cfg80211"
+-WIFI_SDIO_IF_DRIVER_MODULE_ARG   	 := ""
+-WIFI_COMPAT_MODULE_PATH			 := "/system/lib/modules/compat.ko"
+-WIFI_COMPAT_MODULE_NAME			 := "compat"
+-WIFI_COMPAT_MODULE_ARG			 := ""
+-endif
++# UNITE is a virtual device support both atheros and realtek wifi(ar6103 and rtl8723as)
++BOARD_WLAN_DEVICE            := UNITE
++WPA_SUPPLICANT_VERSION       := VER_0_8_UNITE
++TARGET_KERNEL_MODULES        := \
++                                kernel_imx/drivers/net/wireless/rtl8723as/8723as.ko:system/lib/modules/8723as.ko \
++                                kernel_imx/net/wireless/cfg80211.ko:system/lib/modules/cfg80211_realtek.ko
++BOARD_WPA_SUPPLICANT_DRIVER  := NL80211
++BOARD_HOSTAPD_DRIVER         := NL80211
++
+ #for intel vendor
+ ifeq ($(BOARD_WLAN_VENDOR),INTEL)
+-BOARD_HOSTAPD_PRIVATE_LIB		 ?= private_lib_driver_cmd
+-BOARD_WPA_SUPPLICANT_PRIVATE_LIB 	 ?= private_lib_driver_cmd
+-WPA_SUPPLICANT_VERSION			 := VER_0_8_X
+-HOSTAPD_VERSION				 := VER_0_8_X
++BOARD_HOSTAPD_PRIVATE_LIB                ?= private_lib_driver_cmd
++BOARD_WPA_SUPPLICANT_PRIVATE_LIB         ?= private_lib_driver_cmd
++WPA_SUPPLICANT_VERSION                   := VER_0_8_X
++HOSTAPD_VERSION                          := VER_0_8_X
+ BOARD_WPA_SUPPLICANT_PRIVATE_LIB         := private_lib_driver_cmd_intel
+-WIFI_DRIVER_MODULE_PATH          	 := "/system/lib/modules/iwlagn.ko"
+-WIFI_DRIVER_MODULE_NAME          	 := "iwlagn"
+-WIFI_DRIVER_MODULE_PATH			 ?= auto
++WIFI_DRIVER_MODULE_PATH                  := "/system/lib/modules/iwlagn.ko"
++WIFI_DRIVER_MODULE_NAME                  := "iwlagn"
++WIFI_DRIVER_MODULE_PATH                  ?= auto
+ endif
+-BOARD_WPA_SUPPLICANT_DRIVER      	 := NL80211
+-BOARD_HOSTAPD_DRIVER             	 := NL80211
+-WIFI_TEST_INTERFACE			 := "sta"
+ 
+ BOARD_MODEM_VENDOR := AMAZON
+ 
+diff --git a/sabresd_6dq/init.rc b/sabresd_6dq/init.rc
+index 194b797..67135bd 100755
+--- a/sabresd_6dq/init.rc
++++ b/sabresd_6dq/init.rc
+@@ -111,6 +111,21 @@ service p2p_supplicant /system/bin/wpa_supplicant \
+     disabled
+     oneshot
+ 
++service rtw_suppl_con /system/bin/rtl_wpa_supplicant \
++    -ip2p0 -Dnl80211 -c/data/misc/wifi/p2p_supplicant.conf -e/data/misc/wifi/entropy.bin -N \
++    -iwlan0 -Dnl80211 -c/data/misc/wifi/wpa_supplicant.conf
++    class late_start
++    socket wpa_wlan0 dgram 660 wifi wifi
++    disabled
++    oneshot
++
++service wpa_supplicant /system/bin/wpa_supplicant -iwlan0 -Dnl80211
++    -c/data/misc/wifi/wpa_supplicant.conf
++    socket wpa_wlan0 dgram 660 wifi wifi
++    class late_start
++    disabled
++    oneshot
++
+ # magd daemon
+ service magd /system/bin/magd
+     class main
+-- 
+1.8.0
+

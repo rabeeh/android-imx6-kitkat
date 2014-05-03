@@ -1,0 +1,195 @@
+From eb8155937939705b87f0e16e7ff7f49c24ce0f12 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 14 Dec 2011 23:25:53 +0800
+Subject: [PATCH 184/249] ENGR00163375 vpu: Add MVC encoder support for mx6q
+
+Support MVC encoder for mx6q. This will cause vpu API change with
+the patch. The firmware must be or newer than v2.1.2_r25772 version.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c | 44 ++++++++++++++++++++++++++++++++++----------
+ vpu/vpu_lib.h | 21 +++++++++++++++++++--
+ vpu/vpu_reg.h |  2 ++
+ 3 files changed, 55 insertions(+), 12 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 73147ae..c65c7dd 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -553,9 +553,11 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	if ((pop->bitstreamFormat == STD_MPEG4) ||
+ 	    (pop->bitstreamFormat == STD_H263))
+ 		pCodecInst->codecMode = MP4_ENC;
+-	else if (pop->bitstreamFormat == STD_AVC)
++	else if (pop->bitstreamFormat == STD_AVC) {
+ 		pCodecInst->codecMode = AVC_ENC;
+-	else if (pop->bitstreamFormat == STD_MJPG)
++		if (cpu_is_mx6q())
++			pCodecInst->codecModeAux = pop->EncStdParam.avcParam.mvc_extension;
++	} else if (pop->bitstreamFormat == STD_MJPG)
+ 		pCodecInst->codecMode = MJPG_ENC;
+ 
+ 	pEncInfo->streamRdPtr = pop->bitstreamBuffer;
+@@ -928,6 +930,11 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 		data |= (pEncOP->EncStdParam.avcParam.avc_audEnable << 2);
+ 		if (!cpu_is_mx6q())
+ 			data |= (pEncOP->EncStdParam.avcParam.avc_fmoEnable << 4);
++		else if (pCodecInst->codecModeAux == AVC_AUX_MVC) {
++			data |= (pEncInfo->openParam.EncStdParam.avcParam.interview_en << 4);
++			data |= (pEncInfo->openParam.EncStdParam.avcParam.paraset_refresh_en << 8);
++			data |= (pEncInfo->openParam.EncStdParam.avcParam.prefix_nal_en << 9);
++		}
+ 	}
+ 
+ 	if (cpu_is_mx6q()) {
+@@ -1015,8 +1022,13 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 
+ 	if (pCodecInst->codecMode == MJPG_ENC)
+ 		info->minFrameBufferCount = 0;
+-	else
+-		info->minFrameBufferCount = 2;	/* reconstructed frame + reference frame */
++	else {
++		if (pCodecInst->codecMode == AVC_ENC &&
++		    pCodecInst->codecModeAux == AVC_AUX_MVC)
++			info->minFrameBufferCount = 3; /* reconstructed frame + 2 reference frame */
++		else
++			info->minFrameBufferCount = 2;	/* reconstructed frame + reference frame */
++	}
+ 
+ 	info->reportBufSize.sliceInfoBufSize = SIZE_SLICE_INFO;
+ 	info->reportBufSize.mbInfoBufSize = SIZE_MB_DATA;
+@@ -1053,7 +1065,7 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ 				   int num, int frameBufStride, int sourceBufStride,
+ 				   PhysicalAddress subSampBaseA, PhysicalAddress subSampBaseB,
+-				   ExtBufCfg *scratchBuf)
++				   EncExtBufInfo *pBufInfo)
+ {
+ 	CodecInst *pCodecInst;
+ 	EncInfo *pEncInfo;
+@@ -1174,15 +1186,27 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ 		VpuWriteReg(CMD_SET_FRAME_SUBSAMP_A, subSampBaseA);
+ 		VpuWriteReg(CMD_SET_FRAME_SUBSAMP_B, subSampBaseB);
+ 
++		if (pCodecInst->codecMode == AVC_ENC &&
++		    pCodecInst->codecModeAux == AVC_AUX_MVC) {
++			if (pBufInfo == NULL ||
++			    !pBufInfo->subSampBaseAMvc ||
++			    !pBufInfo->subSampBaseBMvc) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_INVALID_PARAM;
++			}
++			VpuWriteReg(CMD_SET_FRAME_SUBSAMP_A_MVC, pBufInfo->subSampBaseAMvc);
++			VpuWriteReg(CMD_SET_FRAME_SUBSAMP_B_MVC, pBufInfo->subSampBaseBMvc);
++		}
++
+ 		if (pCodecInst->codecMode == MP4_ENC) {
+ 			if (pEncInfo->mp4_dataPartitionEnable) {
+-				if (scratchBuf == NULL) {
++				if (pBufInfo == NULL) {
+ 					UnlockVpu(vpu_semap);
+ 					return RETCODE_INVALID_PARAM;
+ 				}
+ 				/* MPEG4 Encoder Data-Partitioned bitstream temporal buffer */
+-				VpuWriteReg(CMD_SET_FRAME_DP_BUF_BASE, scratchBuf->bufferBase);
+-				VpuWriteReg(CMD_SET_FRAME_DP_BUF_SIZE, scratchBuf->bufferSize);
++				VpuWriteReg(CMD_SET_FRAME_DP_BUF_BASE, pBufInfo->scratchBuf.bufferBase);
++				VpuWriteReg(CMD_SET_FRAME_DP_BUF_SIZE, pBufInfo->scratchBuf.bufferSize);
+ 			} else {
+ 				VpuWriteReg(CMD_SET_FRAME_DP_BUF_BASE, 0);
+ 				VpuWriteReg(CMD_SET_FRAME_DP_BUF_SIZE, 0);
+@@ -2034,7 +2058,7 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 
+ 			encHeaderParam = (EncHeaderParam *) param;
+ 			if (!(SPS_RBSP <= encHeaderParam->headerType &&
+-			      encHeaderParam->headerType <= PPS_RBSP)) {
++			      encHeaderParam->headerType <= PPS_RBSP_MVC)) {
+ 				return RETCODE_INVALID_PARAM;
+ 			}
+ 
+@@ -2617,7 +2641,7 @@ dec_out:
+ 	/* Gate-off the clock that is enabled in vpuDecOpen for workaround the issue
+ 	 * of mult-instances decoding on mx6q */
+ 	if (cpu_is_mx6q())
+-                IOClkGateSet(false);
++		IOClkGateSet(false);
+ 
+ 	UnlockVpu(vpu_semap);
+ 
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 094bcd3..3575267 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -286,6 +286,12 @@ typedef struct {
+ } EncSliceMode;
+ 
+ typedef struct {
++	PhysicalAddress subSampBaseAMvc;
++	PhysicalAddress subSampBaseBMvc;
++	ExtBufCfg scratchBuf;
++} EncExtBufInfo;
++
++typedef struct {
+ 	PhysicalAddress sliceSaveBuffer;
+ 	int sliceSaveBufferSize;
+ } DecAvcSliceBufInfo;
+@@ -463,6 +469,11 @@ typedef struct {
+ 	int avc_frameCropRight;
+ 	int avc_frameCropTop;
+ 	int avc_frameCropBottom;
++
++	int mvc_extension;
++	int interview_en;
++	int paraset_refresh_en;
++	int prefix_nal_en;
+ } EncAvcParam;
+ 
+ typedef struct {
+@@ -494,6 +505,8 @@ typedef struct {
+ 	int vbvBufferSize;
+ 	int enableAutoSkip;
+ 	int gopSize;
++	int linear2TiledEnable;
++	int mapType;
+ 
+ 	EncSliceMode slicemode;
+ 	int intraRefresh;
+@@ -604,7 +617,11 @@ typedef enum {
+ 
+ typedef enum {
+ 	SPS_RBSP,
+-	PPS_RBSP
++	PPS_RBSP,
++	END_SEQ_RBSP,
++	END_STREAM_RBSP,
++	SPS_RBSP_MVC,
++	PPS_RBSP_MVC
+ } AvcHeaderType;
+ 
+ typedef struct {
+@@ -687,7 +704,7 @@ RetCode vpu_EncGetInitialInfo(EncHandle, EncInitialInfo *);
+ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ 				   int num, int frameBufStride, int sourceBufStride,
+ 				   PhysicalAddress subSampBaseA, PhysicalAddress subSampBaseB,
+-				   ExtBufCfg *scratchBuf);
++				   EncExtBufInfo * pBufInfo);
+ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle, PhysicalAddress * prdPrt,
+ 				  PhysicalAddress * pwrPtr, Uint32 * size);
+ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size);
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 30c95d8..229b41c 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -342,6 +342,8 @@
+ #define CMD_SET_FRAME_SUBSAMP_B		0x18C
+ #define CMD_SET_FRAME_DP_BUF_BASE	0x1B0
+ #define CMD_SET_FRAME_DP_BUF_SIZE	0x1B4
++#define CMD_SET_FRAME_SUBSAMP_A_MVC	0x1B0
++#define CMD_SET_FRAME_SUBSAMP_B_MVC	0x1B4
+ 
+ /*---------------------------------------------------------------------------
+  * [ENC HEADER] COMMAND
+-- 
+1.8.0
+

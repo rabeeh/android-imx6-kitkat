@@ -1,0 +1,139 @@
+From 42575f104dff5bf4d7fc68ea47ac695b44bbb088 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Wed, 4 Dec 2013 10:56:40 +0800
+Subject: [PATCH 14/14] ENGR00290615 Wifi:enable wifi on KK4.4
+
+Last commit only align with kk4.4 new wifi HAL. This commit do some work
+based on it:
+1.change to use android private socket instead of unix standard socket.
+For AOSP only integrate two interfaces commands to one single connection
+based on the former not the later.
+2.For we still use module install mode, so still need check if driver is ok
+before we start wpa_supplicant, or will cause failure. Once use built in wifi
+driver,this part can strictly align with AOSP's HAL.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ wifi/wifi_unite.c | 64 ++++++++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/wifi/wifi_unite.c b/wifi/wifi_unite.c
+index f3db768..ec7d179 100644
+--- a/wifi/wifi_unite.c
++++ b/wifi/wifi_unite.c
+@@ -144,7 +144,7 @@ static const char P2P_PROP_NAME_REALTEK[]       = "init.svc.rtw_suppl_con";
+ static const char SUPP_CONFIG_TEMPLATE[]= "/system/etc/wifi/wpa_supplicant.conf";
+ static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
+ static const char P2P_CONFIG_FILE[]     = "/data/misc/wifi/p2p_supplicant.conf";
+-static const char CONTROL_IFACE_PATH[]  = "/data/system/wpa_supplicant";
++static const char CONTROL_IFACE_PATH[]  = "/data/misc/wifi/sockets";
+ static const char MODULE_FILE[]         = "/proc/modules";
+ 
+ static const char IFNAME[]              = "IFNAME=";
+@@ -292,6 +292,28 @@ int get_wifi_ifname_from_proc(char *ifname)
+     return check_wifi_ifname_from_proc(ifname, NULL);
+ }
+ 
++#define PRIMARY     0
++#define SECONDARY   1
++
++char *wifi_ifname(int index)
++{
++#define WIFI_P2P_INTERFACE "p2p0"
++
++    char primary_if[IFNAMSIZ+1];
++    char second_if[IFNAMSIZ+1];
++
++    if (index == PRIMARY) {
++        primary_iface[0] = '\0';
++        if (get_wifi_ifname_from_prop(primary_if) == 0 &&
++                check_wifi_ifname_from_proc(primary_iface, primary_if) == 0) {
++            return primary_iface;
++        }
++    } else if (index == SECONDARY) {
++        if (check_wifi_ifname_from_proc(NULL, WIFI_P2P_INTERFACE) == 0)
++            return WIFI_P2P_INTERFACE;
++    }
++    return NULL;
++}
+ 
+ static int insmod(const char *filename, const char *args)
+ {
+@@ -431,6 +453,13 @@ int wifi_load_driver()
+     if (ret < 0)
+         return -1;
+     if (strcmp(FIRMWARE_LOADER,"") == 0) {
++        while (wifi_ifname(PRIMARY) == NULL && count-- > 0) {
++            usleep(100000);
++        }
++        if (wifi_ifname(PRIMARY) == NULL) {
++            ALOGE("%s: get wifi_ifname(PRIMARY) fail\n", __func__);
++            goto timeout;
++        }
+         ALOGD("set driver prop OK");
+         property_set(DRIVER_PROP_NAME, "ok");
+     }
+@@ -568,6 +597,11 @@ int update_ctrl_interface(const char *config_file) {
+ 
+     if (!strcmp(config_file, SUPP_CONFIG_FILE)) {
+         property_get("wifi.interface", ifc, WIFI_TEST_INTERFACE);
++        if (wifi_ifname(PRIMARY) == NULL) {
++            ALOGE("%s: get wifi_ifname(PRIMARY) fail\n", __func__);
++            return -1;
++        }
++        strcpy(ifc, wifi_ifname(PRIMARY));
+     } else {
+         strcpy(ifc, CONTROL_IFACE_PATH);
+     }
+@@ -629,9 +663,13 @@ int ensure_config_file_exists(const char *config_file)
+             ALOGE("Cannot set RW to \"%s\": %s", config_file, strerror(errno));
+             return -1;
+         }
+-        /* return if filesize is at least 10 bytes */
+-        if (stat(config_file, &sb) == 0 && sb.st_size > 10) {
+-            return update_ctrl_interface(config_file);
++        /* return if we were able to update control interface properly */
++        if (update_ctrl_interface(config_file) >=0) {
++            return 0;
++        } else {
++            /* This handles the scenario where the file had bad data
++             * for some reason. We continue and recreate the file.
++             */
+         }
+     } else if (errno != ENOENT) {
+         ALOGE("Cannot access \"%s\": %s", config_file, strerror(errno));
+@@ -747,7 +785,22 @@ int wifi_start_supplicant(int p2p_supported)
+     }
+ #endif
+     property_get("wifi.interface", primary_iface, WIFI_TEST_INTERFACE);
+-    ALOGD("start supplicant cmd=%s",supplicant_name);
++    ALOGD("start supplicant cmd=%s iface=%s",supplicant_name,primary_iface);
++    /* Check the interface exist*/
++    if (p2p_supported) {
++        int count = 10; /* wait at most 1 seconds for completion */
++        while (wifi_ifname(SECONDARY) == NULL && count-- > 0) {
++            usleep(100000);
++        }
++        if (wifi_ifname(SECONDARY) == NULL) {
++            ALOGE("%s get wifi_ifname(SECONDARY) fail", __func__);
++            return -1;
++        }
++    }
++    if(wifi_ifname(PRIMARY) == NULL) {
++        ALOGE("%s get wifi_ifname(PRIMARY) fail", __func__);
++        return -1;
++    }
+     property_set("ctl.start", supplicant_name);
+     sched_yield();
+ 
+@@ -865,6 +918,7 @@ int wifi_connect_to_supplicant()
+     if (access(IFACE_DIR, F_OK) == 0) {
+         snprintf(path, sizeof(path), "%s/%s", IFACE_DIR, primary_iface);
+     } else {
++        ALOGD("wifi will connect android wpa %s\n", primary_iface);
+         snprintf(path, sizeof(path), "@android:wpa_%s", primary_iface);
+     }
+     return wifi_connect_on_socket_path(path);
+-- 
+1.8.0
+

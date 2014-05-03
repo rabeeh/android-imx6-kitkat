@@ -1,0 +1,706 @@
+From 5b4f7b5eec6f5b7d12eb9a24d9558400a1daf921 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Tue, 30 Jul 2013 12:40:54 +0800
+Subject: [PATCH 1/2] ENGR00265715 wifi:refactor to use AOSP wpa_supplicant
+
+This commits include:
+1.add support for virtual device UNITE.
+2.merge realtek's private change(using REALTEK_WIFI_VENDOR to control).
+3.This is only common code of wpa_supplicant. Diff codes is
+locale in hardware/qcom/wlan/qcwcn and /hardware/realtek/wlan.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ Android.mk                         |   2 +-
+ hostapd/Android.mk                 |  26 ++-
+ src/drivers/driver_nl80211.c       |  19 +-
+ wpa_supplicant/Android.mk          |  48 ++--
+ wpa_supplicant/ctrl_iface.c        |   6 +
+ wpa_supplicant/p2p_supplicant.c    |   1 -
+ wpa_supplicant/wpa_supplicant.conf | 458 +------------------------------------
+ 7 files changed, 83 insertions(+), 477 deletions(-)
+
+diff --git a/Android.mk b/Android.mk
+index 4a74b24..1f6d20e 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -3,7 +3,7 @@ LOCAL_PATH:= $(call my-dir)
+ ifndef WPA_SUPPLICANT_VERSION
+ WPA_SUPPLICANT_VERSION := VER_0_8_X
+ endif
+-ifeq ($(WPA_SUPPLICANT_VERSION),VER_0_8_X)
++ifeq ($(WPA_SUPPLICANT_VERSION),$(filter $(WPA_SUPPLICANT_VERSION),VER_0_8_X VER_0_8_UNITE))
+ # The order of the 2 Android.mks does matter!
+ # TODO: Clean up the Android.mks, reset all the temporary variables at the
+ # end of each Android.mk, so that one Android.mk doesn't depend on variables
+diff --git a/hostapd/Android.mk b/hostapd/Android.mk
+index 695e99c..1c9bdc7 100644
+--- a/hostapd/Android.mk
++++ b/hostapd/Android.mk
+@@ -28,7 +28,7 @@ ifeq ($(BOARD_WLAN_DEVICE), bcmdhd)
+ L_CFLAGS += -DANDROID_P2P
+ endif
+ 
+-ifeq ($(BOARD_WLAN_DEVICE), qcwcn)
++ifeq ($(BOARD_WLAN_DEVICE),$(filter $(BOARD_WLAN_DEVICE), qcwcn UNITE))
+ L_CFLAGS += -DANDROID_P2P
+ endif
+ 
+@@ -908,8 +908,8 @@ LOCAL_MODULE_TAGS := optional
+ ifdef CONFIG_DRIVER_CUSTOM
+ LOCAL_STATIC_LIBRARIES := libCustomWifi
+ endif
+-ifneq ($(BOARD_HOSTAPD_PRIVATE_LIB),)
+-LOCAL_STATIC_LIBRARIES += $(BOARD_HOSTAPD_PRIVATE_LIB)
++ifneq ($(BOARD_HOSTAPD_PRIVATE_LIB_QCOM),)
++LOCAL_STATIC_LIBRARIES += $(BOARD_HOSTAPD_PRIVATE_LIB_QCOM)
+ endif
+ LOCAL_SHARED_LIBRARIES := libc libcutils liblog libcrypto libssl
+ ifdef CONFIG_DRIVER_NL80211
+@@ -920,4 +920,24 @@ LOCAL_SRC_FILES := $(OBJS)
+ LOCAL_C_INCLUDES := $(INCLUDES)
+ include $(BUILD_EXECUTABLE)
+ 
++########################
++include $(CLEAR_VARS)
++LOCAL_MODULE := rtl_hostapd
++LOCAL_MODULE_TAGS := optional
++ifdef CONFIG_DRIVER_CUSTOM
++LOCAL_STATIC_LIBRARIES := libCustomWifi
++endif
++ifneq ($(BOARD_HOSTAPD_PRIVATE_LIB_RTL),)
++LOCAL_STATIC_LIBRARIES += $(BOARD_HOSTAPD_PRIVATE_LIB_RTL)
++endif
++LOCAL_SHARED_LIBRARIES := libc libcutils liblog libcrypto libssl
++ifdef CONFIG_DRIVER_NL80211
++LOCAL_STATIC_LIBRARIES += libnl_2
++endif
++LOCAL_CFLAGS := $(L_CFLAGS)
++LOCAL_CFLAGS += -DREALTEK_WIFI_VENDOR
++LOCAL_SRC_FILES := $(OBJS)
++LOCAL_C_INCLUDES := $(INCLUDES)
++include $(BUILD_EXECUTABLE)
++
+ endif # ifeq ($(WPA_BUILD_HOSTAPD),true)
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index a3ff189..ce86e6e 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3179,11 +3179,17 @@ static int wiphy_info_handler(struct nl_msg *msg, void *arg)
+ 	wiphy_info_iface_comb(info, tb[NL80211_ATTR_INTERFACE_COMBINATIONS]);
+ 	wiphy_info_supp_cmds(info, tb[NL80211_ATTR_SUPPORTED_COMMANDS]);
+ 
+-	if (tb[NL80211_ATTR_OFFCHANNEL_TX_OK]) {
+-		wpa_printf(MSG_DEBUG, "nl80211: Using driver-based "
+-			   "off-channel TX");
+-		capa->flags |= WPA_DRIVER_FLAGS_OFFCHANNEL_TX;
+-	}
++#ifndef REALTEK_WIFI_VENDOR
++    if (tb[NL80211_ATTR_OFFCHANNEL_TX_OK]) {
++        wpa_printf(MSG_DEBUG, "nl80211: Using driver-based "
++                "off-channel TX");
++        capa->flags |= WPA_DRIVER_FLAGS_OFFCHANNEL_TX;
++    }
++#endif
++#ifdef REALTEK_WIFI_VENDOR
++    wpa_printf(MSG_INFO, "nl80211: no Using driver-based "
++            "off-channel TX");
++#endif
+ 
+ 	if (tb[NL80211_ATTR_ROAM_SUPPORT]) {
+ 		wpa_printf(MSG_DEBUG, "nl80211: Using driver-based roaming");
+@@ -3198,8 +3204,9 @@ static int wiphy_info_handler(struct nl_msg *msg, void *arg)
+ 
+ 	wiphy_info_tdls(capa, tb[NL80211_ATTR_TDLS_SUPPORT],
+ 			tb[NL80211_ATTR_TDLS_EXTERNAL_SETUP]);
+-
++#ifndef REALTEK_WIFI_VENDOR
+ 	if (tb[NL80211_ATTR_DEVICE_AP_SME])
++#endif
+ 		info->device_ap_sme = 1;
+ 
+ 	wiphy_info_feature_flags(info, tb[NL80211_ATTR_FEATURE_FLAGS]);
+diff --git a/wpa_supplicant/Android.mk b/wpa_supplicant/Android.mk
+index 8515b5a..f836691 100644
+--- a/wpa_supplicant/Android.mk
++++ b/wpa_supplicant/Android.mk
+@@ -34,7 +34,7 @@ L_CFLAGS += -DANDROID_P2P
+ L_CFLAGS += -DP2P_CONCURRENT_SEARCH_DELAY=0
+ endif
+ 
+-ifeq ($(BOARD_WLAN_DEVICE), qcwcn)
++ifeq ($(BOARD_WLAN_DEVICE),$(filter $(BOARD_WLAN_DEVICE), qcwcn UNITE))
+ L_CFLAGS += -DANDROID_P2P
+ endif
+ 
+@@ -1548,8 +1548,8 @@ LOCAL_MODULE := wpa_supplicant
+ ifdef CONFIG_DRIVER_CUSTOM
+ LOCAL_STATIC_LIBRARIES := libCustomWifi
+ endif
+-ifneq ($(BOARD_WPA_SUPPLICANT_PRIVATE_LIB),)
+-LOCAL_STATIC_LIBRARIES += $(BOARD_WPA_SUPPLICANT_PRIVATE_LIB)
++ifneq ($(BOARD_WPA_SUPPLICANT_PRIVATE_LIB_QCOM),)
++LOCAL_STATIC_LIBRARIES += $(BOARD_WPA_SUPPLICANT_PRIVATE_LIB_QCOM)
+ endif
+ LOCAL_SHARED_LIBRARIES := libc libcutils liblog
+ ifeq ($(CONFIG_TLS), openssl)
+@@ -1564,6 +1564,28 @@ LOCAL_C_INCLUDES := $(INCLUDES)
+ include $(BUILD_EXECUTABLE)
+ 
+ ########################
++include $(CLEAR_VARS)
++LOCAL_MODULE := rtl_wpa_supplicant
++ifdef CONFIG_DRIVER_CUSTOM
++LOCAL_STATIC_LIBRARIES := libCustomWifi
++endif
++ifneq ($(BOARD_WPA_SUPPLICANT_PRIVATE_LIB_RTL),)
++LOCAL_STATIC_LIBRARIES += $(BOARD_WPA_SUPPLICANT_PRIVATE_LIB_RTL)
++endif
++LOCAL_SHARED_LIBRARIES := libc libcutils liblog
++ifeq ($(CONFIG_TLS), openssl)
++LOCAL_SHARED_LIBRARIES += libcrypto libssl libkeystore_binder
++endif
++ifdef CONFIG_DRIVER_NL80211
++LOCAL_STATIC_LIBRARIES += libnl_2
++endif
++LOCAL_CFLAGS := $(L_CFLAGS)
++LOCAL_CFLAGS += -DREALTEK_WIFI_VENDOR
++LOCAL_SRC_FILES := $(OBJS)
++LOCAL_C_INCLUDES := $(INCLUDES)
++include $(BUILD_EXECUTABLE)
++
++########################
+ #
+ #include $(CLEAR_VARS)
+ #LOCAL_MODULE := eapol_test
+@@ -1577,16 +1599,16 @@ include $(BUILD_EXECUTABLE)
+ #include $(BUILD_EXECUTABLE)
+ #
+ ########################
+-#
+-#local_target_dir := $(TARGET_OUT)/etc/wifi
+-#
+-#include $(CLEAR_VARS)
+-#LOCAL_MODULE := wpa_supplicant.conf
+-#LOCAL_MODULE_CLASS := ETC
+-#LOCAL_MODULE_PATH := $(local_target_dir)
+-#LOCAL_SRC_FILES := $(LOCAL_MODULE)
+-#include $(BUILD_PREBUILT)
+-#
++
++local_target_dir := $(TARGET_OUT)/etc/wifi
++
++include $(CLEAR_VARS)
++LOCAL_MODULE := wpa_supplicant.conf
++LOCAL_MODULE_CLASS := ETC
++LOCAL_MODULE_PATH := $(local_target_dir)
++LOCAL_SRC_FILES := $(LOCAL_MODULE)
++include $(BUILD_PREBUILT)
++
+ ########################
+ 
+ include $(CLEAR_VARS)
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index 6335605..0e5d562 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -4439,6 +4439,12 @@ static int p2p_ctrl_set(struct wpa_supplicant *wpa_s, char *cmd)
+ 		return p2p_set_listen_channel(wpa_s->global->p2p, 81,
+ 					      atoi(param));
+ 	}
++#ifdef REALTEK_WIFI_VENDOR
++    if (os_strcmp(cmd, "go_intent") == 0) {
++        wpa_s->conf->p2p_go_intent = atoi(param);
++        return 0;
++    }
++#endif
+ 
+ 	if (os_strcmp(cmd, "ssid_postfix") == 0) {
+ 		return p2p_set_ssid_postfix(wpa_s->global->p2p, (u8 *) param,
+diff --git a/wpa_supplicant/p2p_supplicant.c b/wpa_supplicant/p2p_supplicant.c
+index d7b3189..92c49ee 100644
+--- a/wpa_supplicant/p2p_supplicant.c
++++ b/wpa_supplicant/p2p_supplicant.c
+@@ -5402,7 +5402,6 @@ static void wpas_p2p_set_group_idle_timeout(struct wpa_supplicant *wpa_s)
+ 			   "during provisioning");
+ 		return;
+ 	}
+-
+ 	if (wpa_s->show_group_started) {
+ 		/*
+ 		 * Use the normal group formation timeout between the end of
+diff --git a/wpa_supplicant/wpa_supplicant.conf b/wpa_supplicant/wpa_supplicant.conf
+index d73d371..abca51f 100644
+--- a/wpa_supplicant/wpa_supplicant.conf
++++ b/wpa_supplicant/wpa_supplicant.conf
+@@ -1,119 +1,8 @@
+-##### Example wpa_supplicant configuration file ###############################
+-#
+-# This file describes configuration file format and lists all available option.
+-# Please also take a look at simpler configuration examples in 'examples'
+-# subdirectory.
+-#
+-# Empty lines and lines starting with # are ignored
+-
+-# NOTE! This file may contain password information and should probably be made
+-# readable only by root user on multiuser systems.
+-
+-# Note: All file paths in this configuration file should use full (absolute,
+-# not relative to working directory) path in order to allow working directory
+-# to be changed. This can happen if wpa_supplicant is run in the background.
+-
+-# Whether to allow wpa_supplicant to update (overwrite) configuration
+-#
+-# This option can be used to allow wpa_supplicant to overwrite configuration
+-# file whenever configuration is changed (e.g., new network block is added with
+-# wpa_cli or wpa_gui, or a password is changed). This is required for
+-# wpa_cli/wpa_gui to be able to store the configuration changes permanently.
+-# Please note that overwriting configuration file will remove the comments from
+-# it.
+-#update_config=1
+-
+-# global configuration (shared by all network blocks)
+-#
+-# Parameters for the control interface. If this is specified, wpa_supplicant
+-# will open a control interface that is available for external programs to
+-# manage wpa_supplicant. The meaning of this string depends on which control
+-# interface mechanism is used. For all cases, the existence of this parameter
+-# in configuration is used to determine whether the control interface is
+-# enabled.
+-#
+-# For UNIX domain sockets (default on Linux and BSD): This is a directory that
+-# will be created for UNIX domain sockets for listening to requests from
+-# external programs (CLI/GUI, etc.) for status information and configuration.
+-# The socket file will be named based on the interface name, so multiple
+-# wpa_supplicant processes can be run at the same time if more than one
+-# interface is used.
+-# /var/run/wpa_supplicant is the recommended directory for sockets and by
+-# default, wpa_cli will use it when trying to connect with wpa_supplicant.
+-#
+-# Access control for the control interface can be configured by setting the
+-# directory to allow only members of a group to use sockets. This way, it is
+-# possible to run wpa_supplicant as root (since it needs to change network
+-# configuration and open raw sockets) and still allow GUI/CLI components to be
+-# run as non-root users. However, since the control interface can be used to
+-# change the network configuration, this access needs to be protected in many
+-# cases. By default, wpa_supplicant is configured to use gid 0 (root). If you
+-# want to allow non-root users to use the control interface, add a new group
+-# and change this value to match with that group. Add users that should have
+-# control interface access to this group. If this variable is commented out or
+-# not included in the configuration file, group will not be changed from the
+-# value it got by default when the directory or socket was created.
+-#
+-# When configuring both the directory and group, use following format:
+-# DIR=/var/run/wpa_supplicant GROUP=wheel
+-# DIR=/var/run/wpa_supplicant GROUP=0
+-# (group can be either group name or gid)
+-#
+-# For UDP connections (default on Windows): The value will be ignored. This
+-# variable is just used to select that the control interface is to be created.
+-# The value can be set to, e.g., udp (ctrl_interface=udp)
+-#
+-# For Windows Named Pipe: This value can be used to set the security descriptor
+-# for controlling access to the control interface. Security descriptor can be
+-# set using Security Descriptor String Format (see http://msdn.microsoft.com/
+-# library/default.asp?url=/library/en-us/secauthz/security/
+-# security_descriptor_string_format.asp). The descriptor string needs to be
+-# prefixed with SDDL=. For example, ctrl_interface=SDDL=D: would set an empty
+-# DACL (which will reject all connections). See README-Windows.txt for more
+-# information about SDDL string format.
+-#
+-ctrl_interface=/var/run/wpa_supplicant
+-
+-# IEEE 802.1X/EAPOL version
+-# wpa_supplicant is implemented based on IEEE Std 802.1X-2004 which defines
+-# EAPOL version 2. However, there are many APs that do not handle the new
+-# version number correctly (they seem to drop the frames completely). In order
+-# to make wpa_supplicant interoperate with these APs, the version number is set
+-# to 1 by default. This configuration value can be used to set it to the new
+-# version (2).
++##### wpa_supplicant configuration file template #####
++update_config=1
++ctrl_interface=DIR=/data/system/wpa_supplicant GROUP=wifi
+ eapol_version=1
+-
+-# AP scanning/selection
+-# By default, wpa_supplicant requests driver to perform AP scanning and then
+-# uses the scan results to select a suitable AP. Another alternative is to
+-# allow the driver to take care of AP scanning and selection and use
+-# wpa_supplicant just to process EAPOL frames based on IEEE 802.11 association
+-# information from the driver.
+-# 1: wpa_supplicant initiates scanning and AP selection; if no APs matching to
+-#    the currently enabled networks are found, a new network (IBSS or AP mode
+-#    operation) may be initialized (if configured) (default)
+-# 0: driver takes care of scanning, AP selection, and IEEE 802.11 association
+-#    parameters (e.g., WPA IE generation); this mode can also be used with
+-#    non-WPA drivers when using IEEE 802.1X mode; do not try to associate with
+-#    APs (i.e., external program needs to control association). This mode must
+-#    also be used when using wired Ethernet drivers.
+-# 2: like 0, but associate with APs using security policy and SSID (but not
+-#    BSSID); this can be used, e.g., with ndiswrapper and NDIS drivers to
+-#    enable operation with hidden SSIDs and optimized roaming; in this mode,
+-#    the network blocks in the configuration file are tried one by one until
+-#    the driver reports successful association; each network block should have
+-#    explicit security policy (i.e., only one option in the lists) for
+-#    key_mgmt, pairwise, group, proto variables
+-# When using IBSS or AP mode, ap_scan=2 mode can force the new network to be
+-# created immediately regardless of scan results. ap_scan=1 mode will first try
+-# to scan for existing networks and only if no matches with the enabled
+-# networks are found, a new IBSS or AP mode network is created.
+ ap_scan=1
+-
+-# EAP fast re-authentication
+-# By default, fast re-authentication is enabled for all EAP methods that
+-# support it. This variable can be used to disable fast re-authentication.
+-# Normally, there is no need to disable this.
+ fast_reauth=1
+ 
+ # OpenSSL Engine support
+@@ -911,342 +800,5 @@ fast_reauth=1
+ #  2: MCS 0-9
+ #  3: not supported
+ 
+-# Example blocks:
+-
+-# Simple case: WPA-PSK, PSK as an ASCII passphrase, allow all valid ciphers
+-network={
+-	ssid="simple"
+-	psk="very secret passphrase"
+-	priority=5
+-}
+-
+-# Same as previous, but request SSID-specific scanning (for APs that reject
+-# broadcast SSID)
+-network={
+-	ssid="second ssid"
+-	scan_ssid=1
+-	psk="very secret passphrase"
+-	priority=2
+-}
+-
+-# Only WPA-PSK is used. Any valid cipher combination is accepted.
+-network={
+-	ssid="example"
+-	proto=WPA
+-	key_mgmt=WPA-PSK
+-	pairwise=CCMP TKIP
+-	group=CCMP TKIP WEP104 WEP40
+-	psk=06b4be19da289f475aa46a33cb793029d4ab3db7a23ee92382eb0106c72ac7bb
+-	priority=2
+-}
+-
+-# WPA-Personal(PSK) with TKIP and enforcement for frequent PTK rekeying
+-network={
+-	ssid="example"
+-	proto=WPA
+-	key_mgmt=WPA-PSK
+-	pairwise=TKIP
+-	group=TKIP
+-	psk="not so secure passphrase"
+-	wpa_ptk_rekey=600
+-}
+-
+-# Only WPA-EAP is used. Both CCMP and TKIP is accepted. An AP that used WEP104
+-# or WEP40 as the group cipher will not be accepted.
+-network={
+-	ssid="example"
+-	proto=RSN
+-	key_mgmt=WPA-EAP
+-	pairwise=CCMP TKIP
+-	group=CCMP TKIP
+-	eap=TLS
+-	identity="user@example.com"
+-	ca_cert="/etc/cert/ca.pem"
+-	client_cert="/etc/cert/user.pem"
+-	private_key="/etc/cert/user.prv"
+-	private_key_passwd="password"
+-	priority=1
+-}
+-
+-# EAP-PEAP/MSCHAPv2 configuration for RADIUS servers that use the new peaplabel
+-# (e.g., Radiator)
+-network={
+-	ssid="example"
+-	key_mgmt=WPA-EAP
+-	eap=PEAP
+-	identity="user@example.com"
+-	password="foobar"
+-	ca_cert="/etc/cert/ca.pem"
+-	phase1="peaplabel=1"
+-	phase2="auth=MSCHAPV2"
+-	priority=10
+-}
+-
+-# EAP-TTLS/EAP-MD5-Challenge configuration with anonymous identity for the
+-# unencrypted use. Real identity is sent only within an encrypted TLS tunnel.
+-network={
+-	ssid="example"
+-	key_mgmt=WPA-EAP
+-	eap=TTLS
+-	identity="user@example.com"
+-	anonymous_identity="anonymous@example.com"
+-	password="foobar"
+-	ca_cert="/etc/cert/ca.pem"
+-	priority=2
+-}
+-
+-# EAP-TTLS/MSCHAPv2 configuration with anonymous identity for the unencrypted
+-# use. Real identity is sent only within an encrypted TLS tunnel.
+-network={
+-	ssid="example"
+-	key_mgmt=WPA-EAP
+-	eap=TTLS
+-	identity="user@example.com"
+-	anonymous_identity="anonymous@example.com"
+-	password="foobar"
+-	ca_cert="/etc/cert/ca.pem"
+-	phase2="auth=MSCHAPV2"
+-}
+-
+-# WPA-EAP, EAP-TTLS with different CA certificate used for outer and inner
+-# authentication.
+-network={
+-	ssid="example"
+-	key_mgmt=WPA-EAP
+-	eap=TTLS
+-	# Phase1 / outer authentication
+-	anonymous_identity="anonymous@example.com"
+-	ca_cert="/etc/cert/ca.pem"
+-	# Phase 2 / inner authentication
+-	phase2="autheap=TLS"
+-	ca_cert2="/etc/cert/ca2.pem"
+-	client_cert2="/etc/cer/user.pem"
+-	private_key2="/etc/cer/user.prv"
+-	private_key2_passwd="password"
+-	priority=2
+-}
+-
+-# Both WPA-PSK and WPA-EAP is accepted. Only CCMP is accepted as pairwise and
+-# group cipher.
+-network={
+-	ssid="example"
+-	bssid=00:11:22:33:44:55
+-	proto=WPA RSN
+-	key_mgmt=WPA-PSK WPA-EAP
+-	pairwise=CCMP
+-	group=CCMP
+-	psk=06b4be19da289f475aa46a33cb793029d4ab3db7a23ee92382eb0106c72ac7bb
+-}
+-
+-# Special characters in SSID, so use hex string. Default to WPA-PSK, WPA-EAP
+-# and all valid ciphers.
+-network={
+-	ssid=00010203
+-	psk=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+-}
+-
+-
+-# EAP-SIM with a GSM SIM or USIM
+-network={
+-	ssid="eap-sim-test"
+-	key_mgmt=WPA-EAP
+-	eap=SIM
+-	pin="1234"
+-	pcsc=""
+-}
+-
+-
+-# EAP-PSK
+-network={
+-	ssid="eap-psk-test"
+-	key_mgmt=WPA-EAP
+-	eap=PSK
+-	anonymous_identity="eap_psk_user"
+-	password=06b4be19da289f475aa46a33cb793029
+-	identity="eap_psk_user@example.com"
+-}
+-
+-
+-# IEEE 802.1X/EAPOL with dynamically generated WEP keys (i.e., no WPA) using
+-# EAP-TLS for authentication and key generation; require both unicast and
+-# broadcast WEP keys.
+-network={
+-	ssid="1x-test"
+-	key_mgmt=IEEE8021X
+-	eap=TLS
+-	identity="user@example.com"
+-	ca_cert="/etc/cert/ca.pem"
+-	client_cert="/etc/cert/user.pem"
+-	private_key="/etc/cert/user.prv"
+-	private_key_passwd="password"
+-	eapol_flags=3
+-}
+-
+-
+-# LEAP with dynamic WEP keys
+-network={
+-	ssid="leap-example"
+-	key_mgmt=IEEE8021X
+-	eap=LEAP
+-	identity="user"
+-	password="foobar"
+-}
+-
+-# EAP-IKEv2 using shared secrets for both server and peer authentication
+-network={
+-	ssid="ikev2-example"
+-	key_mgmt=WPA-EAP
+-	eap=IKEV2
+-	identity="user"
+-	password="foobar"
+-}
+-
+-# EAP-FAST with WPA (WPA or WPA2)
+-network={
+-	ssid="eap-fast-test"
+-	key_mgmt=WPA-EAP
+-	eap=FAST
+-	anonymous_identity="FAST-000102030405"
+-	identity="username"
+-	password="password"
+-	phase1="fast_provisioning=1"
+-	pac_file="/etc/wpa_supplicant.eap-fast-pac"
+-}
+-
+-network={
+-	ssid="eap-fast-test"
+-	key_mgmt=WPA-EAP
+-	eap=FAST
+-	anonymous_identity="FAST-000102030405"
+-	identity="username"
+-	password="password"
+-	phase1="fast_provisioning=1"
+-	pac_file="blob://eap-fast-pac"
+-}
+-
+-# Plaintext connection (no WPA, no IEEE 802.1X)
+-network={
+-	ssid="plaintext-test"
+-	key_mgmt=NONE
+-}
+-
+-
+-# Shared WEP key connection (no WPA, no IEEE 802.1X)
+-network={
+-	ssid="static-wep-test"
+-	key_mgmt=NONE
+-	wep_key0="abcde"
+-	wep_key1=0102030405
+-	wep_key2="1234567890123"
+-	wep_tx_keyidx=0
+-	priority=5
+-}
+-
+-
+-# Shared WEP key connection (no WPA, no IEEE 802.1X) using Shared Key
+-# IEEE 802.11 authentication
+-network={
+-	ssid="static-wep-test2"
+-	key_mgmt=NONE
+-	wep_key0="abcde"
+-	wep_key1=0102030405
+-	wep_key2="1234567890123"
+-	wep_tx_keyidx=0
+-	priority=5
+-	auth_alg=SHARED
+-}
+-
+-
+-# IBSS/ad-hoc network with WPA-None/TKIP.
+-network={
+-	ssid="test adhoc"
+-	mode=1
+-	frequency=2412
+-	proto=WPA
+-	key_mgmt=WPA-NONE
+-	pairwise=NONE
+-	group=TKIP
+-	psk="secret passphrase"
+-}
+-
+-
+-# Catch all example that allows more or less all configuration modes
+-network={
+-	ssid="example"
+-	scan_ssid=1
+-	key_mgmt=WPA-EAP WPA-PSK IEEE8021X NONE
+-	pairwise=CCMP TKIP
+-	group=CCMP TKIP WEP104 WEP40
+-	psk="very secret passphrase"
+-	eap=TTLS PEAP TLS
+-	identity="user@example.com"
+-	password="foobar"
+-	ca_cert="/etc/cert/ca.pem"
+-	client_cert="/etc/cert/user.pem"
+-	private_key="/etc/cert/user.prv"
+-	private_key_passwd="password"
+-	phase1="peaplabel=0"
+-}
+-
+-# Example of EAP-TLS with smartcard (openssl engine)
+-network={
+-	ssid="example"
+-	key_mgmt=WPA-EAP
+-	eap=TLS
+-	proto=RSN
+-	pairwise=CCMP TKIP
+-	group=CCMP TKIP
+-	identity="user@example.com"
+-	ca_cert="/etc/cert/ca.pem"
+-	client_cert="/etc/cert/user.pem"
+-
+-	engine=1
+-
+-	# The engine configured here must be available. Look at
+-	# OpenSSL engine support in the global section.
+-	# The key available through the engine must be the private key
+-	# matching the client certificate configured above.
+-
+-	# use the opensc engine
+-	#engine_id="opensc"
+-	#key_id="45"
+-
+-	# use the pkcs11 engine
+-	engine_id="pkcs11"
+-	key_id="id_45"
+-
+-	# Optional PIN configuration; this can be left out and PIN will be
+-	# asked through the control interface
+-	pin="1234"
+-}
+-
+-# Example configuration showing how to use an inlined blob as a CA certificate
+-# data instead of using external file
+-network={
+-	ssid="example"
+-	key_mgmt=WPA-EAP
+-	eap=TTLS
+-	identity="user@example.com"
+-	anonymous_identity="anonymous@example.com"
+-	password="foobar"
+-	ca_cert="blob://exampleblob"
+-	priority=20
+-}
+-
+-blob-base64-exampleblob={
+-SGVsbG8gV29ybGQhCg==
+-}
+-
+-
+-# Wildcard match for SSID (plaintext APs only). This example select any
+-# open AP regardless of its SSID.
+-network={
+-	key_mgmt=NONE
+-}
+-
+-
+-# Example config file that will only scan on channel 36.
+-freq_list=5180
+-network={
+-	key_mgmt=NONE
+-}
++config_methods=virtual_push_button physical_display keypad
++persistent_reconnect=1
+-- 
+1.8.0
+

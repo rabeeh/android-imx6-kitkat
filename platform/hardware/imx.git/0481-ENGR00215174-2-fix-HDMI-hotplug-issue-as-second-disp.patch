@@ -1,0 +1,85 @@
+From 4b3c674b8b9d288ccb5f6a3eb897e21709b7014b Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Tue, 17 Dec 2013 10:21:49 +0800
+Subject: [PATCH 481/486] ENGR00215174-2 fix HDMI hotplug issue as second
+ display.
+
+when free framebuffer, it needs to mask the framebuffer flag.
+because the framebuffer info is released before that.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/libgralloc_wrapper/framebuffer.cpp | 2 ++
+ mx6/libgralloc_wrapper/gralloc.cpp     | 8 ++++++++
+ mx6/libgralloc_wrapper/gralloc_priv.h  | 3 ++-
+ 3 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 58d1c75..64f3c5e 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -401,6 +401,7 @@ static int unMapFrameBuffer(fb_context_t* ctx, struct private_module_t* module)
+     munmap(addr, fbSize);
+     delete (module->framebuffer);
+     module->framebuffer = NULL;
++    module->closeDevice = true;
+ 
+     close(fd);
+     pthread_mutex_unlock(&module->lock);
+@@ -500,6 +501,7 @@ int fb_device_open(hw_module_t const* module, const char* name,
+             }
+             else {
+                 priv_m = orig_m->external_module;
++                priv_m->closeDevice = false;
+             }
+ 
+             dev->device.common.module = (hw_module_t*)(priv_m);
+diff --git a/mx6/libgralloc_wrapper/gralloc.cpp b/mx6/libgralloc_wrapper/gralloc.cpp
+index 4369af3..c583fed 100755
+--- a/mx6/libgralloc_wrapper/gralloc.cpp
++++ b/mx6/libgralloc_wrapper/gralloc.cpp
+@@ -144,6 +144,13 @@ static int gralloc_free(alloc_device_t* dev,
+         }
+     }
+ 
++    private_handle_t* hnd = (private_handle_t*)handle;
++    if ((m->closeDevice || ((m->external_module != NULL) &&
++         m->external_module->closeDevice)) &&
++         hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER) {
++        hnd->flags  &= ~private_handle_t::PRIV_FLAGS_FRAMEBUFFER;
++        ALOGI("release framebuffer flags:0x%x", hnd->flags);
++    }
+     return m->gpu_device->free(dev, handle);
+ }
+ 
+@@ -207,6 +214,7 @@ int gralloc_device_open(const hw_module_t* module, const char* name,
+         dev->ext_dev = (alloc_device_t*)ext;
+ 
+         m->priv_dev = (alloc_device_t*)dev;
++        m->closeDevice = false;
+     }
+ 
+     if (!strcmp(name, GRALLOC_HARDWARE_GPU0)) {
+diff --git a/mx6/libgralloc_wrapper/gralloc_priv.h b/mx6/libgralloc_wrapper/gralloc_priv.h
+index 896b1fd..09769ac 100755
+--- a/mx6/libgralloc_wrapper/gralloc_priv.h
++++ b/mx6/libgralloc_wrapper/gralloc_priv.h
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2009-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2009-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -74,6 +74,7 @@ struct private_module_t {
+     struct alloc_device_t *priv_dev;
+     struct private_module_t *external_module;
+     int primary_fd;
++    bool closeDevice;
+     enum {
+         // flag to indicate we'll post this buffer
+         PRIV_USAGE_LOCKED_FOR_POST = 0x80000000
+-- 
+1.8.0
+

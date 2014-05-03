@@ -1,0 +1,201 @@
+From 6bf33570fbe6ef2bb050d0407bf6f934432c7f50 Mon Sep 17 00:00:00 2001
+From: Liu Ying <Ying.Liu@freescale.com>
+Date: Mon, 19 Dec 2011 17:23:06 +0800
+Subject: [PATCH 186/249] ENGR00170632 IPU lib:Allocate pmem buf for rotation
+ buf
+
+This patch uses pmem API to allocate pmem buffer for
+rotation channel input buffer when rotation channel
+links with ic channel.
+
+Signed-off-by: Liu Ying <Ying.Liu@freescale.com>
+---
+ ipu/mxc_ipu_hl_lib.c | 113 +++++++++++++++++++++++++++++++++++++++++++--------
+ ipu/mxc_ipu_hl_lib.h |   9 +---
+ 2 files changed, 98 insertions(+), 24 deletions(-)
+
+diff --git a/ipu/mxc_ipu_hl_lib.c b/ipu/mxc_ipu_hl_lib.c
+index f95236f..afa32cc 100644
+--- a/ipu/mxc_ipu_hl_lib.c
++++ b/ipu/mxc_ipu_hl_lib.c
+@@ -53,6 +53,7 @@ static int debug_level = DBG_ERR;
+ 
+ #ifdef BUILD_FOR_ANDROID
+ #define LOG_TAG	"ipulib"
++#include <linux/android_pmem.h>
+ #include <utils/Log.h>
+ #include <cutils/properties.h>
+ #define FBDEV0	"/dev/graphics/fb0"
+@@ -1101,6 +1102,79 @@ static void __ipu_mem_free(ipu_mem_info * mem_info, void ** vbuf)
+ 	ipu_close();
+ }
+ 
++#ifdef BUILD_FOR_ANDROID
++static int __pmem_alloc(ipu_mem_info * mem_info, void ** vbuf)
++{
++	const size_t pagesize = getpagesize();
++	struct pmem_region region;
++	int fd_pem = 0, ret = 0;
++
++	if (mem_info == NULL) {
++		ret = -1;
++		goto err1;
++	}
++
++	mem_info->size = (mem_info->size + pagesize-1) & ~(pagesize - 1);
++
++	fd_pem = open("/dev/pmem_adsp", O_RDWR | O_SYNC);
++	if (fd_pem < 0) {
++		dbg(DBG_ERR, "Unable to open /dev/pmem_adsp\n");
++		ret = -1;
++		goto err1;
++	}
++
++	ret = ioctl(fd_pem, PMEM_GET_TOTAL_SIZE, &region);
++	if (ret < 0) {
++		dbg(DBG_ERR, "Cannot get pmem total size\n");
++		goto err2;
++	}
++	if (region.len < mem_info->size) {
++		dbg(DBG_ERR, "No enough pmem\n");
++		ret = -1;
++		goto err2;
++	}
++
++	mem_info->vaddr = (unsigned long)mmap(0, mem_info->size,
++		    PROT_READ|PROT_WRITE, MAP_SHARED, fd_pem, 0);
++	if (mem_info->vaddr == (unsigned long)MAP_FAILED) {
++		dbg(DBG_ERR, "mmap(fd=%d, size=%u) failed (%s)",
++			fd_pem, mem_info->size, strerror(errno));
++		ret = -errno;
++		goto err2;
++	}
++	if (vbuf)
++		*vbuf = mem_info->vaddr;
++
++	memset(&region, 0, sizeof(region));
++
++	ret = ioctl(fd_pem, PMEM_GET_PHYS, &region);
++	if (ret < 0) {
++		dbg(DBG_ERR, "Failed to get physical address of source!");
++		munmap(mem_info->vaddr, mem_info->size);
++		goto err2;
++	}
++
++	mem_info->paddr = (unsigned long)region.offset;
++err2:
++	close(fd_pem);
++err1:
++	return ret;
++}
++
++static void __pmem_free(ipu_mem_info * mem_info, void ** vbuf)
++{
++	if (mem_info == NULL)
++		return;
++
++	if (vbuf && *vbuf)
++		munmap(*vbuf, mem_info->size);
++	else if (mem_info->vaddr)
++		munmap(mem_info->vaddr, mem_info->size);
++
++	return;
++}
++#endif
++
+ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 		ipu_lib_overlay_param_t * overlay,
+ 		ipu_lib_output_param_t * output,
+@@ -1185,27 +1259,27 @@ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 			}
+ 		}
+ 
+-		/* allocate or get dma buffer for rotation? */
++		/* allocate buffer for rotation? */
+ 		if((ipu_priv_handle->output.task_mode == (ROT_MODE | IC_MODE)) ||
+ 		   (ipu_priv_handle->output.task_mode == (ROT_MODE | VDI_IC_MODE))) {
+ 			ipu_priv_handle->output.r_minfo[i].size =
+ 				ipu_priv_handle->output.owidth/8*ipu_priv_handle->output.oheight
+ 				*fmt_to_bpp(output->fmt);
+-			if (ipu_handle->rotbuf_phy_start[i] == 0 ||
+-			    ipu_handle->rotfr_size < ipu_priv_handle->output.r_minfo[i].size) {
+-				ret = __ipu_mem_alloc(&ipu_priv_handle->output.r_minfo[i], NULL);
+-				if (ret < 0)
+-					goto err;
+-				dbg(DBG_INFO, "\033[0;35mAlocate %d dma mem [%d] for rotation, dma addr 0x%x!\033[0m\n",
+-						ipu_priv_handle->output.r_minfo[i].size, i,
+-						ipu_priv_handle->output.r_minfo[i].paddr);
+-			} else {
+-				ipu_priv_handle->output.r_minfo[i].paddr = ipu_handle->rotbuf_phy_start[i];
+-				ipu_priv_handle->output.r_minfo[i].size = ipu_handle->rotfr_size;
+-				dbg(DBG_INFO, "\033[0;35mGet %d dma mem [%d] from user for rotation, dma addr 0x%x!\033[0m\n",
+-						ipu_priv_handle->output.r_minfo[i].size, i,
+-						ipu_priv_handle->output.r_minfo[i].paddr);
+-			}
++#ifdef BUILD_FOR_ANDROID
++			ret = __pmem_alloc(&ipu_priv_handle->output.r_minfo[i], NULL);
++			if (ret < 0)
++				goto err;
++			dbg(DBG_INFO, "\033[0;35mAlocate %d pmem [%d] for rotation, pmem addr 0x%x!\033[0m\n",
++					ipu_priv_handle->output.r_minfo[i].size, i,
++					ipu_priv_handle->output.r_minfo[i].paddr);
++#else
++			ret = __ipu_mem_alloc(&ipu_priv_handle->output.r_minfo[i], NULL);
++			if (ret < 0)
++				goto err;
++			dbg(DBG_INFO, "\033[0;35mAlocate %d dma mem [%d] for rotation, dma addr 0x%x!\033[0m\n",
++					ipu_priv_handle->output.r_minfo[i].size, i,
++					ipu_priv_handle->output.r_minfo[i].paddr);
++#endif
+ 		}
+ 
+ again:
+@@ -1458,11 +1532,18 @@ static void _ipu_mem_free(ipu_lib_priv_handle_t * ipu_priv_handle)
+ 		}
+ 
+ 		if (ipu_priv_handle->output.r_minfo[i].vaddr) {
++#ifdef BUILD_FOR_ANDROID
++			__pmem_free(&ipu_priv_handle->output.r_minfo[i], NULL);
++			dbg(DBG_INFO, "\033[0;35mFree %d pmem [%d] for rotation, pmem addr 0x%x!\033[0m\n",
++					ipu_priv_handle->output.r_minfo[i].size, i,
++					ipu_priv_handle->output.r_minfo[i].paddr);
++#else
+ 			__ipu_mem_free(&ipu_priv_handle->output.r_minfo[i],
+ 					NULL);
+ 			dbg(DBG_INFO, "\033[0;35mFree %d dma mem [%d] for rotation, dma addr 0x%x!\033[0m\n",
+ 					ipu_priv_handle->output.r_minfo[i].size, i,
+ 					ipu_priv_handle->output.r_minfo[i].paddr);
++#endif
+ 		}
+ 
+ again:
+diff --git a/ipu/mxc_ipu_hl_lib.h b/ipu/mxc_ipu_hl_lib.h
+index fbb989f..565b5f4 100644
+--- a/ipu/mxc_ipu_hl_lib.h
++++ b/ipu/mxc_ipu_hl_lib.h
+@@ -307,11 +307,7 @@ typedef struct {
+  * The ifr_size/ofr_size indicate the size of input/output buffer.
+  * User should not care the priv parameter and DO NOT change it.
+  * Note that inbuf_start[2] is used only for TASK_VDI_VF_MODE and motion
+- * mode is selected to be medium motion or low motion,
+- * rotbuf_phy_start[] is set by the user to tell the physical address(es)
+- * of rotation buffer(s) so that IPU lib will not do allocation in kernel
+- * and rotfr_size is also set by the user to tell the rotation buffer
+- * size.
++ * mode is selected to be medium motion or low motion.
+  */
+ typedef struct {
+         void * inbuf_start[3];
+@@ -324,9 +320,6 @@ typedef struct {
+ 	int ofr_size;
+ 
+ 	void * priv;
+-
+-	void * rotbuf_phy_start[2];
+-	int rotfr_size;
+ } ipu_lib_handle_t;
+ 
+ /*!
+-- 
+1.8.0
+

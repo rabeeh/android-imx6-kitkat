@@ -1,0 +1,753 @@
+From 38b41cc6e3f412650ec91aa8e825dc9c27cfbab8 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 4 Aug 2010 01:18:53 +0800
+Subject: [PATCH 058/486] 1. Use seperate threads of capturing frame and
+ showing frame by    overlay to improve performance
+ in camera HAL. 2. Enable overlay push mode for
+ camera display in camera hal for    performance
+ improvement. Only on-board camera is covered in   
+ the patch.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ libcamera/CameraHal.cpp | 341 ++++++++++++++++++++++++++++++------------------
+ libcamera/CameraHal.h   |  76 +++++++----
+ 2 files changed, 269 insertions(+), 148 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index a5f2f2e..f6108bf 100644
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -33,11 +33,8 @@
+ namespace android {
+ int CameraHal::camera_device = -1;
+ int CameraHal::g_rotate=0;
+-//Camera Take Picture Parameter
+ int CameraHal::g_still_bpp = 16;
+ char CameraHal::dev_node[FILENAME_LENGTH];
+-int CameraHal::error_status = 0;
+-struct picbuffer CameraHal::buffers[CAPTURE_BUFFER_NUM];
+ 
+ #ifdef USE_FSL_JPEG_ENC 
+ JPEG_ENC_UINT32 CameraHal::g_JpegDataSize = 0;//Total size of g_JpegData
+@@ -63,7 +60,6 @@ CameraHal::CameraHal()
+                     mOverlay(NULL),
+                     mPreviewRunning(0),
+                     mPreviewHeap(0),
+-                    nOverlayBuffersQueued(0),
+                     mRecordFrameSize(0),
+                     mRecordRunning(0),
+                     mCurrentRecordFrame(0),
+@@ -73,24 +69,23 @@ CameraHal::CameraHal()
+                     mDataCbTimestamp(0),
+                     mCallbackCookie(0),
+                     mMsgEnabled(0),
+-                    mCurrentPreviewFrame(0),
+                     nCameraBuffersQueued(0),
+-                    mCameraOpened(0),
+-                    mIsTakingPic(0)
++                    mCameraOpened(0)
+ {
+     int i;
+ 
+-    for (i = 0; i < kVideoBufferCount; i++) {
+-        mVideoBuffer[i] = 0;
++    for (i = 0; i < VIDEO_OUTPUT_BUFFER_NUM; i++) {
++        mVideoBuffers[i] = 0;
+         mVideoBufferUsing[i] = 0;
+     }
+ 
+-    mPreviewBuffer = 0;
+-
+     for (i = 0; i < CAPTURE_BUFFER_NUM; i++) {
+-        buffers[i].length = 0;
++	mPreviewBuffers[i] = 0;
++	mCaptureBuffers[i].length = 0;
+     }
+ 
++    is_overlay_pushmode = 0;
++
+ #ifdef UVC_CAMERA
+     mRecordFormat = mPictureFormat = V4L2_PIX_FMT_YUYV;
+ #else
+@@ -200,7 +195,7 @@ void CameraHal::initDefaultParameters()
+     if (setParameters(p) != NO_ERROR) {
+         LOGE("Failed to set default parameters?!");
+     }
+-    error_status = 0;
++
+ }
+ 
+ CameraHal::~CameraHal()
+@@ -324,10 +319,10 @@ int CameraHal::cameraClose()
+     LOG_FUNCTION_NAME
+     /* Free buffers firstly */
+     for (int i = 0; i < CAPTURE_BUFFER_NUM; i++) {
+-        if (buffers[i].length && (buffers[i].start > 0)) {
+-	    munmap(buffers[i].start, buffers[i].length);
+-            buffers[i].length = 0;
+-	    LOGD("munmap buffers 0x%x\n", buffers[i].start);
++        if (mCaptureBuffers[i].length && (mCaptureBuffers[i].virt_start > 0)) {
++	    munmap(mCaptureBuffers[i].virt_start, mCaptureBuffers[i].length);
++            mCaptureBuffers[i].length = 0;
++	    LOGD("munmap buffers 0x%x\n", mCaptureBuffers[i].virt_start);
+         }
+     }
+     if (camera_device != -1) {
+@@ -528,14 +523,14 @@ int CameraHal::cameraPreviewStart()
+             LOGE("VIDIOC_QUERYBUF ok\n");
+         }
+ 
+-        buffers[i].length = buf.length;
+-        buffers[i].offset = (size_t) buf.m.offset;
+-        buffers[i].start = (unsigned char *)mmap (NULL, buffers[i].length,
+-                    PROT_READ | PROT_WRITE, MAP_SHARED, fd_v4l, buffers[i].offset);
+-        memset(buffers[i].start, 0xFF, buffers[i].length);
+-        LOGE("buffers[%d].length = %d\n", i, buffers[i].length);
+-        LOGE("buffers[%d].offset = 0x%x\n", i, buffers[i].offset);
+-        LOGE("buffers[%d].start = 0x%x\n", i, buffers[i].start);
++        mCaptureBuffers[i].length = buf.length;
++        mCaptureBuffers[i].phy_offset = (size_t) buf.m.offset;
++        mCaptureBuffers[i].virt_start = (unsigned char *)mmap (NULL, mCaptureBuffers[i].length,
++                    PROT_READ | PROT_WRITE, MAP_SHARED, fd_v4l, mCaptureBuffers[i].phy_offset);
++        memset(mCaptureBuffers[i].virt_start, 0xFF, mCaptureBuffers[i].length);
++        LOGE("capture buffers[%d].length = %d\n", i, mCaptureBuffers[i].length);
++        LOGE("capture buffers[%d].phy_offset = 0x%x\n", i, mCaptureBuffers[i].phy_offset);
++        LOGE("capture buffers[%d].virt_start = 0x%x\n", i, mCaptureBuffers[i].virt_start);
+     }
+ 
+     nCameraBuffersQueued = 0;
+@@ -544,7 +539,7 @@ int CameraHal::cameraPreviewStart()
+         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+         buf.memory = V4L2_MEMORY_MMAP;
+         buf.index = i;
+-        buf.m.offset = buffers[i].offset;
++        buf.m.offset = mCaptureBuffers[i].phy_offset;
+ 
+         if (ioctl (fd_v4l, VIDIOC_QBUF, &buf) < 0) {
+             LOGE("VIDIOC_QBUF error\n");
+@@ -611,96 +606,100 @@ bool CameraHal::msgTypeEnabled(int32_t msgType)
+ 
+ void CameraHal::previewOneFrame()
+ {
+-    overlay_buffer_t overlaybuffer;
+     struct v4l2_buffer cfilledbuffer;
+-    int ret, index, i, image_size;
+-
+-    memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
+-    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    cfilledbuffer.memory = V4L2_MEMORY_MMAP;
++    overlay_buffer_t overlaybuffer;
++    int ret, display_index, i, image_size;
+ 
+-#ifdef UVC_CAMERA
+-    /* De-queue the next avaiable buffer */
+-    ret = ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer);
+-    if (ret < 0) {
+-        LOGE("uvc camera device VIDIOC_DQBUF failure, ret=%d", ret);
+-        error_status = -1;
+-        return;
+-    }
+-#else
+-    /* De-queue the next avaliable buffer in loop since timout is used in driver */
+-    while (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
+-        LOGE("VIDIOC_DQBUF Failed in previewOneFrame!!!");
+-	usleep(1000);
+-    }
+-#endif
+-    nCameraBuffersQueued--;
+-    index = cfilledbuffer.index;
++    sem_wait(&avaiable_show_frame);
+ 
+     image_size = mRecordFrameSize;
+-    /* Convert YUYV to YUV420SP and put to mPreviewBuffer */
+-    if (mRecordFormat == V4L2_PIX_FMT_YUYV)
+-        convertYUYVtoYUV420SP(buffers[cfilledbuffer.index].start,
+-                                 (uint8_t *)mPreviewBuffer->pointer(), mRecordWidth, mRecordHeight);
++    display_index = buffer_index_maps[queue_head];
+ 
+     if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+         nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+-        for(i = 0 ; i < kVideoBufferCount; i ++) {
++        for(i = 0 ; i < VIDEO_OUTPUT_BUFFER_NUM; i ++) {
+             if(mVideoBufferUsing[i] == 0) {
+                 if (mRecordFormat == V4L2_PIX_FMT_YUYV)
+-                    memcpy(mVideoBuffer[i]->pointer(), mPreviewBuffer->pointer(), image_size);
++                    memcpy(mVideoBuffers[i]->pointer(), mPreviewBuffers[display_index]->pointer(), image_size);
+                 else
+-                    memcpy(mVideoBuffer[i]->pointer(),
+-		                       (void*)buffers[cfilledbuffer.index].start, image_size);
++                    memcpy(mVideoBuffers[i]->pointer(),
++		                       (void*)mCaptureBuffers[display_index].virt_start, image_size);
+                  mVideoBufferUsing[i] = 1;
+-                 mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoBuffer[i], mCallbackCookie);
++                 mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoBuffers[i], mCallbackCookie);
+                  break;
+             }
+         }
+-        if (i == kVideoBufferCount)
++        if (i == VIDEO_OUTPUT_BUFFER_NUM)
+                  LOGD("no Buffer can be used for record\n");
+     }
+ 
++    if (mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
++        if (mRecordFormat != V4L2_PIX_FMT_YUYV)
++            memcpy(mPreviewBuffers[display_index]->pointer(),
++                     (void*)mCaptureBuffers[display_index].virt_start, image_size);
++        mDataCb(CAMERA_MSG_PREVIEW_FRAME, mPreviewBuffers[display_index], mCallbackCookie);
++    }
++
+     /* Notify overlay of a new frame. */
+     if (mOverlay != 0) {
+-        mOverlay->dequeueBuffer(&overlaybuffer);
+-        void* address = mOverlay->getBufferAddress(overlaybuffer);
+-        nOverlayBuffersQueued--;
+-        if (mRecordFormat == V4L2_PIX_FMT_YUYV)
+-            memcpy(address, mPreviewBuffer->pointer(), image_size);
+-        else
+-            memcpy(address, (void*)buffers[cfilledbuffer.index].start,  image_size);
+-        if (mOverlay->queueBuffer(overlaybuffer))
+-            LOGD("qbuf failed. May be bcos stream was not turned on yet. So try again");
+-        else
+-            nOverlayBuffersQueued++;
++	if (is_overlay_pushmode) {
++	    if (mOverlay->queueBuffer((overlay_buffer_t)mCaptureBuffers[display_index].phy_offset))
++		LOGD("qbuf failed. May be bcos stream was not turned on yet.");
++	    /* For overlay push mode, the second queueBuffer return means last buffer can
++	       be used for capturing next frame */
++	    if (is_first_buffer) {
++		is_first_buffer = 0;
++		goto out;
++	    }
++	} else {
++            mOverlay->dequeueBuffer(&overlaybuffer);
++            void* address = mOverlay->getBufferAddress(overlaybuffer);
++            if (mRecordFormat == V4L2_PIX_FMT_YUYV)
++                memcpy(address, mPreviewBuffers[display_index]->pointer(), image_size);
++            else
++                memcpy(address, (void*)mCaptureBuffers[display_index].virt_start, image_size);
++            if (mOverlay->queueBuffer(overlaybuffer))
++		LOGD("qbuf failed. May be bcos stream was not turned on yet.");
++	}
+     }
+ 
+-    if (mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
+-        if (mRecordFormat != V4L2_PIX_FMT_YUYV)
+-            memcpy(mPreviewBuffer->pointer(),
+-                     (void*)buffers[cfilledbuffer.index].start, image_size);
+-        mDataCb(CAMERA_MSG_PREVIEW_FRAME, mPreviewBuffer, mCallbackCookie);
++    /* Queue the buffer to camera for coming usage */
++    memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
++    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    cfilledbuffer.memory = V4L2_MEMORY_MMAP;
++    cfilledbuffer.index = display_index;
++
++    ret = ioctl(camera_device, VIDIOC_QUERYBUF, &cfilledbuffer);
++    if (ret < 0) {
++	error_status = -1;
++	LOGE("VIDIOC_QUERYBUF camera device failure, ret=%d", ret);
++	return;
+     }
+ 
+ #ifdef UVC_CAMER
+     ret = ioctl(camera_device, VIDIOC_QBUF, &cfilledbuffer);
+     if (ret < 0) {
+-        LOGE("uvc camera device VIDIOC_QBUF failure, ret=%d", ret);
+-        error_status = -1;
+-        return;
++	LOGE("uvc camera device VIDIOC_QBUF failure, ret=%d", ret);
++	error_status = -1;
++	return;
+     }
+ #else
+     while (ioctl(camera_device, VIDIOC_QBUF, &cfilledbuffer) < 0) {
+-	    LOGE("VIDIOC_QBUF Failed.");
++	LOGE("VIDIOC_QBUF Failed.");
+     }
+ #endif
+     nCameraBuffersQueued++;
+ 
++    sem_post(&avaible_dequeue_frame);
++
++    queue_head ++;
++    queue_head %= CAPTURE_BUFFER_NUM;
++
++out:
+     return;
+ }
+ 
+-int CameraHal::previewThread()
++int CameraHal::previewShowFrameThread()
+ {
+     if (mPreviewRunning && !error_status) {
+         previewOneFrame();
+@@ -718,9 +717,62 @@ status_t CameraHal::setOverlay(const sp<Overlay> &overlay)
+         LOGE("Trying to set overlay, but overlay is null!");
+     mOverlay = overlay;
+ 
++    if (mOverlay != 0) {
++	/* Not enable push mode for UVC camera case yet*/
++#ifndef UVC_CAMERA
++	mOverlay->setParameter(OVERLAY_MODE, OVERLAY_PUSH_MODE);
++	is_overlay_pushmode = 1;
++#endif
++    }
++
+     return NO_ERROR;
+ }
+ 
++int CameraHal::previewCaptureFrameThread()
++{
++    struct v4l2_buffer cfilledbuffer;
++    int ret, index;
++
++    if (mPreviewRunning && !error_status) {
++
++	sem_wait(&avaible_dequeue_frame);
++
++	memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
++	cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	cfilledbuffer.memory = V4L2_MEMORY_MMAP;
++
++#ifdef UVC_CAMERA
++	/* De-queue the next avaiable buffer */
++	ret = ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer);
++	if (ret < 0) {
++	    LOGE("uvc camera device VIDIOC_DQBUF failure, ret=%d", ret);
++	    error_status = -1;
++	    return -1;
++	}
++#else
++	/* De-queue the next avaliable buffer in loop since timout is used in driver */
++	while (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
++	    LOGE("VIDIOC_DQBUF Failed in previewCaptureFrameThread!!!");
++	    usleep(1000);
++	}
++#endif
++	nCameraBuffersQueued--;
++
++	/* Convert YUYV to YUV420SP and put to mPreviewBuffer */
++	if (mRecordFormat == V4L2_PIX_FMT_YUYV) {
++	    convertYUYVtoYUV420SP(mCaptureBuffers[cfilledbuffer.index].virt_start,
++                                 (uint8_t *)mPreviewBuffers[cfilledbuffer.index]->pointer(), mRecordWidth, mRecordHeight);
++	}
++
++	buffer_index_maps[dequeue_head] = cfilledbuffer.index;
++	dequeue_head ++;
++	dequeue_head %= CAPTURE_BUFFER_NUM;
++	sem_post(&avaiable_show_frame);
++    }
++
++    return UNKNOWN_ERROR;
++}
++
+ status_t CameraHal::startPreview()
+ {
+     LOG_FUNCTION_NAME
+@@ -733,18 +785,35 @@ status_t CameraHal::startPreview()
+         return INVALID_OPERATION;
+     }
+ 
++    dequeue_head = 0;
++    queue_head = 0;
++    error_status = 0;
++    is_first_buffer = 1;
++
++    for (i = 0; i < CAPTURE_BUFFER_NUM; i++) {
++        mCaptureBuffers[i].length = 0;
++    }
++
+     if (cameraPreviewConfig() < 0)
+         return INVALID_OPERATION;
+ 
+     LOGD("Clear the old preview memory and Init new memory");
+     mPreviewHeap.clear();
+-    mPreviewBuffer.clear();
+-    mPreviewHeap = new MemoryHeapBase(mRecordFrameSize);
+-    mPreviewBuffer = new MemoryBase(mPreviewHeap, 0, mRecordFrameSize);
++    for (i = 0; i< 3; i++)
++        mPreviewBuffers[i].clear();
++    mPreviewHeap = new MemoryHeapBase(mRecordFrameSize * 3);
++    for (i = 0; i < 3; i++)
++       mPreviewBuffers[i] = new MemoryBase(mPreviewHeap, mRecordFrameSize * i, mRecordFrameSize);
+ 
+     cameraPreviewStart();
+ 
+-    mPreviewThread = new PreviewThread(this);
++    sem_init(&avaiable_show_frame, 0, 0);
++    /* Init sem to CAPTURE_BUFFER_NUM -1 since buffer can be dequeued at least
++       two buffers are queued */
++    sem_init(&avaible_dequeue_frame, 0, CAPTURE_BUFFER_NUM - 1);
++
++    mPreviewCaptureFrameThread = new PreviewCaptureFrameThread(this);
++    mPreviewShowFrameThread = new PreviewShowFrameThread(this);
+ 
+     mPreviewRunning = true;
+ 
+@@ -764,7 +833,8 @@ void CameraHal::stopPreview()
+ 
+ void CameraHal::cameraPreviewStop()
+ {
+-    sp<PreviewThread> previewThread;
++    sp<PreviewShowFrameThread> previewShowFrameThread;
++    sp<PreviewCaptureFrameThread> previewCaptureFrameThread;
+     struct v4l2_requestbuffers creqbuf;
+ 
+     LOG_FUNCTION_NAME
+@@ -778,13 +848,32 @@ void CameraHal::cameraPreviewStop()
+ 
+ 	{// scope for the lock
+ //	Mutex::Autolock lock(mLock);
+-        previewThread = mPreviewThread;
++        previewShowFrameThread = mPreviewShowFrameThread;
++	previewCaptureFrameThread = mPreviewCaptureFrameThread;
+ 	}
+ 
+-        if (previewThread != 0) {
+-            previewThread->requestExitAndWait();
++	if (previewCaptureFrameThread != 0)
++	    previewCaptureFrameThread->requestExitAndWait();
++
++        if (previewShowFrameThread != 0)
++	    previewShowFrameThread->requestExitAndWait();
++
++	sem_destroy(&avaiable_show_frame);
++	sem_destroy(&avaible_dequeue_frame);
++
++        /* Flush to release buffer used in overlay */
++        if (mOverlay != 0) {
++            if (is_overlay_pushmode) {
++                //if (mOverlay->queueBuffer(NULL))
++                //    LOGD("overlay queueBuffer NULL failure");
++		/* FIXME: Cannot use queueBuffer here since overlay may be streamed off,
++		   delay some time here now*/
++		usleep(30000);
++            }
+         }
+ 
++/* no need to DQBUF before STREAMOFF for UVC camera to improve performance */
++#ifndef UVC_CAMERA
+     if (!error_status) {
+         memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
+         cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+@@ -798,7 +887,9 @@ void CameraHal::cameraPreviewStop()
+             nCameraBuffersQueued--;
+             LOGD("DQUEUING UNDQUEUED BUFFERS exit = %d",nCameraBuffersQueued);
+         }
+-}
++    }
++#endif
++
+         creqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+         if (ioctl(camera_device, VIDIOC_STREAMOFF, &creqbuf.type) == -1) {
+             LOGE("VIDIOC_STREAMOFF Failed");
+@@ -808,7 +899,9 @@ void CameraHal::cameraPreviewStop()
+ 	cameraClose();
+     }
+ //    Mutex::Autolock lock(mLock);
+-    mPreviewThread.clear();
++    mPreviewShowFrameThread.clear();
++    mPreviewCaptureFrameThread.clear();
++
+ }
+ 
+ bool CameraHal::previewEnabled()
+@@ -829,13 +922,13 @@ status_t CameraHal::startRecording()
+ 
+     LOGD("Clear the old memory ");
+     mVideoHeap.clear();
+-    for(i = 0; i < kVideoBufferCount; i++)
+-        mVideoBuffer[i].clear();
++    for(i = 0; i < VIDEO_OUTPUT_BUFFER_NUM; i++)
++        mVideoBuffers[i].clear();
+     LOGD("Init the video Memory %d", mRecordFrameSize);
+-    mVideoHeap = new MemoryHeapBase(mRecordFrameSize * kVideoBufferCount);
+-    for(i = 0; i < kVideoBufferCount; i++) {
++    mVideoHeap = new MemoryHeapBase(mRecordFrameSize * VIDEO_OUTPUT_BUFFER_NUM);
++    for(i = 0; i < VIDEO_OUTPUT_BUFFER_NUM; i++) {
+         LOGD("Init Video Buffer:%d ",i);
+-        mVideoBuffer[i] = new MemoryBase(mVideoHeap,
++        mVideoBuffers[i] = new MemoryBase(mVideoHeap,
+ 	                       mRecordFrameSize * i, mRecordFrameSize);
+     }
+     mRecordRunning = true;
+@@ -979,11 +1072,6 @@ int CameraHal::cameraTakePicture()
+ 
+     LOG_FUNCTION_NAME
+ 
+-    if (mMsgEnabled & CAMERA_MSG_SHUTTER) {
+-        LOGI("CAMERA_MSG_SHUTTER");
+-        mNotifyCb(CAMERA_MSG_SHUTTER, 0, 0, mCallbackCookie);
+-    }
+-
+     mParameters.getPictureSize(&w, &h);
+     LOGD("Picture Size: Width = %d \tHeight = %d", w, h);
+     mPictureWidth = w;
+@@ -1012,6 +1100,11 @@ int CameraHal::cameraTakePicture()
+     }
+     memset(buf1, 0 ,target_size);
+ 
++    if (mMsgEnabled & CAMERA_MSG_SHUTTER) {
++        LOGI("CAMERA_MSG_SHUTTER");
++        mNotifyCb(CAMERA_MSG_SHUTTER, 0, 0, mCallbackCookie);
++    }
++
+ #ifdef UVC_CAMERA
+     memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
+     cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+@@ -1024,7 +1117,7 @@ int CameraHal::cameraTakePicture()
+         error_status = -1;
+     }
+ 
+-    convertYUYVtoYUV420SP(buffers[cfilledbuffer.index].start,
++    convertYUYVtoYUV420SP(mCaptureBuffers[cfilledbuffer.index].virt_start,
+                           buf1, mPictureWidth, mPictureHeight);
+ 
+     target_size = mPictureWidth * mPictureHeight * 3 / 2;
+@@ -1039,6 +1132,15 @@ int CameraHal::cameraTakePicture()
+ #endif
+     LOGD("Generated a picture");
+ 
++#ifdef UVC_CAMERA
++    creqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    if (ioctl(camera_device, VIDIOC_STREAMOFF, &creqbuf.type) == -1) {
++        LOGE("VIDIOC_STREAMOFF Failed");
++    }
++#endif
++    /* Close device */
++    cameraClose();
++
+ #ifdef USE_FSL_JPEG_ENC
+     sp<MemoryBase> jpegMemBase = encodeImage((void*)buf1, target_size);
+     if (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
+@@ -1054,28 +1156,6 @@ int CameraHal::cameraTakePicture()
+         mJpegPictureCallback(mem, mPictureCallbackCookie);
+ #endif
+ 
+-#ifdef UVC_CAMERA
+-    /* stop video stream and close device */
+-    memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
+-    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    cfilledbuffer.memory = V4L2_MEMORY_MMAP;
+-
+-    while ((count < CAPTURE_BUFFER_NUM - 1) && !error_status) {
+-        if (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
+-            LOGE("VIDIOC_DQBUF Failed before STREAMOFF!!!");
+-            error_status = -1;
+-        }
+-        count++;
+-    }
+-
+-    creqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    if (ioctl(camera_device, VIDIOC_STREAMOFF, &creqbuf.type) == -1) {
+-        LOGE("VIDIOC_STREAMOFF Failed");
+-    }
+-#endif
+-    /* Close device */
+-    cameraClose();
+-
+ exit0:
+     if (buf1)
+             free(buf1);
+@@ -1083,7 +1163,13 @@ exit0:
+     return NO_ERROR;
+ }
+ 
+-status_t CameraHal::takePicture()
++int CameraHal::beginPictureThread(void *cookie)
++{
++    CameraHal *c = (CameraHal *)cookie;
++    return c->pictureThread();
++}
++
++int CameraHal::pictureThread()
+ {
+     LOG_FUNCTION_NAME
+ 
+@@ -1097,6 +1183,13 @@ status_t CameraHal::takePicture()
+     cameraTakePicture();
+ 
+     return NO_ERROR;
++
++}
++status_t CameraHal::takePicture()
++{
++    if (createThread(beginPictureThread, this) == false)
++        return -1;
++    return NO_ERROR;
+ }
+ 
+ status_t CameraHal::cancelPicture()
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index f5cabcd..a957ee1 100644
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -47,6 +47,8 @@
+ #include <ui/Overlay.h>
+ #include <dirent.h>
+ 
++#include <semaphore.h>
++
+ #define FB_DEVICE               "/dev/graphics/fb0"
+ #define MIN_WIDTH               176
+ #define MIN_HEIGHT              144
+@@ -59,6 +61,8 @@
+ #define RECORDING_HEIGHT_NORMAL 288     //default recording height
+ 
+ #define CAPTURE_BUFFER_NUM      3
++#define VIDEO_OUTPUT_BUFFER_NUM	3
++
+ #define LOG_FUNCTION_NAME       LOGD("%d: %s() Executing...", __LINE__, __FUNCTION__);
+ 
+ //#define UVC_CAMERA              1
+@@ -73,9 +77,9 @@
+ 
+ struct picbuffer
+ {
+-        unsigned char *start;
+-        size_t offset;
+-        unsigned int length;
++    unsigned char *virt_start;
++    size_t phy_offset;
++    unsigned int length;
+ };
+ 
+ namespace android {
+@@ -132,16 +136,31 @@ private:
+ 
+     static wp<CameraHardwareInterface> singleton;
+ 
+-    class PreviewThread : public Thread {
++    class PreviewShowFrameThread : public Thread {
+         CameraHal* mHardware;
+     public:
+-        PreviewThread(CameraHal* hw)
++        PreviewShowFrameThread(CameraHal* hw)
+             : Thread(false), mHardware(hw) { }
+         virtual void onFirstRef() {
+-            run("CameraPreviewThread", PRIORITY_URGENT_DISPLAY);
++            run("CameraPreviewShowFrameThread", PRIORITY_URGENT_DISPLAY);
+         }
+         virtual bool threadLoop() {
+-            mHardware->previewThread();
++            mHardware->previewShowFrameThread();
++            // loop until we need to quit
++            return true;
++        }
++    };
++
++    class PreviewCaptureFrameThread : public Thread {
++        CameraHal* mHardware;
++    public:
++        PreviewCaptureFrameThread(CameraHal* hw)
++            : Thread(false), mHardware(hw) { }
++        virtual void onFirstRef() {
++            run("CameraPreviewCaptureFrameThread", PRIORITY_URGENT_DISPLAY);
++        }
++        virtual bool threadLoop() {
++            mHardware->previewCaptureFrameThread();
+             // loop until we need to quit
+             return true;
+         }
+@@ -150,11 +169,15 @@ private:
+     void initDefaultParameters();
+     bool initHeapLocked();
+ 
+-    int previewThread();
++    int previewShowFrameThread();
++    int previewCaptureFrameThread();
+ 
+     static int beginAutoFocusThread(void *cookie);
+     int autoFocusThread();
+ 
++    static int beginPictureThread(void *cookie);
++    int pictureThread();
++
+     int validateSize(int w, int h);
+     void* cropImage(unsigned long buffer);
+ 
+@@ -180,15 +203,17 @@ private:
+     CameraParameters    mParameters;
+ 
+     sp<MemoryHeapBase>  mPreviewHeap;
+-    sp<MemoryBase>      mPreviewBuffer;
++    sp<MemoryBase>      mPreviewBuffers[CAPTURE_BUFFER_NUM]; // used when UVC camera
+     bool                mPreviewRunning;
+-    int                 mPreviewFrameSize;
+     int                 mRecordHeight;
+     int                 mRecordWidth;
+     int                 mRecordFormat;
++    int                 display_head;
++
+     // protected by mLock
+     sp<Overlay>         mOverlay;
+-    sp<PreviewThread>   mPreviewThread;
++    sp<PreviewShowFrameThread>   mPreviewShowFrameThread;
++    sp<PreviewCaptureFrameThread> mPreviewCaptureFrameThread;
+ 
+     notify_callback    mNotifyCb;
+     data_callback      mDataCb;
+@@ -198,7 +223,6 @@ private:
+     int32_t             mMsgEnabled;
+ 
+     bool                mCameraOpened;
+-    bool                mIsTakingPic;;
+ 
+     int                 mPictureHeight;
+     int                 mPictureWidth;
+@@ -208,15 +232,12 @@ private:
+     bool                mRecordRunning;
+     int                 mCurrentRecordFrame;
+     int 		nCameraBuffersQueued;
+-   
+-    static const int    kVideoBufferCount = 3;
+-    sp<MemoryHeapBase>  mVideoHeap;
+-    sp<MemoryBase>      mVideoBuffer[kVideoBufferCount];
+-    int   		mVideoBufferUsing[kVideoBufferCount];
+ 
+-    // only used from PreviewThread
+-    int                 mCurrentPreviewFrame;
+-    int 		nOverlayBuffersQueued;
++    /* These buffers are used to output captured video to upper layer,
++       eg, for to use video encoder */
++    sp<MemoryHeapBase>  mVideoHeap;
++    sp<MemoryBase>      mVideoBuffers[VIDEO_OUTPUT_BUFFER_NUM];
++    int   		mVideoBufferUsing[VIDEO_OUTPUT_BUFFER_NUM];
+ 
+     bool previewStopped;
+     bool recordStopped;
+@@ -227,12 +248,12 @@ private:
+     static int g_camera_framerate;
+     static char dev_node[FILENAME_LENGTH];
+ 
+-    //used for priview
+     static int g_rotate;
+-    //used for taking picture
+     static int g_still_bpp;
++
+     //used for recording
+-    static struct picbuffer buffers[3];
++    struct picbuffer mCaptureBuffers[CAPTURE_BUFFER_NUM];
++    int    buffer_index_maps[CAPTURE_BUFFER_NUM];
+ 
+     static const char supportedPictureSizes[];
+     static const char supportedPreviewSizes[];
+@@ -240,7 +261,14 @@ private:
+     static const char supprotedThumbnailSizes[];
+     static const char PARAMS_DELIMITER[];
+ 
+-    static int error_status;
++    int error_status;
++    int queue_head;
++    int dequeue_head;
++    int is_first_buffer;
++    int is_overlay_pushmode;
++
++    sem_t avaiable_show_frame;
++    sem_t avaible_dequeue_frame;
+ 
+ #ifdef DUMP_CAPTURE_YUV
+     static FILE *record_yuvFile;
+-- 
+1.8.0
+

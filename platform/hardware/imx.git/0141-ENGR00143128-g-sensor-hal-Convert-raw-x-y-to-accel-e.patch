@@ -1,0 +1,169 @@
+From 85238a5d9a6476420bc1e633d730267debd51f69 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Mon, 9 May 2011 23:37:24 +0800
+Subject: [PATCH 141/486] ENGR00143128 g-sensor hal: Convert raw x/y to accel
+ event per hw rotation
+
+User can define default android screen by setprop of ro.sf.hwrotation.
+Sensor convertion needs to consider this property.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ libsensors/AccelSensor.cpp | 62 ++++++++++++++++++++++++++++++++--------------
+ libsensors/AccelSensor.h   |  1 +
+ libsensors/sensors.h       |  9 +++++--
+ 3 files changed, 51 insertions(+), 21 deletions(-)
+
+diff --git a/libsensors/AccelSensor.cpp b/libsensors/AccelSensor.cpp
+index 396f165..10e4e62 100755
+--- a/libsensors/AccelSensor.cpp
++++ b/libsensors/AccelSensor.cpp
+@@ -25,6 +25,7 @@
+ #include <sys/select.h>
+ #include <dlfcn.h>
+ #include <cutils/log.h>
++#include <cutils/properties.h>
+ 
+ #include "AccelSensor.h"
+ 
+@@ -35,8 +36,11 @@ AccelSensor::AccelSensor()
+       mPendingMask(0),
+       mInputReader(32),
+       mMinPollDelay(0),
+-      mMaxPollDelay(0)
++      mMaxPollDelay(0),
++      mHwRotation(0)
+ {
++    char  hwrotBuf[PROPERTY_VALUE_MAX];
++
+ #if defined(ACCELEROMETER_SENSOR_MMA8451)
+     data_name = "mma8451";
+ #elif defined(ACCELEROMETER_SENSOR_MMA8450)
+@@ -58,22 +62,10 @@ AccelSensor::AccelSensor()
+     mPendingEvents[Accelerometer].type = SENSOR_TYPE_ACCELEROMETER;
+     mPendingEvents[Accelerometer].acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
+ 
+-    // read the actual value of all sensors if they're enabled already
+-    struct input_absinfo absinfo;
+-    short flags = 0;
+-
+-    if (accel_is_sensor_enabled(SENSOR_TYPE_ACCELEROMETER))  {
+-        mEnabled |= 1<<Accelerometer;
+-        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_X), &absinfo)) {
+-            mPendingEvents[Accelerometer].acceleration.x = absinfo.value * CONVERT_A_X;
+-        }
+-        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_Y), &absinfo)) {
+-            mPendingEvents[Accelerometer].acceleration.y = absinfo.value * CONVERT_A_Y;
+-        }
+-        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_Z), &absinfo)) {
+-            mPendingEvents[Accelerometer].acceleration.z = absinfo.value * CONVERT_A_Z;
+-        }
+-    }
++    /* sensor abs_x/y/z convertion is related to default hardware display orientation
++       property and the chip position/direction of the sensor soldered in the board */
++    property_get("ro.sf.hwrotation", hwrotBuf, "0");
++    mHwRotation = atoi(hwrotBuf) / 90;
+ }
+ 
+ AccelSensor::~AccelSensor()
+@@ -266,18 +258,50 @@ int AccelSensor::readEvents(sensors_event_t* data, int count)
+ 
+ void AccelSensor::processEvent(int code, int value)
+ {
++    float temp_x = 0.0f, temp_y = 0.0f, raw_x_ev = 0.0f, raw_y_ev = 0.0f;
++
+     switch (code) {
+         case EVENT_TYPE_ACCEL_X:
+             mPendingMask |= 1<<Accelerometer;
+-            mPendingEvents[Accelerometer].acceleration.x = value * CONVERT_A_X;
++            temp_x = value * CONVERT_A_X;
++            raw_x_ev = 1;
+             break;
+         case EVENT_TYPE_ACCEL_Y:
+             mPendingMask |= 1<<Accelerometer;
+-            mPendingEvents[Accelerometer].acceleration.y = value * CONVERT_A_Y;
++            temp_y = value * CONVERT_A_Y;
++            raw_y_ev = 1;
+             break;
+         case EVENT_TYPE_ACCEL_Z:
+             mPendingMask |= 1<<Accelerometer;
+             mPendingEvents[Accelerometer].acceleration.z = value * CONVERT_A_Z;
+             break;
+     }
++
++    /* Transfer to correct abs_x/y per hw orientation */
++    switch (mHwRotation) {
++        case HWROTATION_0:
++            if (raw_y_ev)
++                mPendingEvents[Accelerometer].acceleration.x = temp_y;
++            if (raw_x_ev)
++                mPendingEvents[Accelerometer].acceleration.y = -temp_x;
++            break;
++        case HWROTATION_90:
++            if (raw_x_ev)
++                mPendingEvents[Accelerometer].acceleration.x = temp_x;
++            if (raw_y_ev)
++                mPendingEvents[Accelerometer].acceleration.y = temp_y;
++            break;
++        case HWROTATION_180:
++            if (raw_y_ev)
++                mPendingEvents[Accelerometer].acceleration.x = -temp_y;
++            if (raw_x_ev)
++                mPendingEvents[Accelerometer].acceleration.y = temp_x;
++            break;
++        case HWROTATION_270:
++            if (raw_x_ev)
++                mPendingEvents[Accelerometer].acceleration.x = -temp_x;
++            if (raw_y_ev)
++                mPendingEvents[Accelerometer].acceleration.y = -temp_y;
++            break;
++    }
+ }
+diff --git a/libsensors/AccelSensor.h b/libsensors/AccelSensor.h
+index 4d2f338..9ac0f32 100755
+--- a/libsensors/AccelSensor.h
++++ b/libsensors/AccelSensor.h
+@@ -56,6 +56,7 @@ private:
+     char poll_sysfs_file[PATH_MAX];
+     int poll_sysfs_file_len;
+     int getPollFile(const char* inputName);
++    int mHwRotation;
+     static inline int accel_is_sensor_enabled(uint32_t sensor_type)
+     {
+         //dummy now......
+diff --git a/libsensors/sensors.h b/libsensors/sensors.h
+index 10ca250..152b57e 100755
+--- a/libsensors/sensors.h
++++ b/libsensors/sensors.h
+@@ -41,6 +41,11 @@ __BEGIN_DECLS
+ #define ID_P  (4)
+ #define ID_GY (5)
+ 
++#define HWROTATION_0   (0)
++#define HWROTATION_90  (1)
++#define HWROTATION_180 (2)
++#define HWROTATION_270 (3)
++
+ /*****************************************************************************/
+ 
+ /*
+@@ -81,14 +86,14 @@ __BEGIN_DECLS
+ 
+ // conversion of magnetic data to uT units
+ #define CONVERT_M                   (1.0f/20.0f)
+-#define CONVERT_M_X                 (-CONVERT_M)
++#define CONVERT_M_X                 (CONVERT_M)
+ #define CONVERT_M_Y                 (CONVERT_M)
+ #define CONVERT_M_Z                 (-CONVERT_M)
+ 
+ /* conversion of orientation data to degree units */
+ #define CONVERT_O                   (1.0f/100.0f)
+ #define CONVERT_O_Y                 (CONVERT_O)
+-#define CONVERT_O_P                 (-CONVERT_O)
++#define CONVERT_O_P                 (CONVERT_O)
+ #define CONVERT_O_R                 (CONVERT_O)
+ 
+ #define SENSOR_STATE_MASK           (0x7FFF)
+-- 
+1.8.0
+

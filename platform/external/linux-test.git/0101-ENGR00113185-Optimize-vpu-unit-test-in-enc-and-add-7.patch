@@ -1,0 +1,280 @@
+From f3dd7a94fd87766409dd8d551615e0930fa32406 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 10 Jun 2009 15:42:32 +0800
+Subject: [PATCH 101/435] ENGR00113185 Optimize vpu unit test in enc and add
+ 720p-TV and VDI in dec
+
+1. Add 720p-TV and VDI support to dec unit test for mx51;
+2. Enable annexJ for h263 encoder;
+3. Remove forceIframe every 10 frames, use goz to control I frame in encoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 36 ++++++++++++++++++--------
+ test/mxc_vpu_test/display.c  | 60 ++++++++++++++++++++++++++++++++++++--------
+ test/mxc_vpu_test/enc.c      | 10 +-------
+ test/mxc_vpu_test/loopback.c |  2 +-
+ test/mxc_vpu_test/vpu_test.h |  4 +--
+ 5 files changed, 79 insertions(+), 33 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 7898028..66cc95f 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -666,7 +666,7 @@ decoder_start(struct decode *dec)
+ 	int rotid = 0, dblkid = 0, mirror;
+ 	int count = dec->cmdl->count;
+ 	int totalNumofErrMbs = 0;
+-	int disp_clr_index = -1, actual_display_index = -1;
++	int disp_clr_index = -1, actual_display_index = -1, field = V4L2_FIELD_NONE;
+ 
+ 	if ((dec->cmdl->dst_scheme == PATH_V4L2) && (dec->cmdl->ipu_rot_en))
+ 		rot_en = 0;
+@@ -908,22 +908,35 @@ decoder_start(struct decode *dec)
+ 			if (dec->cmdl->format == STD_VC1) {
+ 				if (outinfo.pictureStructure == 2)
+ 					info_msg("dec_idx %d : FRAME_INTERLACE\n", decIndex);
+-				else if (outinfo.pictureStructure == 3)
+-					info_msg("dec_idx %d : FIELD_INTERLACE\n", decIndex);
++				else if (outinfo.pictureStructure == 3) {
++					if (outinfo.topFieldFirst)
++						field = V4L2_FIELD_INTERLACED_TB;
++					else
++						field = V4L2_FIELD_INTERLACED_BT;
++				}
+ 				if (outinfo.vc1_repeatFrame)
+ 					info_msg("dec_idx %d : VC1 RPTFRM [%1d]\n", decIndex, outinfo.vc1_repeatFrame);
+ 			} else if (dec->cmdl->format == STD_AVC) {
+-				if (outinfo.interlacedFrame)
++				if (outinfo.interlacedFrame) {
++					if (outinfo.topFieldFirst)
++						field = V4L2_FIELD_INTERLACED_TB;
++					else
++						field = V4L2_FIELD_INTERLACED_BT;
+ 					dprintf(3, "Top Field First flag: %d, dec_idx %d\n",
+ 						  outinfo.topFieldFirst, decIndex);
++				}
+ 			} else if ((dec->cmdl->format != STD_MPEG4) && (dec->cmdl->format != STD_RV)){
+ 				if (outinfo.interlacedFrame || !outinfo.progressiveFrame) {
+ 					if (outinfo.pictureStructure == 1)
+-						info_msg("Top Field First flag: %d, dec_idx %d is top field\n",
+-							 outinfo.topFieldFirst, decIndex);
++						field = V4L2_FIELD_TOP;
+ 					else if (outinfo.pictureStructure == 2)
+-						info_msg("Top Field First flag: %d, dec_idx %d is bottom field\n",
+-							  outinfo.topFieldFirst, decIndex);
++						field = V4L2_FIELD_BOTTOM;
++					else if (outinfo.pictureStructure == 3) {
++						if (outinfo.topFieldFirst)
++							field = V4L2_FIELD_INTERLACED_TB;
++						else
++							field = V4L2_FIELD_INTERLACED_BT;
++					}
+ 				}
+ 				if (outinfo.repeatFirstField)
+ 					info_msg("frame_idx %d : Repeat First Field\n", decIndex);
+@@ -1009,7 +1022,10 @@ decoder_start(struct decode *dec)
+ 							(img_size >> 2);
+ 			}
+ 
+-			err = v4l_put_data(disp, actual_display_index);
++			if (cpu_is_mx51())
++				err = v4l_put_data(disp, actual_display_index, field);
++			else
++				err = v4l_put_data(disp, actual_display_index, V4L2_FIELD_ANY);
+ 
+ 			if (err)
+ 				return -1;
+@@ -1573,7 +1589,7 @@ decoder_open(struct decode *dec)
+ 	oparam.mp4DeblkEnable = dec->cmdl->deblock_en;
+ 	oparam.chromaInterleave = dec->cmdl->chromaInterleave;
+ 	oparam.mp4Class = dec->cmdl->mp4Class;
+-
++	oparam.mjpg_thumbNailDecEnable = 0;
+ 	/*
+ 	 * mp4 deblocking filtering is optional out-loop filtering for image
+ 	 * quality. In other words, mpeg4 deblocking is post processing.
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 963da33..98fe5bb 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -95,7 +95,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	int bottom = cropRect.bottom;
+ 	int disp_width = dec->cmdl->width;
+ 	int disp_height = dec->cmdl->height;
+-	int fd, err, out, i;
++	int fd = -1, err = 0, out = 0, i = 0;
+ 	char v4l_device[32] = "/dev/video16";
+ 	struct v4l2_cropcap cropcap = {0};
+ 	struct v4l2_crop crop = {0};
+@@ -105,6 +105,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	struct v4l2_mxc_offset off = {0};
+ 	struct vpu_display *disp;
+ 	int fd_fb;
++	char *tv_mode;
+ 	struct mxcfb_gbl_alpha alpha;
+ 
+ 	int ratio = 1;
+@@ -129,16 +130,29 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	dprintf(3, "rot_en:%d; rot_angle:%d; ipu_rot_en:%d\n", rotation.rot_en,
+ 			rotation.rot_angle, rotation.ipu_rot_en);
+ 
+-#ifdef	TVOUT_ENABLE
+-	/* NTSC mode */
+-	err = system("/bin/echo U:720x480i-60 > /sys/class/graphics/fb1/mode");
+-	if (err == -1) {
+-		warn_msg("set tv mode error\n");
++	tv_mode = getenv("VPU_TV_MODE");
++
++	if (tv_mode) {
++		if (!strcmp(tv_mode, "NTSC")) {
++			err = system("/bin/echo U:720x480i-60 > /sys/class/graphics/fb1/mode");
++			out = 5;
++		} else if (!strcmp(tv_mode, "PAL")) {
++			err = system("/bin/echo U:720x576i-50 > /sys/class/graphics/fb1/mode");
++			out = 5;
++		} else if (!strcmp(tv_mode, "720P")) {
++			err = system("/bin/echo U:1280x720p-60 > /sys/class/graphics/fb1/mode");
++			out = 5;
++		} else {
++			out = 3;
++			warn_msg("VPU_TV_MODE should be set to NTSC, PAL, or 720P.\n"
++				 "\tDefault display is LCD if not set this environment "
++				 "or set wrong string.\n");
++		}
++		if (err == -1) {
++			warn_msg("set tv mode error\n");
++		}
+ 	}
+ 
+-	out = 5;
+-#endif
+-
+ 	if (rotation.rot_en) {
+ 		if (rotation.rot_angle == 90 || rotation.rot_angle == 270) {
+ 			i = width;
+@@ -269,6 +283,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	dprintf(1, "fmt.fmt.pix.width = %d\n\tfmt.fmt.pix.height = %d\n",
+ 				fmt.fmt.pix.width, fmt.fmt.pix.height);
+ 
++	fmt.fmt.pix.field = V4L2_FIELD_ANY;
+ 	if (dec->cmdl->chromaInterleave == 0)
+ 		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+ 	else {
+@@ -361,10 +376,11 @@ void v4l_display_close(struct vpu_display *disp)
+ 	}
+ }
+ 
+-int v4l_put_data(struct vpu_display *disp, int index)
++int v4l_put_data(struct vpu_display *disp, int index, int field)
+ {
+ 	struct timeval tv;
+ 	int err, type;
++	struct v4l2_format fmt = {0};
+ 
+ 	if (disp->ncount == 0) {
+ 		gettimeofday(&tv, 0);
+@@ -399,6 +415,7 @@ int v4l_put_data(struct vpu_display *disp, int index)
+ 	}
+ 
+ 	disp->buf.index = index;
++	disp->buf.field = field;
+ 	err = ioctl(disp->fd, VIDIOC_QBUF, &disp->buf);
+ 	if (err < 0) {
+ 		err_msg("VIDIOC_QBUF failed\n");
+@@ -407,6 +424,29 @@ int v4l_put_data(struct vpu_display *disp, int index)
+ 	disp->queued_count++;
+ 
+ 	if (disp->ncount == 1) {
++		if ((disp->buf.field == V4L2_FIELD_TOP) ||
++		    (disp->buf.field == V4L2_FIELD_BOTTOM) ||
++		    (disp->buf.field == V4L2_FIELD_INTERLACED_TB) ||
++		    (disp->buf.field == V4L2_FIELD_INTERLACED_BT)) {
++			/* For interlace feature */
++			fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++			err = ioctl(disp->fd, VIDIOC_G_FMT, &fmt);
++			if (err < 0) {
++				err_msg("VIDIOC_G_FMT failed\n");
++				goto err;
++			}
++			if ((disp->buf.field == V4L2_FIELD_TOP) ||
++			    (disp->buf.field == V4L2_FIELD_BOTTOM))
++				fmt.fmt.pix.field = V4L2_FIELD_ALTERNATE;
++			else
++				fmt.fmt.pix.field = field;
++			fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++			err = ioctl(disp->fd, VIDIOC_S_FMT, &fmt);
++			if (err < 0) {
++				err_msg("VIDIOC_S_FMT failed\n");
++				goto err;
++			}
++		}
+ 		type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 		err = ioctl(disp->fd, VIDIOC_STREAMON, &type);
+ 		if (err < 0) {
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index b09df24..5941204 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -434,14 +434,6 @@ encoder_start(struct encode *enc)
+ 				break;
+ 		}
+ 
+-		if ((frame_id % 10) == 0) {
+-			enc_param.forceIPicture = 1;
+-			enc->cmdl->iframe = 1;
+-		} else {
+-			enc_param.forceIPicture = 0;
+-			enc->cmdl->iframe = 0;
+-		}
+-
+ 		gettimeofday(&tenc_begin, NULL);
+ 		ret = vpu_EncStartOneFrame(handle, &enc_param);
+ 		if (ret != RETCODE_SUCCESS) {
+@@ -825,7 +817,7 @@ encoder_open(struct encode *enc)
+ 		encop.EncStdParam.mp4Param.mp4_hecEnable = 0;
+ 		encop.EncStdParam.mp4Param.mp4_verid = 2;
+ 	} else if ( enc->cmdl->format == STD_H263) {
+-		encop.EncStdParam.h263Param.h263_annexJEnable = 0;
++		encop.EncStdParam.h263Param.h263_annexJEnable = 1;
+ 		encop.EncStdParam.h263Param.h263_annexKEnable = 0;
+ 		encop.EncStdParam.h263Param.h263_annexTEnable = 0;
+ 	} else if (enc->cmdl->format == STD_AVC) {
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 2d5f54e..9eb4ac2 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -93,7 +93,7 @@ decode(void)
+ 		goto out;
+ 	}
+ 
+-	ret = v4l_put_data(disp, outinfo.indexFrameDisplay);
++	ret = v4l_put_data(disp, outinfo.indexFrameDisplay, V4L2_FIELD_ANY);
+ 	if (ret)
+ 		return -1;
+ 
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 5a35d80..d302136 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -40,8 +40,6 @@
+ 	printf("[WARN]\t" fmt, ## arg);	\
+ 	} while (0)
+ 
+-/*#define TVOUT_ENABLE*/
+-
+ typedef unsigned long u32;
+ typedef unsigned short u16;
+ typedef unsigned char u8;
+@@ -203,7 +201,7 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode);
+ 
+ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ 					struct rot rotation, Rect rotCrop);
+-int v4l_put_data(struct vpu_display *disp, int index);
++int v4l_put_data(struct vpu_display *disp, int index, int field);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(int stdMode, int strideY, int height);
+ void framebuf_free(struct frame_buf *fb);
+-- 
+1.8.0
+

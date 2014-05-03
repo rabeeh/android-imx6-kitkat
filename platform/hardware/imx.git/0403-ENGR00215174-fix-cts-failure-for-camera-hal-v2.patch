@@ -1,0 +1,648 @@
+From 0d235c0daccd52915c6f5f5be5b5b2b66b4111c1 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Wed, 9 Jan 2013 12:56:51 +0800
+Subject: [PATCH 403/486] ENGR00215174 fix cts failure for camera hal v2.
+
+add frame request.
+refine RequestManager to reduce stop count.
+refine video snap shot code.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera2/CameraHal.cpp      |  2 +-
+ mx6/libcamera2/CameraUtil.h       |  3 ++
+ mx6/libcamera2/CaptureStream.cpp  | 26 +++++++----
+ mx6/libcamera2/JpegBuilder.cpp    |  2 +-
+ mx6/libcamera2/MetadaManager.cpp  | 72 ++++++++++++++++++++++------
+ mx6/libcamera2/MetadaManager.h    |  1 +
+ mx6/libcamera2/Ov5640.cpp         |  7 ++-
+ mx6/libcamera2/Ov5642.cpp         |  7 ++-
+ mx6/libcamera2/OvDevice.cpp       |  8 ++--
+ mx6/libcamera2/RequestManager.cpp | 98 +++++++++++++++++++++++++--------------
+ mx6/libcamera2/RequestManager.h   |  7 ++-
+ mx6/libcamera2/StreamAdapter.cpp  |  4 +-
+ mx6/libcamera2/StreamAdapter.h    |  2 +
+ 13 files changed, 170 insertions(+), 69 deletions(-)
+
+diff --git a/mx6/libcamera2/CameraHal.cpp b/mx6/libcamera2/CameraHal.cpp
+index 07f792b..3432619 100755
+--- a/mx6/libcamera2/CameraHal.cpp
++++ b/mx6/libcamera2/CameraHal.cpp
+@@ -70,7 +70,7 @@ int CameraHal::set_frame_queue_dst_ops(
+                     const camera2_frame_queue_dst_ops_t *frame_dst_ops)
+ {
+     mFrameQueue = frame_dst_ops;
+-    return 0;
++    return mRequestManager->setFrameOperation(frame_dst_ops);
+ }
+ 
+ int CameraHal::get_in_progress_count()
+diff --git a/mx6/libcamera2/CameraUtil.h b/mx6/libcamera2/CameraUtil.h
+index 6771121..5f87692 100755
+--- a/mx6/libcamera2/CameraUtil.h
++++ b/mx6/libcamera2/CameraUtil.h
+@@ -120,8 +120,11 @@ struct CameraInfo : public camera_info
+ struct SensorInfo
+ {
+     int mPreviewResolutions[MAX_RESOLUTION_SIZE];
++    int mPreviewResolutionCount;
+     int mPictureResolutions[MAX_RESOLUTION_SIZE];
++    int mPictureResolutionCount;
+     int mAvailableFormats[MAX_SENSOR_FORMAT];
++    int mAvailableFormatCount;
+     nsecs_t mMinFrameDuration;
+     nsecs_t mMaxFrameDuration;
+     int mTargetFpsRange[MAX_FPS_RANGE];
+diff --git a/mx6/libcamera2/CaptureStream.cpp b/mx6/libcamera2/CaptureStream.cpp
+index f652165..abfa4e2 100755
+--- a/mx6/libcamera2/CaptureStream.cpp
++++ b/mx6/libcamera2/CaptureStream.cpp
+@@ -28,6 +28,7 @@ CaptureStream::CaptureStream(int id)
+     mVideoSnapShot = false;
+     mPhysMemAdapter = new PhysMemAdapter();
+     sem_init(&mRespondSem, 0, 0);
++    mRequestStream = false;
+ }
+ 
+ CaptureStream::~CaptureStream()
+@@ -60,15 +61,6 @@ int CaptureStream::configure(int fps, bool videoSnapshot)
+     mJpegBuilder->reset();
+     mJpegBuilder->setMetadaManager(mMetadaManager);
+ 
+-    mVideoSnapShot = videoSnapshot;
+-    if (mVideoSnapShot) {
+-        FLOGE("%s video Snapshot", __FUNCTION__);
+-        mPrepared = true;
+-        return ret;
+-    }
+-
+-    fAssert(mDeviceAdapter.get() != NULL);
+-
+     if (mFormat == HAL_PIXEL_FORMAT_BLOB) {
+         mActualFormat = mDeviceAdapter->getPicturePixelFormat();
+         //fmt = HAL_PIXEL_FORMAT_YCbCr_420_SP;
+@@ -77,6 +69,14 @@ int CaptureStream::configure(int fps, bool videoSnapshot)
+         mActualFormat = mFormat;
+     }
+ 
++    mVideoSnapShot = videoSnapshot;
++    if (mVideoSnapShot) {
++        FLOGE("%s video Snapshot", __FUNCTION__);
++        mPrepared = true;
++        return ret;
++    }
++
++    fAssert(mDeviceAdapter.get() != NULL);
+     ret = mDeviceAdapter->setDeviceConfig(mWidth, mHeight, mActualFormat, fps);
+     if (ret != NO_ERROR) {
+         FLOGE("%s setDeviceConfig failed", __FUNCTION__);
+@@ -159,6 +159,7 @@ int CaptureStream::release()
+ 
+ void CaptureStream::applyRequest()
+ {
++    mRequestStream = true;
+     sem_wait(&mRespondSem);
+ }
+ 
+@@ -166,6 +167,10 @@ int CaptureStream::processFrame(CameraFrame *frame)
+ {
+     status_t ret = NO_ERROR;
+ 
++    if (mVideoSnapShot && !mRequestStream) {
++        return ret;
++    }
++
+     StreamBuffer buffer;
+     ret = requestBuffer(&buffer);
+     if (ret != NO_ERROR) {
+@@ -173,6 +178,8 @@ int CaptureStream::processFrame(CameraFrame *frame)
+         goto exit_err;
+     }
+ 
++    mJpegBuilder->reset();
++    mJpegBuilder->setMetadaManager(mMetadaManager);
+     ret = makeJpegImage(&buffer, frame);
+     if (ret != NO_ERROR) {
+         FLOGE("%s makeJpegImage failed", __FUNCTION__);
+@@ -187,6 +194,7 @@ int CaptureStream::processFrame(CameraFrame *frame)
+     }
+ 
+ exit_err:
++    mRequestStream = false;
+     sem_post(&mRespondSem);
+ 
+     return ret;
+diff --git a/mx6/libcamera2/JpegBuilder.cpp b/mx6/libcamera2/JpegBuilder.cpp
+index d89243f..87b7e0e 100755
+--- a/mx6/libcamera2/JpegBuilder.cpp
++++ b/mx6/libcamera2/JpegBuilder.cpp
+@@ -502,7 +502,7 @@ void JpegBuilder::setMetadaManager(sp<MetadaManager> &metadaManager)
+     ret = mMetadaManager->getGpsProcessingMethod(gpsProcessingMethod, GPS_PROCESSING_SIZE);
+     if (ret == 0) {
+         memset(mEXIFData.mGPSData.mProcMethod, 0, GPS_PROCESSING_SIZE);
+-        strncpy(mEXIFData.mGPSData.mProcMethod, (const char*)gpsProcessingMethod, GPS_PROCESSING_SIZE - 1);
++        strcpy(mEXIFData.mGPSData.mProcMethod, (const char*)gpsProcessingMethod);
+         mEXIFData.mGPSData.mProcMethodValid = true;
+     }
+     else {
+diff --git a/mx6/libcamera2/MetadaManager.cpp b/mx6/libcamera2/MetadaManager.cpp
+index e98d590..b5b527d 100755
+--- a/mx6/libcamera2/MetadaManager.cpp
++++ b/mx6/libcamera2/MetadaManager.cpp
+@@ -119,8 +119,7 @@ status_t MetadaManager::createDefaultRequest(
+     static float aperture = 2.8;
+     ADD_OR_SIZE(ANDROID_LENS_APERTURE, &aperture, 1);
+ 
+-    static float focalLength = 0.0;
+-    ADD_OR_SIZE(ANDROID_LENS_FOCAL_LENGTH, &focalLength, 1);
++    ADD_OR_SIZE(ANDROID_LENS_FOCAL_LENGTH, &mSensorInfo->mFocalLength, 1);
+ 
+     static const float filterDensity = 0;
+     ADD_OR_SIZE(ANDROID_LENS_FILTER_DENSITY, &filterDensity, 1);
+@@ -491,9 +490,11 @@ status_t MetadaManager::getGpsProcessingMethod(uint8_t* src, int count)
+         return BAD_VALUE;
+     }
+ 
+-    for (int i=0; i<(int)streams.count && i<count; i++) {
++    int i;
++    for (i=0; i<(int)streams.count && i<count-1; i++) {
+         src[i] = streams.data.u8[i];
+     }
++    src[i] = '\0';
+ 
+     return NO_ERROR;
+ }
+@@ -555,6 +556,49 @@ status_t MetadaManager::getJpegThumbSize(int &width, int &height)
+     return NO_ERROR;
+ }
+ 
++status_t MetadaManager::generateFrameRequest(camera_metadata_t * frame)
++{
++    if (mCurrentRequest == NULL || frame == NULL) {
++        FLOGE("%s invalid param", __FUNCTION__);
++        return BAD_VALUE;
++    }
++
++    camera_metadata_entry_t streams;
++    int res;
++
++    res = find_camera_metadata_entry(mCurrentRequest,
++            ANDROID_REQUEST_ID, &streams);
++    if (res != NO_ERROR) {
++        FLOGE("%s: error reading output stream tag", __FUNCTION__);
++        return BAD_VALUE;
++    }
++
++    int requestId = streams.data.i32[0];
++    res = add_camera_metadata_entry(frame, ANDROID_REQUEST_ID, &requestId, 1);
++    if (res != NO_ERROR) {
++        FLOGE("%s: error add ANDROID_REQUEST_ID tag", __FUNCTION__);
++        return BAD_VALUE;
++    }
++
++    static const int32_t frameCount = 0;
++    res = add_camera_metadata_entry(frame, ANDROID_REQUEST_FRAME_COUNT,
++                          &frameCount, 1);
++    if (res != NO_ERROR) {
++        FLOGE("%s: error add ANDROID_REQUEST_FRAME_COUNT tag", __FUNCTION__);
++        return BAD_VALUE;
++    }
++
++    nsecs_t timeStamp = systemTime();
++    res = add_camera_metadata_entry(frame, ANDROID_SENSOR_TIMESTAMP,
++                         &timeStamp, 1);
++    if (res != NO_ERROR) {
++        FLOGE("%s: error add ANDROID_SENSOR_TIMESTAMP tag", __FUNCTION__);
++        return BAD_VALUE;
++    }
++
++    return 0;
++}
++
+ status_t MetadaManager::getRequestType(int *reqType)
+ {
+     if (mCurrentRequest == NULL) {
+@@ -569,7 +613,7 @@ status_t MetadaManager::getRequestType(int *reqType)
+     res = find_camera_metadata_entry(mCurrentRequest,
+             ANDROID_REQUEST_ID, &streams);
+     if (res != NO_ERROR) {
+-        ALOGE("%s: error reading output stream tag", __FUNCTION__);
++        FLOGE("%s: error reading output stream tag", __FUNCTION__);
+         return BAD_VALUE;
+     }
+ 
+@@ -631,9 +675,8 @@ status_t MetadaManager::createStaticInfo(camera_metadata_t **info, bool sizeRequ
+     ADD_OR_SIZE(ANDROID_LENS_HYPERFOCAL_DISTANCE,
+             &minFocusDistance, 1);
+ 
+-    static float focalLength = 0.0;
+     ADD_OR_SIZE(ANDROID_LENS_AVAILABLE_FOCAL_LENGTHS,
+-            &focalLength, 1);
++            &mSensorInfo->mFocalLength, 1);
+ 
+     static float aperture = 2.8;
+     ADD_OR_SIZE(ANDROID_LENS_AVAILABLE_APERTURES,
+@@ -721,7 +764,7 @@ status_t MetadaManager::createStaticInfo(camera_metadata_t **info, bool sizeRequ
+ 
+     ADD_OR_SIZE(ANDROID_SCALER_AVAILABLE_FORMATS,
+             mSensorInfo->mAvailableFormats,
+-            sizeof(mSensorInfo->mAvailableFormats)/sizeof(uint32_t));
++            mSensorInfo->mAvailableFormatCount);
+ #if 0
+     const uint32_t kAvailableFormats[3] = {
+         HAL_PIXEL_FORMAT_RAW_SENSOR,
+@@ -744,10 +787,10 @@ status_t MetadaManager::createStaticInfo(camera_metadata_t **info, bool sizeRequ
+ 
+     ADD_OR_SIZE(ANDROID_SCALER_AVAILABLE_PROCESSED_SIZES,
+         mSensorInfo->mPreviewResolutions,
+-        ARRAY_SIZE(mSensorInfo->mPreviewResolutions));
++        mSensorInfo->mPreviewResolutionCount);
+     ADD_OR_SIZE(ANDROID_SCALER_AVAILABLE_JPEG_SIZES,
+         mSensorInfo->mPictureResolutions,
+-        ARRAY_SIZE(mSensorInfo->mPictureResolutions));
++        mSensorInfo->mPictureResolutionCount);
+ 
+     ADD_OR_SIZE(ANDROID_SCALER_AVAILABLE_PROCESSED_MIN_DURATIONS,
+             &mSensorInfo->mMinFrameDuration,
+@@ -763,10 +806,9 @@ status_t MetadaManager::createStaticInfo(camera_metadata_t **info, bool sizeRequ
+     // android.jpeg
+ 
+     static const int32_t jpegThumbnailSizes[] = {
+-            160, 120,
+-            160, 160,
+             96, 96,
+-            144, 96
++            160, 120,
++            0, 0
+     };
+ 
+     ADD_OR_SIZE(ANDROID_JPEG_AVAILABLE_THUMBNAIL_SIZES,
+@@ -807,7 +849,8 @@ status_t MetadaManager::createStaticInfo(camera_metadata_t **info, bool sizeRequ
+     // android.control
+ 
+     static const uint8_t availableSceneModes[] = {
+-            ANDROID_CONTROL_SCENE_MODE_UNSUPPORTED
++            ANDROID_CONTROL_SCENE_MODE_PORTRAIT,
++            ANDROID_CONTROL_SCENE_MODE_LANDSCAPE
+     };
+     ADD_OR_SIZE(ANDROID_CONTROL_AVAILABLE_SCENE_MODES,
+             availableSceneModes, sizeof(availableSceneModes));
+@@ -852,7 +895,8 @@ status_t MetadaManager::createStaticInfo(camera_metadata_t **info, bool sizeRequ
+             availableAntibandingModes, sizeof(availableAntibandingModes));
+ 
+     static const uint8_t availableAwbModes[] = {
+-            ANDROID_CONTROL_AWB_OFF
++            ANDROID_CONTROL_AWB_OFF,
++            ANDROID_CONTROL_AWB_AUTO
+     };
+     ADD_OR_SIZE(ANDROID_CONTROL_AWB_AVAILABLE_MODES,
+             availableAwbModes, sizeof(availableAwbModes));
+diff --git a/mx6/libcamera2/MetadaManager.h b/mx6/libcamera2/MetadaManager.h
+index f009ebf..abfe10e 100755
+--- a/mx6/libcamera2/MetadaManager.h
++++ b/mx6/libcamera2/MetadaManager.h
+@@ -48,6 +48,7 @@ public:
+         bool sizeRequest);
+ 
+     status_t setCurrentRequest(camera_metadata_t* request);
++    status_t generateFrameRequest(camera_metadata_t * frame);
+     status_t getRequestType(int *reqType);
+     status_t getRequestStreams(camera_metadata_entry_t *reqStreams);
+     status_t getFrameRate(int *value);
+diff --git a/mx6/libcamera2/Ov5640.cpp b/mx6/libcamera2/Ov5640.cpp
+index 2a62360..80f9d3e 100755
+--- a/mx6/libcamera2/Ov5640.cpp
++++ b/mx6/libcamera2/Ov5640.cpp
+@@ -54,8 +54,7 @@ status_t Ov5640::initSensorInfo()
+     sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
+     sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
+     //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
+-    index = 4;
+-
++    mAvailableFormatCount = index;
+     changeSensorFormats(sensorFormats, index);
+ 
+     index = 0;
+@@ -108,6 +107,9 @@ status_t Ov5640::initSensorInfo()
+         }
+     } // end while
+ 
++    mPreviewResolutionCount = previewCnt;
++    mPictureResolutionCount = pictureCnt;
++
+     mMinFrameDuration = 33331760L;
+     mMaxFrameDuration = 30000000000L;
+     int i;
+@@ -129,6 +131,7 @@ status_t Ov5640::initSensorInfo()
+ 
+     setMaxPictureResolutions();
+     FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
++    mFocalLength = 10.001;
+ 
+     return NO_ERROR;
+ }
+diff --git a/mx6/libcamera2/Ov5642.cpp b/mx6/libcamera2/Ov5642.cpp
+index 24255c5..b52f05c 100755
+--- a/mx6/libcamera2/Ov5642.cpp
++++ b/mx6/libcamera2/Ov5642.cpp
+@@ -53,8 +53,7 @@ status_t Ov5642::initSensorInfo()
+     sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
+     sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
+     //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
+-    index = 4;
+-
++    mAvailableFormatCount = index;
+     changeSensorFormats(sensorFormats, index);
+ 
+     index = 0;
+@@ -107,6 +106,9 @@ status_t Ov5642::initSensorInfo()
+         }
+     } // end while
+ 
++    mPreviewResolutionCount = previewCnt;
++    mPictureResolutionCount = pictureCnt;
++
+     mMinFrameDuration = 33331760L;
+     mMaxFrameDuration = 30000000000L;
+     int i;
+@@ -128,6 +130,7 @@ status_t Ov5642::initSensorInfo()
+ 
+     setMaxPictureResolutions();
+     FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
++    mFocalLength = 10.001;
+ 
+     return NO_ERROR;
+ }
+diff --git a/mx6/libcamera2/OvDevice.cpp b/mx6/libcamera2/OvDevice.cpp
+index cb73543..57d9dce 100755
+--- a/mx6/libcamera2/OvDevice.cpp
++++ b/mx6/libcamera2/OvDevice.cpp
+@@ -92,8 +92,7 @@ status_t OvDevice::initSensorInfo()
+     sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
+     sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
+     //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
+-    index = 4;
+-
++    mAvailableFormatCount = index;
+     changeSensorFormats(sensorFormats, index);
+ 
+     index = 0;
+@@ -146,6 +145,9 @@ status_t OvDevice::initSensorInfo()
+         }
+     } // end while
+ 
++    mPreviewResolutionCount = previewCnt;
++    mPictureResolutionCount = pictureCnt;
++
+     mMinFrameDuration = 33331760L;
+     mMaxFrameDuration = 30000000000L;
+     int i;
+@@ -167,7 +169,7 @@ status_t OvDevice::initSensorInfo()
+ 
+     setMaxPictureResolutions();
+     FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
+-    mFocalLength = 0.0f;
++    mFocalLength = 10.001;
+ 
+     return NO_ERROR;
+ }
+diff --git a/mx6/libcamera2/RequestManager.cpp b/mx6/libcamera2/RequestManager.cpp
+index f13c63e..030c56a 100755
+--- a/mx6/libcamera2/RequestManager.cpp
++++ b/mx6/libcamera2/RequestManager.cpp
+@@ -84,21 +84,26 @@ void RequestManager::handleError(int err)
+     }
+ }
+ 
+-void RequestManager::stopAllStreamsLocked()
++void RequestManager::stopStream(int id)
++{
++    sp<StreamAdapter> cameraStream = mStreamAdapter[id];
++    FLOG_RUNTIME("%s steam id:%d", __FUNCTION__, id);
++    if (cameraStream.get() != NULL) {
++        if (cameraStream->mStarted) {
++            cameraStream->stop();
++        }
++        if (cameraStream->mPrepared) {
++            cameraStream->release();
++        }
++    }
++    FLOG_RUNTIME("%s end", __FUNCTION__);
++}
++
++void RequestManager::stopAllStreams()
+ {
+     FLOG_TRACE("%s running", __FUNCTION__);
+-    sp<StreamAdapter> cameraStream;
+     for (int id = 0; id < MAX_STREAM_NUM; id++) {
+-        cameraStream = mStreamAdapter[id];
+-        FLOG_RUNTIME("%s steam id:%d", __FUNCTION__, id);
+-        if (cameraStream.get() != NULL) {
+-            if (cameraStream->mStarted) {
+-                cameraStream->stop();
+-            }
+-            if (cameraStream->mPrepared) {
+-                cameraStream->release();
+-            }
+-        }
++        stopStream(id);
+     }
+     FLOG_TRACE("%s end", __FUNCTION__);
+ }
+@@ -109,6 +114,12 @@ int RequestManager::setRequestOperation(const camera2_request_queue_src_ops_t *r
+     return 0;
+ }
+ 
++int RequestManager::setFrameOperation(const camera2_frame_queue_dst_ops_t *frame_dst_ops)
++{
++    mFrameOperation = frame_dst_ops;
++    return 0;
++}
++
+ int RequestManager::CreateDefaultRequest(int request_template, camera_metadata_t **request)
+ {
+     FLOG_TRACE("DEBUG(%s): making template (%d) ", __FUNCTION__, request_template);
+@@ -181,6 +192,27 @@ bool RequestManager::handleRequest()
+         mMetadaManager->getRequestType(&requestType);
+         FLOG_RUNTIME("%s:start request %d", __FUNCTION__, requestType);
+ 
++        int numEntries = 0;
++        int frameSize = 0;
++        numEntries = get_camera_metadata_entry_count(request);
++        frameSize = get_camera_metadata_size(request);
++        camera_metadata_t *currentFrame = NULL;
++        res = mFrameOperation->dequeue_frame(mFrameOperation, numEntries,
++                               frameSize, &currentFrame);
++        if (res < 0) {
++            FLOGE("%s: dequeue_frame failed", __FUNCTION__);
++            currentFrame = NULL;
++        }
++        else {
++            res = mMetadaManager->generateFrameRequest(currentFrame);
++            if (res == 0) {
++                mFrameOperation->enqueue_frame(mFrameOperation, currentFrame);
++            }
++            else {
++                mFrameOperation->cancel_frame(mFrameOperation, currentFrame);
++            }
++        }
++
+         res = tryRestartStreams(requestType);
+         if (res != NO_ERROR) {
+             FLOGE("%s: tryRestartStreams failed", __FUNCTION__);
+@@ -194,7 +226,7 @@ bool RequestManager::handleRequest()
+     }//end while
+ 
+     FLOG_TRACE("%s exiting", __FUNCTION__);
+-    stopAllStreamsLocked();
++    stopAllStreams();
+     mRequestThread.clear();
+     mPendingRequests--;
+     FLOG_TRACE("%s end...", __FUNCTION__);
+@@ -202,11 +234,20 @@ bool RequestManager::handleRequest()
+     return false;
+ }
+ 
+-bool RequestManager::isStreamValid(int requestType, int streamId)
++bool RequestManager::isStreamValid(int requestType, int streamId, int videoSnap)
+ {
++    if (videoSnap) {
++        return true;
++    }
++
+     if (requestType == REQUEST_TYPE_CAPTURE && streamId == STREAM_ID_PREVIEW) {
+         return false;
+     }
++
++    if (requestType == REQUEST_TYPE_CAPTURE && streamId == STREAM_ID_PRVCB) {
++        return false;
++    }
++
+     if (requestType == REQUEST_TYPE_PREVIEW && streamId == STREAM_ID_JPEG) {
+         return false;
+     }
+@@ -219,7 +260,6 @@ int RequestManager::tryRestartStreams(int requestType)
+     FLOG_RUNTIME("%s running", __FUNCTION__);
+     int res = 0;
+     int fps = 30;
+-    bool needRestart = false;
+     res = mMetadaManager->getFrameRate(&fps);
+     if (res != NO_ERROR) {
+         FLOGE("%s: getFrameRate failed", __FUNCTION__);
+@@ -250,29 +290,19 @@ int RequestManager::tryRestartStreams(int requestType)
+         videoSnapshot = true;
+     }
+ 
+-    for (uint32_t i = 0; i < streams.count; i++) {
+-        int streamId = streams.data.u8[i];
+-        if (!isStreamValid(requestType, streamId)) {
+-            continue;
+-        }
+-        sp<StreamAdapter> stream = mStreamAdapter[streamId];
+-        if (stream.get() == NULL) {
+-            continue;
+-        }
+-        if (!stream->mPrepared) {
+-            FLOGI("stream id:%d need restart", streamId);
+-            needRestart = true;
+-            break;
++    for (int id = 0; id < MAX_STREAM_NUM; id++) {
++        sp<StreamAdapter> stream = mStreamAdapter[id];
++        if (!isStreamValid(requestType, id, videoSnapshot)) {
++            if (stream.get() != NULL && stream->mPrepared) {
++                FLOGI("%s stop unused stream %d", __FUNCTION__, id);
++                stopStream(id);
++            }
+         }
+     }
+ 
+-    if (needRestart) {
+-        stopAllStreamsLocked();
+-    }
+-
+     for (uint32_t i = 0; i < streams.count; i++) {
+         int streamId = streams.data.u8[i];
+-        if (!isStreamValid(requestType, streamId)) {
++        if (!isStreamValid(requestType, streamId, videoSnapshot)) {
+             continue;
+         }
+         sp<StreamAdapter> stream = mStreamAdapter[streamId];
+@@ -299,7 +329,7 @@ int RequestManager::tryRestartStreams(int requestType)
+ 
+     for (uint32_t i = 0; i < streams.count; i++) {
+         int streamId = streams.data.u8[i];
+-        if (!isStreamValid(requestType, streamId)) {
++        if (!isStreamValid(requestType, streamId, videoSnapshot)) {
+             continue;
+         }
+ 
+diff --git a/mx6/libcamera2/RequestManager.h b/mx6/libcamera2/RequestManager.h
+index 35f34ca..6444005 100755
+--- a/mx6/libcamera2/RequestManager.h
++++ b/mx6/libcamera2/RequestManager.h
+@@ -52,6 +52,7 @@ public:
+ 
+     int initialize(CameraInfo& info);
+     int setRequestOperation(const camera2_request_queue_src_ops_t *request_src_ops);
++    int setFrameOperation(const camera2_frame_queue_dst_ops_t *frame_dst_ops);
+     int CreateDefaultRequest(int request_template, camera_metadata_t **request);
+     int allocateStream(uint32_t width,
+                         uint32_t height, int format,
+@@ -85,8 +86,9 @@ public:
+ 
+ private:
+     int tryRestartStreams(int requestType);
+-    void stopAllStreamsLocked();
+-    bool isStreamValid(int requestType, int streamId);
++    void stopStream(int id);
++    void stopAllStreams();
++    bool isStreamValid(int requestType, int streamId, int videoSnap);
+     void handleError(int err);
+ 
+ private:
+@@ -94,6 +96,7 @@ private:
+     sp<RequestHandleThread> mRequestThread;
+     mutable Mutex mThreadLock;
+     const camera2_request_queue_src_ops_t *mRequestOperation;
++    const camera2_frame_queue_dst_ops_t *mFrameOperation;
+     sp<MetadaManager> mMetadaManager;
+ 
+     sp<StreamAdapter> mStreamAdapter[MAX_STREAM_NUM];
+diff --git a/mx6/libcamera2/StreamAdapter.cpp b/mx6/libcamera2/StreamAdapter.cpp
+index 445d0ec..5d55397 100755
+--- a/mx6/libcamera2/StreamAdapter.cpp
++++ b/mx6/libcamera2/StreamAdapter.cpp
+@@ -201,6 +201,7 @@ void StreamAdapter::applyRequest()
+ int StreamAdapter::processFrame(CameraFrame *frame)
+ {
+     status_t ret = NO_ERROR;
++    int size;
+ 
+     StreamBuffer buffer;
+     int err = requestBuffer(&buffer);
+@@ -209,7 +210,8 @@ int StreamAdapter::processFrame(CameraFrame *frame)
+         goto err_ext;
+     }
+ 
+-    memcpy(buffer.mVirtAddr, (void *)frame->mVirtAddr, frame->mSize);
++    size = (frame->mSize > buffer.mSize) ? buffer.mSize : frame->mSize;
++    memcpy(buffer.mVirtAddr, (void *)frame->mVirtAddr, size);
+     buffer.mTimeStamp = frame->mTimeStamp;
+     err = renderBuffer(&buffer);
+     if (ret != NO_ERROR) {
+diff --git a/mx6/libcamera2/StreamAdapter.h b/mx6/libcamera2/StreamAdapter.h
+index 116b874..c3844bf 100755
+--- a/mx6/libcamera2/StreamAdapter.h
++++ b/mx6/libcamera2/StreamAdapter.h
+@@ -169,6 +169,8 @@ private:
+     bool mVideoSnapShot;
+     PhysMemAdapter *mPhysMemAdapter;
+     sp<JpegBuilder> mJpegBuilder;
++
++    bool mRequestStream;
+     mutable sem_t mRespondSem;
+ };
+ 
+-- 
+1.8.0
+

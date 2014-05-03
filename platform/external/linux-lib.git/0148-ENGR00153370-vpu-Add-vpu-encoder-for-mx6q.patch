@@ -1,0 +1,261 @@
+From 3401157696cbbc130f5908d32748660447f5d458 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 19 Jul 2011 18:05:11 +0800
+Subject: [PATCH 148/249] ENGR00153370 vpu: Add vpu encoder for mx6q
+
+1) MPEG4/H263/H264 encoder can be supported for mx6q, not including
+   MJPG yet.
+2) vpu iram is enabled default.
+
+VPU can support up to 1080p stream encoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c  | 32 +++++++++++++-------------
+ vpu/vpu_lib.h  |  9 +++++---
+ vpu/vpu_reg.h  |  2 +-
+ vpu/vpu_util.c | 71 ++++++++++++++++++++++++++++++++++++++++++++++++++--------
+ 4 files changed, 86 insertions(+), 28 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 7378aee..aacb4a5 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -433,6 +433,7 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	}
+ 	pEncInfo->openParam = *pop;
+ 
++	pCodecInst->codecModeAux = 0;
+ 	if ((pop->bitstreamFormat == STD_MPEG4) ||
+ 	    (pop->bitstreamFormat == STD_H263))
+ 		pCodecInst->codecMode = MP4_ENC;
+@@ -821,8 +822,9 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	}
+ 
+ 	if (pEncOP->bitRate) {	/* rate control enabled */
+-		data = (!pEncInfo->openParam.enableAutoSkip) << 31 |
+-			pEncOP->initialDelay << 16 | pEncOP->bitRate << 1 | 1;
++		data = pEncOP->initialDelay << 16 | pEncOP->bitRate << 1 | 1;
++		if (cpu_is_mx6q())
++			data |= (!pEncInfo->openParam.enableAutoSkip) << 31;
+ 		VpuWriteReg(CMD_ENC_SEQ_RC_PARA, data);
+ 	} else {
+ 		VpuWriteReg(CMD_ENC_SEQ_RC_PARA, 0);
+@@ -839,13 +841,14 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 		data |= (pEncOP->sliceReport << 1) | pEncOP->mbReport;
+ 		data |= (pEncOP->mbQpReport << 3);
+ 	}
+-	if (pEncOP->rcIntraQp >= 0) {
++	if (pEncOP->rcIntraQp >= 0)
+ 		data |= (1 << 5);
+-		VpuWriteReg(CMD_ENC_SEQ_INTRA_QP, pEncOP->rcIntraQp);
+-	}
++	VpuWriteReg(CMD_ENC_SEQ_INTRA_QP, pEncOP->rcIntraQp);
++
+ 	if (pCodecInst->codecMode == AVC_ENC) {
+ 		data |= (pEncOP->EncStdParam.avcParam.avc_audEnable << 2);
+-		data |= (pEncOP->EncStdParam.avcParam.avc_fmoEnable << 4);
++		if (!cpu_is_mx6q())
++			data |= (pEncOP->EncStdParam.avcParam.avc_fmoEnable << 4);
+ 	}
+ 
+ 	if (cpu_is_mx6q()) {
+@@ -875,7 +878,7 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 		}
+ 	}
+ 
+-	if (pCodecInst->codecMode == AVC_ENC) {
++	if (!cpu_is_mx6q() && pCodecInst->codecMode == AVC_ENC) {
+ 		if (pEncOP->avcIntra16x16OnlyModeEnable)
+ 			data |= (1 << 9);
+ 	}
+@@ -1065,7 +1068,6 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ 		       (pEncInfo->cacheConfig.CbBufferSize << 8) |
+ 		       (pEncInfo->cacheConfig.CrBufferSize);
+ 		VpuWriteReg(CMD_SET_FRAME_CACHE_CONFIG, val);
+-
+ 	}
+ 
+ 	if (!cpu_is_mx27()) {
+@@ -1400,7 +1402,6 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 			    (pEncInfo->encReportMVInfo.enable << 4) |
+ 			    (pEncInfo->encReportMBInfo.enable << 3) | 1);
+ 	} else {
+-
+ 		if (cpu_is_mx6q()) {
+ 			VpuWriteReg(CMD_ENC_PIC_SRC_INDEX, pSrcFrame->myIndex);
+ 			VpuWriteReg(CMD_ENC_PIC_SRC_STRIDE, pSrcFrame->strideY);
+@@ -1412,12 +1413,13 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 		VpuWriteReg(CMD_ENC_PIC_SRC_ADDR_CR, pSrcFrame->bufCr +
+ 			    param->encTopOffset/2 * pSrcFrame->strideC + param->encLeftOffset/2);
+ 
+-		VpuWriteReg(CMD_ENC_PIC_OPTION,
+-			    (pEncInfo->encReportSliceInfo.enable << 5) |
+-			    (pEncInfo->encReportMVInfo.enable << 4) |
+-			    (pEncInfo->encReportMBInfo.enable << 3) |
+-			    ((!param->enableAutoSkip) << 2) |
+-			    (param->forceIPicture << 1 & 0x2));
++		val = (pEncInfo->encReportSliceInfo.enable << 5) |
++		      (pEncInfo->encReportMVInfo.enable << 4) |
++		      (pEncInfo->encReportMBInfo.enable << 3) |
++		      (param->forceIPicture << 1 & 0x2);
++		if (!cpu_is_mx6q())
++			val |= (!param->enableAutoSkip) << 2;
++		VpuWriteReg(CMD_ENC_PIC_OPTION, val);
+ 	}
+ 
+ 	if (pEncInfo->dynamicAllocEnable == 1) {
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index ac79ff1..67cadd7 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -60,9 +60,7 @@ typedef enum {
+ 	STD_RV = 6,
+ 	STD_MJPG = 7,
+ 	STD_AVS = 8,
+-	// STD_THO = 9,
+-	STD_VP6 = 10,
+-	STD_VP8 = 11
++	STD_VP8 = 9
+ } CodStd;
+ 
+ typedef enum {
+@@ -404,6 +402,11 @@ typedef struct {
+ 	int avc_fmoSliceNum;
+ 	int avc_fmoType;
+ 	int avc_fmoSliceSaveBufSize;
++	int avc_frameCroppingFlag;
++	int avc_frameCropLeft;
++	int avc_frameCropRight;
++	int avc_frameCropTop;
++	int avc_frameCropBottom;
+ } EncAvcParam;
+ 
+ typedef struct {
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index f9fc1f0..e0a332a 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -277,7 +277,7 @@
+ #if defined(IMX6Q)
+ #define CMD_ENC_PIC_SRC_ADDR_Y          0x1A8
+ #define CMD_ENC_PIC_SRC_ADDR_CB         0x1AC
+-#define CMD_ENC_PIC_SRC_ADDR_CR         0x1A4
++#define CMD_ENC_PIC_SRC_ADDR_CR         0x1B0
+ #else
+ #define CMD_ENC_PIC_SRC_ADDR_Y          0x180
+ #define CMD_ENC_PIC_SRC_ADDR_CB         0x184
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 6891994..54de53a 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -447,6 +447,19 @@ RetCode CheckEncOpenParam(EncOpenParam * pop)
+ 		    param->avc_chromaQpOffset > 12) {
+ 			return RETCODE_INVALID_PARAM;
+ 		}
++
++		if (param->avc_frameCroppingFlag != 0 &&
++		    param->avc_frameCroppingFlag != 1) {
++			return RETCODE_INVALID_PARAM;
++		}
++
++		if (param->avc_frameCropLeft & 0x01 ||
++		    param->avc_frameCropRight & 0x01 ||
++		    param->avc_frameCropTop & 0x01 ||
++		    param->avc_frameCropBottom & 0x01) {
++			return RETCODE_INVALID_PARAM;
++		}
++
+ 		if (param->avc_audEnable != 0 && param->avc_audEnable != 1) {
+ 			return RETCODE_INVALID_PARAM;
+ 		}
+@@ -509,7 +522,7 @@ void EncodeHeader(EncHandle handle, EncHeaderParam * encHeaderParam)
+ 	EncInfo *pEncInfo;
+ 	PhysicalAddress rdPtr;
+ 	PhysicalAddress wrPtr;
+-	int data = 0;
++	int data = 0, frameCroppingFlag = 0;
+ 
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+@@ -520,14 +533,36 @@ void EncodeHeader(EncHandle handle, EncHeaderParam * encHeaderParam)
+ 		VpuWriteReg(CMD_ENC_HEADER_BB_SIZE, encHeaderParam->size);
+ 	}
+ 
+-	if (encHeaderParam->headerType == VOS_HEADER ||
+-	    encHeaderParam->headerType == SPS_RBSP) {
+-		data = (((encHeaderParam->userProfileLevelIndication & 0xFF) << 8) |
+-			((encHeaderParam->userProfileLevelEnable & 0x01) << 4) |
+-			(encHeaderParam->headerType & 0x0F));
+-		VpuWriteReg(CMD_ENC_HEADER_CODE, data);
++	if (cpu_is_mx6q() && (encHeaderParam->headerType == 0) &&
++	    (pEncInfo->openParam.bitstreamFormat == STD_AVC)) {
++		EncOpenParam *encOP;
++		Uint32 CropV, CropH;
++
++		encOP = &(pEncInfo->openParam);
++		if (encOP->EncStdParam.avcParam.avc_frameCroppingFlag == 1) {
++			frameCroppingFlag = 1;
++			CropH = encOP->EncStdParam.avcParam.avc_frameCropLeft << 16;
++			CropH |= encOP->EncStdParam.avcParam.avc_frameCropRight;
++			CropV = encOP->EncStdParam.avcParam.avc_frameCropTop << 16;
++			CropV |= encOP->EncStdParam.avcParam.avc_frameCropBottom;
++			VpuWriteReg(CMD_ENC_HEADER_FRAME_CROP_H, CropH);
++			VpuWriteReg(CMD_ENC_HEADER_FRAME_CROP_V, CropV);
++		}
++	}
++
++	if (cpu_is_mx6q()) {
++		VpuWriteReg(CMD_ENC_HEADER_CODE, encHeaderParam->headerType |
++			frameCroppingFlag << 2);
+ 	} else {
+-		VpuWriteReg(CMD_ENC_HEADER_CODE, encHeaderParam->headerType); /* 0: SPS, 1: PPS */
++		if (encHeaderParam->headerType == VOS_HEADER ||
++		    encHeaderParam->headerType == SPS_RBSP) {
++			data = (((encHeaderParam->userProfileLevelIndication & 0xFF) << 8) |
++				((encHeaderParam->userProfileLevelEnable & 0x01) << 4) |
++				(encHeaderParam->headerType & 0x0F));
++			VpuWriteReg(CMD_ENC_HEADER_CODE, data);
++		} else {
++			VpuWriteReg(CMD_ENC_HEADER_CODE, encHeaderParam->headerType); /* 0: SPS, 1: PPS */
++		}
+ 	}
+ 
+ 	BitIssueCommandEx(pCodecInst, ENCODE_HEADER);
+@@ -663,14 +698,32 @@ void GetParaSet(EncHandle handle, int paraSetType, EncParamSet * para)
+ {
+ 	CodecInst *pCodecInst;
+ 	EncInfo *pEncInfo;
++	int frameCroppingFlag = 0;
+ 
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
+ 	IOClkGateSet(true);
+ 
++	if (cpu_is_mx6q() && (paraSetType == 0) &&
++	    (pEncInfo->openParam.bitstreamFormat == STD_AVC)) {
++		EncOpenParam *encOP;
++		Uint32 CropV, CropH;
++
++		encOP = &(pEncInfo->openParam);
++		if (encOP->EncStdParam.avcParam.avc_frameCroppingFlag == 1) {
++			frameCroppingFlag = 1;
++			CropH = encOP->EncStdParam.avcParam.avc_frameCropLeft << 16;
++			CropH |= encOP->EncStdParam.avcParam.avc_frameCropRight;
++			CropV = encOP->EncStdParam.avcParam.avc_frameCropTop << 16;
++			CropV |= encOP->EncStdParam.avcParam.avc_frameCropBottom;
++			VpuWriteReg(CMD_ENC_HEADER_FRAME_CROP_H, CropH);
++			VpuWriteReg(CMD_ENC_HEADER_FRAME_CROP_V, CropV);
++		}
++	}
++
+ 	/* SPS: 0, PPS: 1, VOS: 1, VO: 2, VOL: 0 */
+-	VpuWriteReg(CMD_ENC_PARA_SET_TYPE, paraSetType);
++	VpuWriteReg(CMD_ENC_PARA_SET_TYPE, paraSetType | (frameCroppingFlag << 2));
+ 	BitIssueCommandEx(pCodecInst, ENC_PARA_SET);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+-- 
+1.8.0
+

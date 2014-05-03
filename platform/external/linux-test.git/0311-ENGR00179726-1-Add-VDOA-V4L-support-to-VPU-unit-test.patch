@@ -1,0 +1,186 @@
+From beb70a9b7571b90700b70b018743570f875bd2c3 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Mon, 16 Apr 2012 19:19:30 +0800
+Subject: [PATCH 311/435] ENGR00179726-1 Add VDOA V4L support to VPU unit test
+
+Add VDOA V4L support to VPU unit test
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/dec.c     | 30 +++++++++++++++++-----
+ test/mxc_vpu_test/display.c | 39 ++++++++++++++++++----------
+ test/mxc_vpu_test/fb.c      | 62 ++++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 111 insertions(+), 20 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 9602483..de07634 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1551,12 +1551,30 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 
+ 			for (i = 0; i < totalfb; i++) {
+ 				fb[i].myIndex = i;
+-				if (dst_scheme == PATH_V4L2)
+-					fb[i].bufY = disp->buffers[i]->offset;
+-				else
+-					fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
+-				fb[i].bufCb = fb[i].bufY + img_size;
+-				fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
++
++                if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
++                    if (dst_scheme == PATH_V4L2)
++                        fb[i].bufY = disp->buffers[i]->offset;
++                    else
++                        fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
++                    fb[i].bufCb = fb[i].bufY + img_size;
++                    fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
++                }
++                else if ((dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP)
++                        ||(dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP)){
++                    if (dst_scheme == PATH_V4L2)
++                        tiled_framebuf_base(&fb[i], disp->buffers[i]->offset,
++                                dec->stride, dec->picheight, dec->cmdl->mapType);
++                    else {
++                        fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
++                        fb[i].bufCb = fb[i].bufY + img_size;
++                        fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
++                    }
++                } else {
++                    err_msg("undefined mapType = %d\n", dec->cmdl->mapType);
++                    goto err1;
++                }
++
+ 				/* allocate MvCol buffer here */
+ 				if (!cpu_is_mx27()) {
+ 					memset(&mvcol_md[i], 0,
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 6f18742..c8fd32b 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -759,19 +759,32 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 				fmt.fmt.pix.width, fmt.fmt.pix.height);
+ 
+ 	fmt.fmt.pix.field = V4L2_FIELD_ANY;
+-	if (dec->cmdl->chromaInterleave == 0) {
+-		if (dec->mjpg_fmt == MODE420)
+-			fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+-		else if (dec->mjpg_fmt == MODE422)
+-			fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV422P;
+-		else {
+-			err_msg(" Display cannot support this MJPG format\n");
+-			goto err;
+-		}
+-	} else {
+-		info_msg("Display: NV12\n");
+-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+-	}
++
++    if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
++        if (dec->cmdl->chromaInterleave == 0) {
++            if (dec->mjpg_fmt == MODE420)
++                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
++            else if (dec->mjpg_fmt == MODE422)
++                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV422P;
++            else {
++                err_msg(" Display cannot support this MJPG format\n");
++                goto err;
++            }
++        } else {
++            info_msg("Display: NV12\n");
++            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
++        }
++    }
++    else if (dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP) {
++        fmt.fmt.pix.pixelformat = IPU_PIX_FMT_TILED_NV12;
++    }
++    else if (dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP) {
++        fmt.fmt.pix.pixelformat = IPU_PIX_FMT_TILED_NV12F;
++    }
++    else {
++        err_msg(" Display cannot support mapType = %d\n", dec->cmdl->mapType);
++        goto err;
++    }
+ 	err = ioctl(fd, VIDIOC_S_FMT, &fmt);
+ 	if (err < 0) {
+ 		err_msg("VIDIOC_S_FMT failed\n");
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index 28a83c2..0f96fa2 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -106,6 +106,66 @@ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int heigh
+ 	return fb;
+ }
+ 
++int tiled_framebuf_base(FrameBuffer *fb, Uint32 frame_base, int strideY, int height, int mapType)
++{
++	int align;
++	int divX, divY;
++	Uint32 lum_top_base, lum_bot_base, chr_top_base, chr_bot_base;
++	Uint32 lum_top_20bits, lum_bot_20bits, chr_top_20bits, chr_bot_20bits;
++	int luma_top_size, luma_bot_size, chroma_top_size, chroma_bot_size;
++
++	divX = 2;
++	divY = 2;
++
++	/*
++	 * The buffers is luma top, chroma top, luma bottom and chroma bottom for
++	 * tiled map type, and only 20bits for the address description, so we need
++	 * to do 4K page align for each buffer.
++	 */
++	align = SZ_4K;
++	if (mapType == TILED_FRAME_MB_RASTER_MAP) {
++		/* luma_top_size means the Y size of one frame, chroma_top_size
++		 * means the interleaved UV size of one frame in frame tiled map type*/
++		luma_top_size = (strideY * height + align - 1) & ~(align - 1);
++		chroma_top_size = (strideY / divX * height / divY * 2 + align - 1) & ~(align - 1);
++		luma_bot_size = chroma_bot_size = 0;
++	} else {
++		/* This is FIELD_FRAME_MB_RASTER_MAP case, there are two fields */
++		luma_top_size = (strideY * height / 2 + align - 1) & ~(align - 1);
++		luma_bot_size = luma_top_size;
++		chroma_top_size = (strideY / divX * height / divY + align - 1) & ~(align - 1);
++		chroma_bot_size = chroma_top_size;
++	}
++
++	lum_top_base = (frame_base + align - 1) & ~(align -1);
++	chr_top_base = lum_top_base + luma_top_size;
++	if (mapType == TILED_FRAME_MB_RASTER_MAP) {
++		lum_bot_base = 0;
++		chr_bot_base = 0;
++	} else {
++		lum_bot_base = chr_top_base + chroma_top_size;
++		chr_bot_base = lum_bot_base + luma_bot_size;
++	}
++
++	lum_top_20bits = lum_top_base >> 12;
++	lum_bot_20bits = lum_bot_base >> 12;
++	chr_top_20bits = chr_top_base >> 12;
++	chr_bot_20bits = chr_bot_base >> 12;
++
++	/*
++	 * In tiled map format the construction of the buffer pointers is as follows:
++	 * 20bit = addrY [31:12]: lum_top_20bits
++	 * 20bit = addrY [11: 0], addrCb[31:24]: chr_top_20bits
++	 * 20bit = addrCb[23: 4]: lum_bot_20bits
++	 * 20bit = addrCb[ 3: 0], addrCr[31:16]: chr_bot_20bits
++	 */
++	fb->bufY = (lum_top_20bits << 12) + (chr_top_20bits >> 8);
++	fb->bufCb = (chr_top_20bits << 24) + (lum_bot_20bits << 4) + (chr_bot_20bits >> 16);
++	fb->bufCr = chr_bot_20bits << 16;
++
++    return 0;
++}
++
+ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int mvCol, int mapType)
+ {
+ 	struct frame_buf *fb;
+-- 
+1.8.0
+

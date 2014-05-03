@@ -1,0 +1,112 @@
+From aaf557675e69bfeecfbc188e80bf4b8731b7057d Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 15 Dec 2011 19:41:58 +0800
+Subject: [PATCH 181/249] ENGR00170344 vpu: Use reserved memory for bitwork
+ buffer on android
+
+Change to use vpu driver reserved memory for bitwork buffer,
+not use pmem.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_io.c | 57 ++++++++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 34 insertions(+), 23 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index dc52b96..bbbd86d 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -177,31 +177,24 @@ int IOSystemInit(void *callback)
+ 
+ 	IOClkGateSet(true);
+ #ifdef BUILD_FOR_ANDROID
+-	if (ioctl(vpu_fd, VPU_IOC_QUERY_BITWORK_MEM, &bit_work_addr) < 0) {
+-		LOGE("Query bitwork memory failed!");
++	unsigned long va_addr;
++
++	/* Special handle the bit work buffer, which reserved in vpu driver probe */
++	bit_work_addr.size = TEMP_BUF_SIZE + PARA_BUF_SIZE +
++			     CODE_BUF_SIZE + PARA_BUF2_SIZE;
++	if (_IOGetPhyMem(VPU_IOC_GET_WORK_ADDR, &bit_work_addr) < 0) {
++		err_msg("Get bitwork address failed!\n");
+ 		goto err;
+ 	}
+ 
+-	if (bit_work_addr.cpu_addr == 0) {
+-		bit_work_addr.size = TEMP_BUF_SIZE + PARA_BUF_SIZE +
+-				     CODE_BUF_SIZE + PARA_BUF2_SIZE;
+-		/* Allocate bitwork memory by pmem */
+-		if (IOGetPhyMem(&bit_work_addr) < 0) {
+-			LOGE("Get bitwork address failed!");
+-			goto err;
+-		}
+-		if (IOGetVirtMem(&bit_work_addr) <= 0) {
+-			IOFreePhyMem(&bit_work_addr);
+-			goto err;
+-		}
+-		/* Make sure to save bitwork memory info to vpu driver */
+-		if (ioctl(vpu_fd, VPU_IOC_SET_BITWORK_MEM, &bit_work_addr) < 0) {
+-			LOGE("Store bitwork memory failed!");
+-			IOFreeVirtMem(&bit_work_addr);
+-			IOFreePhyMem(&bit_work_addr);
+-			goto err;
+-		}
++	va_addr = (unsigned long)mmap(NULL, bit_work_addr.size, PROT_READ | PROT_WRITE,
++					MAP_SHARED, vpu_fd, bit_work_addr.phy_addr);
++	if ((void *)va_addr == MAP_FAILED) {
++		bit_work_addr.virt_uaddr = 0;
++		goto err;
+ 	}
++
++	bit_work_addr.virt_uaddr = va_addr;
+ #else
+ 	bit_work_addr.size = TEMP_BUF_SIZE + PARA_BUF_SIZE +
+ 			     CODE_BUF_SIZE + PARA_BUF2_SIZE;
+@@ -264,7 +257,15 @@ int IOSystemShutdown(void)
+ 	 * Do not call IOFreePhyMem/IOFreePhyPicParaMem/IOFreePhyUserDataMem
+ 	 * to free memory, let kernel do.
+ 	 */
++#ifdef BUILD_FOR_ANDROID
++	if (bit_work_addr.virt_uaddr != 0) {
++		if (munmap((void *)bit_work_addr.virt_uaddr, bit_work_addr.size) != 0)
++			err_msg("munmap failed\n");
++	}
++	bit_work_addr.virt_uaddr = 0;
++#else
+ 	IOFreeVirtMem(&bit_work_addr);
++#endif
+ 	IOFreeVirtMem(&pic_para_addr);
+ 	IOFreeVirtMem(&user_data_addr);
+ 
+@@ -331,8 +332,18 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ 	buff->phy_addr = 0;
+ 	buff->virt_uaddr = 0;
+ 
++	if (which == VPU_IOC_GET_WORK_ADDR) {
++		if (ioctl(vpu_fd, which, buff) < 0) {
++			err_msg("mem allocation failed!\n");
++			buff->phy_addr = 0;
++			buff->cpu_addr = 0;
++			return -1;
++		}
++		return 0;
++	}
++
+ 	if (which != VPU_IOC_PHYMEM_ALLOC) {
+-		LOGE("Error!_IOGetPhyMem unsupported memtyp: %d", which);
++		LOGE("Error!_IOGetPhyMem unsupported memtype: %d", which);
+ 		return -1;
+ 	}
+ 
+@@ -416,7 +427,7 @@ int _IOFreePhyMem(int which, vpu_mem_desc * buff)
+ 	}
+ 
+ 	if (which != VPU_IOC_PHYMEM_FREE) {
+-		LOGE("Error!_IOFreePhyMem unsupported memtyp: %d",which);
++		LOGE("Error!_IOFreePhyMem unsupported memtype: %d",which);
+ 		return -1;
+ 	}
+ 
+-- 
+1.8.0
+

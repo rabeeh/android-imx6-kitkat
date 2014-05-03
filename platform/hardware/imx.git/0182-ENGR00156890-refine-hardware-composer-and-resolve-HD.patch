@@ -1,0 +1,208 @@
+From d0772cb54c4caaffacec6d68850eecc224727619 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Fri, 16 Sep 2011 19:43:12 +0800
+Subject: [PATCH 182/486] ENGR00156890 refine hardware composer and resolve
+ HDMI hang up problem
+
+refine hardware composer and resolve HDMI hang up problem.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx5x/hwcomposer/hwcomposer.cpp | 60 ++++++++++++++++++++++++++----------------
+ 1 file changed, 38 insertions(+), 22 deletions(-)
+
+diff --git a/mx5x/hwcomposer/hwcomposer.cpp b/mx5x/hwcomposer/hwcomposer.cpp
+index ed6b1f8..26d51b3 100755
+--- a/mx5x/hwcomposer/hwcomposer.cpp
++++ b/mx5x/hwcomposer/hwcomposer.cpp
+@@ -43,7 +43,6 @@ struct hwc_context_t {
+ 
+     //the system property for dual display and overlay switch.
+     int display_mode;
+-    int display_mode_changed; //the initial value is 0
+ };
+ 
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+@@ -84,7 +83,6 @@ static int hwc_check_property(hwc_context_t *dev)
+ {
+     //bool bValue = false;
+     char value[10];
+-    int orignMode = dev->display_mode;
+ 
+     property_get("rw.VIDEO_TVOUT_DISPLAY", value, "");
+     if (strcmp(value, "1") == 0) {
+@@ -140,12 +138,7 @@ static int hwc_check_property(hwc_context_t *dev)
+     if (strcmp(value, "2") == 0){
+         dev->display_mode |= DISPLAY_MODE_DISP2;
+     }
+-
+-		if(dev->display_mode ^ orignMode) {
+-				dev->display_mode_changed = 1;
+-		}
+-HWCOMPOSER_LOG_RUNTIME("*********display_mode=%x, display_mode_changed=%d\n", dev->display_mode, dev->display_mode_changed);
+-		return 0;
++	return 0;
+ }
+ 
+ static int hwc_modify_property(hwc_context_t *dev, private_handle_t *handle)
+@@ -154,7 +147,7 @@ static int hwc_modify_property(hwc_context_t *dev, private_handle_t *handle)
+ 
+     if(dev->display_mode & DISPLAY_MODE_DISP1){
+             handle->usage |= GRALLOC_USAGE_HWC_DISP1;
+-            dev->display_mode &= ~DISPLAY_MODE_DISP1;
++            //dev->display_mode &= ~DISPLAY_MODE_DISP1;
+ 			return 0;
+     }
+ 
+@@ -211,6 +204,7 @@ static int findOutputDevice(struct hwc_context_t *ctx, int *index, int usage, in
+ 	output_device *out;
+ 	int uFlag = 0;
+ 	int usg = 0;
++    *index = -1;
+ 
+ 	for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ 		if(ctx->m_using[i]) {
+@@ -317,11 +311,28 @@ static void checkDisplayFrame(struct hwc_context_t *ctx, hwc_layer_t *layer, int
+ 
+ }
+ 
++static int open_outputDevice(struct hwc_context_t *ctx, const char *dev_name, output_device **device, int flag) 
++{
++    int usage;
++    output_device *out;
++    for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
++        if(ctx->m_using[i] && ctx->m_out[i]) {
++            out = ctx->m_out[i];
++            usage = out->getUsage();
++            if(((usage | flag) == GRALLOC_USAGE_OVERLAY0_MASK) || ((usage | flag) == GRALLOC_USAGE_OVERLAY1_MASK)) {
++                output_dev_close(ctx->m_out[i]);
++                ctx->m_using[i] = 0;
++                ctx->m_out[i] = NULL;
++            }
++        }
++    }
++    return output_dev_open(dev_name, device, flag);
++}
++
+ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ //#if 1
+ 		//HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---1>>>>>>>>>>>>>>>>>\n");
+ 		char out_using[MAX_OUTPUT_DISPLAY] = {0};
+-
+ //		for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ //				out_using[i] = m_using[i];
+ //		}
+@@ -332,7 +343,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 			hwc_check_property(ctx);
+ 		}
+ #endif
+-    if (list && dev && ((list->flags & HWC_GEOMETRY_CHANGED) || ctx->display_mode_changed)) {
++    if (list && dev) {
+         for (size_t i=0 ; i<list->numHwLayers ; i++) {
+             //dump_layer(&list->hwLayers[i]);
+             //list->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
+@@ -347,7 +358,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 		    //HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---2>>>>>>>>>>>>>>>>>\n");
+             private_handle_t *handle = (private_handle_t *)(layer->handle);
+             if(!(handle->usage & GRALLOC_USAGE_HWC_OVERLAY)) {
+-            	//HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---usage=%x>>phy=%x>>>>>>>>>>>>>>>\n", handle->usage, handle->phys);
++                //HWCOMPOSER_LOG_ERR("<<<<<<<<<<<<<<<hwc_prepare---usage=%x>>phy=%x>>>>>>>>>>>>>>>\n", handle->usage, handle->phys);
+             	continue;
+             }
+             HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---3>usage=%x, phy=%x>>>>>>>>>>>>>>>>\n", handle->usage, handle->phys);
+@@ -392,7 +403,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 	            if(ctx->m_out[index])
+ 	            		deleteEmtpyIndex(ctx);
+ 
+-		        status = output_dev_open(dev_name, &(ctx->m_out[index]), ruse);
++		        status = open_outputDevice(ctx, dev_name, &(ctx->m_out[index]), ruse);//output_dev_open(dev_name, &(ctx->m_out[index]), ruse);
+ 		        if(status < 0){
+ 		        	  HWCOMPOSER_LOG_ERR("Error! open output device failed!");
+ 		        	  continue;
+@@ -405,7 +416,6 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ #endif
+         }//end for
+ #if 1
+-        ctx->display_mode_changed = 0;
+ 	    for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ 			if(!out_using[i] && ctx->m_using[i]) {
+ 				ctx->m_using[i] = 0;
+@@ -415,7 +425,6 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 		}
+ #endif
+     }//end if
+-
+ //#endif
+     return 0;
+ }
+@@ -460,7 +469,7 @@ static int hwc_set(hwc_composer_device_t *dev,
+     if(ctx && (dpy == NULL) && (sur == NULL) && (list == NULL)) {
+ 		//close the output device.
+ 		releaseAllOutput(ctx);
+-		ctx->display_mode_changed = 1;
++		//ctx->display_mode_changed = 1;
+ 
+ 		return 0;
+     }
+@@ -475,19 +484,21 @@ static int hwc_set(hwc_composer_device_t *dev,
+     if(list == NULL || dev == NULL) {
+     	return 0;
+     }
+-#if 1
+  		//HWCOMPOSER_LOG_RUNTIME("==============hwc_set=3==============\n");
+     if(getActiveOuputDevice(ctx) == 0) {return 0;}//eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur); return 0;}
+ 
+     int status = -EINVAL;
+ 	HWCOMPOSER_LOG_RUNTIME("==============hwc_set=4==============\n");
+ 	hwc_buffer out_buffer[MAX_OUTPUT_DISPLAY];
++    char bufs_state[MAX_OUTPUT_DISPLAY];
++    memset(bufs_state, 0, sizeof(bufs_state));
+ 	memset(out_buffer, 0, sizeof(out_buffer));
++#if 0    
+ 	for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ 		if(ctx->m_using[i] && ctx->m_out[i])
+ 			status = ctx->m_out[i]->fetch(&out_buffer[i]);
+-	}
+-
++    }
++#endif
+     blit_device *bltdev = ctx->blit;
+     for (size_t i=0 ; i<list->numHwLayers ; i++){
+ 		hwc_layer_t *layer = &list->hwLayers[i];
+@@ -513,9 +524,15 @@ static int hwc_set(hwc_composer_device_t *dev,
+         		retv = findOutputDevice(ctx, &index, i_usage, &m_usage);
+                 if((index >= 0) && (index < MAX_OUTPUT_DISPLAY)) {
+                 	outdev = ctx->m_out[index];
++                }else {
++                    break;
+                 }
++                
+     			if(outdev != NULL) {
+-    	    //HWCOMPOSER_LOG_ERR("======hwc_set===retv=%x===i_usage=%x, index=%d\n", retv, i_usage, index);
++                    if(!bufs_state[index] && ctx->m_using[i]) {
++                        outdev->fetch(&out_buffer[index]);
++                        bufs_state[index] = 1;
++                    }
+     				status = bltdev->blit(layer, &(out_buffer[index]));
+     				if(status < 0){
+     					HWCOMPOSER_LOG_ERR("Error! bltdev->blit() failed!");
+@@ -528,7 +545,7 @@ static int hwc_set(hwc_composer_device_t *dev,
+     }//end for
+ 
+     for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+-				if(ctx->m_using[i]) {
++				if(ctx->m_using[i] && bufs_state[i]) {
+ 						status = ctx->m_out[i]->post(&out_buffer[i]);
+ 						if(status < 0){
+ 								HWCOMPOSER_LOG_ERR("Error! output device post buffer failed!");
+@@ -536,7 +553,6 @@ static int hwc_set(hwc_composer_device_t *dev,
+ 						}
+ 				}
+ 		}
+-#endif
+     return 0;
+ }
+ 
+-- 
+1.8.0
+

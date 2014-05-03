@@ -1,0 +1,126 @@
+From b4ba6539e51c869507e169933c24d65c499eb116 Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Wed, 21 Mar 2012 11:14:59 +0800
+Subject: [PATCH 03/52] ENGR00177076-1 FSLOta: refine version checking and UI.
+
+upgrade button only show when have new release.
+compare new version with the build time, the utc timestamp.
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ FSLOta/res/layout/main.xml                          |  5 ++---
+ FSLOta/res/values/strings.xml                       |  1 +
+ .../src/com/fsl/android/ota/OTAServerManager.java   | 21 ++++++++++++++-------
+ FSLOta/src/com/fsl/android/ota/OtaAppActivity.java  | 12 +++++++-----
+ 4 files changed, 24 insertions(+), 15 deletions(-)
+
+diff --git a/FSLOta/res/layout/main.xml b/FSLOta/res/layout/main.xml
+index 571c314..2bc7013 100644
+--- a/FSLOta/res/layout/main.xml
++++ b/FSLOta/res/layout/main.xml
+@@ -29,13 +29,12 @@
+         <TextView
+             android:id="@+id/version_text_view"
+             android:layout_width="match_parent"
+-            android:layout_height="38dp"
++            android:layout_height="50dp"
+             android:layout_column="2"
+             android:layout_columnSpan="5"
+             android:layout_gravity="bottom"
+             android:layout_row="1"
+-            android:layout_rowSpan="2"
+-            />
++            android:layout_rowSpan="2" />
+ 
+         <ProgressBar
+             android:id="@+id/spinner"
+diff --git a/FSLOta/res/values/strings.xml b/FSLOta/res/values/strings.xml
+index 35907e5..2c22277 100644
+--- a/FSLOta/res/values/strings.xml
++++ b/FSLOta/res/values/strings.xml
+@@ -16,4 +16,5 @@
+         <string name="size">Size </string>
+         <string name="length_unknown">Unknown</string>
+         <string name="verify_package">Verifing package</string>
++        <string name="full_version">Description</string>
+     </resources>
+diff --git a/FSLOta/src/com/fsl/android/ota/OTAServerManager.java b/FSLOta/src/com/fsl/android/ota/OTAServerManager.java
+index c4aa90b..dc5cb0e 100644
+--- a/FSLOta/src/com/fsl/android/ota/OTAServerManager.java
++++ b/FSLOta/src/com/fsl/android/ota/OTAServerManager.java
+@@ -124,15 +124,22 @@ public class OTAServerManager  {
+ 		}
+ 	}
+ 	
+-	// return 0 means equal
+-	// return 1 means remote is updated
+-	// return -1 means you are the latest or the network error
+-	public int compareLocalVersionToServer() {
+-		if (parser == null)
+-			return -1;
++	// return true if needs to upgrade
++	public boolean compareLocalVersionToServer() {
++		if (parser == null) {
++			Log.d(TAG, "compareLocalVersion Without fetch remote prop list.");
++			return false;
++		}
+ 		String localNumVersion = Build.VERSION.INCREMENTAL;
++		Long buildutc = Build.TIME;
++		Long remoteBuildUTC = (Long.parseLong(parser.getProp("ro.build.date.utc"))) * 1000;
++		// *1000 because Build.java also *1000, align with it.
+ 		Log.d(TAG, "Local Version:" + Build.VERSION.INCREMENTAL + "server Version:" + parser.getNumRelease());
+-		return parser.getNumRelease().compareTo(localNumVersion);
++		boolean upgrade = false;
++		upgrade = remoteBuildUTC > buildutc;
++		// here only check build time, in your case, you may also check build id, etc.
++		Log.d(TAG, "remote BUILD TIME: " + remoteBuildUTC + " local build rtc:" + buildutc);
++		return upgrade;
+ 	}
+ 	
+ 	void publishDownloadProgress(long total, long downloaded) {
+diff --git a/FSLOta/src/com/fsl/android/ota/OtaAppActivity.java b/FSLOta/src/com/fsl/android/ota/OtaAppActivity.java
+index 6f3199e..fc76ea7 100644
+--- a/FSLOta/src/com/fsl/android/ota/OtaAppActivity.java
++++ b/FSLOta/src/com/fsl/android/ota/OtaAppActivity.java
+@@ -163,7 +163,6 @@ public class OtaAppActivity extends Activity implements OTAServerManager.OTAStat
+ 			mVersionTextView.post(new Runnable() {
+ 				public void run() {
+ 					mVersionTextView.setVisibility(View.VISIBLE);
+-					mUpgradeButton.setVisibility(View.VISIBLE);
+ 				}
+ 			});
+ 		} else if (newstate == STATE_IN_DOWNLOADING) {
+@@ -273,15 +272,16 @@ public class OtaAppActivity extends Activity implements OTAServerManager.OTAStat
+ 		if (error == 0) {
+ 			// return no error, usually means have a version info from remote server, release name is in @info
+ 			// needs check here whether the local version is newer then remote version
+-			if (mOTAManager.compareLocalVersionToServer() <= 0) {
++			if (mOTAManager.compareLocalVersionToServer() == false) {
+ 				// we are already latest...
+ 				mMessageTextView.post(new Runnable() {
+ 					public void run() {
+-						mMessageTextView.setText(Build.VERSION.RELEASE + getText(R.string.already_up_to_date));
++						mMessageTextView.setText(Build.VERSION.RELEASE + ", " + Build.ID + "\n" +  getText(R.string.already_up_to_date));
++						mVersionTextView.setVisibility(View.INVISIBLE);
+ 					}
+ 				});
+ 				
+-			} else if (mOTAManager.compareLocalVersionToServer() > 0) {
++			} else if (mOTAManager.compareLocalVersionToServer() == true ) {
+ 				final BuildPropParser parser = (BuildPropParser) info;
+ 				final long bytes = mOTAManager.getUpgradePackageSize();
+ 				mMessageTextView.post(new Runnable() {
+@@ -293,7 +293,9 @@ public class OtaAppActivity extends Activity implements OTAServerManager.OTAStat
+ 						
+ 						if (bytes > 0)
+ 							length = byteCountToDisplaySize(bytes, false);
+-						mVersionTextView.setText(getText(R.string.version) +  " " +
++						mVersionTextView.setText(getText(R.string.version) +  ":" +
++								parser.getProp("ro.build.id") + "\n" +
++								getText(R.string.full_version) + ":" +
+ 								parser.getProp("ro.build.description") + "\n" +
+ 								getText(R.string.size) + " " + length);
+ 						mUpgradeButton.setVisibility(View.VISIBLE);
+-- 
+1.8.0
+

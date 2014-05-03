@@ -1,0 +1,519 @@
+From 29f2ae0f63d4c65ab7ed7dc14bf2545b13d73971 Mon Sep 17 00:00:00 2001
+From: Danny Nold <dannynold@freescale.com>
+Date: Tue, 3 Aug 2010 13:33:08 -0500
+Subject: [PATCH 171/435] ENGR00125901 - EPDC Unit test: Add test for panning
+ and overlay features
+
+Add additional unit test functions for panning and for overlay IOCTL.
+
+Signed-off-by: Danny Nold <dannynold@freescale.com>
+---
+ test/mxc_fb_test/mxc_epdc_fb_test.c | 354 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 323 insertions(+), 31 deletions(-)
+
+diff --git a/test/mxc_fb_test/mxc_epdc_fb_test.c b/test/mxc_fb_test/mxc_epdc_fb_test.c
+index 265cdf5..74a8266 100644
+--- a/test/mxc_fb_test/mxc_epdc_fb_test.c
++++ b/test/mxc_fb_test/mxc_epdc_fb_test.c
+@@ -57,6 +57,9 @@ extern "C"{
+ #define TRUE 1
+ #define FALSE 0
+ 
++#define BUFFER_FB		0
++#define BUFFER_OVERLAY		1
++
+ #define WAVEFORM_MODE_INIT	0x0	/* Screen goes to white (clears) */
+ #define WAVEFORM_MODE_DU	0x1	/* Grey->white/grey->black */
+ #define WAVEFORM_MODE_GC16	0x2	/* High fidelity (flashing) */
+@@ -82,11 +85,21 @@ void memset_dword(void *s, int c, size_t count)
+ 	}
+ }
+ 
+-static void copy_image_to_fb(int left, int top, int width, int height, uint *img_ptr, struct fb_var_screeninfo *screen_info)
++static void copy_image_to_buffer(int left, int top, int width, int height, uint *img_ptr,
++			uint target_buf, struct fb_var_screeninfo *screen_info)
+ {
+ 	int i;
+ 	__u32 *dest, *src;
+-	uint *fb_ptr =  (uint *)fb;
++	uint *fb_ptr;
++
++	if (target_buf == BUFFER_FB)
++		fb_ptr =  (uint *)fb;
++	else if (target_buf == BUFFER_OVERLAY)
++		fb_ptr = (uint *)fb + g_fb_size/2/4;
++	else {
++		printf("Invalid target buffer specified!\n");
++		return;
++	}
+ 
+ 	if ((width > screen_info->xres) || (height > screen_info->yres)) {
+ 		printf("Bad image dimensions!\n");
+@@ -415,33 +428,33 @@ static int test_updates(void)
+ 
+ 	printf("FSL updates\n");
+ 	memset(fb, 0xFF, 800*600*2);
+-	copy_image_to_fb(300, 0, 488, 360, fsl_rgb_488x360, &screen_info);
++	copy_image_to_buffer(300, 0, 488, 360, fsl_rgb_488x360, BUFFER_FB, &screen_info);
+ 	update_to_display(300, 0, 488, 560, WAVEFORM_MODE_AUTO, TRUE);
+ 
+ 	memset(fb, 0xFF, 800*600*2);
+-	copy_image_to_fb(300, 48, 488, 360, fsl_rgb_488x360, &screen_info);
++	copy_image_to_buffer(300, 48, 488, 360, fsl_rgb_488x360, BUFFER_FB, &screen_info);
+ 	update_to_display(300, 0, 488, 560, WAVEFORM_MODE_AUTO, TRUE);
+ 
+ 	memset(fb, 0xFF, 800*600*2);
+-	copy_image_to_fb(300, 100, 488, 360, fsl_rgb_488x360, &screen_info);
++	copy_image_to_buffer(300, 100, 488, 360, fsl_rgb_488x360, BUFFER_FB, &screen_info);
+ 	update_to_display(300, 0, 488, 560, WAVEFORM_MODE_AUTO, TRUE);
+ 
+ 	memset(fb, 0xFF, 800*600*2);
+-	copy_image_to_fb(300, 148, 488, 360, fsl_rgb_488x360, &screen_info);
++	copy_image_to_buffer(300, 148, 488, 360, fsl_rgb_488x360, BUFFER_FB, &screen_info);
+ 	update_to_display(300, 0, 488, 560, WAVEFORM_MODE_AUTO, TRUE);
+ 
+ 	memset(fb, 0xFF, 800*600*2);
+-	copy_image_to_fb(300, 200, 488, 360, fsl_rgb_488x360, &screen_info);
++	copy_image_to_buffer(300, 200, 488, 360, fsl_rgb_488x360, BUFFER_FB, &screen_info);
+ 	update_to_display(300, 0, 488, 560, WAVEFORM_MODE_AUTO, TRUE);
+ 
+ 	printf("Ginger update\n");
+-	copy_image_to_fb(0, 0, 800, 600, ginger_rgb_800x600, &screen_info);
++	copy_image_to_buffer(0, 0, 800, 600, ginger_rgb_800x600, BUFFER_FB, &screen_info);
+ 	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, FALSE);
+ 
+ 	sleep(3);
+ 
+ 	printf("Colorbar update\n");
+-	copy_image_to_fb(0, 0, 800, 600, colorbar_rgb_800x600, &screen_info);
++	copy_image_to_buffer(0, 0, 800, 600, colorbar_rgb_800x600, BUFFER_FB, &screen_info);
+ 	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, FALSE);
+ 
+ 	sleep(3);
+@@ -471,7 +484,7 @@ static int test_rotation(void)
+ 		printf("After rotation...xres = %d, yres = %d\n", screen_info.xres, screen_info.yres);
+ 
+ 		printf("Rotated FSL\n");
+-		copy_image_to_fb(0, 0, 488, 360, fsl_rgb_488x360, &screen_info);
++		copy_image_to_buffer(0, 0, 488, 360, fsl_rgb_488x360, BUFFER_FB, &screen_info);
+ 		update_to_display(0, 0, 488, 360, WAVEFORM_MODE_AUTO, FALSE);
+ 
+ 		sleep(3);
+@@ -495,13 +508,22 @@ static int test_rotation(void)
+ 		printf("Rotated crosshatch updates\n");
+ 		draw_rgb_crosshatch(&screen_info, CROSSHATCH_COLUMNS_ROWS);
+ 
+-		sleep(5);
++		sleep(4);
+ 
+ 		printf("Blank screen\n");
+ 		memset(fb, 0xFF, screen_info.xres*screen_info.yres*screen_info.bits_per_pixel/8);
+ 		update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_DU, TRUE);
+ 	}
+ 
++	printf("Return rotation to 0\n");
++	screen_info.rotate = FB_ROTATE_UR;
++	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
++	if (retval < 0)
++	{
++		printf("Rotation failed\n");
++		return TFAIL;
++	}
++
+ 	return TPASS;
+ }
+ 
+@@ -510,6 +532,10 @@ static int test_y8(void)
+ 	int retval = TPASS;
+ 	int iter;
+ 
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres*screen_info.yres*screen_info.bits_per_pixel/8);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_GC16, TRUE);
++
+ 	/*
+ 	 * Do Y8 FB test sequence twice:
+ 	 * - once for normal Y8 (grayscale = 1)
+@@ -531,7 +557,7 @@ static int test_y8(void)
+ 		}
+ 
+ 		printf("Top-half black\n");
+-		memset(fb, 0x00, screen_info.xres*screen_info.yres/2);
++		memset(fb, 0x00, screen_info.xres*screen_info.yres*screen_info.bits_per_pixel/8/2);
+ 		update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_AUTO, FALSE);
+ 
+ 		sleep(3);
+@@ -543,10 +569,10 @@ static int test_y8(void)
+ 		sleep(3);
+ 	}
+ 
+-	printf("Change back to non-inverted Y8\n");
+-	screen_info.rotate = FB_ROTATE_CW;
+-	screen_info.bits_per_pixel = 8;
+-	screen_info.grayscale = GRAYSCALE_8BIT;
++	printf("Change back to non-inverted RGB565\n");
++	screen_info.rotate = FB_ROTATE_UR;
++	screen_info.bits_per_pixel = 16;
++	screen_info.grayscale = 0;
+ 	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
+ 	if (retval < 0)
+ 	{
+@@ -562,6 +588,17 @@ static int test_auto_waveform(void)
+ 	int retval = TPASS;
+ 	int i, j;
+ 
++	printf("Change to Y8 FB\n");
++	screen_info.rotate = FB_ROTATE_UR;
++	screen_info.bits_per_pixel = 8;
++	screen_info.grayscale = GRAYSCALE_8BIT;
++	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
++	if (retval < 0)
++	{
++		printf("Back to normal failed\n");
++		return TFAIL;
++	}
++
+ 	printf("Blank screen - auto-selected to DU\n");
+ 	memset(fb, 0xFF, screen_info.xres*screen_info.yres*screen_info.bits_per_pixel/8);
+ 	update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_AUTO, TRUE);
+@@ -633,17 +670,6 @@ static int test_auto_update(void)
+ 
+ 	sleep(1);
+ 
+-	printf("Manual update middle and lower stripes\n");
+-	for (i = 0; i < 5; i++)
+-		memset(fb + screen_info.xres*300*screen_info.bits_per_pixel/8/2, 0x00, screen_info.xres*5*screen_info.bits_per_pixel/8);
+-	for (i = 0; i < 5; i++)
+-		memset(fb + screen_info.xres*500*screen_info.bits_per_pixel/8/2, 0x00, screen_info.xres*5*screen_info.bits_per_pixel/8);
+-	update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_DU, TRUE);
+-	sleep(2);
+-	printf("Blank screen\n");
+-	memset(fb, 0xFF, screen_info.xres*screen_info.yres*screen_info.bits_per_pixel/8);
+-	update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_DU, TRUE);
+-
+ 	printf("Auto-update middle and lower stripes\n");
+ 	for (i = 0; i < 5; i++)
+ 		memset(fb + screen_info.xres*300*screen_info.bits_per_pixel/8/2, 0x00, screen_info.xres*5*screen_info.bits_per_pixel/8);
+@@ -657,7 +683,7 @@ static int test_auto_update(void)
+ 	sleep(1);
+ 
+ 	printf("Auto-update FSL logo\n");
+-	copy_image_to_fb(0, 0, 488, 360, fsl_rgb_488x360, &screen_info);
++	copy_image_to_buffer(0, 0, 488, 360, fsl_rgb_488x360, BUFFER_FB, &screen_info);
+ 
+ 	sleep(2);
+ 
+@@ -685,6 +711,261 @@ static int test_auto_update(void)
+ }
+ 
+ 
++static int test_pan(void)
++{
++	int y;
++	int retval;
++
++	printf("Draw to offscreen region.\n");
++	copy_image_to_buffer(0, 0, 800, 600, colorbar_rgb_800x600,
++		BUFFER_OVERLAY, &screen_info);
++
++	printf("Ginger update\n");
++	copy_image_to_buffer(0, 0, 800, 600, ginger_rgb_800x600, BUFFER_FB,
++		&screen_info);
++	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, FALSE);
++
++	for (y = 0; y <= screen_info.yres; y+=50) {
++		screen_info.yoffset = y;
++		retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++		if (retval < 0) {
++			printf("Pan fail!\n");
++			break;
++		}
++	}
++	printf("Pan test done.\n");
++
++	screen_info.yoffset = 0;
++	retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++	if (retval < 0)
++		printf("Pan fail!\n");
++
++	printf("Returned to original position.\n");
++
++	sleep(1);
++
++	return TPASS;
++}
++
++
++static int test_overlay(void)
++{
++	struct mxcfb_update_data upd_data;
++	int retval;
++	struct fb_fix_screeninfo fix_screen_info;
++	__u32 ol_phys_addr;
++
++	printf("Ginger update\n");
++	copy_image_to_buffer(0, 0, 800, 600, ginger_rgb_800x600, BUFFER_FB,
++		&screen_info);
++	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, TRUE);
++
++	sleep(1);
++
++	retval = ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix_screen_info);
++	if (retval < 0)
++		return TFAIL;
++
++	/* Fill overlay buffer with data */
++	copy_image_to_buffer(0, 0, 800, 600, colorbar_rgb_800x600,
++		BUFFER_OVERLAY, &screen_info);
++
++	ol_phys_addr = fix_screen_info.smem_start + screen_info.xres*screen_info.yres*screen_info.bits_per_pixel/8;
++
++	upd_data.update_mode = UPDATE_MODE_FULL;
++	upd_data.waveform_mode = WAVEFORM_MODE_AUTO;
++	upd_data.update_region.left = 0;
++	upd_data.update_region.width = screen_info.xres;
++	upd_data.update_region.top = 0;
++	upd_data.update_region.height = screen_info.yres;
++	upd_data.temp = TEMP_USE_AMBIENT;
++	upd_data.update_marker = marker_val++;
++
++	upd_data.use_alt_buffer = TRUE;
++	/* Overlay buffer data */
++	upd_data.alt_buffer_data.phys_addr = ol_phys_addr;
++	upd_data.alt_buffer_data.width = 800;
++	upd_data.alt_buffer_data.height = 600;
++	upd_data.alt_buffer_data.alt_update_region.left = 0;
++	upd_data.alt_buffer_data.alt_update_region.width = screen_info.xres;
++	upd_data.alt_buffer_data.alt_update_region.top = 0;
++	upd_data.alt_buffer_data.alt_update_region.height = screen_info.yres;
++
++	printf("Show full-screen overlay\n");
++
++	retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	while (retval < 0) {
++		/* We have limited memory available for updates, so wait and
++		 * then try again after some updates have completed */
++		sleep(1);
++		retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	}
++
++	/* Wait for update to complete */
++	retval = ioctl(fd_fb, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	if (retval < 0) {
++		printf("Wait for update complete failed.  Error = 0x%x", retval);
++	}
++
++	sleep(2);
++
++	printf("Show FB contents again\n");
++
++	update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_AUTO, TRUE);
++
++	sleep(1);
++
++	printf("Show top half overlay\n");
++
++	/* Update region of overlay shown */
++	upd_data.update_region.left = 0;
++	upd_data.update_region.width = screen_info.xres;
++	upd_data.update_region.top = 0;
++	upd_data.update_region.height = screen_info.yres/2;
++	upd_data.update_marker = marker_val++;
++	upd_data.alt_buffer_data.alt_update_region.left = 0;
++	upd_data.alt_buffer_data.alt_update_region.width = screen_info.xres;
++	upd_data.alt_buffer_data.alt_update_region.top = 0;
++	upd_data.alt_buffer_data.alt_update_region.height = screen_info.yres/2;
++
++	retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	while (retval < 0) {
++		/* We have limited memory available for updates, so wait and
++		 * then try again after some updates have completed */
++		sleep(1);
++		retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	}
++
++	/* Wait for update to complete */
++	retval = ioctl(fd_fb, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	if (retval < 0) {
++		printf("Wait for update complete failed.  Error = 0x%x", retval);
++	}
++
++	sleep(2);
++
++	printf("Show FB contents again\n");
++
++	update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_AUTO, TRUE);
++
++	sleep(1);
++
++	printf("Show cutout region of overlay\n");
++
++	/* Update region of overlay shown */
++	upd_data.update_region.left = screen_info.xres/4;
++	upd_data.update_region.width = screen_info.xres/2;
++	upd_data.update_region.top = screen_info.yres/4;
++	upd_data.update_region.height = screen_info.yres/2;
++	upd_data.update_marker = marker_val++;
++	upd_data.alt_buffer_data.alt_update_region.left = screen_info.xres/4;
++	upd_data.alt_buffer_data.alt_update_region.width = screen_info.xres/2;
++	upd_data.alt_buffer_data.alt_update_region.top = screen_info.yres/4;
++	upd_data.alt_buffer_data.alt_update_region.height = screen_info.yres/2;
++
++	retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	while (retval < 0) {
++		/* We have limited memory available for updates, so wait and
++		 * then try again after some updates have completed */
++		sleep(1);
++		retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	}
++
++	/* Wait for update to complete */
++	retval = ioctl(fd_fb, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	if (retval < 0) {
++		printf("Wait for update complete failed.  Error = 0x%x", retval);
++	}
++
++	sleep(1);
++
++	printf("Show cutout in upper corner\n");
++
++	/* Update region of overlay shown */
++	upd_data.update_region.left = 0;
++	upd_data.update_region.width = screen_info.xres/2;
++	upd_data.update_region.top = 0;
++	upd_data.update_region.height = screen_info.yres/2;
++	upd_data.update_marker = marker_val++;
++	upd_data.alt_buffer_data.alt_update_region.left = screen_info.xres/4;
++	upd_data.alt_buffer_data.alt_update_region.width = screen_info.xres/2;
++	upd_data.alt_buffer_data.alt_update_region.top = screen_info.yres/4;
++	upd_data.alt_buffer_data.alt_update_region.height = screen_info.yres/2;
++
++	retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	while (retval < 0) {
++		/* We have limited memory available for updates, so wait and
++		 * then try again after some updates have completed */
++		sleep(1);
++		retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	}
++
++	/* Wait for update to complete */
++	retval = ioctl(fd_fb, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	if (retval < 0) {
++		printf("Wait for update complete failed.  Error = 0x%x", retval);
++	}
++
++	sleep(1);
++
++
++	printf("Test overlay at 90 degree rotation\n");
++	screen_info.rotate = FB_ROTATE_CW;
++	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
++	if (retval < 0)
++	{
++		printf("Rotation failed\n");
++		return TFAIL;
++	}
++
++	/* FB to black */
++	printf("Background to black\n");
++	memset(fb, 0x00, screen_info.xres*screen_info.yres*screen_info.bits_per_pixel/8);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres, WAVEFORM_MODE_AUTO, TRUE);
++
++	printf("Show rotated overlay in center\n");
++	copy_image_to_buffer(0, 0, 488, 360, fsl_rgb_488x360,
++		BUFFER_OVERLAY, &screen_info);
++
++	/* Update region of overlay shown */
++	upd_data.update_region.left = (screen_info.xres - 488)/2;
++	upd_data.update_region.width = 488;
++	upd_data.update_region.top = (screen_info.yres - 360)/2;
++	upd_data.update_region.height = 360;
++	upd_data.update_marker = marker_val++;
++	upd_data.alt_buffer_data.alt_update_region.left = 0;
++	upd_data.alt_buffer_data.alt_update_region.width = 488;
++	upd_data.alt_buffer_data.alt_update_region.top = 0;
++	upd_data.alt_buffer_data.alt_update_region.height = 360;
++
++	retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	while (retval < 0) {
++		/* We have limited memory available for updates, so wait and
++		 * then try again after some updates have completed */
++		sleep(1);
++		retval = ioctl(fd_fb, MXCFB_SEND_UPDATE, &upd_data);
++	}
++
++	/* Wait for update to complete */
++	retval = ioctl(fd_fb, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	if (retval < 0) {
++		printf("Wait for update complete failed.  Error = 0x%x", retval);
++	}
++
++	sleep(3);
++
++	printf("Revert rotation\n");
++	screen_info.rotate = FB_ROTATE_UR;
++	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
++	if (retval < 0)
++	{
++		printf("Rotation failed\n");
++		return TFAIL;
++	}
++
++	return TPASS;
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -698,7 +979,6 @@ main(int argc, char **argv)
+ 	/* Find EPDC FB device */
+ 	while (1) {
+ 		fb_dev[7] = '0' + fb_num;
+-		printf("opening this fb_dev - %s\n", fb_dev);
+ 		fd_fb = open(fb_dev, O_RDWR, 0);
+ 		if (fd_fb < 0) {
+ 			printf("Unable to open %s\n", fb_dev);
+@@ -722,7 +1002,7 @@ main(int argc, char **argv)
+ 		fb_num++;
+ 	}
+ 
+-	printf("Found EPDC fb device %s\n", fb_dev);
++	printf("Opened EPDC fb device %s\n", fb_dev);
+ 
+ 	retval = ioctl(fd_fb, FBIOGET_VSCREENINFO, &screen_info);
+ 	if (retval < 0)
+@@ -744,6 +1024,9 @@ main(int argc, char **argv)
+ 	}
+ 	g_fb_size = screen_info.xres * screen_info.yres_virtual * screen_info.bits_per_pixel / 8;
+ 
++	printf("screen_info.xres = %d\nscreen_info.yres_virtual = %d\nscreen_info.bits_per_pixel = %d\n",
++		screen_info.xres, screen_info.yres_virtual, screen_info.bits_per_pixel);
++
+ 	printf("Mem-Mapping FB0\n");
+ 
+ 	/* Map the device to memory*/
+@@ -795,11 +1078,20 @@ main(int argc, char **argv)
+ 		goto err2;
+ 	}
+ 
++	if (test_pan()){
++		printf("\nError: Pan test failed.\n");
++		goto err2;
++	}
++
++	if (test_overlay()){
++		printf("\nError: Overlay test failed.\n");
++		goto err2;
++	}
++
+ 	if (test_auto_update()){
+ 		printf("\nError: Auto update test failed.\n");
+ 		goto err2;
+ 	}
+-
+ err2:
+ 	munmap(fb, g_fb_size);
+ err1:
+-- 
+1.8.0
+

@@ -1,0 +1,142 @@
+From 94d463eae0100a446e5dbd88dc5ced26a81f1c8f Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Fri, 21 Nov 2008 15:38:37 +0800
+Subject: [PATCH 056/435] ENGR00099817 FIX slice buf overflow issue for some
+ H264 bitstreams
+
+Assign slicebuf size for H264 based on worstSliceSize gotten from
+vpu_DecGetInitialInfo(), rather than hard-coded
+
+Change the PS buffer size for covering MX37&MX51
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 26 ++++++++++++++++----------
+ test/mxc_vpu_test/loopback.c | 21 ++++++++++++---------
+ test/mxc_vpu_test/vpu_test.h |  4 ++--
+ 3 files changed, 30 insertions(+), 21 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 92f9cf9..1a8301b 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -993,7 +993,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 
+ 	stride = ((dec->stride + 15) & ~15);
+ 	bufinfo.avcSliceBufInfo.sliceSaveBuffer = dec->phy_slice_buf;
+-	bufinfo.avcSliceBufInfo.sliceSaveBufferSize = SLICE_SAVE_SIZE;
++	bufinfo.avcSliceBufInfo.sliceSaveBufferSize = dec->phy_slicebuf_size;
+ 	
+ 	ret = vpu_DecRegisterFrameBuffer(handle, fb, fbcount, stride, &bufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+@@ -1083,6 +1083,8 @@ decoder_parse(struct decode *dec)
+ 	memcpy(&(dec->picCropRect), &(initinfo.picCropRect),
+ 					sizeof(initinfo.picCropRect));
+ 
++	/* worstSliceSize is in kilo-byte unit */
++	dec->phy_slicebuf_size = initinfo.worstSliceSize * 1024;
+ 	dec->stride = dec->picwidth;
+ 	return 0;
+ }
+@@ -1173,16 +1175,8 @@ decode_test(void *arg)
+ 			err_msg("Unable to obtain physical ps save mem\n");
+ 			goto err;
+ 		}
+-
+-		slice_mem_desc.size = SLICE_SAVE_SIZE;
+-		ret = IOGetPhyMem(&slice_mem_desc);
+-		if (ret) {
+-			err_msg("Unable to obtain physical slice save mem\n");
+-			goto err;
+-		}
+-
+ 		dec->phy_ps_buf = ps_mem_desc.phy_addr;
+-		dec->phy_slice_buf = slice_mem_desc.phy_addr;
++
+ 	}
+ 
+ 	/* open decoder */
+@@ -1208,6 +1202,18 @@ decode_test(void *arg)
+ 		goto err1;
+ 	}
+ 
++	/* allocate slice buf */
++	if (cmdl->format == STD_AVC) {
++		slice_mem_desc.size = dec->phy_slicebuf_size;
++		ret = IOGetPhyMem(&slice_mem_desc);
++		if (ret) {
++			err_msg("Unable to obtain physical slice save mem\n");
++			goto err1;
++		}
++
++		dec->phy_slice_buf = slice_mem_desc.phy_addr;
++	}
++
+ 	/* allocate frame buffers */
+ 	ret = decoder_allocate_framebuffer(dec);
+ 	if (ret)
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 2d42085..5d5a999 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -356,16 +356,7 @@ encdec_test(void *arg)
+ 			goto err;
+ 		}
+ 
+-		slice_mem_desc.size = SLICE_SAVE_SIZE;
+-		ret = IOGetPhyMem(&slice_mem_desc);
+-		if (ret) {
+-			err_msg("Unable to obtain physical slice save mem\n");
+-			IOFreePhyMem(&ps_mem_desc);
+-			goto err;
+-		}
+-
+ 		dec->phy_ps_buf = ps_mem_desc.phy_addr;
+-		dec->phy_slice_buf = slice_mem_desc.phy_addr;
+ 	}
+ 
+ 	/* open the encoder */
+@@ -417,6 +408,18 @@ encdec_test(void *arg)
+ 		goto err5;
+ 	}
+ 
++	/* allocate slice buf */
++	if (cmdl->format == STD_AVC) {
++		slice_mem_desc.size = dec->phy_slicebuf_size;
++		ret = IOGetPhyMem(&slice_mem_desc);
++		if (ret) {
++			err_msg("Unable to obtain physical slice save mem\n");
++			goto err5;
++		}
++
++		dec->phy_slice_buf = slice_mem_desc.phy_addr;
++	}
++
+ 	/* allocate frame buffers */
+ 	ret = decoder_allocate_framebuffer(dec);
+ 	if (ret)
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index e0fa8ee..797a98a 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -53,8 +53,7 @@ typedef signed char s8;
+ #define STREAM_FILL_SIZE	0x10000
+ #define STREAM_READ_SIZE	(512 * 8)
+ #define STREAM_END_SIZE		0
+-#define PS_SAVE_SIZE		0x028000
+-#define SLICE_SAVE_SIZE		0x02D800
++#define PS_SAVE_SIZE		0x080000
+ 
+ #define STREAM_ENC_PIC_RESET 	1
+ 
+@@ -141,6 +140,7 @@ struct decode {
+ 	PhysicalAddress phy_bsbuf_addr;
+ 	PhysicalAddress phy_ps_buf;
+ 	PhysicalAddress phy_slice_buf;
++	int phy_slicebuf_size;
+ 	u32 virt_bsbuf_addr;
+ 	int picwidth;
+ 	int picheight;
+-- 
+1.8.0
+

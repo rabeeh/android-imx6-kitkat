@@ -1,0 +1,371 @@
+From ede74e1bdd1e43005a2ddabceca3ba108af93070 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Tue, 27 Nov 2012 15:19:46 +0800
+Subject: [PATCH 116/281] ENGR00236857: update fsl device configuration to 4.2
+
+* Temporary disable mobile network to boot up 4.2.
+* Add TARGET_ARCH and ARCH_ARM_HAVE_TLS_REGISTER define.
+* Merge the 4.2 init.rc
+* Add watchdog service, which implemented by google
+  as a simple daemon service, we do not need to do
+  in power HAL.
+* Enable internal storage and multi user
+* Enable navigation bar formally, but not qemu prop.
+* Update the default kernel command line
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ imx6/BoardConfigCommon.mk                          |  2 +
+ imx6/etc/init.rc                                   | 72 ++++++++++++++++------
+ imx6/sabresd/init.rc                               | 17 +++++
+ .../frameworks/base/core/res/res/values/config.xml | 17 ++---
+ .../base/core/res/res/xml/storage_list.xml         |  3 +-
+ sabresd_6dq/BoardConfig.mk                         |  2 +-
+ 6 files changed, 78 insertions(+), 35 deletions(-)
+
+diff --git a/imx6/BoardConfigCommon.mk b/imx6/BoardConfigCommon.mk
+index aba41c9..ff3b7b0 100644
+--- a/imx6/BoardConfigCommon.mk
++++ b/imx6/BoardConfigCommon.mk
+@@ -5,7 +5,9 @@
+ TARGET_BOARD_PLATFORM := imx6
+ TARGET_CPU_ABI := armeabi-v7a
+ TARGET_CPU_ABI2 := armeabi
++TARGET_ARCH := arm
+ TARGET_ARCH_VARIANT := armv7-a-neon
++ARCH_ARM_HAVE_TLS_REGISTER := true
+ 
+ TARGET_NO_BOOTLOADER := true
+ TARGET_NO_KERNEL := false
+diff --git a/imx6/etc/init.rc b/imx6/etc/init.rc
+index a384792..ed82864 100755
+--- a/imx6/etc/init.rc
++++ b/imx6/etc/init.rc
+@@ -4,14 +4,18 @@
+ # This is a common source of Android security bugs.
+ #
+ 
+-import /init.${ro.hardware}.rc
+ import /init.usb.rc
++import /init.${ro.hardware}.rc
+ import /init.trace.rc
+ 
+ on early-init
+     # Set init and its forked children's oom_adj.
+     write /proc/1/oom_adj -16
+ 
++    # Set the security context for the init process.
++    # This should occur before anything else (e.g. ueventd) is started.
++    setcon u:r:init:s0
++
+     start ueventd
+ 
+ # create mountpoints
+@@ -30,11 +34,11 @@ loglevel 3
+     export ANDROID_ROOT /system
+     export ANDROID_ASSETS /system/app
+     export ANDROID_DATA /data
++    export ANDROID_STORAGE /storage
+     export ASEC_MOUNTPOINT /mnt/asec
+     export LOOP_MOUNTPOINT /mnt/obb
+-    export BOOTCLASSPATH /system/framework/core.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar
++    export BOOTCLASSPATH /system/framework/core.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/telephony-common.jar:/system/framework/mms-common.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar
+     export SHM_MOUNTPOINT /mnt/shm
+-    export EXTERNAL_STORAGE /storage/sdcard0
+     export LIGHTSENSOR_PATH /sys/class/i2c-adapter/i2c-1/1-0044
+     export VPU_FW_PATH /system/lib/firmware/vpu
+     export CODEC_SHM_PATH /mnt/shm
+@@ -60,23 +64,21 @@ loglevel 3
+     symlink /mnt/extsd /extsd
+     mkdir /mnt/udisk 0000 system system
+     symlink /mnt/udisk /udisk
++
+     mkdir /system
+     mkdir /data 0771 system system
+     mkdir /cache 0770 system cache
+     mkdir /config 0500 root root
+ 
+     mkdir /device 0771 system system
+-
+     # See storage config details at http://source.android.com/tech/storage/
++    mkdir /mnt/shell 0700 shell shell
+     mkdir /storage 0050 root sdcard_r
+-    mkdir /storage/sdcard0 0700 shell shell
+-    # Support legacy paths
+-    symlink /storage/sdcard0 /sdcard
+-    symlink /storage/sdcard0 /mnt/sdcard
+-
+ 
+     # Directory for putting things only root should see.
+     mkdir /mnt/secure 0700 root root
++    # Create private mountpoint so we can MS_MOVE from staging
++    mount tmpfs tmpfs /mnt/secure mode=0700,uid=0,gid=0
+ 
+     # Directory for staging bindmounts
+     mkdir /mnt/secure/staging 0700 root root
+@@ -142,23 +144,36 @@ loglevel 3
+ on post-fs
+     # once everything is setup, no need to modify /
+     mount rootfs rootfs / ro remount
++    # mount shared so changes propagate into child namespaces
++    mount rootfs rootfs / shared rec
++    mount tmpfs tmpfs /mnt/secure private rec
++
+     # We chown/chmod /cache again so because mount is run as root + defaults
+     chown system cache /cache
+     chmod 0770 /cache
++    # We restorecon /cache in case the cache partition has been reset.
++    restorecon /cache
+ 
+     # This may have been created by the recovery system with odd permissions
+     chown system cache /cache/recovery
+     chmod 0770 /cache/recovery
++    # This may have been created by the recovery system with the wrong context.
++    restorecon /cache/recovery
+ 
+     #change permissions on vmallocinfo so we can grab it from bugreports
+     chown root log /proc/vmallocinfo
+     chmod 0440 /proc/vmallocinfo
+ 
++    chown root log /proc/slabinfo
++    chmod 0440 /proc/slabinfo
++
+     #change permissions on kmsg & sysrq-trigger so bugreports can grab kthread stacks
+     chown root system /proc/kmsg
+     chmod 0440 /proc/kmsg
+     chown root system /proc/sysrq-trigger
+     chmod 0220 /proc/sysrq-trigger
++    chown system log /proc/last_kmsg
++    chmod 0440 /proc/last_kmsg
+ 
+     # create the lost+found directories, so as to enforce our permissions
+     mkdir /cache/lost+found 0770 root root
+@@ -167,8 +182,8 @@ on post-fs-data
+     # We chown/chmod /data again so because mount is run as root + defaults
+     chown system system /data
+     chmod 0771 /data
+-
+-    mkdir /data/media 0770 media_rw media_rw
++    # We restorecon /data in case the userdata partition has been reset.
++    restorecon /data
+ 
+     # Create dump dir and collect dumps.
+     # Do this before we mount cache so eventually we can use cache for
+@@ -186,12 +201,16 @@ on post-fs-data
+ 
+     write /proc/apanic_console 1
+ 
++    mkdir /data/media 0770 media_rw media_rw
++
+     # create basic filesystem structure
+     mkdir /data/misc 01771 system misc
+-    mkdir /data/misc/bluetoothd 0770 bluetooth bluetooth
++    mkdir /data/misc/adb 02750 system shell
++    mkdir /data/misc/bluedroid 0770 bluetooth net_bt_stack
+     mkdir /data/misc/bluetooth 0770 system system
+     mkdir /data/misc/keystore 0700 keystore keystore
+     mkdir /data/misc/keychain 0771 system system
++    mkdir /data/misc/sms 0770 system radio
+     mkdir /data/misc/vpn 0770 system vpn
+     mkdir /data/misc/systemkeys 0700 system system
+     # give system access to wpa_supplicant.conf for backup and restore
+@@ -208,6 +227,7 @@ on post-fs-data
+     mkdir /data/data 0771 system system
+     mkdir /data/app-private 0771 system system
+     mkdir /data/app-asec 0700 root root
++    mkdir /data/app-lib 0771 system system
+     mkdir /data/app 0771 system system
+     mkdir /data/app/ing 0771 root root
+     mkdir /data/property 0700 root root
+@@ -238,10 +258,6 @@ on post-fs-data
+     # Set indication (checked by vold) that we have finished this action
+     #setprop vold.post_fs_data_done 1
+ 
+-    chown system system /sys/class/android_usb/android0/f_mass_storage/lun/file
+-    chmod 0660 /sys/class/android_usb/android0/f_mass_storage/lun/file
+-    chown system system /sys/class/android_usb/android0/f_rndis/ethaddr
+-    chmod 0660 /sys/class/android_usb/android0/f_rndis/ethaddr
+ 
+ on boot
+ # basic network init
+@@ -254,7 +270,7 @@ on boot
+ 
+ # Memory management.  Basic kernel parameters, and allow the high
+ # level system server to be able to adjust the kernel OOM driver
+-# paramters to match how it is managing things.
++# parameters to match how it is managing things.
+ 
+     write /proc/sys/vm/overcommit_memory 1
+     write /proc/sys/vm/min_free_order_shift 4
+@@ -274,6 +290,7 @@ on boot
+     chown radio system /sys/android_power/acquire_full_wake_lock
+     chown radio system /sys/android_power/acquire_partial_wake_lock
+     chown radio system /sys/android_power/release_wake_lock
++    chown system system /sys/power/autosleep
+     chown system system /sys/power/state
+     chown system system /sys/power/wakeup_count
+     chown radio system /sys/power/wake_lock
+@@ -320,8 +337,12 @@ on boot
+     setprop net.tcp.buffersize.lte     524288,1048576,2097152,262144,524288,1048576
+     setprop net.tcp.buffersize.umts    4094,87380,110208,4096,16384,110208
+     setprop net.tcp.buffersize.hspa    4094,87380,262144,4096,16384,262144
++    setprop net.tcp.buffersize.hsupa   4094,87380,262144,4096,16384,262144
++    setprop net.tcp.buffersize.hsdpa   4094,87380,262144,4096,16384,262144
++    setprop net.tcp.buffersize.hspap   4094,87380,1220608,4096,16384,1220608
+     setprop net.tcp.buffersize.edge    4093,26280,35040,4096,16384,35040
+     setprop net.tcp.buffersize.gprs    4092,8760,11680,4096,8760,11680
++    setprop net.tcp.buffersize.evdo    4094,87380,262144,4096,16384,262144
+ 
+ # Define fsl avi/aac/asf/mkv/flv/flac format support
+     setprop ro.FSL_AVI_PARSER 1
+@@ -428,6 +449,11 @@ on property:vold.decrypt=trigger_shutdown_framework
+ service ueventd /sbin/ueventd
+     class core
+     critical
++    seclabel u:r:ueventd:s0
++
++on property:selinux.reload_policy=1
++    restart ueventd
++    restart installd
+ 
+ service console /system/bin/sh
+     class core
+@@ -441,7 +467,9 @@ service console /system/bin/sh
+ # adbd is controlled via property triggers in init.<platform>.usb.rc
+ service adbd /sbin/adbd
+     class core
++    socket adbd stream 660 system system
+     disabled
++    seclabel u:r:adbd:s0
+ 
+ # adbd on at boot in emulator
+ on property:ro.kernel.qemu=1
+@@ -474,7 +502,7 @@ service debuggerd /system/bin/debuggerd
+ service surfaceflinger /system/bin/surfaceflinger
+     class main
+     user system
+-    group graphics
++    group graphics drmrpc
+     onrestart restart zygote
+ 
+ service zygote /system/bin/app_process -Xzygote /system/bin --zygote --start-system-server
+@@ -488,7 +516,7 @@ service zygote /system/bin/app_process -Xzygote /system/bin --zygote --start-sys
+ service drm /system/bin/drmserver
+     class main
+     user drm
+-    group drm system inet drmrpc sdcard_r
++    group drm system inet drmrpc
+ 
+ service media /system/bin/mediaserver
+     class main
+@@ -615,5 +643,9 @@ service wifi_mac /system/bin/sh /system/etc/check_wifi_mac.sh
+     oneshot
+ 
+ # virtual sdcard daemon running as media_rw (1023)
+-service sdcard /system/bin/sdcard /data/media 1023 1023
++service sdcard /system/bin/sdcard /data/media /mnt/shell/emulated 1023 1023
+     class late_start
++
++# Set watchdog timer to 30 seconds and pet it every 10 seconds to get a 20 second margin
++service watchdogd /sbin/watchdogd 10 20
++    class core
+diff --git a/imx6/sabresd/init.rc b/imx6/sabresd/init.rc
+index bb61e2c..82447e8 100755
+--- a/imx6/sabresd/init.rc
++++ b/imx6/sabresd/init.rc
+@@ -1,5 +1,22 @@
+ import init.${ro.hardware}.usb.rc
+ 
++on init
++    start watchdogd
++
++    # See storage config details at http://source.android.com/tech/storage/
++    mkdir /mnt/shell/emulated 0700 shell shell
++    mkdir /storage/emulated 0555 root root
++
++    export EXTERNAL_STORAGE /storage/emulated/legacy
++    export EMULATED_STORAGE_SOURCE /mnt/shell/emulated
++    export EMULATED_STORAGE_TARGET /storage/emulated
++
++    # Support legacy paths
++    symlink /storage/emulated/legacy /sdcard
++    symlink /storage/emulated/legacy /mnt/sdcard
++    symlink /storage/emulated/legacy /storage/sdcard0
++    symlink /mnt/shell/emulated/0 /storage/emulated/legacy
++
+ on boot
+ 
+     # Set permission for IIM node
+diff --git a/imx6/sabresd/overlay/frameworks/base/core/res/res/values/config.xml b/imx6/sabresd/overlay/frameworks/base/core/res/res/values/config.xml
+index b9ea4cd..3c32eb1 100755
+--- a/imx6/sabresd/overlay/frameworks/base/core/res/res/values/config.xml
++++ b/imx6/sabresd/overlay/frameworks/base/core/res/res/values/config.xml
+@@ -60,7 +60,6 @@
+                       [# simultaneous connection types]"  -->
+     <string-array translatable="false" name="radioAttributes">
+         <item>"1,1"</item>
+-        <item>"0,1"</item>
+         <item>"9,1"</item>
+     </string-array>
+ 
+@@ -72,13 +71,6 @@
+     <!-- the 6th element indicates boot-time dependency-met value. -->
+     <string-array translatable="false" name="networkAttributes">
+         <item>"wifi,1,1,1,-1,true"</item>
+-        <item>"mobile,0,0,0,-1,true"</item>
+-        <item>"mobile_mms,2,0,3,60000,true"</item>
+-        <item>"mobile_supl,3,0,3,60000,true"</item>
+-        <item>"mobile_hipri,5,0,4,60000,true"</item>
+-        <item>"mobile_fota,10,0,3,60000,true"</item>
+-        <item>"mobile_ims,11,0,3,60000,true"</item>
+-        <item>"mobile_cbs,12,0,3,60000,true"</item>
+         <item>"wifi_p2p,13,1,0,-1,true"</item>
+         <item>"ethernet,9,9,2,-1,true"</item>
+     </string-array>
+@@ -158,10 +150,11 @@
+          movement threshold where scrolling should begin. -->
+     <dimen name="config_viewConfigurationTouchSlop">24dp</dimen>
+ 
+-    <!-- Component name of the service providing network location support. -->
+-    <string name="config_networkLocationProviderPackageName" translatable="false">com.google.android.location</string>
++    <!--  Maximum number of supported users -->
++    <integer name="config_multiuserMaximumUsers">8</integer>
+ 
+-    <!-- Component name of the service providing geocoder API support. -->
+-    <string name="config_geocodeProviderPackageName" translatable="false">com.google.android.location</string>
++    <!-- Whether a software navigation bar should be shown. NOTE: in the future this may be
++         autodetected from the Configuration. -->
++    <bool name="config_showNavigationBar">true</bool>
+ 
+ </resources>
+diff --git a/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml b/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml
+index 51ba794..84cce20 100644
+--- a/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml
++++ b/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml
+@@ -33,8 +33,7 @@
+ -->
+ 
+ <StorageList xmlns:android="http://schemas.android.com/apk/res/android">
+-    <storage android:mountPoint="/storage/sdcard0"
+-             android:storageDescription="@string/storage_internal"
++    <storage android:storageDescription="@string/storage_internal"
+              android:primary="true"
+              android:emulated="true"
+              android:mtpReserve="100" />
+diff --git a/sabresd_6dq/BoardConfig.mk b/sabresd_6dq/BoardConfig.mk
+index 98597dd..137b97e 100755
+--- a/sabresd_6dq/BoardConfig.mk
++++ b/sabresd_6dq/BoardConfig.mk
+@@ -7,7 +7,7 @@ include device/fsl/sabresd_6dq/build_id.mk
+ include device/fsl/imx6/sabresd/SabreSDBoardConfigComm.mk
+ include device/fsl-proprietary/gpu-viv/fsl-gpu.mk
+ 
+-BOARD_KERNEL_CMDLINE := console=ttymxc0,115200 init=/init video=mxcfb0 video=mxcfb1:off video=mxcfb2:off fbmem=10M fb0base=0x27b00000 vmalloc=400M androidboot.console=ttymxc0 androidboot.hardware=freescale
++BOARD_KERNEL_CMDLINE := console=ttymxc0,115200 init=/init video=mxcfb0:dev=ldb,bpp=32 video=mxcfb1:off video=mxcfb2:off fbmem=10M fb0base=0x27b00000 vmalloc=400M androidboot.console=ttymxc0 androidboot.hardware=freescale
+ 
+ 
+ ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
+-- 
+1.8.0
+

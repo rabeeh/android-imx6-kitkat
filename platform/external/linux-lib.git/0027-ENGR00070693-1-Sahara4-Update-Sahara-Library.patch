@@ -1,0 +1,5201 @@
+From 083631ff287f7feef44f27c9e982a3b8ff1e00f4 Mon Sep 17 00:00:00 2001
+From: Raj Rajasekaran <b10872@freescale.com>
+Date: Fri, 24 Oct 2008 12:16:23 -0500
+Subject: [PATCH 027/249] ENGR00070693-1 Sahara4: Update Sahara Library.
+
+Updated Sahara library files for version 4.
+
+Signed-off-by: Raj Rajasekaran <b10872@freescale.com>
+---
+ sahara2/Makefile       |   29 +-
+ sahara2/fsl_shw_auth.c |  245 +++++---
+ sahara2/fsl_shw_wrap.c | 1387 +++++++++++++++++++++++------------------
+ sahara2/sf_util.c      | 1606 ++++++++++++++++++++++++++----------------------
+ sahara2/um_adaptor.c   | 1085 +++++++++++++++++++++++++++-----
+ 5 files changed, 2773 insertions(+), 1579 deletions(-)
+
+diff --git a/sahara2/Makefile b/sahara2/Makefile
+index 96e8fd2..fd60f4f 100644
+--- a/sahara2/Makefile
++++ b/sahara2/Makefile
+@@ -1,16 +1,7 @@
+-# +FHDR-----------------------------------------------------------------------
+-# Copyright (c) 2005, Freescale Semiconductor, Inc.
+-# ----------------------------------------------------------------------------
+-# FILE NAME      : $RCSfile: Makefile,v $
+-# DEPARTMENT     : Security Technology Center (STC), NCSG
+-# ----------------------------------------------------------------------------
+-# KEYWORDS : SHW, crypto, sahara
+-# ----------------------------------------------------------------------------
+-# PURPOSE: Makefile for API Library for Sahara Crypto Accelerator
+-# -FHDR-----------------------------------------------------------------------
+-
+ AR = ar -crv
+ RM = rm -f
++CC=$(CROSS_COMPILE)gcc
++LD=$(CROSS_COMPILE)ld
+ 
+ INC := $(INCLUDE)
+ 
+@@ -31,15 +22,16 @@ endif
+ ifeq ("$(PLATFORM)", "MXC30031ADS")
+ TARGET_ARCH=-DCONFIG_ARCH_MXC92323
+ endif
++ifeq ("$(PLATFORM)", "IMX51_3STACK")
++TARGET_ARCH=-DCONFIG_ARCH_MX51
++endif
+ 
+ # Add compilation checks
+ CFLAGS += -g -Wall -W -Wmissing-prototypes -Wstrict-prototypes -Wdeclaration-after-statement
+ 
+ OBJS= fsl_shw_rand.o  fsl_shw_hash.o  fsl_shw_sym.o  fsl_shw_user.o         \
+-      fsl_shw_auth.o  fsl_shw_hmac.o  fsl_shw_wrap.o  um_adaptor.o  sf_util.o
++      fsl_shw_auth.o  fsl_shw_hmac.o  fsl_shw_wrap.o  fsl_shw_keystore.o um_adaptor.o  sf_util.o
+ 
+-CC=$(CROSS_COMPILE)gcc
+-LD=$(CROSS_COMPILE)ld
+ 
+ #CFLAGS += -DSAHARA -DLINUX -I$(APIINCDIR)
+ CFLAGS += -DSAHARA -DLINUX $(INC)
+@@ -51,9 +43,9 @@ CFLAGS += $(TARGET_ARCH)
+ 
+ LIBNAME=libsahara
+ 
+-ifeq ("$(TARGET_ARCH)", "")
+-all install:
+-else
++#ifeq ("$(TARGET_ARCH)", "")
++#all install:
++#else
+ all: $(LIBNAME).so $(LIBNAME).a
+ 
+ install: install_headers
+@@ -62,7 +54,7 @@ install: install_headers
+ 
+ install_headers:
+ 	@mkdir -p $(DEST_DIR)/usr/include
+-endif
++#endif
+ 
+ 
+ $(LIBNAME).a: $(OBJS)
+@@ -89,6 +81,7 @@ fsl_shw_auth.o: fsl_shw_auth.c $(API_INCL)
+ 
+ fsl_shw_wrap.o: fsl_shw_wrap.c
+ 
++fsl_shw_keystore.o: fsl_shw_keystore.c
+ um_adaptor.o: um_adaptor.c
+ 
+ sf_util.o: sf_util.c
+diff --git a/sahara2/fsl_shw_auth.c b/sahara2/fsl_shw_auth.c
+index 29bb2d6..9226830 100644
+--- a/sahara2/fsl_shw_auth.c
++++ b/sahara2/fsl_shw_auth.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright 2005-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -34,6 +34,7 @@ EXPORT_SYMBOL(fsl_shw_gen_encrypt);
+ EXPORT_SYMBOL(fsl_shw_auth_decrypt);
+ #endif
+ 
++
+ /*! Size of buffer to repetively sink useless CBC output */
+ #define CBC_BUF_LEN 4096
+ 
+@@ -82,7 +83,10 @@ EXPORT_SYMBOL(fsl_shw_auth_decrypt);
+ }
+ 
+ /*! Buffer to repetively sink useless CBC output */
++#if defined (FSL_HAVE_SAHARA2) || defined (USE_S2_CCM_DECRYPT_CHAIN)          \
++    || defined (USE_S2_CCM_ENCRYPT_CHAIN)
+ static uint8_t cbc_buffer[CBC_BUF_LEN];
++#endif
+ 
+ /*!
+  * Place to store useless output (while bumping CTR0 to CTR1, for instance.
+@@ -99,6 +103,7 @@ static uint8_t block_zeros[16] = {
+ 	0, 0, 0, 0, 0, 0, 0, 0
+ };
+ 
++#if 0
+ /*!
+  * Append a descriptor which will load the key and counter values into
+  * Sahara.
+@@ -159,6 +164,7 @@ static inline fsl_shw_return_t load_dummy_iv(sah_Head_Desc ** desc_chain,
+ 
+ 	return status;
+ }
++#endif
+ 
+ /*!
+  * Append a descriptor chain which will compute CBC over the
+@@ -236,6 +242,7 @@ static inline fsl_shw_return_t process_assoc_from_nist_params(sah_Link ** link1,
+ 	return status;
+ }
+ 
++#if 0
+ /*!
+  * Append a descriptor chain which will process the payload in
+  * CCM mode.
+@@ -270,13 +277,14 @@ static inline fsl_shw_return_t process_payload(sah_Head_Desc ** desc_chain,
+ 
+ 	return status;
+ }
+-
++#endif
+ /*!
+  * Add a Descriptor which will process with CBC the NIST preamble data
+  *
+  * @param     desc_chain   Current chain
+  * @param     user_ctx     User's context
+  * @param     auth_ctx     Inf
++ * @pararm    encrypt      0 => decrypt, non-zero => encrypt
+  * @param     auth_data    Additional auth data for this call
+  * @param     auth_data_length   Length in bytes of @a auth_data
+  *
+@@ -285,6 +293,7 @@ static inline fsl_shw_return_t process_payload(sah_Head_Desc ** desc_chain,
+ static inline fsl_shw_return_t add_assoc_preamble(sah_Head_Desc ** desc_chain,
+ 						  fsl_shw_uco_t * user_ctx,
+ 						  fsl_shw_acco_t * auth_ctx,
++						  int encrypt,
+ 						  const uint8_t * auth_data,
+ 						  uint32_t auth_data_length)
+ {
+@@ -295,6 +304,19 @@ static inline fsl_shw_return_t add_assoc_preamble(sah_Head_Desc ** desc_chain,
+ 	uint32_t cbc_data_length = 0;
+ 	/* Assume AES */
+ 	uint32_t header = SAH_HDR_SKHA_ENC_DEC;
++	uint32_t temp_buf_flag;
++	unsigned chain_s2 = 1;
++	
++#if defined (FSL_HAVE_SAHARA4) && !defined (USE_S2_CCM_DECRYPT_CHAIN)
++	if (!encrypt) {
++		chain_s2 = 0;
++	}
++#endif
++#if defined (FSL_HAVE_SAHARA4) && !defined (USE_S2_CCM_ENCRYPT_CHAIN)
++	if (encrypt) {
++		chain_s2 = 0;
++	}
++#endif
+ 
+ 	/* Grab a block big enough for multiple uses so that only one allocate
+ 	 * request needs to be made.
+@@ -307,8 +329,8 @@ static inline fsl_shw_return_t add_assoc_preamble(sah_Head_Desc ** desc_chain,
+ 
+ 	if (temp_buf == NULL) {
+ 		status = FSL_RETURN_NO_RESOURCE_S;
+-	} else {
+-		uint32_t temp_buf_flag;
++		goto out;
++	}
+ 
+ 		if (auth_ctx->flags & FSL_ACCO_NIST_CCM) {
+ 			status = process_assoc_from_nist_params(&link1,
+@@ -318,35 +340,49 @@ static inline fsl_shw_return_t add_assoc_preamble(sah_Head_Desc ** desc_chain,
+ 								auth_data,
+ 								auth_data_length,
+ 								&temp_buf);
++			
++			if (status != FSL_RETURN_OK_S) {
++				goto out;
++			}
+ 			/* temp_buf has been referenced (and incremented).  Only 'own' it
+ 			 * once, at its first value.  Since the nist routine called above
+ 			 * bumps it...
+ 			 */
+ 			temp_buf_flag = SAH_USES_LINK_DATA;
+ 		} else {	/* if NIST */
+-			if (status == FSL_RETURN_OK_S) {
+-				status =
+-				    sah_Create_Link(user_ctx->mem_util, &link1,
+-						    (uint8_t *) auth_data,
+-						    auth_data_length,
+-						    SAH_USES_LINK_DATA);
+-				/* for next/first use of temp_buf */
+-				temp_buf_flag = SAH_OWNS_LINK_DATA;
++			status =
++			    sah_Create_Link(user_ctx->mem_util, &link1,
++					    (uint8_t *) auth_data,
++					    auth_data_length,
++					    SAH_USES_LINK_DATA);
++			if (status != FSL_RETURN_OK_S) {
++				goto out;
+ 			}
++			/* for next/first use of temp_buf */
++			temp_buf_flag = SAH_OWNS_LINK_DATA;
++			
+ 			cbc_data_length = auth_data_length;
+ 		}		/* else not NIST */
++#if defined (FSL_HAVE_SAHARA2) || defined (USE_S2_CCM_ENCRYPT_CHAIN)   \
++	|| defined (USE_S2_CCM_DECRYPT_CHAIN)
++		
++	if (!chain_s2) {
++		header = SAH_HDR_SKHA_CBC_ICV
++				^ sah_insert_skha_mode_cbc ^ sah_insert_skha_aux0
++				^ sah_insert_skha_encrypt;
++	} else {
+ 
+ 		/*
+ 		 * Auth data links have been created.  Now create link for the
+ 		 * useless output of the CBC calculation.
+ 		 */
+-		if (status == FSL_RETURN_OK_S) {
+-			status = sah_Create_Link(user_ctx->mem_util, &link2,
+-						 temp_buf,
+-						 auth_ctx->auth_info.
+-						 CCM_ctx_info.block_size_bytes,
+-						 temp_buf_flag |
+-						 SAH_OUTPUT_LINK);
++		status = sah_Create_Link(user_ctx->mem_util, &link2,
++				 temp_buf,
++				 auth_ctx->auth_info.CCM_ctx_info.block_size_bytes,
++				 temp_buf_flag | SAH_OUTPUT_LINK);
++
++		if (status != FSL_RETURN_OK_S) {
++			goto out;
+ 		}
+ 		temp_buf += auth_ctx->auth_info.CCM_ctx_info.block_size_bytes;
+ 
+@@ -366,9 +402,23 @@ static inline fsl_shw_return_t add_assoc_preamble(sah_Head_Desc ** desc_chain,
+ 						    cbc_buffer, linklen,
+ 						    SAH_USES_LINK_DATA |
+ 						    SAH_OUTPUT_LINK);
++				if (status != FSL_RETURN_OK_S) {
++					goto out;
++				}
+ 				cbc_data_length -= linklen;
+ 			}
+ 		}
++   }
++#else
++			header = SAH_HDR_SKHA_CBC_ICV
++				^ sah_insert_skha_mode_cbc ^ sah_insert_skha_aux0
++				^ sah_insert_skha_encrypt;
++#endif
++		/* Crank through auth data */
++		status = sah_Append_Desc(user_ctx->mem_util, desc_chain,
++					 header, link1, link2);
++		
++out:
+ 
+ 		if (status != FSL_RETURN_OK_S) {
+ 			if (link1 != NULL) {
+@@ -377,16 +427,13 @@ static inline fsl_shw_return_t add_assoc_preamble(sah_Head_Desc ** desc_chain,
+ 			if (link2 != NULL) {
+ 				sah_Destroy_Link(user_ctx->mem_util, link2);
+ 			}
+-		} else {
+-			/* Header to set up crank through auth data */
+-			status = sah_Append_Desc(user_ctx->mem_util, desc_chain,
+-						 header, link1, link2);
+ 		}
+-	}
++	
++    (void)encrypt;
+ 
+ 	return status;
+ }
+-
++#if 0
+ /*!
+  * Append a descriptor chain which will pull the MAC (CBC IV) out of the
+  * hardware registers.
+@@ -455,6 +502,7 @@ static inline fsl_shw_return_t encrypt_mac(sah_Head_Desc ** desc_chain,
+ 
+ 	return status;
+ }
++#endif
+ 
+ #if SUPPORT_SSL
+ /*!
+@@ -610,7 +658,7 @@ fsl_shw_return_t fsl_shw_gen_encrypt(fsl_shw_uco_t * user_ctx,
+ #else
+ 		ret = FSL_RETURN_BAD_MODE_S;
+ #endif
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	if (auth_ctx->mode != FSL_ACC_MODE_CCM) {
+@@ -625,53 +673,73 @@ fsl_shw_return_t fsl_shw_gen_encrypt(fsl_shw_uco_t * user_ctx,
+ 		ret = FSL_RETURN_BAD_FLAG_S;
+ 		goto out;
+ 	}
+-	ret = load_ctr_key(&desc_chain, user_ctx, auth_ctx, cipher_key_info);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++	
++	/* Load CTR0 and Key */
++	header = (SAH_HDR_SKHA_SET_MODE_IV_KEY
++		  ^ sah_insert_skha_mode_ctr
++		  ^ sah_insert_skha_modulus_128 ^ sah_insert_skha_encrypt);
++	DESC_IN_KEY(header,
++		    auth_ctx->cipher_ctx_info.block_size_bytes,
++		    auth_ctx->cipher_ctx_info.context, cipher_key_info);
+ 
+-	header = SAH_HDR_SKHA_ENC_DEC;
+-	DESC_IN_OUT(header, auth_ctx->cipher_ctx_info.block_size_bytes,
+-		    garbage_output, auth_ctx->cipher_ctx_info.block_size_bytes,
+-		    garbage_output);
++	/* Encrypt dummy data to bump to CTR1 */
+ 
++	header = SAH_HDR_SKHA_ENC_DEC;
++	DESC_IN_OUT(header, auth_ctx->mac_length, garbage_output,
++		auth_ctx->mac_length, garbage_output);
++	
++#if defined(FSL_HAVE_SAHARA2) || defined(USE_S2_CCM_ENCRYPT_CHAIN)
+ #ifndef NO_ZERO_IV_LOAD
+-	ret = load_dummy_iv(&desc_chain, user_ctx,
+-			    1,
+-			    auth_ctx->auth_info.CCM_ctx_info.block_size_bytes);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++	header = (SAH_HDR_SKHA_SET_MODE_IV_KEY
++		  ^ sah_insert_skha_encrypt ^ sah_insert_skha_mode_cbc);
++	DESC_IN_IN(header,
++			    auth_ctx->auth_info.CCM_ctx_info.block_size_bytes,
++				block_zeros, 0, NULL);
++#endif
+ #endif
+ 
+ 	if (auth_data_length > 0) {
+ 		ret = add_assoc_preamble(&desc_chain, user_ctx,
+-					 auth_ctx, auth_data, auth_data_length);
++					 auth_ctx, 1, auth_data, auth_data_length);
+ 		if (ret != FSL_RETURN_OK_S) {
+ 			goto out;
+ 		}
+ 	}
+ 	/* if auth_data_length > 0 */
+-	ret = process_payload(&desc_chain, user_ctx, 1,
+-			      payload_length, payload, ct);
++	/* Process the payload */
++	header = (SAH_HDR_SKHA_SET_MODE_ENC_DEC
++		  ^ sah_insert_skha_mode_ccm
++		  ^ sah_insert_skha_modulus_128 ^ sah_insert_skha_encrypt);
++#if defined (FSL_HAVE_SAHARA4) && !defined (USE_S2_CCM_ENCRYPT_CHAIN)
++	header ^= sah_insert_skha_aux0;
++#endif
++	DESC_IN_OUT(header, payload_length, payload, payload_length, ct);
+ 
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++#if defined (FSL_HAVE_SAHARA4) && !defined (USE_S2_CCM_ENCRYPT_CHAIN)
+ 
+ 	/* Pull out the CBC-MAC value. */
+-	ret = extract_mac(&desc_chain, user_ctx,
+-			  auth_ctx->mac_length, auth_ctx->unencrypted_mac);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++	
++	DESC_OUT_OUT(SAH_HDR_SKHA_READ_CONTEXT_IV, 0, NULL,
++				 auth_ctx->mac_length, auth_value);
++#else
++		/* Pull out the unencrypted CBC-MAC value. */
++	DESC_OUT_OUT(SAH_HDR_SKHA_READ_CONTEXT_IV,
++		0, NULL, auth_ctx->mac_length, auth_ctx->unencrypted_mac);
+ 
+ 	/* Now load CTR0 in, and encrypt the MAC */
+-	ret = encrypt_mac(&desc_chain, user_ctx, auth_ctx,
+-			  auth_ctx->unencrypted_mac, auth_value);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++	
++	header = SAH_HDR_SKHA_SET_MODE_IV_KEY
++			^ sah_insert_skha_encrypt
++			^ sah_insert_skha_mode_ctr ^ sah_insert_skha_modulus_128;
++		DESC_IN_IN(header,
++			   auth_ctx->cipher_ctx_info.block_size_bytes,
++			   auth_ctx->cipher_ctx_info.context, 0, NULL);
++	
++		header = SAH_HDR_SKHA_ENC_DEC;	/* Desc. #4 SKHA Enc/Dec */
++		DESC_IN_OUT(header,
++				auth_ctx->mac_length, auth_ctx->unencrypted_mac,
++					  auth_ctx->mac_length, auth_value);
++#endif
+ 
+ 	SAH_SF_EXECUTE();
+ 
+@@ -710,62 +778,77 @@ fsl_shw_return_t fsl_shw_auth_decrypt(fsl_shw_uco_t * user_ctx,
+ 				      uint8_t * payload)
+ {
+ 	SAH_SF_DCLS;
++#if defined(FSL_HAVE_SAHARA2) || defined(USE_S2_CCM_DECRYPT_CHAIN)
+ 	uint8_t *calced_auth = NULL;
+ 	unsigned blocking = user_ctx->flags & FSL_UCO_BLOCKING_MODE;
++#endif
+ 
+ 	SAH_SF_USER_CHECK();
+ 
+-	/* Only support INIT and FINALIZE flags right now. */
++	/* Only support CCM. */
+ 	if (auth_ctx->mode != FSL_ACC_MODE_CCM) {
+ 		ret = FSL_RETURN_BAD_MODE_S;
+ 		goto out;
+ 	}
++	
++	/* Only support INIT and FINALIZE flags right now. */
+ 	if ((auth_ctx->flags & (FSL_ACCO_CTX_INIT | FSL_ACCO_CTX_LOAD |
+ 				FSL_ACCO_CTX_SAVE | FSL_ACCO_CTX_FINALIZE))
+ 	    != (FSL_ACCO_CTX_INIT | FSL_ACCO_CTX_FINALIZE)) {
+ 		ret = FSL_RETURN_BAD_FLAG_S;
+ 		goto out;
+ 	}
+-	ret = load_ctr_key(&desc_chain, user_ctx, auth_ctx, cipher_key_info);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
++	/* Load CTR0 and Key */
++	header = SAH_HDR_SKHA_SET_MODE_IV_KEY
++	    ^ sah_insert_skha_mode_ctr ^ sah_insert_skha_modulus_128;
++#if defined (FSL_HAVE_SAHARA4) && !defined (USE_S2_CCM_DECRYPT_CHAIN)
++	header ^= sah_insert_skha_aux0;
++#endif
++	DESC_IN_KEY(header,
++		    auth_ctx->cipher_ctx_info.block_size_bytes,
++			auth_ctx->cipher_ctx_info.context, cipher_key_info);
++	
+ 	/* Decrypt the MAC which the user passed in */
+ 	header = SAH_HDR_SKHA_ENC_DEC;
+ 	DESC_IN_OUT(header,
+ 		    auth_ctx->mac_length, auth_value,
+ 		    auth_ctx->mac_length, auth_ctx->unencrypted_mac);
+-
++#if defined(FSL_HAVE_SAHARA2) || defined(USE_S2_CCM_DECRYPT_CHAIN)
+ #ifndef NO_ZERO_IV_LOAD
+-	ret = load_dummy_iv(&desc_chain, user_ctx, 1,
+-			    auth_ctx->auth_info.CCM_ctx_info.block_size_bytes);
++	header = (SAH_HDR_SKHA_SET_MODE_IV_KEY
++			  ^ sah_insert_skha_encrypt ^ sah_insert_skha_mode_cbc);
++	DESC_IN_IN(header,
++			    auth_ctx->auth_info.CCM_ctx_info.block_size_bytes,
++			    block_zeros, 0, NULL);
++#endif
+ #endif
+ 
+ 	if (auth_data_length > 0) {
+ 		ret = add_assoc_preamble(&desc_chain, user_ctx,
+-					 auth_ctx, auth_data, auth_data_length);
++					 auth_ctx, 0, auth_data, auth_data_length);
+ 		if (ret != FSL_RETURN_OK_S) {
+ 			goto out;
+ 		}
+ 	}
+ 	/* if auth_data_length > 0 */
+-	ret = process_payload(&desc_chain, user_ctx, 0,
+-			      payload_length, ct, payload);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++	
++	/* Process the payload */
++	header = (SAH_HDR_SKHA_SET_MODE_ENC_DEC
++		^ sah_insert_skha_mode_ccm ^ sah_insert_skha_modulus_128);
++#if defined (FSL_HAVE_SAHARA4) && !defined (USE_S2_CCM_DECRYPT_CHAIN)
++	header ^= sah_insert_skha_aux0;
++#endif
++	DESC_IN_OUT(header, payload_length, ct, payload_length, payload);
++	
++#if defined (FSL_HAVE_SAHARA2) || defined (USE_S2_CCM_DECRYPT_CHAIN)
+ 
+ 	/* Now pull CBC context (unencrypted MAC) out for comparison. */
+ 	/* Need to allocate a place for it, to handle non-blocking mode
+ 	 * when this stack frame will disappear!
+ 	 */
+ 	calced_auth = DESC_TEMP_ALLOC(auth_ctx->mac_length);
+-	ret = extract_mac(&desc_chain, user_ctx,
+-			  auth_ctx->mac_length, calced_auth);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++	header = SAH_HDR_SKHA_READ_CONTEXT_IV;
++	DESC_OUT_OUT(header, 0, NULL, auth_ctx->mac_length, calced_auth);
+ 
+ 	if (!blocking) {
+ 		/* get_results will need this for comparison */
+@@ -773,9 +856,12 @@ fsl_shw_return_t fsl_shw_auth_decrypt(fsl_shw_uco_t * user_ctx,
+ 		desc_chain->out2_ptr = auth_ctx->unencrypted_mac;
+ 		desc_chain->out_len = auth_ctx->mac_length;
+ 	}
++#endif
+ 
+ 	SAH_SF_EXECUTE();
+ 
++#if defined (FSL_HAVE_SAHARA2) || defined (USE_S2_CCM_DECRYPT_CHAIN)
++
+ 	if (blocking && (ret == FSL_RETURN_OK_S)) {
+ 		unsigned i;
+ 		/* Validate the auth code */
+@@ -787,10 +873,13 @@ fsl_shw_return_t fsl_shw_auth_decrypt(fsl_shw_uco_t * user_ctx,
+ 		}
+ 	}
+ 
+-      out:
++#endif
++out:
+ 	SAH_SF_DESC_CLEAN();
++#if defined (FSL_HAVE_SAHARA2) || defined (USE_S2_CCM_DECRYPT_CHAIN)
+ 	DESC_TEMP_FREE(calced_auth);
+-
++#endif
+ 	(void)auth_key_info;
+ 	return ret;
+ }				/* fsl_shw_gen_decrypt() */
++
+diff --git a/sahara2/fsl_shw_wrap.c b/sahara2/fsl_shw_wrap.c
+index fbc8117..b988bdb 100644
+--- a/sahara2/fsl_shw_wrap.c
++++ b/sahara2/fsl_shw_wrap.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright 2005-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -73,666 +73,837 @@
+ 
+ #include "sahara.h"
+ #include "fsl_platform.h"
+-
++#include "fsl_shw_keystore.h"
++ 
+ #include "sf_util.h"
+ #include "adaptor.h"
+-
++ 
+ #if defined(DIAG_SECURITY_FUNC)
+-#include <diagnostic.h>
++#include "diagnostic.h"
+ #endif
+-
++ 
+ #if defined(NEED_CTR_WORKAROUND)
+-/* CTR mode needs block-multiple data in/out */
++ /* CTR mode needs block-multiple data in/out */
+ #define LENGTH_PATCH  16
+ #define LENGTH_PATCH_MASK  0xF
+ #else
+ #define LENGTH_PATCH  4
+ #define LENGTH_PATCH_MASK  3
+ #endif
+-
++ 
+ #if LENGTH_PATCH
+ #define ROUND_LENGTH(len)                                                  \
+-({                                                                         \
+-    uint32_t orig_len = len;                                               \
+-    uint32_t new_len;                                                      \
+-                                                                           \
+-   if ((orig_len & LENGTH_PATCH_MASK) != 0) {                              \
+-       new_len = (orig_len + LENGTH_PATCH                                  \
+-            - (orig_len & LENGTH_PATCH_MASK));                             \
+-   }                                                                       \
+-   else {                                                                  \
+-       new_len = orig_len;                                                 \
+-   }                                                                       \
+-       new_len;                                                            \
+-})
++ ({ 																		\
++	 uint32_t orig_len = len;												\
++	 uint32_t new_len;														\
++																			\
++	if ((orig_len & LENGTH_PATCH_MASK) != 0) {								\
++		new_len = (orig_len + LENGTH_PATCH									\
++			 - (orig_len & LENGTH_PATCH_MASK)); 							\
++	}																		\
++	else {																	\
++		new_len = orig_len; 												\
++	}																		\
++		new_len;															\
++ })
+ #else
+ #define ROUND_LENGTH(len) (len)
+ #endif
+-
++ 
+ #ifdef __KERNEL__
+-EXPORT_SYMBOL(fsl_shw_establish_key);
+-EXPORT_SYMBOL(fsl_shw_extract_key);
+-EXPORT_SYMBOL(fsl_shw_release_key);
++ EXPORT_SYMBOL(fsl_shw_establish_key);
++ EXPORT_SYMBOL(fsl_shw_extract_key);
++ EXPORT_SYMBOL(fsl_shw_release_key);
+ #endif
+-
++ 
+ #define ICV_LENGTH 16
+ #define T_LENGTH 16
+ #define KEK_LENGTH 16
+ #define LENGTH_LENGTH 1
+ #define ALGORITHM_LENGTH 1
+-
+-/* ICV | T' | LEN | ALG | KEY' */
++ 
++ /* ICV | T' | LEN | ALG | KEY' */
+ #define ICV_OFFSET       0
+ #define T_PRIME_OFFSET   (ICV_OFFSET + ICV_LENGTH)
+ #define LENGTH_OFFSET    (T_PRIME_OFFSET + T_LENGTH)
+ #define ALGORITHM_OFFSET (LENGTH_OFFSET + LENGTH_LENGTH)
+ #define KEY_PRIME_OFFSET (ALGORITHM_OFFSET + ALGORITHM_LENGTH)
+-
+-/*
+- * For testing of the algorithm implementation,, the DO_REPEATABLE_WRAP flag
+- * causes the T_block to go into the T field during a wrap operation.  This
+- * will make the black key value repeatable (for a given SCC secret key, or
+- * always if the default key is in use).
+- *
+- * Normally, a random sequence is used.
+- */
++ 
++ /*
++  * For testing of the algorithm implementation,, the DO_REPEATABLE_WRAP flag
++  * causes the T_block to go into the T field during a wrap operation.	This
++  * will make the black key value repeatable (for a given SCC secret key, or
++  * always if the default key is in use).
++  *
++  * Normally, a random sequence is used.
++  */
+ #ifdef DO_REPEATABLE_WRAP
+-/*!
+- * Block of zeroes which is maximum Symmetric block size, used for
+- * initializing context register, etc.
+- */
+-static uint8_t T_block_[16] = {
+-	0x42, 0, 0, 0x42, 0x42, 0, 0, 0x42,
+-	0x42, 0, 0, 0x42, 0x42, 0, 0, 0x42
+-};
++ /*!
++  * Block of zeroes which is maximum Symmetric block size, used for
++  * initializing context register, etc.
++  */
++ static uint8_t T_block_[16] = {
++	 0x42, 0, 0, 0x42, 0x42, 0, 0, 0x42,
++	 0x42, 0, 0, 0x42, 0x42, 0, 0, 0x42
++ };
+ #endif
+-
+-/*
+- * Insert descriptors to calculate ICV = HMAC(key=T, data=LEN|ALG|KEY')
+- *
+- * @param  user_ctx      User's context for this operation
+- * @param  desc_chain    Descriptor chain to append to
+- * @param  t_key_info    T's key object
+- * @param  black_key     Beginning of Black Key region
+- * @param  key_length    Number of bytes of key' there are in @c black_key
+- * @param[out] hmac      Location to store ICV.  Will be tagged "USES" so
+- *                       sf routines will not try to free it.
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-static inline fsl_shw_return_t create_icv_calc(fsl_shw_uco_t * user_ctx,
+-					       sah_Head_Desc ** desc_chain,
+-					       fsl_shw_sko_t * t_key_info,
+-					       const uint8_t * black_key,
+-					       uint32_t key_length,
+-					       uint8_t * hmac)
+-{
+-	fsl_shw_return_t sah_code;
+-	uint32_t header;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
+-
+-	/* Load up T as key for the HMAC */
+-	header = (SAH_HDR_MDHA_SET_MODE_MD_KEY	/* #6 */
+-		  ^ sah_insert_mdha_algorithm_sha1
+-		  ^ sah_insert_mdha_init ^ sah_insert_mdha_hmac ^
+-		  sah_insert_mdha_pdata ^ sah_insert_mdha_mac_full);
+-	sah_code = sah_add_in_key_desc(header, NULL, 0, t_key_info,	/* Reference T in RED */
+-				       user_ctx->mem_util, desc_chain);
+-	if (sah_code != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	/* Previous step loaded key; Now set up to hash the data */
+-	header = SAH_HDR_MDHA_HASH;	/* #10 */
+-
+-	/* Input - start with ownerid */
+-	sah_code = sah_Create_Link(user_ctx->mem_util, &link1,
+-				   (void *)&t_key_info->userid,
+-				   sizeof(t_key_info->userid),
+-				   SAH_USES_LINK_DATA);
+-	if (sah_code != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	/* Still input  - Append black-key fields len, alg, key' */
+-	sah_code = sah_Append_Link(user_ctx->mem_util, link1,
+-				   (void *)black_key + LENGTH_OFFSET,
+-				   (LENGTH_LENGTH
+-				    + ALGORITHM_LENGTH
+-				    + key_length), SAH_USES_LINK_DATA);
+-
+-	if (sah_code != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-	/* Output - computed ICV/HMAC */
+-	sah_code = sah_Create_Link(user_ctx->mem_util, &link2,
+-				   hmac, ICV_LENGTH,
+-				   SAH_USES_LINK_DATA | SAH_OUTPUT_LINK);
+-	if (sah_code != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	sah_code = sah_Append_Desc(user_ctx->mem_util, desc_chain,
+-				   header, link1, link2);
+-
+-      out:
+-	if (sah_code != FSL_RETURN_OK_S) {
+-		(void)sah_Destroy_Link(user_ctx->mem_util, link1);
+-		(void)sah_Destroy_Link(user_ctx->mem_util, link2);
+-	}
+-
+-	return sah_code;
+-}				/* create_icv_calc */
+-
+-/*!
+- * Perform unwrapping of a black key into a RED slot
+- *
+- * @param         user_ctx      A user context from #fsl_shw_register_user().
+- * @param[in,out] key_info      The information about the key to be which will
+- *                              be unwrapped... key length, slot info, etc.
+- * @param         black_key     Encrypted key
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-static fsl_shw_return_t unwrap(fsl_shw_uco_t * user_ctx,
+-			       fsl_shw_sko_t * key_info,
+-			       const uint8_t * black_key)
+-{
+-	SAH_SF_DCLS;
+-	uint8_t *hmac = NULL;
+-	fsl_shw_sko_t t_key_info;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
+-	unsigned i;
+-	unsigned rounded_key_length;
+-	unsigned original_key_length = key_info->key_length;
+-
+-	hmac = DESC_TEMP_ALLOC(ICV_LENGTH);
+-
+-	/* Set up key_info for "T" - use same slot as eventual key */
+-	fsl_shw_sko_init(&t_key_info, FSL_KEY_ALG_AES);
+-	t_key_info.userid = key_info->userid;
+-	t_key_info.handle = key_info->handle;
+-	t_key_info.flags = key_info->flags;
+-	t_key_info.key_length = T_LENGTH;
+-
+-	/* Compute T = SLID_decrypt(T'); leave in RED slot */
+-	ret = do_scc_slot_decrypt(user_ctx, key_info->userid,
+-				  t_key_info.handle,
+-				  T_LENGTH, black_key + T_PRIME_OFFSET);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	/* Compute ICV = HMAC(T, ownerid | len | alg | key' */
+-	ret = create_icv_calc(user_ctx, &desc_chain, &t_key_info,
+-			      black_key, original_key_length, hmac);
+-	if (ret != FSL_RETURN_OK_S) {
++ 
++ /*
++  * Insert descriptors to calculate ICV = HMAC(key=T, data=LEN|ALG|KEY')
++  *
++  * @param	user_ctx	  User's context for this operation
++  * @param	desc_chain	  Descriptor chain to append to
++  * @param	t_key_info	  T's key object
++  * @param	black_key	  Beginning of Black Key region
++  * @param	key_length	  Number of bytes of key' there are in @c black_key
++  * @param[out] hmac	  Location to store ICV.  Will be tagged "USES" so
++  * 					  sf routines will not try to free it.
++  *
++  * @return    A return code of type #fsl_shw_return_t.
++  */
++ static inline fsl_shw_return_t create_icv_calc(fsl_shw_uco_t * user_ctx,
++							sah_Head_Desc ** desc_chain,
++							fsl_shw_sko_t * t_key_info,
++							const uint8_t * black_key,
++							uint32_t key_length,
++							uint8_t * hmac)
++ {
++	 fsl_shw_return_t sah_code;
++	 uint32_t header;
++	 sah_Link *link1 = NULL;
++	 sah_Link *link2 = NULL;
++ 
++	 /* Load up T as key for the HMAC */
++	 header = (SAH_HDR_MDHA_SET_MODE_MD_KEY  /* #6 */
++		   ^ sah_insert_mdha_algorithm_sha1
++		   ^ sah_insert_mdha_init ^ sah_insert_mdha_hmac ^
++		   sah_insert_mdha_pdata ^ sah_insert_mdha_mac_full);
++	 sah_code = sah_add_in_key_desc(header, NULL, 0, t_key_info, /* Reference T in RED */
++						user_ctx->mem_util, desc_chain);
++	 if (sah_code != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Previous step loaded key; Now set up to hash the data */
++	 header = SAH_HDR_MDHA_HASH; /* #10 */
++ 
++	 /* Input - start with ownerid */
++	 sah_code = sah_Create_Link(user_ctx->mem_util, &link1,
++					(void *)&t_key_info->userid,
++					sizeof(t_key_info->userid),
++					SAH_USES_LINK_DATA);
++	 if (sah_code != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Still input  - Append black-key fields len, alg, key' */
++	 sah_code = sah_Append_Link(user_ctx->mem_util, link1,
++					(void *)black_key + LENGTH_OFFSET,
++					(LENGTH_LENGTH
++					 + ALGORITHM_LENGTH
++					 + key_length), SAH_USES_LINK_DATA);
++ 
++	 if (sah_code != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++	 /* Output - computed ICV/HMAC */
++	 sah_code = sah_Create_Link(user_ctx->mem_util, &link2,
++					hmac, ICV_LENGTH,
++					SAH_USES_LINK_DATA | SAH_OUTPUT_LINK);
++	 if (sah_code != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 sah_code = sah_Append_Desc(user_ctx->mem_util, desc_chain,
++					header, link1, link2);
++ 
++	   out:
++	 if (sah_code != FSL_RETURN_OK_S) {
++		 (void)sah_Destroy_Link(user_ctx->mem_util, link1);
++		 (void)sah_Destroy_Link(user_ctx->mem_util, link2);
++	 }
++ 
++	 return sah_code;
++ }				 /* create_icv_calc */
++ 
++ /*!
++  * Perform unwrapping of a black key into a RED slot
++  *
++  * @param		   user_ctx 	 A user context from #fsl_shw_register_user().
++  * @param[in,out] key_info 	 The information about the key to be which will
++  * 							 be unwrapped... key length, slot info, etc.
++  * @param		   black_key	 Encrypted key
++  *
++  * @return    A return code of type #fsl_shw_return_t.
++  */
++ static fsl_shw_return_t unwrap(fsl_shw_uco_t * user_ctx,
++					fsl_shw_sko_t * key_info,
++					const uint8_t * black_key)
++ {
++	 SAH_SF_DCLS;
++	 uint8_t *hmac = NULL;
++	 fsl_shw_sko_t t_key_info;
++	 sah_Link *link1 = NULL;
++	 sah_Link *link2 = NULL;
++	 unsigned i;
++	 unsigned rounded_key_length;
++	 unsigned original_key_length = key_info->key_length;
++ 
++	 hmac = DESC_TEMP_ALLOC(ICV_LENGTH);
++ 
++	 /* Set up key_info for "T" - use same slot as eventual key */
++	 fsl_shw_sko_init(&t_key_info, FSL_KEY_ALG_AES);
++	 t_key_info.userid = key_info->userid;
++	 t_key_info.handle = key_info->handle;
++	 t_key_info.flags = key_info->flags;
++	 t_key_info.key_length = T_LENGTH;
++	 t_key_info.keystore = key_info->keystore;
++ 
++	 /* Compute T = SLID_decrypt(T'); leave in RED slot */
++	 if (key_info->keystore == NULL) {
++		 /* Key goes in system keystore */
++		 ret = do_system_keystore_slot_decrypt(user_ctx,
++					 key_info->userid,
++					 t_key_info.handle,
++					 T_LENGTH, black_key + T_PRIME_OFFSET);
++	 
++	 } else {
++			 /* Key goes in user keystore */
++			 ret = keystore_slot_decrypt(user_ctx,
++							 key_info->keystore,
++							 key_info->userid,
++							 t_key_info.handle,
++							 T_LENGTH,
++							 black_key + T_PRIME_OFFSET);
++	 }
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Compute ICV = HMAC(T, ownerid | len | alg | key' */
++	 ret = create_icv_calc(user_ctx, &desc_chain, &t_key_info,
++				   black_key, original_key_length, hmac);
++	 if (ret != FSL_RETURN_OK_S) {
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("Creation of sah_Key_Link failed due to bad key"
+-			 " flag!\n");
++		 LOG_DIAG("Creation of sah_Key_Link failed due to bad key"
++			  " flag!\n");
+ #endif				/*DIAG_SECURITY_FUNC */
+-		goto out;
+-	}
++		 goto out;
++	 }
+ #ifdef DIAG_SECURITY_FUNC
+-	LOG_DIAG("Validating MAC of wrapped key");
++	 LOG_DIAG("Validating MAC of wrapped key");
+ #endif
+-	SAH_SF_EXECUTE();
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-	SAH_SF_DESC_CLEAN();
+-
+-	/* Check computed ICV against value in Black Key */
+-	for (i = 0; i < ICV_LENGTH; i++) {
+-		if (black_key[ICV_OFFSET + i] != hmac[i]) {
+-			ret = FSL_RETURN_AUTH_FAILED_S;
+-			goto out;
+-		}
+-	}
+-
+-	/* This is no longer needed. */
+-	DESC_TEMP_FREE(hmac);
+-
+-	/* Compute KEK = SHA1(T | ownerid).  Rewrite slot with value */
+-	header = (SAH_HDR_MDHA_SET_MODE_HASH	/* #8 */
+-		  ^ sah_insert_mdha_init
+-		  ^ sah_insert_mdha_algorithm_sha1 ^ sah_insert_mdha_pdata);
+-
+-	/* Input - Start with T */
+-	ret = sah_Create_Key_Link(user_ctx->mem_util, &link1, &t_key_info);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	/* Still input - append ownerid */
+-	ret = sah_Append_Link(user_ctx->mem_util, link1,
+-			      (void *)&key_info->userid,
+-			      sizeof(key_info->userid), SAH_USES_LINK_DATA);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	/* Output - KEK goes into RED slot */
+-	ret = sah_Create_Key_Link(user_ctx->mem_util, &link2, &t_key_info);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	/* Put the Hash calculation into the chain. */
+-	ret = sah_Append_Desc(user_ctx->mem_util, &desc_chain,
+-			      header, link1, link2);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	/* Compute KEY = AES-decrypt(KEK, KEY') */
+-	header = (SAH_HDR_SKHA_SET_MODE_IV_KEY	/* #1 */
+-		  ^ sah_insert_skha_mode_ctr
+-		  ^ sah_insert_skha_algorithm_aes
+-		  ^ sah_insert_skha_modulus_128);
+-	/* Load KEK in as the key to use */
+-	DESC_IN_KEY(header, 0, NULL, &t_key_info);
+-
+-	rounded_key_length = ROUND_LENGTH(original_key_length);
+-	key_info->key_length = rounded_key_length;
+-
+-	/* Now set up for computation.  Result in RED */
+-	header = SAH_HDR_SKHA_ENC_DEC;	/* #4 */
+-	DESC_IN_KEY(header, rounded_key_length, black_key + KEY_PRIME_OFFSET,
+-		    key_info);
+-
+-	/* Perform the operation */
++	 SAH_SF_EXECUTE();
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++	 SAH_SF_DESC_CLEAN();
++ 
++	 /* Check computed ICV against value in Black Key */
++	 for (i = 0; i < ICV_LENGTH; i++) {
++		 if (black_key[ICV_OFFSET + i] != hmac[i]) {
+ #ifdef DIAG_SECURITY_FUNC
+-	LOG_DIAG("Decrypting key with KEK");
++			 LOG_DIAG_ARGS("computed ICV fails at offset %i\n", i);
++ 
++			 {
++				 char buff[300];
++				 int a;
++				 for (a = 0; a < ICV_LENGTH; a++)
++					 sprintf(&(buff[a * 2]), "%02x",
++						 black_key[ICV_OFFSET + a]);
++				 buff[a * 2 + 1] = 0;
++				 LOG_DIAG_ARGS("black key: %s", buff);
++ 
++				 for (a = 0; a < ICV_LENGTH; a++)
++					 sprintf(&(buff[a * 2]), "%02x",
++						 hmac[a]);
++				 buff[a * 2 + 1] = 0;
++				 LOG_DIAG_ARGS("hmac:	   %s", buff);
++			 }
+ #endif
+-	SAH_SF_EXECUTE();
+-
+-      out:
+-	key_info->key_length = original_key_length;
+-	SAH_SF_DESC_CLEAN();
+-
+-	DESC_TEMP_FREE(hmac);
+-
+-	/* Erase tracks */
+-	t_key_info.userid = 0xdeadbeef;
+-	t_key_info.handle = 0xdeadbeef;
+-
+-	return ret;
+-}				/* unwrap */
+-
+-/*!
+- * Perform wrapping of a black key from a RED slot
+- *
+- * @param      user_ctx         A user context from #fsl_shw_register_user().
+- * @param[in,out] key_info      The information about the key to be which will
+- *                              be wrapped... key length, slot info, etc.
+- * @param      black_key        Place to store encrypted key
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-static fsl_shw_return_t wrap(fsl_shw_uco_t * user_ctx,
+-			     fsl_shw_sko_t * key_info, uint8_t * black_key)
+-{
+-	SAH_SF_DCLS;
+-	unsigned slots_allocated = 0;	/* boolean */
+-	fsl_shw_sko_t T_key_info;	/* for holding T */
+-	fsl_shw_sko_t KEK_key_info;	/* for holding KEK */
+-	unsigned original_key_length = key_info->key_length;
+-	unsigned rounded_key_length;
+-	sah_Link *link1;
+-	sah_Link *link2;
+-
+-	black_key[LENGTH_OFFSET] = key_info->key_length;
+-	black_key[ALGORITHM_OFFSET] = key_info->algorithm;
+-
+-	memcpy(&T_key_info, key_info, sizeof(T_key_info));
+-	fsl_shw_sko_set_key_length(&T_key_info, T_LENGTH);
+-	T_key_info.algorithm = FSL_KEY_ALG_HMAC;
+-
+-	memcpy(&KEK_key_info, &T_key_info, sizeof(KEK_key_info));
+-	KEK_key_info.algorithm = FSL_KEY_ALG_AES;
+-
+-	ret = do_scc_slot_alloc(user_ctx, T_LENGTH, key_info->userid,
+-				&T_key_info.handle);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-
+-	ret = do_scc_slot_alloc(user_ctx, KEK_LENGTH, key_info->userid,
+-				&KEK_key_info.handle);
+-	if (ret != FSL_RETURN_OK_S) {
++			 ret = FSL_RETURN_AUTH_FAILED_S;
++			 goto out;
++		 }
++	 }
++ 
++	 /* This is no longer needed. */
++	 DESC_TEMP_FREE(hmac);
++ 
++	 /* Compute KEK = SHA1(T | ownerid).  Rewrite slot with value */
++	 header = (SAH_HDR_MDHA_SET_MODE_HASH	 /* #8 */
++		   ^ sah_insert_mdha_init
++		   ^ sah_insert_mdha_algorithm_sha1 ^ sah_insert_mdha_pdata);
++ 
++	 /* Input - Start with T */
++	 ret = sah_Create_Key_Link(user_ctx->mem_util, &link1, &t_key_info);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Still input - append ownerid */
++	 ret = sah_Append_Link(user_ctx->mem_util, link1,
++				   (void *)&key_info->userid,
++				   sizeof(key_info->userid), SAH_USES_LINK_DATA);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Output - KEK goes into RED slot */
++	 ret = sah_Create_Key_Link(user_ctx->mem_util, &link2, &t_key_info);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Put the Hash calculation into the chain. */
++	 ret = sah_Append_Desc(user_ctx->mem_util, &desc_chain,
++				   header, link1, link2);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Compute KEY = AES-decrypt(KEK, KEY') */
++	 header = (SAH_HDR_SKHA_SET_MODE_IV_KEY  /* #1 */
++		   ^ sah_insert_skha_mode_ctr
++		   ^ sah_insert_skha_algorithm_aes
++		   ^ sah_insert_skha_modulus_128);
++	 /* Load KEK in as the key to use */
++	 DESC_IN_KEY(header, 0, NULL, &t_key_info);
++ 
++	 rounded_key_length = ROUND_LENGTH(original_key_length);
++	 key_info->key_length = rounded_key_length;
++ 
++	 /* Now set up for computation.  Result in RED */
++	 header = SAH_HDR_SKHA_ENC_DEC;  /* #4 */
++	 DESC_IN_KEY(header, rounded_key_length, black_key + KEY_PRIME_OFFSET,
++			 key_info);
++ 
++	 /* Perform the operation */
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("do_scc_slot_alloc() failed");
++	 LOG_DIAG("Decrypting key with KEK");
+ #endif
+-		(void)do_scc_slot_dealloc(user_ctx, key_info->userid,
+-					  T_key_info.handle);
+-	} else {
+-		slots_allocated = 1;
+-	}
+-
+-	/* Set up to compute everything except T' ... */
++	 SAH_SF_EXECUTE();
++ 
++	   out:
++	 key_info->key_length = original_key_length;
++	 SAH_SF_DESC_CLEAN();
++ 
++	 DESC_TEMP_FREE(hmac);
++ 
++	 /* Erase tracks */
++	 t_key_info.userid = 0xdeadbeef;
++	 t_key_info.handle = 0xdeadbeef;
++ 
++	 return ret;
++ }				 /* unwrap */
++ 
++ /*!
++  * Perform wrapping of a black key from a RED slot
++  *
++  * @param		user_ctx		 A user context from #fsl_shw_register_user().
++  * @param[in,out] key_info 	 The information about the key to be which will
++  * 							 be wrapped... key length, slot info, etc.
++  * @param		black_key		 Place to store encrypted key
++  *
++  * @return    A return code of type #fsl_shw_return_t.
++  */
++ static fsl_shw_return_t wrap(fsl_shw_uco_t * user_ctx,
++				  fsl_shw_sko_t * key_info, uint8_t * black_key)
++ {
++	 SAH_SF_DCLS;
++	 unsigned slots_allocated = 0;	 /* boolean */
++	 fsl_shw_sko_t T_key_info;	 /* for holding T */
++	 fsl_shw_sko_t KEK_key_info; /* for holding KEK */
++	 unsigned original_key_length = key_info->key_length;
++	 unsigned rounded_key_length;
++	 sah_Link *link1;
++	 sah_Link *link2;
++ 
++	 black_key[LENGTH_OFFSET] = key_info->key_length;
++	 black_key[ALGORITHM_OFFSET] = key_info->algorithm;
++ 
++	 memcpy(&T_key_info, key_info, sizeof(T_key_info));
++	 fsl_shw_sko_set_key_length(&T_key_info, T_LENGTH);
++	 T_key_info.algorithm = FSL_KEY_ALG_HMAC;
++ 
++	 memcpy(&KEK_key_info, &T_key_info, sizeof(KEK_key_info));
++	 KEK_key_info.algorithm = FSL_KEY_ALG_AES;
++ 
++	 if (key_info->keystore == NULL) {
++		 /* Key goes in system keystore */
++		 ret = do_system_keystore_slot_alloc(user_ctx,
++				 T_LENGTH, key_info->userid,
++				 &T_key_info.handle);
++	 
++	 } else {
++		 /* Key goes in user keystore */
++		 ret = keystore_slot_alloc(key_info->keystore,
++				   T_LENGTH,
++				   key_info->userid, &T_key_info.handle);
++	 }
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 if (key_info->keystore == NULL) {
++		 /* Key goes in system keystore */
++		 ret = do_system_keystore_slot_alloc(user_ctx,
++				 KEK_LENGTH, key_info->userid,
++				 &KEK_key_info.handle);
++		 
++	 } else {
++		 /* Key goes in user keystore */
++		 ret = keystore_slot_alloc(key_info->keystore,
++			   KEK_LENGTH,	key_info->userid,
++			   &KEK_key_info.handle);
++	 }
++ 
++	 if (ret != FSL_RETURN_OK_S) {
++#ifdef DIAG_SECURITY_FUNC
++		 LOG_DIAG("do_scc_slot_alloc() failed");
++#endif
++		 if (key_info->keystore == NULL) {
++			 /* Key goes in system keystore */
++			 ret = do_system_keystore_slot_dealloc(user_ctx,
++				 key_info->userid, T_key_info.handle);
++	 
++		 } else {
++			 /* Key goes in user keystore */
++			 ret = keystore_slot_dealloc(key_info->keystore,
++					 key_info->userid, T_key_info.handle);
++		 }
++	 } else {
++		 slots_allocated = 1;
++	 }
++ 
++	 /* Set up to compute everything except T' ... */
+ #ifndef DO_REPEATABLE_WRAP
+-	/* Compute T = RND() */
+-	header = SAH_HDR_RNG_GENERATE;	/* Desc. #18 */
+-	DESC_KEY_OUT(header, &T_key_info, 0, NULL);
++	 /* Compute T = RND() */
++	 header = SAH_HDR_RNG_GENERATE;  /* Desc. #18 */
++	 DESC_KEY_OUT(header, &T_key_info, 0, NULL);
+ #else
+-	ret = do_scc_slot_load_slot(user_ctx, T_key_info.userid,
+-				    T_key_info.handle, T_block,
+-				    T_key_info.key_length);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++	 if (key_info->keystore == NULL) {
++		 /* Key goes in system keystore */
++		 ret = do_system_keystore_load_slot(user_ctx,
++				T_key_info.userid,
++				T_key_info.handle, T_block,
++				T_key_info.key_length);
++	 } else {
++		 /* Key goes in user keystore */
++		 ret = keystore_load_slot(key_info->keystore,
++				  T_key_info.userid,
++				  T_key_info.handle,
++				  T_block, T_key_info.key_length);
++	 }
++ 
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
+ #endif
+-
+-	/* Compute KEK = SHA1(T | Ownerid) */
+-	header = (SAH_HDR_MDHA_SET_MODE_HASH	/* #8 */
+-		  ^ sah_insert_mdha_init
+-		  ^ sah_insert_mdha_algorithm[FSL_HASH_ALG_SHA1]
+-		  ^ sah_insert_mdha_pdata);
+-	/* Input - Start with T */
+-	ret = sah_Create_Key_Link(user_ctx->mem_util, &link1, &T_key_info);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-	/* Still input - append ownerid */
+-	ret = sah_Append_Link(user_ctx->mem_util, link1,
+-			      (void *)&key_info->userid,
+-			      sizeof(key_info->userid), SAH_USES_LINK_DATA);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-	/* Output - KEK goes into RED slot */
+-	ret = sah_Create_Key_Link(user_ctx->mem_util, &link2, &KEK_key_info);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-	/* Put the Hash calculation into the chain. */
+-	ret = sah_Append_Desc(user_ctx->mem_util, &desc_chain,
+-			      header, link1, link2);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++ 
++	 /* Compute KEK = SHA1(T | Ownerid) */
++	 header = (SAH_HDR_MDHA_SET_MODE_HASH	 /* #8 */
++		   ^ sah_insert_mdha_init
++		   ^ sah_insert_mdha_algorithm[FSL_HASH_ALG_SHA1]
++		   ^ sah_insert_mdha_pdata);
++	 /* Input - Start with T */
++	 ret = sah_Create_Key_Link(user_ctx->mem_util, &link1, &T_key_info);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++	 /* Still input - append ownerid */
++	 ret = sah_Append_Link(user_ctx->mem_util, link1,
++				   (void *)&key_info->userid,
++				   sizeof(key_info->userid), SAH_USES_LINK_DATA);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++	 /* Output - KEK goes into RED slot */
++	 ret = sah_Create_Key_Link(user_ctx->mem_util, &link2, &KEK_key_info);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++	 /* Put the Hash calculation into the chain. */
++	 ret = sah_Append_Desc(user_ctx->mem_util, &desc_chain,
++				   header, link1, link2);
++	 if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
+ #if defined(NEED_CTR_WORKAROUND)
+-	rounded_key_length = ROUND_LENGTH(original_key_length);
+-	key_info->key_length = rounded_key_length;
++	 rounded_key_length = ROUND_LENGTH(original_key_length);
++	 key_info->key_length = rounded_key_length;
+ #else
+-	rounded_key_length = original_key_length;
++	 rounded_key_length = original_key_length;
+ #endif
+-	/* Compute KEY' = AES-encrypt(KEK, KEY) */
+-	header = (SAH_HDR_SKHA_SET_MODE_IV_KEY	/* #1 */
+-		  ^ sah_insert_skha_mode[FSL_SYM_MODE_CTR]
+-		  ^ sah_insert_skha_algorithm[FSL_KEY_ALG_AES]
+-		  ^ sah_insert_skha_modulus[FSL_CTR_MOD_128]);
+-	/* Set up KEK as key to use */
+-	DESC_IN_KEY(header, 0, NULL, &KEK_key_info);
+-	header = SAH_HDR_SKHA_ENC_DEC;
+-	DESC_KEY_OUT(header, key_info,
+-		     key_info->key_length, black_key + KEY_PRIME_OFFSET);
+-
+-	/* Compute and store ICV into Black Key */
+-	ret = create_icv_calc(user_ctx, &desc_chain, &T_key_info,
+-			      black_key, original_key_length,
+-			      black_key + ICV_OFFSET);
+-	if (ret != FSL_RETURN_OK_S) {
++	 /* Compute KEY' = AES-encrypt(KEK, KEY) */
++	 header = (SAH_HDR_SKHA_SET_MODE_IV_KEY  /* #1 */
++		   ^ sah_insert_skha_mode[FSL_SYM_MODE_CTR]
++		   ^ sah_insert_skha_algorithm[FSL_KEY_ALG_AES]
++		   ^ sah_insert_skha_modulus[FSL_CTR_MOD_128]);
++	 /* Set up KEK as key to use */
++	 DESC_IN_KEY(header, 0, NULL, &KEK_key_info);
++	 header = SAH_HDR_SKHA_ENC_DEC;
++	 DESC_KEY_OUT(header, key_info,
++			  key_info->key_length, black_key + KEY_PRIME_OFFSET);
++ 
++	 /* Compute and store ICV into Black Key */
++	 ret = create_icv_calc(user_ctx, &desc_chain, &T_key_info,
++				   black_key, original_key_length,
++				   black_key + ICV_OFFSET);
++	 if (ret != FSL_RETURN_OK_S) {
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("Creation of sah_Key_Link failed due to bad key"
+-			 " flag!\n");
++		 LOG_DIAG("Creation of sah_Key_Link failed due to bad key"
++			  " flag!\n");
+ #endif				/*DIAG_SECURITY_FUNC */
+-		goto out;
+-	}
+-
+-	/* Now get Sahara to do the work. */
++		 goto out;
++	 }
++ 
++	 /* Now get Sahara to do the work. */
+ #ifdef DIAG_SECURITY_FUNC
+-	LOG_DIAG("Encrypting key with KEK");
++	 LOG_DIAG("Encrypting key with KEK");
+ #endif
+-	SAH_SF_EXECUTE();
+-	if (ret != FSL_RETURN_OK_S) {
++	 SAH_SF_EXECUTE();
++	 if (ret != FSL_RETURN_OK_S) {
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("sah_Descriptor_Chain_Execute() failed");
++		 LOG_DIAG("sah_Descriptor_Chain_Execute() failed");
+ #endif
+-		goto out;
+-	}
+-
+-	/* Compute T' = SLID_encrypt(T); Result goes to Black Key */
+-	ret = do_scc_slot_encrypt(user_ctx, T_key_info.userid,
+-				  T_key_info.handle,
+-				  T_LENGTH, black_key + T_PRIME_OFFSET);
+-	if (ret != FSL_RETURN_OK_S) {
++		 goto out;
++	 }
++ 
++	 /* Compute T' = SLID_encrypt(T); Result goes to Black Key */
++	 if (key_info->keystore == NULL) {
++		 /* Key goes in system keystore */
++		 ret = do_system_keystore_slot_encrypt(user_ctx,
++					 T_key_info.userid,  T_key_info.handle,
++					 T_LENGTH, black_key + T_PRIME_OFFSET);
++	 } else {
++		 /* Key goes in user keystore */
++		 ret = keystore_slot_encrypt(user_ctx,
++						 key_info->keystore,
++						 T_key_info.userid,
++						 T_key_info.handle,
++						 T_LENGTH,
++						 black_key + T_PRIME_OFFSET);
++	 }
++ 
++	 if (ret != FSL_RETURN_OK_S) {
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("do_scc_slot_encrypt() failed");
++		 LOG_DIAG("do_scc_slot_encrypt() failed");
+ #endif
+-		goto out;
+-	}
+-
+-      out:
+-	key_info->key_length = original_key_length;
+-
+-	SAH_SF_DESC_CLEAN();
+-	if (slots_allocated) {
+-		do_scc_slot_dealloc(user_ctx, key_info->userid,
+-				    T_key_info.handle);
+-		do_scc_slot_dealloc(user_ctx, key_info->userid,
+-				    KEK_key_info.handle);
+-	}
+-
+-	return ret;
+-}				/* wrap */
+-
+-/*!
+- * Place a key into a protected location for use only by cryptographic
+- * algorithms.
+- *
+- * This only needs to be used to a) unwrap a key, or b) set up a key which
+- * could be wrapped with a later call to #fsl_shw_extract_key().  Normal
+- * cleartext keys can simply be placed into #fsl_shw_sko_t key objects with
+- * #fsl_shw_sko_set_key() and used directly.
+- *
+- * The maximum key size supported for wrapped/unwrapped keys is 32 octets.
+- * (This is the maximum reasonable key length on Sahara - 32 octets for an HMAC
+- * key based on SHA-256.)  The key size is determined by the @a key_info.  The
+- * expected length of @a key can be determined by
+- * #fsl_shw_sko_calculate_wrapped_size()
+- *
+- * The protected key will not be available for use until this operation
+- * successfully completes.
+- *
+- * This feature is not available for all platforms, nor for all algorithms and
+- * modes.
+- *
+- * @param      user_ctx         A user context from #fsl_shw_register_user().
+- * @param[in,out] key_info      The information about the key to be which will
+- *                              be established.  In the create case, the key
+- *                              length must be set.
+- * @param      establish_type   How @a key will be interpreted to establish a
+- *                              key for use.
+- * @param key                   If @a establish_type is #FSL_KEY_WRAP_UNWRAP,
+- *                              this is the location of a wrapped key.  If
+- *                              @a establish_type is #FSL_KEY_WRAP_CREATE, this
+- *                              parameter can be @a NULL.  If @a establish_type
+- *                              is #FSL_KEY_WRAP_ACCEPT, this is the location
+- *                              of a plaintext key.
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t fsl_shw_establish_key(fsl_shw_uco_t * user_ctx,
+-				       fsl_shw_sko_t * key_info,
+-				       fsl_shw_key_wrap_t establish_type,
+-				       const uint8_t * key)
+-{
+-	SAH_SF_DCLS;
+-	unsigned original_key_length = key_info->key_length;
+-	unsigned rounded_key_length;
+-	unsigned slot_allocated = 0;
+-	uint32_t old_flags;
+-
+-	header = SAH_HDR_RNG_GENERATE;	/* Desc. #18 for rand */
+-
+-	/* THIS STILL NEEDS TO BE REFACTORED */
+-
+-	/* Write operations into SCC memory require word-multiple number of
+-	 * bytes.  For ACCEPT and CREATE functions, the key length may need
+-	 * to be rounded up.  Calculate. */
+-	if (LENGTH_PATCH && (original_key_length & LENGTH_PATCH_MASK) != 0) {
+-		rounded_key_length = original_key_length + LENGTH_PATCH
+-		    - (original_key_length & LENGTH_PATCH_MASK);
+-	} else {
+-		rounded_key_length = original_key_length;
+-	}
+-
+-	SAH_SF_USER_CHECK();
+-	ret =
+-	    do_scc_slot_alloc(user_ctx, key_info->key_length, key_info->userid,
+-			      &key_info->handle);
+-	if (ret != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
+-	slot_allocated = 1;
+-
+-	key_info->flags |= FSL_SKO_KEY_ESTABLISHED;
+-	switch (establish_type) {
+-	case FSL_KEY_WRAP_CREATE:
+-		/* Use safe version of key length */
+-		key_info->key_length = rounded_key_length;
+-		/* Generate descriptor to put random value into */
+-		DESC_KEY_OUT(header, key_info, 0, NULL);
+-		/* Restore actual, desired key length */
+-		key_info->key_length = original_key_length;
+-
+-		old_flags = user_ctx->flags;
+-		/* Now put random value into key */
++		 goto out;
++	 }
++ 
++	   out:
++	 key_info->key_length = original_key_length;
++ 
++	 SAH_SF_DESC_CLEAN();
++	 if (slots_allocated) {
++		 if (key_info->keystore == NULL) {
++			 /* Key goes in system keystore */
++			 (void)do_system_keystore_slot_dealloc(user_ctx,
++								   key_info->userid,
++								   T_key_info.
++								   handle);
++			 (void)do_system_keystore_slot_dealloc(user_ctx,
++								   key_info->userid,
++								   KEK_key_info.
++								   handle);
++		 } else {
++			 /* Key goes in user keystore */
++			 (void)keystore_slot_dealloc(key_info->keystore,
++							 key_info->userid,
++					 T_key_info.handle);
++			 (void)keystore_slot_dealloc(key_info->keystore,
++					 key_info->userid,
++					 KEK_key_info.handle);
++		 }
++	 }
++ 
++	 return ret;
++ }				 /* wrap */
++ 
++ /*!
++  * Place a key into a protected location for use only by cryptographic
++  * algorithms.
++  *
++  * This only needs to be used to a) unwrap a key, or b) set up a key which
++  * could be wrapped with a later call to #fsl_shw_extract_key().  Normal
++  * cleartext keys can simply be placed into #fsl_shw_sko_t key objects with
++  * #fsl_shw_sko_set_key() and used directly.
++  *
++  * The maximum key size supported for wrapped/unwrapped keys is 32 octets.
++  * (This is the maximum reasonable key length on Sahara - 32 octets for an HMAC
++  * key based on SHA-256.)	The key size is determined by the @a key_info.	The
++  * expected length of @a key can be determined by
++  * #fsl_shw_sko_calculate_wrapped_size()
++  *
++  * The protected key will not be available for use until this operation
++  * successfully completes.
++  *
++  * This feature is not available for all platforms, nor for all algorithms and
++  * modes.
++  *
++  * @param		user_ctx		 A user context from #fsl_shw_register_user().
++  * @param[in,out] key_info 	 The information about the key to be which will
++  * 							 be established.  In the create case, the key
++  * 							 length must be set.
++  * @param		establish_type	 How @a key will be interpreted to establish a
++  * 							 key for use.
++  * @param key					 If @a establish_type is #FSL_KEY_WRAP_UNWRAP,
++  * 							 this is the location of a wrapped key.  If
++  * 							 @a establish_type is #FSL_KEY_WRAP_CREATE, this
++  * 							 parameter can be @a NULL.	If @a establish_type
++  * 							 is #FSL_KEY_WRAP_ACCEPT, this is the location
++  * 							 of a plaintext key.
++  *
++  * @return    A return code of type #fsl_shw_return_t.
++  */
++ fsl_shw_return_t fsl_shw_establish_key(fsl_shw_uco_t * user_ctx,
++						fsl_shw_sko_t * key_info,
++						fsl_shw_key_wrap_t establish_type,
++						const uint8_t * key)
++ {
++	 SAH_SF_DCLS;
++	 unsigned original_key_length = key_info->key_length;
++	 unsigned rounded_key_length;
++	 unsigned slot_allocated = 0;
++	 uint32_t old_flags;
++ 
++	 header = SAH_HDR_RNG_GENERATE;  /* Desc. #18 for rand */
++
++ 	 /* TODO: THIS STILL NEEDS TO BE REFACTORED */
++ 
++	 /* Write operations into SCC memory require word-multiple number of
++	  * bytes.	For ACCEPT and CREATE functions, the key length may need
++	  * to be rounded up.  Calculate. */
++	 if (LENGTH_PATCH && (original_key_length & LENGTH_PATCH_MASK) != 0) {
++		 rounded_key_length = original_key_length + LENGTH_PATCH
++			 - (original_key_length & LENGTH_PATCH_MASK);
++	 } else {
++		 rounded_key_length = original_key_length;
++	 }
++ 
++	 SAH_SF_USER_CHECK();
++ 
++	 if (key_info->keystore == NULL) {
++		 /* Key goes in system keystore */
++		 ret = do_system_keystore_slot_alloc(user_ctx,
++							 key_info->key_length,
++							 key_info->userid,
++							 &(key_info->handle));
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("Creating random key");
++		 LOG_DIAG_ARGS
++			 ("key length: %i, handle: %i, rounded key length: %i",
++			  key_info->key_length, key_info->handle,
++			  rounded_key_length);
+ #endif
+-		SAH_SF_EXECUTE();
+-		/* Restore user's old flag value */
+-		user_ctx->flags = old_flags;
+-		break;
+-
+-	case FSL_KEY_WRAP_ACCEPT:
+-		if (key == NULL) {
++ 
++	 } else {
++		 /* Key goes in user keystore */
++		 ret = keystore_slot_alloc(key_info->keystore,
++					   key_info->key_length,
++					   key_info->userid,
++					   &(key_info->handle));
++	 }
++	 if (ret != FSL_RETURN_OK_S) {
+ #ifdef DIAG_SECURITY_FUNC
+-			LOG_DIAG("ACCEPT:  Red Key is NULL");
++		 LOG_DIAG("Slot allocation failed\n");
+ #endif
+-			ret = FSL_RETURN_ERROR_S;
+-			goto out;
+-		}
+-		/* Copy in safe number of bytes of Red key */
+-		ret = do_scc_slot_load_slot(user_ctx, key_info->userid,
+-					    key_info->handle, key,
+-					    rounded_key_length);
+-		break;
+-
+-	case FSL_KEY_WRAP_UNWRAP:
+-		/* For now, disallow non-blocking calls. */
+-		if (!(user_ctx->flags & FSL_UCO_BLOCKING_MODE)) {
+-			ret = FSL_RETURN_BAD_FLAG_S;
+-		} else if (key == NULL) {
+-			ret = FSL_RETURN_ERROR_S;
+-		} else {
+-			ret = unwrap(user_ctx, key_info, key);
+-		}
+-		break;
+-
+-	default:
+-		ret = FSL_RETURN_BAD_FLAG_S;
+-		break;
+-	}			/* switch */
+-
+-      out:
+-	if (slot_allocated && (ret != FSL_RETURN_OK_S)) {
+-		fsl_shw_return_t scc_err;
+-		scc_err = do_scc_slot_dealloc(user_ctx, key_info->userid,
+-					      key_info->handle);
+-		key_info->flags &= ~FSL_SKO_KEY_ESTABLISHED;
+-	}
+-
+-	SAH_SF_DESC_CLEAN();
+-
+-	return ret;
+-}				/* fsl_shw_establish_key() */
+-
+-/*!
+- * Wrap a key and retrieve the wrapped value.
+- *
+- * A wrapped key is a key that has been cryptographically obscured.  It is
+- * only able to be used with #fsl_shw_establish_key().
+- *
+- * This function will also release the key (see #fsl_shw_release_key()) so
+- * that it must be re-established before reuse.
+- *
+- * This feature is not available for all platforms, nor for all algorithms and
+- * modes.
+- *
+- * @param      user_ctx         A user context from #fsl_shw_register_user().
+- * @param      key_info         The information about the key to be deleted.
+- * @param[out] covered_key      The location to store the 48-octet wrapped key.
+- *                              (This size is based upon the maximum key size
+- *                              of 32 octets).
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t fsl_shw_extract_key(fsl_shw_uco_t * user_ctx,
+-				     fsl_shw_sko_t * key_info,
+-				     uint8_t * covered_key)
+-{
+-	SAH_SF_DCLS;
+-
+-	SAH_SF_USER_CHECK();
+-
+-	/* For now, only blocking mode calls are supported */
+-	if (user_ctx->flags & FSL_UCO_BLOCKING_MODE) {
+-		if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
+-			ret = wrap(user_ctx, key_info, covered_key);
+-			if (ret != FSL_RETURN_OK_S) {
+-				goto out;
+-			}
+-
+-			/* Need to deallocate on successful extraction */
+-			do_scc_slot_dealloc(user_ctx, key_info->userid,
+-					    key_info->handle);
+-			/* Mark key not available in the flags */
+-			key_info->flags &=
+-			    ~(FSL_SKO_KEY_ESTABLISHED | FSL_SKO_KEY_PRESENT);
+-		}
+-	}
+-
+-      out:
+-	SAH_SF_DESC_CLEAN();
+-
+-	return ret;
+-}
+-
+-/*!
+- * De-establish a key so that it can no longer be accessed.
+- *
+- * The key will need to be re-established before it can again be used.
+- *
+- * This feature is not available for all platforms, nor for all algorithms and
+- * modes.
+- *
+- * @param      user_ctx         A user context from #fsl_shw_register_user().
+- * @param      key_info         The information about the key to be deleted.
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t fsl_shw_release_key(fsl_shw_uco_t * user_ctx,
+-				     fsl_shw_sko_t * key_info)
+-{
+-	SAH_SF_DCLS;
+-
+-	SAH_SF_USER_CHECK();
+-
+-	if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
+-		ret = do_scc_slot_dealloc(user_ctx, key_info->userid,
+-					  key_info->handle);
+-		key_info->flags &= ~(FSL_SKO_KEY_ESTABLISHED |
+-				     FSL_SKO_KEY_PRESENT);
+-	}
+-
+-      out:
+-	SAH_SF_DESC_CLEAN();
+-
+-	return ret;
+-}
++		 goto out;
++	 }
++	 slot_allocated = 1;
++ 
++	 key_info->flags |= FSL_SKO_KEY_ESTABLISHED;
++	 switch (establish_type) {
++	 case FSL_KEY_WRAP_CREATE:
++#ifdef DIAG_SECURITY_FUNC
++		 LOG_DIAG("Creating random key\n");
++#endif
++		 /* Use safe version of key length */
++		 key_info->key_length = rounded_key_length;
++		 /* Generate descriptor to put random value into */
++		 DESC_KEY_OUT(header, key_info, 0, NULL);
++		 /* Restore actual, desired key length */
++		 key_info->key_length = original_key_length;
++ 
++		 old_flags = user_ctx->flags;
++		 /* Now put random value into key */
++		 SAH_SF_EXECUTE();
++		 /* Restore user's old flag value */
++		 user_ctx->flags = old_flags;
++#ifdef DIAG_SECURITY_FUNC
++		 if (ret == FSL_RETURN_OK_S) {
++			 LOG_DIAG("ret is ok");
++		 } else {
++			 LOG_DIAG("ret is not ok");
++		 }
++#endif
++		 break;
++ 
++	 case FSL_KEY_WRAP_ACCEPT:
++#ifdef DIAG_SECURITY_FUNC
++		 LOG_DIAG("Accepting plaintext key\n");
++#endif
++		 if (key == NULL) {
++#ifdef DIAG_SECURITY_FUNC
++			LOG_DIAG("ACCEPT:	Red Key is NULL");
++#endif
++			 ret = FSL_RETURN_ERROR_S;
++			 goto out;
++		 }
++		 /* Copy in safe number of bytes of Red key */
++		 if (key_info->keystore == NULL) {
++			 /* Key goes in system keystore */
++			 ret = do_system_keystore_slot_load(user_ctx,
++							key_info->userid,
++							key_info->handle, key,
++							rounded_key_length);
++		 } else {
++			 /* Key goes in user keystore */
++			 ret = keystore_load_slot(key_info->keystore,
++								  key_info->userid,
++								  key_info->handle, key,
++								  key_info->key_length);
++		 }
++		 break;
++ 
++	 case FSL_KEY_WRAP_UNWRAP:
++#ifdef DIAG_SECURITY_FUNC
++		 LOG_DIAG("Unwrapping wrapped key\n");
++#endif
++		 /* For now, disallow non-blocking calls. */
++		 if (!(user_ctx->flags & FSL_UCO_BLOCKING_MODE)) {
++			 ret = FSL_RETURN_BAD_FLAG_S;
++		 } else if (key == NULL) {
++			 ret = FSL_RETURN_ERROR_S;
++		 } else {
++			 ret = unwrap(user_ctx, key_info, key);
++		 }
++		 break;
++ 
++	 default:
++		 ret = FSL_RETURN_BAD_FLAG_S;
++		 break;
++	 }			 /* switch */
++ 
++	   out:
++	 if (slot_allocated && (ret != FSL_RETURN_OK_S)) {
++		 fsl_shw_return_t scc_err;
++		 
++		 if (key_info->keystore == NULL) {
++			 /* Key goes in system keystore */
++			 scc_err = do_system_keystore_slot_dealloc(user_ctx,
++						   key_info->userid,
++						   key_info->handle);
++		 } else {
++			 /* Key goes in user keystore */
++			 scc_err = keystore_slot_dealloc(key_info->keystore,
++						 key_info->userid,	key_info->handle);
++		 }
++		 
++		 key_info->flags &= ~FSL_SKO_KEY_ESTABLISHED;
++	 }
++	 
++	 SAH_SF_DESC_CLEAN();
++ 
++	 return ret;
++ }				 /* fsl_shw_establish_key() */
++ 
++ /*!
++  * Wrap a key and retrieve the wrapped value.
++  *
++  * A wrapped key is a key that has been cryptographically obscured.  It is
++  * only able to be used with #fsl_shw_establish_key().
++  *
++  * This function will also release the key (see #fsl_shw_release_key()) so
++  * that it must be re-established before reuse.
++  *
++  * This feature is not available for all platforms, nor for all algorithms and
++  * modes.
++  *
++  * @param		user_ctx		 A user context from #fsl_shw_register_user().
++  * @param		key_info		 The information about the key to be deleted.
++  * @param[out] covered_key 	 The location to store the 48-octet wrapped key.
++  * 							 (This size is based upon the maximum key size
++  * 							 of 32 octets).
++  *
++  * @return    A return code of type #fsl_shw_return_t.
++  */
++ fsl_shw_return_t fsl_shw_extract_key(fsl_shw_uco_t * user_ctx,
++					  fsl_shw_sko_t * key_info,
++					  uint8_t * covered_key)
++ {
++	 SAH_SF_DCLS;
++ 
++	 SAH_SF_USER_CHECK();
++ 
++	 /* For now, only blocking mode calls are supported */
++	 if (user_ctx->flags & FSL_UCO_BLOCKING_MODE) {
++		 if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
++			 ret = wrap(user_ctx, key_info, covered_key);
++			 if (ret != FSL_RETURN_OK_S) {
++				 goto out;
++			 }
++ 
++			 /* Need to deallocate on successful extraction */
++			 if (key_info->keystore == NULL) {
++				 /* Key goes in system keystore */
++				 ret = do_system_keystore_slot_dealloc(user_ctx,
++						 key_info->userid, key_info->handle);
++			 } else {
++				 /* Key goes in user keystore */
++				 ret = keystore_slot_dealloc(key_info->keystore,
++						 key_info->userid, key_info->handle);
++			 }
++			 /* Mark key not available in the flags */
++			 key_info->flags &=
++				 ~(FSL_SKO_KEY_ESTABLISHED | FSL_SKO_KEY_PRESENT);
++		 }
++	 }
++ 
++ out:
++	 SAH_SF_DESC_CLEAN();
++ 
++	 return ret;
++ }
++ 
++ /*!
++  * De-establish a key so that it can no longer be accessed.
++  *
++  * The key will need to be re-established before it can again be used.
++  *
++  * This feature is not available for all platforms, nor for all algorithms and
++  * modes.
++  *
++  * @param		user_ctx		 A user context from #fsl_shw_register_user().
++  * @param		key_info		 The information about the key to be deleted.
++  *
++  * @return    A return code of type #fsl_shw_return_t.
++  */
++ fsl_shw_return_t fsl_shw_release_key(fsl_shw_uco_t * user_ctx,
++					  fsl_shw_sko_t * key_info)
++ {
++	 SAH_SF_DCLS;
++ 
++	 SAH_SF_USER_CHECK();
++ 
++	 if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
++		 if (key_info->keystore == NULL) {
++			 /* Key goes in system keystore */
++			 do_system_keystore_slot_dealloc(user_ctx,
++							 key_info->userid,
++							 key_info->handle);
++		 } else {
++			 /* Key goes in user keystore */
++			 keystore_slot_dealloc(key_info->keystore,
++						 key_info->userid,
++						 key_info->handle);
++		 }
++		 key_info->flags &= ~(FSL_SKO_KEY_ESTABLISHED |
++					  FSL_SKO_KEY_PRESENT);
++	 }
++ 
++ out:
++	 SAH_SF_DESC_CLEAN();
++ 
++	 return ret;
++ }
+diff --git a/sahara2/sf_util.c b/sahara2/sf_util.c
+index e234003..be0588a 100644
+--- a/sahara2/sf_util.c
++++ b/sahara2/sf_util.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright 2005-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -32,7 +32,8 @@
+ 
+ #ifdef DIAG_SECURITY_FUNC
+ #include <diagnostic.h>
+-#endif				/*DIAG_SECURITY_FUNC */
++#endif /*DIAG_SECURITY_FUNC*/
++
+ 
+ #ifdef __KERNEL__
+ EXPORT_SYMBOL(sah_Append_Desc);
+@@ -60,78 +61,88 @@ EXPORT_SYMBOL(sah_add_key_out_desc);
+ #endif
+ #endif
+ 
+-/*!
++/**
+  * Convert fsl_shw_hash_alg_t to mdha mode bits.
+  *
+  * Index must be maintained in order of fsl_shw_hash_alg_t enumeration!!!
+  */
+-const uint32_t sah_insert_mdha_algorithm[] = {
+-	[FSL_HASH_ALG_MD5] = sah_insert_mdha_algorithm_md5,
+-	[FSL_HASH_ALG_SHA1] = sah_insert_mdha_algorithm_sha1,
+-	[FSL_HASH_ALG_SHA224] = sah_insert_mdha_algorithm_sha224,
+-	[FSL_HASH_ALG_SHA256] = sah_insert_mdha_algorithm_sha256,
++const uint32_t sah_insert_mdha_algorithm[] =
++{
++    [FSL_HASH_ALG_MD5] = sah_insert_mdha_algorithm_md5,
++    [FSL_HASH_ALG_SHA1] = sah_insert_mdha_algorithm_sha1,
++    [FSL_HASH_ALG_SHA224] = sah_insert_mdha_algorithm_sha224,
++    [FSL_HASH_ALG_SHA256] = sah_insert_mdha_algorithm_sha256,
+ };
+ 
+-/*!
++/**
+  * Header bits for Algorithm field of SKHA header
+  *
+  * Index value must be kept in sync with fsl_shw_key_alg_t
+  */
+-const uint32_t sah_insert_skha_algorithm[] = {
+-	[FSL_KEY_ALG_HMAC] = 0x00000040,
+-	[FSL_KEY_ALG_AES] = sah_insert_skha_algorithm_aes,
+-	[FSL_KEY_ALG_DES] = sah_insert_skha_algorithm_des,
+-	[FSL_KEY_ALG_TDES] = sah_insert_skha_algorithm_tdes,
+-	[FSL_KEY_ALG_ARC4] = sah_insert_skha_algorithm_arc4,
++const uint32_t sah_insert_skha_algorithm[] =
++{
++    [FSL_KEY_ALG_HMAC] = 0x00000040,
++    [FSL_KEY_ALG_AES] = sah_insert_skha_algorithm_aes,
++    [FSL_KEY_ALG_DES] = sah_insert_skha_algorithm_des,
++    [FSL_KEY_ALG_TDES] = sah_insert_skha_algorithm_tdes,
++    [FSL_KEY_ALG_ARC4] = sah_insert_skha_algorithm_arc4,
+ };
+ 
+-/*!
++
++/**
+  * Header bits for MODE field of SKHA header
+  *
+  * Index value must be kept in sync with fsl_shw_sym_mod_t
+  */
+-const uint32_t sah_insert_skha_mode[] = {
+-	[FSL_SYM_MODE_STREAM] = sah_insert_skha_mode_ecb,
+-	[FSL_SYM_MODE_ECB] = sah_insert_skha_mode_ecb,
+-	[FSL_SYM_MODE_CBC] = sah_insert_skha_mode_cbc,
+-	[FSL_SYM_MODE_CTR] = sah_insert_skha_mode_ctr,
++const uint32_t sah_insert_skha_mode[] =
++{
++    [FSL_SYM_MODE_STREAM] = sah_insert_skha_mode_ecb,
++    [FSL_SYM_MODE_ECB] = sah_insert_skha_mode_ecb,
++    [FSL_SYM_MODE_CBC] = sah_insert_skha_mode_cbc,
++    [FSL_SYM_MODE_CTR] = sah_insert_skha_mode_ctr,
+ };
+ 
+-/*!
++
++/**
+  * Header bits to set CTR modulus size.  These have parity
+  * included to allow XOR insertion of values.
+  *
+  * @note Must be kept in sync with fsl_shw_ctr_mod_t
+  */
+-const uint32_t sah_insert_skha_modulus[] = {
+-	[FSL_CTR_MOD_8] = 0x00000000,	/*!< 2**8 */
+-	[FSL_CTR_MOD_16] = 0x80000200,	/*!< 2**16 */
+-	[FSL_CTR_MOD_24] = 0x80000400,	/*!< 2**24 */
+-	[FSL_CTR_MOD_32] = 0x00000600,	/*!< 2**32 */
+-	[FSL_CTR_MOD_40] = 0x80000800,	/*!< 2**40 */
+-	[FSL_CTR_MOD_48] = 0x00000a00,	/*!< 2**48 */
+-	[FSL_CTR_MOD_56] = 0x00000c00,	/*!< 2**56 */
+-	[FSL_CTR_MOD_64] = 0x80000e00,	/*!< 2**64 */
+-	[FSL_CTR_MOD_72] = 0x80001000,	/*!< 2**72 */
+-	[FSL_CTR_MOD_80] = 0x00001200,	/*!< 2**80 */
+-	[FSL_CTR_MOD_88] = 0x00001400,	/*!< 2**88 */
+-	[FSL_CTR_MOD_96] = 0x80001600,	/*!< 2**96 */
+-	[FSL_CTR_MOD_104] = 0x00001800,	/*!< 2**104 */
+-	[FSL_CTR_MOD_112] = 0x80001a00,	/*!< 2**112 */
+-	[FSL_CTR_MOD_120] = 0x80001c00,	/*!< 2**120 */
+-	[FSL_CTR_MOD_128] = 0x00001e00	/*!< 2**128 */
++const uint32_t sah_insert_skha_modulus[] =
++{
++    [FSL_CTR_MOD_8] = 0x00000000, /**< 2**8 */
++    [FSL_CTR_MOD_16] = 0x80000200, /**< 2**16 */
++    [FSL_CTR_MOD_24] = 0x80000400, /**< 2**24 */
++    [FSL_CTR_MOD_32] = 0x00000600, /**< 2**32 */
++    [FSL_CTR_MOD_40] = 0x80000800, /**< 2**40 */
++    [FSL_CTR_MOD_48] = 0x00000a00, /**< 2**48 */
++    [FSL_CTR_MOD_56] = 0x00000c00, /**< 2**56 */
++    [FSL_CTR_MOD_64] = 0x80000e00, /**< 2**64 */
++    [FSL_CTR_MOD_72] = 0x80001000, /**< 2**72 */
++    [FSL_CTR_MOD_80] = 0x00001200, /**< 2**80 */
++    [FSL_CTR_MOD_88] = 0x00001400, /**< 2**88 */
++    [FSL_CTR_MOD_96] = 0x80001600, /**< 2**96 */
++    [FSL_CTR_MOD_104] = 0x00001800, /**< 2**104 */
++    [FSL_CTR_MOD_112] = 0x80001a00, /**< 2**112 */
++    [FSL_CTR_MOD_120] = 0x80001c00, /**< 2**120 */
++    [FSL_CTR_MOD_128] = 0x00001e00 /**< 2**128 */
+ };
+ 
++
+ /******************************************************************************
+ * Internal function declarations
+ ******************************************************************************/
+-static fsl_shw_return_t sah_Create_Desc(const sah_Mem_Util * mu,
+-					sah_Desc ** desc,
+-					int head,
+-					uint32_t header,
+-					sah_Link * link1, sah_Link * link2);
++static fsl_shw_return_t sah_Create_Desc(
++    const sah_Mem_Util *mu,
++    sah_Desc ** desc,
++    int head,
++    uint32_t header,
++    sah_Link * link1,
++    sah_Link * link2);
+ 
+-/*!
++
++/**
+  * Create a descriptor chain using the the header and links passed in as
+  * parameters. The newly created descriptor will be added to the end of
+  * the descriptor chain passed.
+@@ -165,37 +176,41 @@ static fsl_shw_return_t sah_Create_Desc(const sah_Mem_Util * mu,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t sah_Append_Desc(const sah_Mem_Util * mu,
+-				 sah_Head_Desc ** desc_head,
+-				 const uint32_t header,
+-				 sah_Link * link1, sah_Link * link2)
++fsl_shw_return_t sah_Append_Desc(
++    const sah_Mem_Util *mu,
++    sah_Head_Desc **desc_head,
++    const uint32_t header,
++    sah_Link *link1,
++    sah_Link *link2)
+ {
+-	fsl_shw_return_t status;
+-	sah_Desc *desc;
+-	sah_Desc *desc_ptr;
+-
+-	status = sah_Create_Desc(mu, (sah_Desc **) & desc, (*desc_head == NULL),
+-				 header, link1, link2);
+-	/* append newly created descriptor to end of current chain */
+-	if (status == FSL_RETURN_OK_S) {
+-		if (*desc_head == NULL) {
+-			(*desc_head) = (sah_Head_Desc *) desc;
+-			(*desc_head)->out1_ptr = NULL;
+-			(*desc_head)->out2_ptr = NULL;
+-
+-		} else {
+-			desc_ptr = (sah_Desc *) * desc_head;
+-			while (desc_ptr->next != NULL) {
+-				desc_ptr = desc_ptr->next;
+-			}
+-			desc_ptr->next = desc;
+-		}
+-	}
+-
+-	return status;
++    fsl_shw_return_t status;
++    sah_Desc         *desc;
++    sah_Desc         *desc_ptr;
++
++
++    status = sah_Create_Desc(mu, (sah_Desc**)&desc, (*desc_head == NULL),
++                             header, link1, link2);
++    /* append newly created descriptor to end of current chain */
++    if (status == FSL_RETURN_OK_S) {
++        if (*desc_head == NULL) {
++            (*desc_head) = (sah_Head_Desc*)desc;
++            (*desc_head)->out1_ptr = NULL;
++            (*desc_head)->out2_ptr = NULL;
++
++        } else {
++            desc_ptr = (sah_Desc*)*desc_head;
++            while (desc_ptr->next != NULL) {
++                desc_ptr = desc_ptr->next;
++            }
++            desc_ptr->next = desc;
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Releases the memory allocated by the Security Function library for
+  * descriptors, links and any internally allocated memory referenced in the
+  * given chain. Note that memory allocated by user applications is not
+@@ -210,39 +225,41 @@ fsl_shw_return_t sah_Append_Desc(const sah_Mem_Util * mu,
+  *
+  * @return none
+  */
+-void sah_Descriptor_Chain_Destroy(const sah_Mem_Util * mu,
+-				  sah_Head_Desc ** desc_head)
++void sah_Descriptor_Chain_Destroy (
++    const sah_Mem_Util *mu,
++    sah_Head_Desc **desc_head)
+ {
+-	sah_Desc *desc_ptr = &(*desc_head)->desc;
+-	sah_Head_Desc *desc_head_ptr = (sah_Head_Desc *) desc_ptr;
++    sah_Desc *desc_ptr = &(*desc_head)->desc;
++    sah_Head_Desc *desc_head_ptr = (sah_Head_Desc *)desc_ptr;
+ 
+ 	while (desc_ptr != NULL) {
+-		register sah_Desc *next_desc_ptr;
++        register sah_Desc *next_desc_ptr;
+ 
+-		if (desc_ptr->ptr1 != NULL) {
+-			sah_Destroy_Link(mu, desc_ptr->ptr1);
+-		}
+-		if (desc_ptr->ptr2 != NULL) {
+-			sah_Destroy_Link(mu, desc_ptr->ptr2);
+-		}
++        if (desc_ptr->ptr1 != NULL) {
++            sah_Destroy_Link(mu, desc_ptr->ptr1);
++        }
++        if (desc_ptr->ptr2 != NULL) {
++            sah_Destroy_Link(mu, desc_ptr->ptr2);
++        }
+ 
+-		next_desc_ptr = desc_ptr->next;
++        next_desc_ptr = desc_ptr->next;
+ 
+-		/* Be sure to free head descriptor as such */
+-		if (desc_ptr == (sah_Desc *) desc_head_ptr) {
+-			mu->mu_free_head_desc(mu->mu_ref, desc_head_ptr);
+-		} else {
+-			mu->mu_free_desc(mu->mu_ref, desc_ptr);
+-		}
++        /* Be sure to free head descriptor as such */
++        if (desc_ptr == (sah_Desc*)desc_head_ptr) {
++            mu->mu_free_head_desc(mu->mu_ref, desc_head_ptr);
++        } else {
++            mu->mu_free_desc(mu->mu_ref, desc_ptr);
++        }
+ 
+-		desc_ptr = next_desc_ptr;
+-	}
++        desc_ptr = next_desc_ptr;
++    }
+ 
+-	*desc_head = NULL;
++    *desc_head = NULL;
+ }
+ 
++
+ #ifndef NO_INPUT_WORKAROUND
+-/*!
++/**
+  * Reworks the link chain
+  *
+  * @brief   Reworks the link chain
+@@ -252,149 +269,134 @@ void sah_Descriptor_Chain_Destroy(const sah_Mem_Util * mu,
+  *
+  * @return none
+  */
+-static fsl_shw_return_t sah_rework_link_chain(const sah_Mem_Util * mu,
+-					      sah_Link * link)
++static fsl_shw_return_t sah_rework_link_chain(
++        const sah_Mem_Util *mu,
++        sah_Link* link)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-	int found_potential_problem = 0;
+-	uint32_t total_data = 0;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    int found_potential_problem = 0;
++    uint32_t total_data = 0;
+ #ifdef DEBUG_REWORK
+-	sah_Link *first_link = link;
++    sah_Link* first_link = link;
+ #endif
+ 
+-	if ((link->flags & SAH_OUTPUT_LINK)) {
+-		return status;
+-	}
++    if ((link->flags & SAH_OUTPUT_LINK)) {
++        return status;
++    }
+ 
+-	while (link != NULL) {
+-		total_data += link->len;
++    while (link != NULL) {
++        total_data += link->len;
+ 
+-		/* Only non-key Input Links are affected by the DMA flush-to-FIFO
+-		 * problem */
++    /* Only non-key Input Links are affected by the DMA flush-to-FIFO
++     * problem */
+ 
+-		/* If have seen problem and at end of chain... */
+-		if (found_potential_problem && (link->next == NULL) &&
+-		    (total_data > 16)) {
+-			/* insert new 1-byte link */
+-			sah_Link *new_tail_link = mu->mu_alloc_link(mu->mu_ref);
+-			if (new_tail_link == NULL) {
+-				status = FSL_RETURN_NO_RESOURCE_S;
+-			} else {
++        /* If have seen problem and at end of chain... */
++        if (found_potential_problem && (link->next == NULL) &&
++                                         (total_data > 16)) {
++            /* insert new 1-byte link */
++            sah_Link* new_tail_link = mu->mu_alloc_link(mu->mu_ref);
++            if (new_tail_link == NULL) {
++                status = FSL_RETURN_NO_RESOURCE_S;
++            } else {
+ #ifdef DEBUG_REWORK
+-				sah_Link *dump_link = first_link;
+-				while (dump_link != NULL) {
+-					uint32_t i;
+-					unsigned bytes_to_dump =
+-					    (dump_link->len >
+-					     32) ? 32 : dump_link->len;
+-					os_printk("(rework)Link %p: %p/%u/%p\n",
+-						  dump_link, dump_link->data,
+-						  dump_link->len,
+-						  dump_link->next);
+-					if (!
+-					    (dump_link->
+-					     flags & SAH_STORED_KEY_INFO)) {
+-						os_printk("(rework)Data %p: ",
+-							  dump_link->data);
+-						for (i = 0; i < bytes_to_dump;
+-						     i++) {
+-							os_printk("%02X ",
+-								  dump_link->
+-								  data[i]);
+-						}
+-						os_printk("\n");
+-					} else {
+-						os_printk
+-						    ("rework)Data %p: Red key data\n",
+-						     dump_link);
+-					}
+-					dump_link = dump_link->next;
+-				}
++                sah_Link* dump_link = first_link;
++                while (dump_link != NULL) {
++                    uint32_t i;
++                    unsigned bytes_to_dump = (dump_link->len > 32) ?
++                                              32 : dump_link->len;
++                    os_printk("(rework)Link %p: %p/%u/%p\n", dump_link,
++                              dump_link->data, dump_link->len,
++                              dump_link->next);
++                    if (!(dump_link->flags & SAH_STORED_KEY_INFO)) {
++                        os_printk("(rework)Data %p: ", dump_link->data);
++                        for (i = 0; i < bytes_to_dump; i++) {
++                            os_printk("%02X ", dump_link->data[i]);
++                        }
++                        os_printk("\n");
++                    }
++                    else {
++                        os_printk("rework)Data %p: Red key data\n", dump_link);
++                    }
++                    dump_link = dump_link->next;
++                }
+ #endif
+-				link->len--;
+-				link->next = new_tail_link;
+-				new_tail_link->len = 1;
+-				new_tail_link->data = link->data + link->len;
+-				new_tail_link->flags =
+-				    link->flags & ~(SAH_OWNS_LINK_DATA);
+-				new_tail_link->next = NULL;
+-				link = new_tail_link;
++                link->len--;
++                link->next = new_tail_link;
++                new_tail_link->len = 1;
++                new_tail_link->data = link->data+link->len;
++                new_tail_link->flags = link->flags & ~(SAH_OWNS_LINK_DATA);
++                new_tail_link->next = NULL;
++                link = new_tail_link;
+ #ifdef DEBUG_REWORK
+-				os_printk("(rework)New link chain:\n");
+-				dump_link = first_link;
+-				while (dump_link != NULL) {
+-					uint32_t i;
+-					unsigned bytes_to_dump =
+-					    (dump_link->len >
+-					     32) ? 32 : dump_link->len;
+-
+-					os_printk("Link %p: %p/%u/%p\n",
+-						  dump_link, dump_link->data,
+-						  dump_link->len,
+-						  dump_link->next);
+-					if (!
+-					    (dump_link->
+-					     flags & SAH_STORED_KEY_INFO)) {
+-						os_printk("Data %p: ",
+-							  dump_link->data);
+-						for (i = 0; i < bytes_to_dump;
+-						     i++) {
+-							os_printk("%02X ",
+-								  dump_link->
+-								  data[i]);
+-						}
+-						os_printk("\n");
+-					} else {
+-						os_printk
+-						    ("Data %p: Red key data\n",
+-						     dump_link);
+-					}
+-					dump_link = dump_link->next;
+-				}
++                os_printk("(rework)New link chain:\n");
++                dump_link = first_link;
++                while (dump_link != NULL) {
++                    uint32_t i;
++                    unsigned bytes_to_dump = (dump_link->len > 32) ?
++                                              32 : dump_link->len;
++
++                    os_printk("Link %p: %p/%u/%p\n", dump_link,
++                              dump_link->data, dump_link->len,
++                              dump_link->next);
++                    if (!(dump_link->flags & SAH_STORED_KEY_INFO)) {
++                        os_printk("Data %p: ", dump_link->data);
++                        for (i = 0; i < bytes_to_dump; i++) {
++                            os_printk("%02X ", dump_link->data[i]);
++                        }
++                        os_printk("\n");
++                    }
++                    else {
++                        os_printk("Data %p: Red key data\n", dump_link);
++                    }
++                    dump_link = dump_link->next;
++                }
+ #endif
+-			}
+-		} else if ((link->len % 4) || ((uint32_t) link->data % 4)) {
+-			found_potential_problem = 1;
+-		}
++            }
++        } else if ((link->len % 4) || ((uint32_t)link->data % 4)) {
++            found_potential_problem = 1;
++        }
+ 
+-		link = link->next;
+-	}
++        link = link->next;
++    }
+ 
+-	return status;
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Rework links to avoid H/W bug
+  *
+  * @param head   Beginning of descriptor chain
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-static fsl_shw_return_t sah_rework_links(const sah_Mem_Util * mu,
+-					 sah_Head_Desc * head)
++static fsl_shw_return_t sah_rework_links(
++        const sah_Mem_Util *mu,
++        sah_Head_Desc *head)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-	sah_Desc *desc = &head->desc;
+-
+-	while ((status == FSL_RETURN_OK_S) && (desc != NULL)) {
+-		if (desc->header & SAH_HDR_LLO) {
+-			status = FSL_RETURN_ERROR_S;
+-			break;
+-		}
+-		if (desc->ptr1 != NULL) {
+-			status = sah_rework_link_chain(mu, desc->ptr1);
+-		}
+-		if ((status == FSL_RETURN_OK_S) && (desc->ptr2 != NULL)) {
+-			status = sah_rework_link_chain(mu, desc->ptr2);
+-		}
+-		desc = desc->next;
+-	}
+-
+-	return status;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    sah_Desc* desc = &head->desc;
++
++    while ((status == FSL_RETURN_OK_S) && (desc != NULL)) {
++        if (desc->header & SAH_HDR_LLO) {
++            status = FSL_RETURN_ERROR_S;
++            break;
++        }
++        if (desc->ptr1 != NULL) {
++            status = sah_rework_link_chain(mu, desc->ptr1);
++        }
++        if ((status == FSL_RETURN_OK_S) && (desc->ptr2 != NULL)) {
++            status = sah_rework_link_chain(mu, desc->ptr2);
++        }
++        desc = desc->next;
++    }
++
++    return status;
+ }
+-#endif				/* NO_INPUT_WORKAROUND */
++#endif /* NO_INPUT_WORKAROUND */
+ 
+-/*!
++
++/**
+  * Send a descriptor chain to the SAHARA driver for processing.
+  *
+  * Note that SAHARA will read the input data from and write the output data
+@@ -416,35 +418,46 @@ static fsl_shw_return_t sah_rework_links(const sah_Mem_Util * mu,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t sah_Descriptor_Chain_Execute(sah_Head_Desc * head,
+-					      fsl_shw_uco_t * user_ctx)
++fsl_shw_return_t sah_Descriptor_Chain_Execute(
++    sah_Head_Desc *head,
++    fsl_shw_uco_t *user_ctx)
+ {
+-	fsl_shw_return_t status;
++    fsl_shw_return_t status;
++
++
++    /* Check for null pointer or non-multiple-of-four value */
++    if ((head == NULL) || ((uint32_t)head & 0x3)) {
++        status = FSL_RETURN_ERROR_S;
++        goto out;
++    }
+ 
+-	/* Check for null pointer or non-multiple-of-four value */
+-	if ((head == NULL) || ((uint32_t) head & 0x3)) {
+-		status = FSL_RETURN_ERROR_S;
+-		goto out;
+-	}
+ #ifndef NO_INPUT_WORKAROUND
+-	status = sah_rework_links(user_ctx->mem_util, head);
+-	if (status != FSL_RETURN_OK_S) {
+-		goto out;
+-	}
++    status = sah_rework_links(user_ctx->mem_util, head);
++    if (status != FSL_RETURN_OK_S) {
++        goto out;
++    }
+ #endif
+ 
+-	/* complete the information in the descriptor chain head node */
+-	head->user_ref = user_ctx->user_ref;
+-	head->uco_flags = user_ctx->flags;
+-	head->next = NULL;	/* driver will use this to link chain heads */
++    /* complete the information in the descriptor chain head node */
++    head->user_ref = user_ctx->user_ref;
++    head->uco_flags = user_ctx->flags;
++    head->next = NULL; /* driver will use this to link chain heads */
+ 
+-	status = adaptor_Exec_Descriptor_Chain(head, user_ctx);
++    status = adaptor_Exec_Descriptor_Chain(head, user_ctx);
+ 
+-      out:
+-	return status;
++#ifdef DIAG_SECURITY_FUNC
++	 if (status == FSL_RETURN_OK_S)
++		 LOG_DIAG("after exec desc chain: status is ok\n");
++	 else
++		 LOG_DIAG("after exec desc chain: status is not ok\n");
++#endif
++
++ out:
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Create Link
+  *
+  * @brief   Allocate Memory for Link structure and populate using input
+@@ -462,59 +475,62 @@ fsl_shw_return_t sah_Descriptor_Chain_Execute(sah_Head_Desc * head,
+  *
+  * @return FSL_RETURN_OK_S or FSL_RETURN_NO_RESOURCE_S
+  */
+-fsl_shw_return_t sah_Create_Link(const sah_Mem_Util * mu,
+-				 sah_Link ** link,
+-				 uint8_t * p,
+-				 const size_t length,
+-				 const sah_Link_Flags flags)
++fsl_shw_return_t sah_Create_Link(
++    const sah_Mem_Util *mu,
++    sah_Link **link,
++    uint8_t *p,
++    const size_t length,
++    const sah_Link_Flags flags)
+ {
+ #ifdef DIAG_SECURITY_FUNC_UGLY
+-	char diag[50];
+-#endif				/*DIAG_SECURITY_FUNC_UGLY */
+-	fsl_shw_return_t status = FSL_RETURN_NO_RESOURCE_S;
++    char diag[50];
++#endif /*DIAG_SECURITY_FUNC_UGLY*/
++    fsl_shw_return_t status = FSL_RETURN_NO_RESOURCE_S;
+ 
+-	*link = mu->mu_alloc_link(mu->mu_ref);
+ 
+-	/* populate link if memory allocation successful */
+-	if (*link != NULL) {
+-		(*link)->len = length;
+-		(*link)->data = p;
+-		(*link)->next = NULL;
+-		(*link)->flags = flags;
+-		status = FSL_RETURN_OK_S;
++    *link = mu->mu_alloc_link(mu->mu_ref);
+ 
+-#ifdef DIAG_SECURITY_FUNC_UGLY
+-		LOG_DIAG("Created Link");
+-		LOG_DIAG("------------");
+-		sprintf(diag, " address       = 0x%x", (int)*link);
+-		LOG_DIAG(diag);
+-		sprintf(diag, " link->len     = %d", (*link)->len);
+-		LOG_DIAG(diag);
+-		sprintf(diag, " link->data    = 0x%x", (int)(*link)->data);
+-		LOG_DIAG(diag);
+-		sprintf(diag, " link->flags   = 0x%x", (*link)->flags);
+-		LOG_DIAG(diag);
+-		LOG_DIAG(" link->next    = NULL");
+-#endif				/*DIAG_SECURITY_FUNC_UGLY */
++    /* populate link if memory allocation successful */
++    if (*link != NULL) {
++        (*link)->len = length;
++        (*link)->data = p;
++        (*link)->next = NULL;
++        (*link)->flags = flags;
++        status = FSL_RETURN_OK_S;
+ 
+-	} else {
++#ifdef DIAG_SECURITY_FUNC_UGLY
++        LOG_DIAG("Created Link");
++        LOG_DIAG("------------");
++        sprintf(diag," address       = 0x%x", (int) *link);
++        LOG_DIAG(diag);
++        sprintf(diag," link->len     = %d",(*link)->len);
++        LOG_DIAG(diag);
++        sprintf(diag," link->data    = 0x%x",(int) (*link)->data);
++        LOG_DIAG(diag);
++        sprintf(diag," link->flags   = 0x%x",(*link)->flags);
++        LOG_DIAG(diag);
++        LOG_DIAG(" link->next    = NULL");
++#endif /*DIAG_SECURITY_FUNC_UGLY*/
++
++    } else {
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("Allocation of memory for sah_Link failed!\n");
+-#endif				/*DIAG_SECURITY_FUNC */
+-
+-		/* Free memory previously allocated by the security function layer for
+-		   link data. Note that the memory being pointed to will be zeroed before
+-		   being freed, for security reasons. */
+-		if (flags & SAH_OWNS_LINK_DATA) {
+-			mu->mu_memset(mu->mu_ref, p, 0x00, length);
+-			mu->mu_free(mu->mu_ref, p);
+-		}
+-	}
+-
+-	return status;
++        LOG_DIAG("Allocation of memory for sah_Link failed!\n");
++#endif /*DIAG_SECURITY_FUNC*/
++
++        /* Free memory previously allocated by the security function layer for
++        link data. Note that the memory being pointed to will be zeroed before
++        being freed, for security reasons. */
++        if (flags & SAH_OWNS_LINK_DATA) {
++            mu->mu_memset(mu->mu_ref, p, 0x00, length);
++            mu->mu_free(mu->mu_ref, p);
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Create Key Link
+  *
+  * @brief   Allocate Memory for Link structure and populate using key info
+@@ -526,82 +542,107 @@ fsl_shw_return_t sah_Create_Link(const sah_Mem_Util * mu,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t sah_Create_Key_Link(const sah_Mem_Util * mu,
+-				     sah_Link ** link, fsl_shw_sko_t * key_info)
++fsl_shw_return_t sah_Create_Key_Link(
++    const sah_Mem_Util *mu,
++    sah_Link **link,
++    fsl_shw_sko_t *key_info)
+ {
+ #ifdef DIAG_SECURITY_FUNC_UGLY
+-	char diag[50];
+-#endif				/*DIAG_SECURITY_FUNC_UGLY */
+-	fsl_shw_return_t status = FSL_RETURN_NO_RESOURCE_S;
+-	sah_Link_Flags flags = 0;
+-
+-	*link = mu->mu_alloc_link(mu->mu_ref);
+-
+-	/* populate link if memory allocation successful */
+-	if (*link != NULL) {
+-		(*link)->len = key_info->key_length;
+-
+-		if (key_info->flags & FSL_SKO_KEY_PRESENT) {
+-			(*link)->data = key_info->key;
+-			status = FSL_RETURN_OK_S;
+-		} else {
+-			if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
+-				(*link)->slot = key_info->handle;
+-				(*link)->ownerid = key_info->userid;
+-				(*link)->data = 0;
+-				flags |= SAH_STORED_KEY_INFO;
+-				status = FSL_RETURN_OK_S;
+-			} else {
+-				/* the flag is bad. Should never get here */
+-				status = FSL_RETURN_BAD_FLAG_S;
+-			}
+-		}
++    char diag[50];
++#endif /*DIAG_SECURITY_FUNC_UGLY*/
++    fsl_shw_return_t status = FSL_RETURN_NO_RESOURCE_S;
++    sah_Link_Flags flags = 0;
++
++
++    *link = mu->mu_alloc_link(mu->mu_ref);
++
++    /* populate link if memory allocation successful */
++    if (*link != NULL) {
++        (*link)->len = key_info->key_length;
++
++        if (key_info->flags & FSL_SKO_KEY_PRESENT) {
++            (*link)->data = key_info->key;
++            status = FSL_RETURN_OK_S;
++        } else {
++            if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
++				
++				if (key_info->keystore == NULL) {
++					/* System Keystore */
++                	(*link)->slot = key_info->handle;
++                	(*link)->ownerid = key_info->userid;
++                	(*link)->data = 0;
++                	flags |= SAH_STORED_KEY_INFO;
++                	status = FSL_RETURN_OK_S;
++				} else {
++#ifdef FSL_HAVE_SCC2
++					/* User Keystore */
++					fsl_shw_kso_t *keystore = key_info->keystore;
++					/* Note: the key data is stored here, but the address has to
++					 * be converted to a partition and offset in the kernel.
++					 * This will be calculated in kernel space, based on the
++					 * list of partitions held by the users context.
++					 */
++					(*link)->data =
++						keystore->slot_get_address(keystore->user_data,
++												 key_info->handle);
++				
++					flags |= SAH_IN_USER_KEYSTORE;
++					status = FSL_RETURN_OK_S;
++#else
++					/* User keystores only supported in SCC2 */
++					status = FSL_RETURN_BAD_FLAG_S;
++#endif				/* FSL_HAVE_SCC2 */
++				
++				}
++            } else {
++                /* the flag is bad. Should never get here */
++                status = FSL_RETURN_BAD_FLAG_S;
++            }
++        }
+ 
+-		(*link)->next = NULL;
+-		(*link)->flags = flags;
++        (*link)->next = NULL;
++        (*link)->flags = flags;
+ 
+ #ifdef DIAG_SECURITY_FUNC_UGLY
+-		if (status == FSL_RETURN_OK_S) {
+-			LOG_DIAG("Created Link");
+-			LOG_DIAG("------------");
+-			sprintf(diag, " address       = 0x%x", (int)*link);
+-			LOG_DIAG(diag);
+-			sprintf(diag, " link->len     = %d", (*link)->len);
+-			LOG_DIAG(diag);
+-			if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
+-				sprintf(diag, " link->slot    = 0x%x",
+-					(*link)->slot);
+-				LOG_DIAG(diag);
+-			} else {
+-				sprintf(diag, " link->data    = 0x%x",
+-					(int)(*link)->data);
+-				LOG_DIAG(diag);
+-			}
+-			sprintf(diag, " link->flags   = 0x%x", (*link)->flags);
+-			LOG_DIAG(diag);
+-			LOG_DIAG(" link->next    = NULL");
+-		}
+-#endif				/*DIAG_SECURITY_FUNC_UGLY */
+-
+-		if (status == FSL_RETURN_BAD_FLAG_S) {
+-			mu->mu_free_link(mu->mu_ref, *link);
+-			*link = NULL;
++        if (status == FSL_RETURN_OK_S) {
++            LOG_DIAG("Created Link");
++            LOG_DIAG("------------");
++            sprintf(diag," address       = 0x%x", (int) *link);
++            LOG_DIAG(diag);
++            sprintf(diag," link->len     = %d", (*link)->len);
++            LOG_DIAG(diag);
++            if (key_info->flags & FSL_SKO_KEY_ESTABLISHED) {
++                sprintf(diag," link->slot    = 0x%x", (*link)->slot);
++                LOG_DIAG(diag);
++            } else {
++                sprintf(diag," link->data    = 0x%x", (int)(*link)->data);
++                LOG_DIAG(diag);
++            }
++            sprintf(diag," link->flags   = 0x%x", (*link)->flags);
++            LOG_DIAG(diag);
++            LOG_DIAG(" link->next    = NULL");
++        }
++#endif /*DIAG_SECURITY_FUNC_UGLY*/
++
++        if (status == FSL_RETURN_BAD_FLAG_S) {
++            mu->mu_free_link(mu->mu_ref, *link);
++            *link = NULL;
+ #ifdef DIAG_SECURITY_FUNC
+-			LOG_DIAG
+-			    ("Creation of sah_Key_Link failed due to bad key flag!\n");
+-#endif				/*DIAG_SECURITY_FUNC */
+-		}
++            LOG_DIAG("Creation of sah_Key_Link failed due to bad key flag!\n");
++#endif /*DIAG_SECURITY_FUNC*/
++        }
+ 
+-	} else {
++    } else {
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("Allocation of memory for sah_Key_Link failed!\n");
+-#endif				/*DIAG_SECURITY_FUNC */
+-	}
++        LOG_DIAG("Allocation of memory for sah_Key_Link failed!\n");
++#endif /*DIAG_SECURITY_FUNC*/
++    }
+ 
+-	return status;
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Append Link
+  *
+  * @brief   Allocate Memory for Link structure and append it to the end of
+@@ -619,31 +660,34 @@ fsl_shw_return_t sah_Create_Key_Link(const sah_Mem_Util * mu,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t sah_Append_Link(const sah_Mem_Util * mu,
+-				 sah_Link * link_head,
+-				 uint8_t * p,
+-				 const size_t length,
+-				 const sah_Link_Flags flags)
++fsl_shw_return_t sah_Append_Link(
++    const sah_Mem_Util *mu,
++    sah_Link *link_head,
++    uint8_t *p,
++    const size_t length,
++    const sah_Link_Flags flags)
+ {
+-	sah_Link *new_link;
+-	fsl_shw_return_t status;
++    sah_Link* new_link;
++    fsl_shw_return_t status;
+ 
+-	status = sah_Create_Link(mu, &new_link, p, length, flags);
+ 
+-	if (status == FSL_RETURN_OK_S) {
+-		/* chase for the tail */
+-		while (link_head->next != NULL) {
+-			link_head = link_head->next;
+-		}
++    status = sah_Create_Link(mu, &new_link, p, length, flags);
+ 
+-		/* and add new tail */
+-		link_head->next = new_link;
+-	}
++    if (status == FSL_RETURN_OK_S) {
++        /* chase for the tail */
++        while (link_head->next != NULL) {
++            link_head = link_head->next;
++        }
+ 
+-	return status;
++        /* and add new tail */
++        link_head->next = new_link;
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Create and populate a single descriptor
+  *
+  * The pointer and length fields will be be set based on the chains passed in
+@@ -662,84 +706,88 @@ fsl_shw_return_t sah_Append_Link(const sah_Mem_Util * mu,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-static fsl_shw_return_t sah_Create_Desc(const sah_Mem_Util * mu,
+-					sah_Desc ** desc,
+-					int head_desc,
+-					uint32_t header,
+-					sah_Link * link1, sah_Link * link2)
++static fsl_shw_return_t sah_Create_Desc(
++    const sah_Mem_Util *mu,
++    sah_Desc ** desc,
++    int head_desc,
++    uint32_t header,
++    sah_Link * link1,
++    sah_Link * link2)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_NO_RESOURCE_S;
++    fsl_shw_return_t status = FSL_RETURN_NO_RESOURCE_S;
+ #ifdef DIAG_SECURITY_FUNC_UGLY
+-	char diag[50];
+-#endif				/*DIAG_SECURITY_FUNC_UGLY */
++    char diag[50];
++#endif /*DIAG_SECURITY_FUNC_UGLY*/
+ 
+-	if (head_desc != 0) {
+-		*desc = (sah_Desc *) mu->mu_alloc_head_desc(mu->mu_ref);
+-	} else {
+-		*desc = mu->mu_alloc_desc(mu->mu_ref);
+-	}
+ 
+-	/* populate descriptor if memory allocation successful */
+-	if ((*desc) != NULL) {
+-		sah_Link *temp_link;
++    if (head_desc != 0) {
++        *desc = (sah_Desc *)mu->mu_alloc_head_desc(mu->mu_ref);
++    } else {
++        *desc = mu->mu_alloc_desc(mu->mu_ref);
++    }
+ 
+-		status = FSL_RETURN_OK_S;
+-		(*desc)->header = header;
++    /* populate descriptor if memory allocation successful */
++    if ((*desc) != NULL) {
++        sah_Link* temp_link;
+ 
+-		temp_link = (*desc)->ptr1 = link1;
+-		(*desc)->len1 = 0;
+-		while (temp_link != NULL) {
+-			(*desc)->len1 += temp_link->len;
+-			temp_link = temp_link->next;
+-		}
++        status = FSL_RETURN_OK_S;
++        (*desc)->header = header;
+ 
+-		temp_link = (*desc)->ptr2 = link2;
+-		(*desc)->len2 = 0;
+-		while (temp_link != NULL) {
+-			(*desc)->len2 += temp_link->len;
+-			temp_link = temp_link->next;
+-		}
++        temp_link = (*desc)->ptr1 = link1;
++        (*desc)->len1 = 0;
++        while (temp_link != NULL) {
++            (*desc)->len1 += temp_link->len;
++            temp_link = temp_link->next;
++        }
++
++        temp_link = (*desc)->ptr2 = link2;
++        (*desc)->len2 = 0;
++        while (temp_link != NULL) {
++            (*desc)->len2 += temp_link->len;
++            temp_link = temp_link->next;
++        }
+ 
+-		(*desc)->next = NULL;
++        (*desc)->next = NULL;
+ 
+ #ifdef DIAG_SECURITY_FUNC_UGLY
+-		LOG_DIAG("Created Desc");
+-		LOG_DIAG("------------");
+-		sprintf(diag, " address       = 0x%x", (int)*desc);
+-		LOG_DIAG(diag);
+-		sprintf(diag, " desc->header  = 0x%x", (*desc)->header);
+-		LOG_DIAG(diag);
+-		sprintf(diag, " desc->len1    = %d", (*desc)->len1);
+-		LOG_DIAG(diag);
+-		sprintf(diag, " desc->ptr1    = 0x%x", (int)((*desc)->ptr1));
+-		LOG_DIAG(diag);
+-		sprintf(diag, " desc->len2    = %d", (*desc)->len2);
+-		LOG_DIAG(diag);
+-		sprintf(diag, " desc->ptr2    = 0x%x", (int)((*desc)->ptr2));
+-		LOG_DIAG(diag);
+-		sprintf(diag, " desc->next    = 0x%x", (int)((*desc)->next));
+-		LOG_DIAG(diag);
+-#endif				/*DIAG_SECURITY_FUNC_UGLY */
+-	} else {
++        LOG_DIAG("Created Desc");
++        LOG_DIAG("------------");
++        sprintf(diag," address       = 0x%x",(int) *desc);
++        LOG_DIAG(diag);
++        sprintf(diag," desc->header  = 0x%x",(*desc)->header);
++        LOG_DIAG(diag);
++        sprintf(diag," desc->len1    = %d",(*desc)->len1);
++        LOG_DIAG(diag);
++        sprintf(diag," desc->ptr1    = 0x%x",(int) ((*desc)->ptr1));
++        LOG_DIAG(diag);
++        sprintf(diag," desc->len2    = %d",(*desc)->len2);
++        LOG_DIAG(diag);
++        sprintf(diag," desc->ptr2    = 0x%x",(int) ((*desc)->ptr2));
++        LOG_DIAG(diag);
++        sprintf(diag," desc->next    = 0x%x",(int) ((*desc)->next));
++        LOG_DIAG(diag);
++#endif /*DIAG_SECURITY_FUNC_UGLY*/
++    } else {
+ #ifdef DIAG_SECURITY_FUNC
+-		LOG_DIAG("Allocation of memory for sah_Desc failed!\n");
+-#endif				/*DIAG_SECURITY_FUNC */
+-
+-		/* Destroy the links, otherwise the memory allocated by the Security
+-		   Function layer for the links (and possibly the data within the links)
+-		   will be lost */
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	}
+-
+-	return status;
++        LOG_DIAG("Allocation of memory for sah_Desc failed!\n");
++#endif /*DIAG_SECURITY_FUNC*/
++
++        /* Destroy the links, otherwise the memory allocated by the Security
++        Function layer for the links (and possibly the data within the links)
++        will be lost */
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Destroy a link (chain) and free memory
+  *
+  * @param mu   memory utility suite
+@@ -747,27 +795,30 @@ static fsl_shw_return_t sah_Create_Desc(const sah_Mem_Util * mu,
+  *
+  * @return none
+  */
+-void sah_Destroy_Link(const sah_Mem_Util * mu, sah_Link * link)
++void sah_Destroy_Link(
++    const sah_Mem_Util *mu,
++    sah_Link * link)
+ {
+ 
+-	while (link != NULL) {
+-		sah_Link *next_link = link->next;
++    while (link != NULL) {
++        sah_Link * next_link = link->next;
+ 
+-		if (link->flags & SAH_OWNS_LINK_DATA) {
+-			/* zero data for security purposes */
+-			mu->mu_memset(mu->mu_ref, link->data, 0x00, link->len);
+-			mu->mu_free(mu->mu_ref, link->data);
+-		}
++        if (link->flags & SAH_OWNS_LINK_DATA) {
++            /* zero data for security purposes */
++            mu->mu_memset(mu->mu_ref, link->data, 0x00, link->len);
++            mu->mu_free(mu->mu_ref, link->data);
++        }
+ 
+-		link->data = NULL;
+-		link->next = NULL;
+-		mu->mu_free_link(mu->mu_ref, link);
++        link->data = NULL;
++        link->next = NULL;
++        mu->mu_free_link(mu->mu_ref, link);
+ 
+-		link = next_link;
+-	}
++        link = next_link;
++    }
+ }
+ 
+-/*!
++
++/**
+  * Add descriptor where both links are inputs.
+  *
+  * @param         header     The Sahara header value for the descriptor.
+@@ -781,12 +832,64 @@ void sah_Destroy_Link(const sah_Mem_Util * mu, sah_Link * link)
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+ fsl_shw_return_t sah_add_two_in_desc(uint32_t header,
+-				     const uint8_t * in1,
+-				     uint32_t in1_length,
+-				     const uint8_t * in2,
+-				     uint32_t in2_length,
+-				     const sah_Mem_Util * mu,
+-				     sah_Head_Desc ** desc_chain)
++                                 const uint8_t* in1,
++                                 uint32_t in1_length,
++                                 const uint8_t* in2,
++                                 uint32_t in2_length,
++                                 const sah_Mem_Util* mu,
++                                 sah_Head_Desc** desc_chain)
++{
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    sah_Link* link1 = NULL;
++    sah_Link* link2 = NULL;
++
++
++    if (in1 != NULL) {
++        status = sah_Create_Link(mu, &link1,
++                                 (sah_Oct_Str) in1, in1_length,
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if ( (in2 != NULL) && (status == FSL_RETURN_OK_S) ) {
++        status = sah_Create_Link(mu, &link2,
++                                 (sah_Oct_Str) in2, in2_length,
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    } else {
++        status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++    }
++
++    return status;
++}
++
++/*!
++ * Add descriptor where neither link needs sync
++ *
++ * @param         header     The Sahara header value for the descriptor.
++ * @param         in1        The first input buffer (or NULL)
++ * @param         in1_length Size of @a in1
++ * @param[out]    in2        The second input buffer (or NULL)
++ * @param         in2_length Size of @a in2
++ * @param         mu         Memory functions
++ * @param[in,out] desc_chain Chain to start or append to
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t sah_add_two_d_desc(uint32_t header,
++				    const uint8_t * in1,
++				    uint32_t in1_length,
++				    const uint8_t * in2,
++				    uint32_t in2_length,
++				    const sah_Mem_Util * mu,
++				    sah_Head_Desc ** desc_chain)
+ {
+ 	fsl_shw_return_t status = FSL_RETURN_OK_S;
+ 	sah_Link *link1 = NULL;
+@@ -816,9 +919,9 @@ fsl_shw_return_t sah_add_two_in_desc(uint32_t header,
+ 	}
+ 
+ 	return status;
+-}
++}				/* sah_add_two_d_desc() */
+ 
+-/*!
++/**
+  * Add descriptor where both links are inputs, the second one being a key.
+  *
+  * @param         header     The Sahara header value for the descriptor.
+@@ -832,41 +935,51 @@ fsl_shw_return_t sah_add_two_in_desc(uint32_t header,
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+ fsl_shw_return_t sah_add_in_key_desc(uint32_t header,
+-				     const uint8_t * in1,
+-				     uint32_t in1_length,
+-				     fsl_shw_sko_t * key_info,
+-				     const sah_Mem_Util * mu,
+-				     sah_Head_Desc ** desc_chain)
++                                 const uint8_t* in1,
++                                 uint32_t in1_length,
++                                 fsl_shw_sko_t* key_info,
++                                 const sah_Mem_Util* mu,
++                                 sah_Head_Desc** desc_chain)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    sah_Link         *link1 = NULL;
++    sah_Link         *link2 = NULL;
+ 
+-	if (in1 != NULL) {
+-		status = sah_Create_Link(mu, &link1,
+-					 (sah_Oct_Str) in1, in1_length,
+-					 SAH_USES_LINK_DATA);
+-	}
+ 
+-	if (status == FSL_RETURN_OK_S) {
+-		status = sah_Create_Key_Link(mu, &link2, key_info);
++    if (in1 != NULL) {
++        status = sah_Create_Link(mu, &link1,
++                                 (sah_Oct_Str) in1, in1_length,
++                                 SAH_USES_LINK_DATA);
++    }
++
++	if (status != FSL_RETURN_OK_S) {
++		goto out;
+ 	}
+ 
++    status = sah_Create_Key_Link(mu, &link2, key_info);
++
++	
+ 	if (status != FSL_RETURN_OK_S) {
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	} else {
+-		status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++		goto out;
+ 	}
+ 
+-	return status;
++	status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++	
++out:
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Create two links using keys allocated in the scc
+  *
+  * @param         header     The Sahara header value for the descriptor.
+@@ -880,36 +993,38 @@ fsl_shw_return_t sah_add_in_key_desc(uint32_t header,
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+ fsl_shw_return_t sah_add_key_key_desc(uint32_t header,
+-				      fsl_shw_sko_t * key_info1,
+-				      fsl_shw_sko_t * key_info2,
+-				      const sah_Mem_Util * mu,
+-				      sah_Head_Desc ** desc_chain)
++                                  fsl_shw_sko_t *key_info1,
++                                  fsl_shw_sko_t *key_info2,
++                                  const sah_Mem_Util *mu,
++                                  sah_Head_Desc **desc_chain)
+ {
+-	fsl_shw_return_t status;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
++    fsl_shw_return_t status;
++    sah_Link         *link1 = NULL;
++    sah_Link         *link2 = NULL;
+ 
+-	status = sah_Create_Key_Link(mu, &link1, key_info1);
+ 
+-	if (status == FSL_RETURN_OK_S) {
+-		status = sah_Create_Key_Link(mu, &link2, key_info2);
+-	}
++    status = sah_Create_Key_Link(mu, &link1, key_info1);
+ 
+-	if (status != FSL_RETURN_OK_S) {
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	} else {
+-		status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
+-	}
++    if (status == FSL_RETURN_OK_S) {
++        status = sah_Create_Key_Link(mu, &link2, key_info2);
++    }
+ 
+-	return status;
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    } else {
++        status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Add descriptor where first link is input, the second is a changing key
+  *
+  * @param         header     The Sahara header value for the descriptor.
+@@ -922,43 +1037,51 @@ fsl_shw_return_t sah_add_key_key_desc(uint32_t header,
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+ fsl_shw_return_t sah_add_in_keyout_desc(uint32_t header,
+-					const uint8_t * in1,
+-					uint32_t in1_length,
+-					fsl_shw_sko_t * key_info,
+-					const sah_Mem_Util * mu,
+-					sah_Head_Desc ** desc_chain)
++                                 const uint8_t* in1,
++                                 uint32_t in1_length,
++                                 fsl_shw_sko_t* key_info,
++                                 const sah_Mem_Util* mu,
++                                 sah_Head_Desc** desc_chain)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    sah_Link         *link1 = NULL;
++    sah_Link         *link2 = NULL;
+ 
+-	if (in1 != NULL) {
+-		status = sah_Create_Link(mu, &link1,
+-					 (sah_Oct_Str) in1, in1_length,
+-					 SAH_USES_LINK_DATA);
+-	}
+ 
+-	if (status == FSL_RETURN_OK_S) {
+-		status = sah_Create_Key_Link(mu, &link2, key_info);
+-	}
++    if (in1 != NULL) {
++        status = sah_Create_Link(mu, &link1,
++                                 (sah_Oct_Str) in1, in1_length,
++                                 SAH_USES_LINK_DATA);
++    }
+ 
+-	if (status != FSL_RETURN_OK_S) {
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	} else {
+-		link2->flags |= SAH_OUTPUT_LINK;
++    if (status != FSL_RETURN_OK_S) {
++		goto out;
++    }
+ 
+-		status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++	status = sah_Create_Key_Link(mu, &link2, key_info);
++    
++	if (status != FSL_RETURN_OK_S) {
++		goto out;
+ 	}
+ 
+-	return status;
++link2->flags |= SAH_OUTPUT_LINK;	/* mark key for output */
++status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++
++out:
++
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++/**
+  * Add descriptor where both links are outputs.
+  *
+  * @param         header      The Sahara header value for the descriptor.
+@@ -972,44 +1095,48 @@ fsl_shw_return_t sah_add_in_keyout_desc(uint32_t header,
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+ fsl_shw_return_t sah_add_two_out_desc(uint32_t header,
+-				      uint8_t * out1,
+-				      uint32_t out1_length,
+-				      uint8_t * out2,
+-				      uint32_t out2_length,
+-				      const sah_Mem_Util * mu,
+-				      sah_Head_Desc ** desc_chain)
++                                      uint8_t* out1,
++                                      uint32_t out1_length,
++                                      uint8_t* out2,
++                                      uint32_t out2_length,
++                                      const sah_Mem_Util* mu,
++                                      sah_Head_Desc** desc_chain)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
+-
+-	if (out1 != NULL) {
+-		status = sah_Create_Link(mu, &link1,
+-					 (sah_Oct_Str) out1, out1_length,
+-					 SAH_OUTPUT_LINK | SAH_USES_LINK_DATA);
+-	}
+-
+-	if ((out2 != NULL) && (status == FSL_RETURN_OK_S)) {
+-		status = sah_Create_Link(mu, &link2,
+-					 (sah_Oct_Str) out2, out2_length,
+-					 SAH_OUTPUT_LINK | SAH_USES_LINK_DATA);
+-	}
+-
+-	if (status != FSL_RETURN_OK_S) {
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	} else {
+-		status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
+-	}
+-
+-	return status;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    sah_Link         *link1 = NULL;
++    sah_Link         *link2 = NULL;
++
++
++    if (out1 != NULL) {
++        status = sah_Create_Link(mu, &link1,
++                                 (sah_Oct_Str) out1, out1_length,
++                                 SAH_OUTPUT_LINK |
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if ( (out2 != NULL) && (status == FSL_RETURN_OK_S) ) {
++        status = sah_Create_Link(mu, &link2,
++                                 (sah_Oct_Str) out2, out2_length,
++                                 SAH_OUTPUT_LINK |
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    } else {
++        status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Add descriptor where first link is output, second is output
+  *
+  * @param         header      The Sahara header value for the descriptor.
+@@ -1023,44 +1150,47 @@ fsl_shw_return_t sah_add_two_out_desc(uint32_t header,
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+ fsl_shw_return_t sah_add_out_in_desc(uint32_t header,
+-				     uint8_t * out1,
+-				     uint32_t out1_length,
+-				     const uint8_t * in2,
+-				     uint32_t in2_length,
+-				     const sah_Mem_Util * mu,
+-				     sah_Head_Desc ** desc_chain)
++                                     uint8_t* out1,
++                                     uint32_t out1_length,
++                                     const uint8_t* in2,
++                                     uint32_t in2_length,
++                                     const sah_Mem_Util* mu,
++                                     sah_Head_Desc** desc_chain)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
+-
+-	if (out1 != NULL) {
+-		status = sah_Create_Link(mu, &link1,
+-					 (sah_Oct_Str) out1, out1_length,
+-					 SAH_OUTPUT_LINK | SAH_USES_LINK_DATA);
+-	}
+-
+-	if ((in2 != NULL) && (status == FSL_RETURN_OK_S)) {
+-		status = sah_Create_Link(mu, &link2,
+-					 (sah_Oct_Str) in2, in2_length,
+-					 SAH_USES_LINK_DATA);
+-	}
+-
+-	if (status != FSL_RETURN_OK_S) {
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	} else {
+-		status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
+-	}
+-
+-	return status;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    sah_Link         *link1 = NULL;
++    sah_Link         *link2 = NULL;
++
++
++    if (out1 != NULL) {
++        status = sah_Create_Link(mu, &link1,
++                                 (sah_Oct_Str) out1, out1_length,
++                                 SAH_OUTPUT_LINK |
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if ( (in2 != NULL) && (status == FSL_RETURN_OK_S) ) {
++        status = sah_Create_Link(mu, &link2,
++                                 (sah_Oct_Str) in2, in2_length,
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    } else {
++        status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Add descriptor where link1 is input buffer, link2 is output buffer.
+  *
+  * @param         header     The Sahara header value for the descriptor.
+@@ -1074,42 +1204,45 @@ fsl_shw_return_t sah_add_out_in_desc(uint32_t header,
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+ fsl_shw_return_t sah_add_in_out_desc(uint32_t header,
+-				     const uint8_t * in, uint32_t in_length,
+-				     uint8_t * out, uint32_t out_length,
+-				     const sah_Mem_Util * mu,
+-				     sah_Head_Desc ** desc_chain)
++                                 const uint8_t* in, uint32_t in_length,
++                                 uint8_t* out, uint32_t out_length,
++                                 const sah_Mem_Util* mu,
++                                 sah_Head_Desc** desc_chain)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
+-
+-	if (in != NULL) {
+-		status = sah_Create_Link(mu, &link1,
+-					 (sah_Oct_Str) in, in_length,
+-					 SAH_USES_LINK_DATA);
+-	}
+-
+-	if ((status == FSL_RETURN_OK_S) && (out != NULL)) {
+-		status = sah_Create_Link(mu, &link2,
+-					 (sah_Oct_Str) out, out_length,
+-					 SAH_OUTPUT_LINK | SAH_USES_LINK_DATA);
+-	}
+-
+-	if (status != FSL_RETURN_OK_S) {
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	} else {
+-		status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
+-	}
+-
+-	return status;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++    sah_Link         *link1 = NULL;
++    sah_Link         *link2 = NULL;
++
++
++    if (in != NULL) {
++        status = sah_Create_Link(mu, &link1,
++                                 (sah_Oct_Str) in, in_length,
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if ((status == FSL_RETURN_OK_S) && (out != NULL))  {
++        status = sah_Create_Link(mu, &link2,
++                                 (sah_Oct_Str) out, out_length,
++                                 SAH_OUTPUT_LINK |
++                                 SAH_USES_LINK_DATA);
++    }
++
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    } else {
++        status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Add descriptor where link1 is a key, link2 is output buffer.
+  *
+  * @param         header     The Sahara header value for the descriptor.
+@@ -1121,38 +1254,49 @@ fsl_shw_return_t sah_add_in_out_desc(uint32_t header,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t sah_add_key_out_desc(uint32_t header, fsl_shw_sko_t * key_info,
+-				      uint8_t * out, uint32_t out_length,
+-				      const sah_Mem_Util * mu,
+-				      sah_Head_Desc ** desc_chain)
++fsl_shw_return_t sah_add_key_out_desc(uint32_t header,
++								  const fsl_shw_sko_t *key_info,
++                                  uint8_t* out, uint32_t out_length,
++                                  const sah_Mem_Util *mu,
++                                  sah_Head_Desc **desc_chain)
+ {
+-	fsl_shw_return_t status;
+-	sah_Link *link1 = NULL;
+-	sah_Link *link2 = NULL;
++    fsl_shw_return_t status;
++    sah_Link         *link1 = NULL;
++    sah_Link         *link2 = NULL;
+ 
+-	status = sah_Create_Key_Link(mu, &link1, key_info);
+-
+-	if ((status == FSL_RETURN_OK_S) && (out != NULL)) {
+-		status = sah_Create_Link(mu, &link2,
+-					 (sah_Oct_Str) out, out_length,
+-					 SAH_OUTPUT_LINK | SAH_USES_LINK_DATA);
+-	}
+ 
++    status = sah_Create_Key_Link(mu, &link1, (fsl_shw_sko_t *) key_info);
+ 	if (status != FSL_RETURN_OK_S) {
+-		if (link1 != NULL) {
+-			sah_Destroy_Link(mu, link1);
+-		}
+-		if (link2 != NULL) {
+-			sah_Destroy_Link(mu, link2);
+-		}
+-	} else {
+-		status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++		goto out;
+ 	}
+-
+-	return status;
++    
++
++    if (out != NULL)  {
++        status = sah_Create_Link(mu, &link2,
++                                 (sah_Oct_Str) out, out_length,
++                                 SAH_OUTPUT_LINK |
++                                 SAH_USES_LINK_DATA);
++		if (status != FSL_RETURN_OK_S) {
++			goto out;
++	   }
++    }
++status = sah_Append_Desc(mu, desc_chain, header, link1, link2);
++	
++out:
++    if (status != FSL_RETURN_OK_S) {
++        if (link1 != NULL) {
++            sah_Destroy_Link(mu, link1);
++        }
++        if (link2 != NULL) {
++            sah_Destroy_Link(mu, link2);
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Sanity checks the user context object fields to ensure that they make some
+  * sense before passing the uco as a parameter
+  *
+@@ -1162,48 +1306,48 @@ fsl_shw_return_t sah_add_key_out_desc(uint32_t header, fsl_shw_sko_t * key_info,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t sah_validate_uco(fsl_shw_uco_t * uco)
++fsl_shw_return_t sah_validate_uco(fsl_shw_uco_t *uco)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
+-
+-	/* check if file is opened */
+-	if (uco->sahara_openfd < 0) {
+-		status = FSL_RETURN_NO_RESOURCE_S;
+-	} else {
+-		/* check flag combination: the only invalid setting of the
+-		 * blocking and callback flags is blocking with callback. So check
+-		 * for that
+-		 */
+-		if ((uco->
+-		     flags & (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) ==
+-		    (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) {
+-			status = FSL_RETURN_BAD_FLAG_S;
+-		} else {
+-			/* check that memory utilities have been attached */
+-			if (uco->mem_util == NULL) {
+-				status = FSL_RETURN_MEMORY_ERROR_S;
+-			} else {
+-				/* must have pool of at least 1, even for blocking mode */
+-				if (uco->pool_size == 0) {
+-					status = FSL_RETURN_ERROR_S;
+-				} else {
+-					/* if callback flag is set, it better have a callback
+-					 * routine */
+-					if (uco->flags & FSL_UCO_CALLBACK_MODE) {
+-						if (uco->callback == NULL) {
+-							status =
+-							    FSL_RETURN_INTERNAL_ERROR_S;
+-						}
+-					}
+-				}
+-			}
+-		}
+-	}
+-
+-	return status;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++
++
++    /* check if file is opened */
++    if (uco->sahara_openfd < 0) {
++        status = FSL_RETURN_NO_RESOURCE_S;
++    } else {
++        /* check flag combination: the only invalid setting of the
++         * blocking and callback flags is blocking with callback. So check
++         * for that
++         */
++        if ((uco->flags & (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) ==
++                         (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) {
++            status = FSL_RETURN_BAD_FLAG_S;
++        } else {
++            /* check that memory utilities have been attached */
++            if (uco->mem_util == NULL) {
++                status = FSL_RETURN_MEMORY_ERROR_S;
++            } else {
++                /* must have pool of at least 1, even for blocking mode */
++                if (uco->pool_size == 0) {
++                    status = FSL_RETURN_ERROR_S;
++                } else {
++                    /* if callback flag is set, it better have a callback
++                     * routine */
++                    if (uco->flags & FSL_UCO_CALLBACK_MODE) {
++                        if (uco->callback == NULL) {
++                            status = FSL_RETURN_INTERNAL_ERROR_S;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Perform any post-processing on non-blocking results.
+  *
+  * For instance, free descriptor chains, compare authentication codes, ...
+@@ -1211,46 +1355,46 @@ fsl_shw_return_t sah_validate_uco(fsl_shw_uco_t * uco)
+  * @param  user_ctx     User context object
+  * @param  result_info  A set of results
+  */
+-void sah_Postprocess_Results(fsl_shw_uco_t * user_ctx,
+-			     sah_results * result_info)
++void sah_Postprocess_Results(fsl_shw_uco_t* user_ctx, sah_results* result_info)
+ {
+-	unsigned i;
+-
+-	/* for each result returned */
+-	for (i = 0; i < *result_info->actual; i++) {
+-		sah_Head_Desc *desc = result_info->results[i].user_desc;
+-		uint8_t *out1 = desc->out1_ptr;
+-		uint8_t *out2 = desc->out2_ptr;
+-		uint32_t len = desc->out_len;
+-
+-		/*
+-		 * For now, tne only post-processing besides freeing the
+-		 * chain is the need to check the auth code for fsl_shw_auth_decrypt().
+-		 *
+-		 * If other uses are required in the future, this code will probably
+-		 * need a flag in the sah_Head_Desc (or a function pointer!) to
+-		 * determine what needs to be done.
+-		 */
+-		if ((out1 != NULL) && (out2 != NULL)) {
+-			unsigned j;
+-			for (j = 0; j < len; j++) {
+-				if (out1[j] != out2[j]) {
+-					/* Problem detected.  Change result. */
+-					result_info->results[i].code =
+-					    FSL_RETURN_AUTH_FAILED_S;
+-					break;
+-				}
+-			}
+-			/* free allocated 'calced_auth' */
+-			user_ctx->mem_util->
+-			    mu_free(user_ctx->mem_util->mu_ref, out1);
+-		}
+-
+-		/* Free the API-created chain, unless tagged as not-from-API */
+-		if (!(desc->uco_flags & FSL_UCO_SAVE_DESC_CHAIN)) {
+-			sah_Descriptor_Chain_Destroy(user_ctx->mem_util, &desc);
+-		}
+-	}
++    unsigned i;
++
++    /* for each result returned */
++    for (i = 0; i < *result_info->actual; i++) {
++        sah_Head_Desc* desc = result_info->results[i].user_desc;
++        uint8_t* out1 = desc->out1_ptr;
++        uint8_t* out2 = desc->out2_ptr;
++        uint32_t len = desc->out_len;
++
++        /*
++         * For now, tne only post-processing besides freeing the
++         * chain is the need to check the auth code for fsl_shw_auth_decrypt().
++         *
++         * If other uses are required in the future, this code will probably
++         * need a flag in the sah_Head_Desc (or a function pointer!) to
++         * determine what needs to be done.
++         */
++        if ((out1 != NULL) && (out2 != NULL)) {
++            unsigned j;
++            for (j = 0; j < len; j++) {
++                if (out1[j] != out2[j]) {
++                    /* Problem detected.  Change result. */
++                    result_info->results[i].code = FSL_RETURN_AUTH_FAILED_S;
++                    break;
++                }
++            }
++            /* free allocated 'calced_auth' */
++            user_ctx->mem_util->
++                mu_free(user_ctx->mem_util->mu_ref, out1);
++        }
++
++        /* Free the API-created chain, unless tagged as not-from-API */
++        if (! (desc->uco_flags & FSL_UCO_SAVE_DESC_CHAIN)) {
++            sah_Descriptor_Chain_Destroy(user_ctx->mem_util, &desc);
++        }
++    }
+ }
+ 
+-/* End of sah_util.c */
++
++/* End of sf_util.c */
++
+diff --git a/sahara2/um_adaptor.c b/sahara2/um_adaptor.c
+index 1016c76..6043128 100644
+--- a/sahara2/um_adaptor.c
++++ b/sahara2/um_adaptor.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -31,6 +31,7 @@
+ #include <sys/types.h>
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
++#include <sys/mman.h>
+ #include <signal.h>
+ #include <errno.h>
+ #include <string.h>
+@@ -62,12 +63,12 @@ static void um_Dump_Link(const char *prefix, const sah_Link * link);
+ 
+ void um_Dump_Words(const char *prefix, const unsigned *data, unsigned length);
+ 
+-#undef LOG_DIAG
++/*#undef LOG_DIAG
+ 
+-#define LOG_DIAG(x) printf("%s\n", x)
++#define LOG_DIAG(x) printf("%s\n", x)*/
+ 
+ #ifndef MAX_DUMP
+-#define MAX_DUMP 16
++#define MAX_DUMP 64
+ #endif
+ 
+ /* This static error message buffer is likely not thread-safe */
+@@ -200,6 +201,20 @@ static fsl_shw_return_t sah_service_request(unsigned int command,
+ 					    void *arg, fsl_shw_uco_t * uco);
+ 
+ /*!
++ * @brief    Sends a request to get the platform capabilities
++ *
++ * @param[in]   user_ctx                User context.
++ * @param[out]  sahara2_capabilities    Platform capabilities.
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t get_capabilities(fsl_shw_uco_t * user_ctx,
++				  fsl_shw_pco_t * capabilities)
++{
++	return sah_service_request(SAHARA_GET_CAPS, capabilities, user_ctx);
++}
++
++/*!
+  * @brief    Sends a request to register this user
+  *
+  * @param[in,out] uco User context.  Part of the structre contains input
+@@ -208,50 +223,50 @@ static fsl_shw_return_t sah_service_request(unsigned int command,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t sah_register(fsl_shw_uco_t * uco)
++fsl_shw_return_t sah_register(fsl_shw_uco_t * user_ctx)
+ {
+ 	fsl_shw_return_t status = FSL_RETURN_ERROR_S;
+ 	unsigned dev_opened = 0;	/* boolean */
+ 	unsigned user_added = 0;	/* boolean */
+ 
+ 	/* Link user into process-local chain of contexts */
+-	status = add_user(uco);
++	status = add_user(user_ctx);
+ 	if (status != FSL_RETURN_OK_S) {
+ 		goto out;
+ 	}
+ 	user_added = 1;
+ 
+-	if (uco->sahara_openfd >= 0) {
++	if (user_ctx->sahara_openfd >= 0) {
+ 		status = FSL_RETURN_ERROR_S;
+ 		goto out;
+ 	}
+ 
+ 	/* This code needs to open the device RIGHT HERE */
+-	uco->sahara_openfd = open(SAHARA_DEVICE, O_WRONLY);
+-	if (uco->sahara_openfd < 0) {
++	user_ctx->sahara_openfd = open(SAHARA_DEVICE, O_RDWR);
++	if (user_ctx->sahara_openfd < 0) {
+ 		status = FSL_RETURN_ERROR_S;
+ 		goto out;
+ 	}
+ 	dev_opened = 1;
+-	uco->mem_util = &std_usermode_mem_util;
++	user_ctx->mem_util = &std_usermode_mem_util;
+ 
+ 	/* check that uco is valid */
+-	status = sah_validate_uco(uco);
++	status = sah_validate_uco(user_ctx);
+ 	if (status != FSL_RETURN_OK_S) {
+ 		goto out;
+ 	}
+ 
+ 	/*  Life is good, register this user */
+-	status = sah_service_request(SAHARA_REGISTER, (void *)uco, uco);
++	status = sah_service_request(SAHARA_REGISTER, (void *)user_ctx, user_ctx);
+ 
+       out:
+ 	if (status != FSL_RETURN_OK_S) {
+ 		if (user_added) {
+-			remove_user(uco);
++			remove_user(user_ctx);
+ 		}
+ 		if (dev_opened) {
+-			close(uco->sahara_openfd);
+-			uco->sahara_openfd = -1;
++			close(user_ctx->sahara_openfd);
++			user_ctx->sahara_openfd = -1;
+ 		}
+ 	}
+ 
+@@ -311,6 +326,430 @@ fsl_shw_return_t sah_get_results(sah_results * arg, fsl_shw_uco_t * uco)
+ }
+ 
+ /*!
++ * @brief   Allocate a slot in the system keystore
++ *
++ * @param       user_ctx    User context
++ * @param       key_length  Requested length (octets)
++ * @param       ownerid     Owner ID to associate with key
++ * @param[out]  slot        Allocated slot number
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t do_system_keystore_slot_alloc(fsl_shw_uco_t * user_ctx,
++					       uint32_t key_length,
++					       uint64_t ownerid,
++					       uint32_t * slot)
++{
++	fsl_shw_return_t ret;
++	scc_slot_t slot_info;
++
++	slot_info.key_length = key_length;
++	slot_info.ownerid = ownerid;
++
++	ret = sah_service_request(SAHARA_SK_ALLOC, &slot_info, user_ctx);
++
++	if (ret == FSL_RETURN_OK_S) {
++		*slot = slot_info.slot;
++		ret = slot_info.code;
++	}
++
++	return ret;
++}
++
++/*!
++ * @brief   Deallocate an allocated slot in the system keystore
++ *
++ * @param       user_ctx    User context
++ * @param       ownerid     Owner ID to associate with key
++ * @param[out]  slot        Allocated slot number
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t do_system_keystore_slot_dealloc(fsl_shw_uco_t * user_ctx,
++						 uint64_t ownerid,
++						 uint32_t slot)
++{
++	scc_slot_t slot_info;
++	fsl_shw_return_t ret;
++
++	slot_info.ownerid = ownerid;
++	slot_info.slot = slot;
++
++	ret = sah_service_request(SAHARA_SK_DEALLOC, &slot_info, user_ctx);
++	if (ret == FSL_RETURN_OK_S) {
++		ret = slot_info.code;
++	}
++
++	return ret;
++}
++
++/*!
++ * @brief   Load a plaintext key into a slot in the system keystore
++ *
++ * @param       user_ctx    User context
++ * @param       ownerid     Owner ID to associate with key
++ * @param       slot        Slot to load the key into
++ * @param       key         Plaintext key data to put in the slot
++ * @param       key_length  Length of plaintext key (octets)
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t do_system_keystore_slot_load(fsl_shw_uco_t * user_ctx,
++					      uint64_t ownerid,
++					      uint32_t slot,
++					      const uint8_t * key,
++					      uint32_t key_length)
++{
++	scc_slot_t slot_info;
++	fsl_shw_return_t ret;
++
++	slot_info.ownerid = ownerid;
++	slot_info.slot = slot;
++	slot_info.key_length = key_length;
++	slot_info.key = (void *)key;
++
++	ret = sah_service_request(SAHARA_SK_LOAD, &slot_info, user_ctx);
++	if (ret == FSL_RETURN_OK_S) {
++		ret = slot_info.code;
++	}
++
++	return ret;
++}
++
++/*!
++ * @brief   Encrypt a key stored in the system keystore
++ *
++ * @param       user_ctx    User context
++ * @param       ownerid     Owner ID associated with the key
++ * @param       slot        Slot to encrypt
++ * @param       key_length  Length of plaintext key (octets)
++ * @param       black_data  Location to store the encrypted key
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t do_system_keystore_slot_encrypt(fsl_shw_uco_t * user_ctx,
++						 uint64_t ownerid,
++						 uint32_t slot,
++						 uint32_t key_length,
++						 uint8_t * black_data)
++{
++	scc_slot_t slot_info;
++	fsl_shw_return_t ret;
++
++	slot_info.ownerid = ownerid;
++	slot_info.slot = slot;
++	slot_info.key = black_data;
++	slot_info.key_length = key_length;
++
++	ret = sah_service_request(SAHARA_SK_SLOT_ENC, &slot_info, user_ctx);
++	if (ret == FSL_RETURN_OK_S) {
++		ret = slot_info.code;
++	}
++
++	return ret;
++}
++
++/*!
++ * @brief   Decrypt a key to the system keystore
++ *
++ * @param       user_ctx    User context
++ * @param       ownerid     Owner ID associated with the key
++ * @param       slot        Slot to fill
++ * @param       key_length  Length of plaintext key (octets)
++ * @param       black_data  Location of the encrypted key
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t do_system_keystore_slot_decrypt(fsl_shw_uco_t * user_ctx,
++						 uint64_t ownerid,
++						 uint32_t slot,
++						 uint32_t key_length,
++						 const uint8_t * black_data)
++{
++	scc_slot_t slot_info;
++	fsl_shw_return_t ret;
++
++	slot_info.ownerid = ownerid;
++	slot_info.slot = slot;
++	slot_info.key = (uint8_t *) black_data;
++	slot_info.key_length = key_length;
++
++	ret = sah_service_request(SAHARA_SK_SLOT_DEC, &slot_info, user_ctx);
++	if (ret == FSL_RETURN_OK_S) {
++		ret = slot_info.code;
++	}
++
++	return ret;
++}
++
++/*!
++ * @brief   Encrypt a region of secure memory using the hardware secret key
++ *
++ * @param       user_ctx        User context
++ * @param       partition_base  Base address of the partition
++ * @param       offset_bytes    Offset of data from the partition base
++ * @param       byte_count      Length of the data to encrypt
++ * @param       black_data      Location to store the encrypted data
++ * @param       IV              IV to use for the encryption routine
++ * @param       cypher_mode     Cyphering mode to use, specified by type
++ *                              #fsl_shw_cypher_mode_t
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t
++do_scc_encrypt_region(fsl_shw_uco_t * user_ctx,
++		      void *partition_base, uint32_t offset_bytes,
++		      uint32_t byte_count, uint8_t * black_data,
++		      uint32_t * IV, fsl_shw_cypher_mode_t cypher_mode)
++{
++	fsl_shw_return_t ret;
++	scc_region_t region_info;
++	int i;
++
++	region_info.partition_base = (uint32_t) partition_base;
++	region_info.offset = offset_bytes;
++	region_info.length = byte_count;
++	region_info.black_data = black_data;
++	region_info.cypher_mode = cypher_mode;
++
++	if (cypher_mode == FSL_SHW_CYPHER_MODE_CBC) {
++		for (i = 0; i < 4; i++) {
++			region_info.IV[i] = IV[i];
++		}
++	}
++
++	ret = sah_service_request(SAHARA_SCC_ENCRYPT, &region_info, user_ctx);
++
++	if (ret == FSL_RETURN_OK_S) {
++		ret = region_info.code;
++	}
++
++	return ret;
++}
++
++/*!
++ * @brief   Decrypt a region of secure memory using the hardware secret key
++ *
++ * @param       user_ctx        User context
++ * @param       partition_base  Base address of the partition
++ * @param       offset_bytes    Offset of data from the partition base
++ * @param       byte_count      Length of the data to decrypt
++ * @param       black_data      Location to store the decrypted data
++ * @param       IV              IV to use for the decryption routine
++ * @param       cypher_mode     Cyphering mode to use, specified by type
++ *                              #fsl_shw_cypher_mode_t
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t
++do_scc_decrypt_region(fsl_shw_uco_t * user_ctx,
++		      void *partition_base, uint32_t offset_bytes,
++		      uint32_t byte_count, const uint8_t * black_data,
++		      uint32_t * IV, fsl_shw_cypher_mode_t cypher_mode)
++{
++	fsl_shw_return_t ret;
++	scc_region_t region_info;
++	int i;
++
++	region_info.partition_base = (uint32_t) partition_base;
++	region_info.offset = offset_bytes;
++	region_info.length = byte_count;
++	region_info.black_data = (uint8_t *) black_data;
++	region_info.cypher_mode = cypher_mode;
++	if (cypher_mode == FSL_SHW_CYPHER_MODE_CBC) {
++		for (i = 0; i < 4; i++) {
++			region_info.IV[i] = IV[i];
++		}
++	}
++
++	ret = sah_service_request(SAHARA_SCC_DECRYPT, &region_info, user_ctx);
++
++	if (ret == FSL_RETURN_OK_S) {
++		ret = region_info.code;
++	}
++
++	return ret;
++}
++
++/*!
++ * Allocate a block of secure memory
++ *
++ * @param       user_ctx        User context
++ * @param       size            Memory size (octets).  Note: currently only
++ *                              supports only single-partition sized blocks.
++ * @param       UMID            User Mode ID to use when registering the
++ *                              partition.
++ * @param       permissions     Permissions to initialize the partition with.
++ *                              Can be made by ORing flags from the
++ *                              #fsl_shw_permission_t.
++ *
++ * @return                      Address of the allocated memory.  NULL if the
++ *                              call was not successful.
++ */
++void *fsl_shw_smalloc(fsl_shw_uco_t * user_ctx,
++		      uint32_t size, const uint8_t * UMID, uint32_t permissions)
++{
++	void *address;
++	uint8_t engaged = 0;
++
++	/* Acquire a secure partition by calling mmap() on the SHW file */
++	address = mmap(NULL, size,
++		       PROT_READ | PROT_WRITE,
++		       MAP_SHARED, user_ctx->sahara_openfd, 0);
++
++	if (address == MAP_FAILED) {
++		printf("Could not acquire partition!\n");
++		goto out;
++	}
++
++	/* Finish setup of the secure partition by writing the UMID and permissions
++	 * registers.
++	 */
++	if (do_scc_engage_partition(user_ctx, address, UMID, permissions)
++	    == FSL_RETURN_OK_S) {
++		engaged = 1;
++	}
++
++      out:
++	if (address == NULL) {
++		return NULL;
++	}
++
++	if (engaged == 0) {
++		/* engage failed, release partition */
++		fsl_shw_sfree(user_ctx, address);
++		return NULL;
++	}
++
++	return address;
++}
++
++fsl_shw_return_t do_scc_engage_partition(fsl_shw_uco_t * user_ctx,
++					 void *address,
++					 const uint8_t * UMID,
++					 uint32_t permissions)
++{
++#ifdef FSL_HAVE_SCC2
++	uint8_t *UMID_base = address + 0x10;
++	uint32_t *MAP_base = address;
++	uint8_t i;
++	fsl_shw_partition_status_t status;
++
++	if (fsl_shw_sstatus(user_ctx, address, &status) != FSL_RETURN_OK_S ||
++	    status != FSL_PART_S_ALLOCATED) {
++		printf("partition not allocated, cannot engage!\n");
++		return FSL_RETURN_ERROR_S;
++	}
++
++	if (UMID != NULL) {
++		for (i = 0; i < 16; i++) {
++			UMID_base[i] = UMID[i];
++		}
++	} else {
++		for (i = 0; i < 16; i++) {
++			UMID_base[i] = 0;
++		}
++	}
++
++	MAP_base[0] = permissions;
++
++	/* Check the partition status */
++	if (fsl_shw_sstatus(user_ctx, address, &status) == FSL_RETURN_OK_S &&
++	    status == FSL_PART_S_ENGAGED) {
++		return FSL_RETURN_OK_S;
++	} else {
++		printf("partition failed to engage!\n");
++		return FSL_RETURN_ERROR_S;
++	}
++#else				/* FSL_HAVE_SCC2 */
++	(void)user_ctx;
++	(void)address;
++	(void)UMID;
++	(void)permissions;
++	return FSL_RETURN_ERROR_S;
++#endif
++}
++
++/*!
++ * Free a block of secure memory that was allocated with #fsl_shw_smalloc
++ *
++ * @param       user_ctx        User context
++ * @param       address         Address of the block of secure memory to be
++ *                              released.
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t fsl_shw_sfree(fsl_shw_uco_t * user_ctx, void *address)
++{
++	/* call ioctl on the SHW file to release the partition
++	 *
++	 * note: munmap cannot be used because it doesn't notify the driver that
++	 * the memory is being unmapped.
++	 */
++	scc_partition_info_t partition_info;
++	fsl_shw_return_t ret;
++
++	partition_info.user_base = (uint32_t) address;
++
++	ret = sah_service_request(SAHARA_SCC_SFREE, &partition_info, user_ctx);
++
++	return ret;
++}
++
++fsl_shw_return_t fsl_shw_sstatus(fsl_shw_uco_t * user_ctx,
++				 void *address,
++				 fsl_shw_partition_status_t * status)
++{
++	/* call ioctl on the SHW file to release the partition
++	 *
++	 * note: munmap cannot be used because it doesn't notify the driver that
++	 * the memory is being unmapped.
++	 */
++	scc_partition_info_t partition_info;
++	fsl_shw_return_t ret;
++
++	partition_info.user_base = (uint32_t) address;
++
++	ret =
++	    sah_service_request(SAHARA_SCC_SSTATUS, &partition_info, user_ctx);
++
++	if (ret == FSL_RETURN_OK_S) {
++		*status = partition_info.status;
++	}
++
++	return ret;
++}
++
++/*!
++ * Diminish the permissions of a block of secure memory.  Note that permissions
++ * can only be revoked.
++ *
++ * @param       user_ctx        User context
++ * @param       address         Base address of the secure memory to work with
++ * @param       permissions     Permissions to initialize the partition with.
++ *                              Can be made by ORing flags from the
++ *                              #fsl_shw_permission_t.
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t fsl_shw_diminish_perms(fsl_shw_uco_t * user_ctx,
++					void *address, uint32_t permissions)
++{
++	/* Call ioctl on the SHW file to diminish permissions on the partition */
++	scc_partition_info_t partition_info;
++	fsl_shw_return_t ret;
++
++	partition_info.user_base = (uint32_t) address;
++	partition_info.permissions = permissions;
++
++	ret =
++	    sah_service_request(SAHARA_SCC_DROP_PERMS, &partition_info,
++				user_ctx);
++
++	return ret;
++}
++
++/*!
+  * This function writes the Descriptor Chain to the kernel driver.
+  *
+  * @brief     Writes the Descriptor Chain to the kernel driver.
+@@ -343,11 +782,27 @@ fsl_shw_return_t adaptor_Exec_Descriptor_Chain(sah_Head_Desc * dar,
+ 		ret = sah_service_request(SAHARA_DAR, (void *)dar, uco);
+ 	}
+ 
++#ifdef DIAG_ADAPTOR
++		if (ret == FSL_RETURN_OK_S) {
++			LOG_DIAG("sah_service_request returned OK");
++		} else {
++			LOG_DIAG("sah_service_request failed");
++		}
++#endif
++
+ 	if (blocking && (ret == FSL_RETURN_OK_S)) {
+ 		/* chain actually executed, or at least queue */
+ 		ret = dar->result;
+ 	};
+ 
++#ifdef DIAG_ADAPTOR
++		if (ret == FSL_RETURN_OK_S) {
++			LOG_DIAG("chain return OK");
++		} else {
++			LOG_DIAG("chain return failed");
++		}
++#endif
++
+ 	return ret;
+ }
+ 
+@@ -383,8 +838,7 @@ fsl_shw_return_t sah_service_request(unsigned int command,
+ 		status = FSL_RETURN_OK_S;
+ 	} else {
+ #ifdef DIAG_ADAPTOR
+-		sprintf(Diag_msg, "errno from ioctl() is %d", errno);
+-		LOG_DIAG(Diag_msg);
++		 LOG_DIAG_ARGS("errno from ioctl() is %d", errno);
+ #endif
+ 		status = FSL_RETURN_ERROR_S;
+ 	}
+@@ -520,161 +974,489 @@ static void sah_sighandler(int num)
+ 	return;
+ }
+ 
+-/*!
+- * Allocate a slot on the SCC
+- *
+- * @param   user_ctx
+- * @param   key_len
+- * @param   ownerid
+- * @param   slot
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t do_scc_slot_alloc(fsl_shw_uco_t * user_ctx,
+-				   uint32_t key_len,
+-				   uint64_t ownerid, uint32_t * slot)
++#ifdef DIAG_ADAPTOR
++
++#define add_literal(str) snprintf(buffer + output_count,            \
++                                  count - output_count, "%s", str)
++
++static int interpret_skha_modes(uint32_t header, char *buffer, int count)
+ {
+-	fsl_shw_return_t ret;
+-	scc_slot_t slot_info;
++	unsigned output_count = 0;
++
++	switch (header & 0x3) {
++	case 0:
++		output_count += add_literal("AES ");
++		break;
++	case 1:
++		output_count += add_literal("DES ");
++		break;
++	case 2:
++		output_count += add_literal("3DES ");
++		break;
++	case 3:
++		output_count += add_literal("ARC4 ");
++		break;
++	}
+ 
+-	slot_info.key_length = key_len;
+-	slot_info.ownerid = ownerid;
++	if (header & 0x4) {
++		output_count += add_literal("Encrypt ");
++	} else {
++		output_count += add_literal("Decrypt ");
++	}
+ 
+-	slot_info.slot = 400;
+-	slot_info.code = 500;
+-	ret = sah_service_request(SAHARA_SCC_ALLOC, &slot_info, user_ctx);
++	switch ((header >> 3) & 0x3) {
++	case 0:
++		output_count += add_literal("ECB ");
++		break;
++	case 1:
++		output_count += add_literal("CBC ");
++		break;
++	case 2:
++		output_count += add_literal("CCM ");
++		break;
++	case 3:
++		output_count += add_literal("CTR ");
++		break;
++	}
+ 
+-	if (ret == FSL_RETURN_OK_S) {
+-		*slot = slot_info.slot;
+-		ret = slot_info.code;
++	if (header & 0x20) {
++		output_count += add_literal("Aux0 ");
+ 	}
+ 
+-	return ret;
+-}
++	if (header & 0x100) {
++		output_count += add_literal("DisKeyPar ");
++	}
+ 
+-/*!
+- * Deallocate a slot on the SCC
+- *
+- * @param   user_ctx
+- * @param   ownerid
+- * @param   slot
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t do_scc_slot_dealloc(fsl_shw_uco_t * user_ctx, uint64_t ownerid,
+-				     uint32_t slot)
+-{
+-	scc_slot_t slot_info;
+-	fsl_shw_return_t ret;
++	if ((((header >> 3) & 0x3) == 2) || (((header >> 3) & 0x3) == 3)) {
++		switch ((header >> 9) & 0xF) {
++		case 0:
++			output_count += add_literal("CtrMod2^8 ");
++			break;
++		case 1:
++			output_count += add_literal("CtrMod2^16 ");
++			break;
++		case 2:
++			output_count += add_literal("CtrMod2^24 ");
++			break;
++		case 3:
++			output_count += add_literal("CtrMod2^32 ");
++			break;
++		case 4:
++			output_count += add_literal("CtrMod2^40 ");
++			break;
++		case 5:
++			output_count += add_literal("CtrMod2^48 ");
++			break;
++		case 6:
++			output_count += add_literal("CtrMod2^56 ");
++			break;
++		case 7:
++			output_count += add_literal("CtrMod2^64 ");
++			break;
++		case 8:
++			output_count += add_literal("CtrMod2^72 ");
++			break;
++		case 9:
++			output_count += add_literal("CtrMod2^80 ");
++			break;
++		case 10:
++			output_count += add_literal("CtrMod2^88 ");
++			break;
++		case 11:
++			output_count += add_literal("CtrMod2^96 ");
++			break;
++		case 12:
++			output_count += add_literal("CtrMod2^104 ");
++			break;
++		case 13:
++			output_count += add_literal("CtrMod2^112 ");
++		case 14:
++			output_count += add_literal("CtrMod2^120 ");
++			break;
++		case 15:
++			output_count += add_literal("CtrMod2^128 ");
++			break;
++		}
++	}
+ 
+-	slot_info.ownerid = ownerid;
+-	slot_info.slot = slot;
++	if (header & 0xE0C0) {
++		output_count += add_literal("unknown_bits ");
+ 
+-	ret = sah_service_request(SAHARA_SCC_DEALLOC, &slot_info, user_ctx);
+-	if (ret == FSL_RETURN_OK_S) {
+-		ret = slot_info.code;
+ 	}
+ 
+-	return ret;
++	return output_count;
+ }
+ 
+-/*!
+- * Populate a slot on the SCC
+- *
+- * @param   user_ctx
+- * @param   ownerid
+- * @param   slot
+- * @param   key
+- * @param   key_size
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t do_scc_slot_load_slot(fsl_shw_uco_t * user_ctx,
+-				       uint64_t ownerid, uint32_t slot,
+-				       const uint8_t * key, uint32_t key_size)
++static int interpret_mdha_modes(uint32_t header, char *buffer, int count)
+ {
+-	scc_slot_t slot_info;
+-	fsl_shw_return_t ret;
++	unsigned output_count = 0;
++
++	switch (header & 3) {
++	case 0:
++		output_count += add_literal("SHA-1 ");
++		break;
++	case 1:
++		output_count += add_literal("MD5 ");
++		break;
++	case 2:
++		output_count += add_literal("SHA-256 ");
++		break;
++	case 3:
++		output_count += add_literal("SHA-224 ");
++		break;
++	}
+ 
+-	slot_info.ownerid = ownerid;
+-	slot_info.slot = slot;
+-	slot_info.key_length = key_size;
+-	slot_info.key = (void *)key;
++	if (header & 0x4) {
++		output_count += add_literal("Pdata ");
++	}
+ 
+-	ret = sah_service_request(SAHARA_SCC_LOAD, &slot_info, user_ctx);
+-	if (ret == FSL_RETURN_OK_S) {
+-#ifdef DIAG_ADAPTOR
+-		LOG_DIAG("SAHARA_SCC_LOAD reported error");
+-#endif
+-		ret = slot_info.code;
++	if (header & 0x8) {
++		output_count += add_literal("HMAC ");
+ 	}
+ 
+-	return ret;
+-}
++	if (header & 0x20) {
++		output_count += add_literal("Init ");
++	}
+ 
+-/*!
+- * Encrypt a slot on the SCC
+- *
+- * @param   user_ctx
+- * @param   ownerid
+- * @param   slot
+- * @param   key_length
+- * @param   black_data
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t do_scc_slot_encrypt(fsl_shw_uco_t * user_ctx, uint64_t ownerid,
+-				     uint32_t slot, uint32_t key_length,
+-				     uint8_t * black_data)
+-{
+-	scc_slot_t slot_info;
+-	fsl_shw_return_t ret;
++	if (header & 0x40) {
++		output_count += add_literal("IPad ");
++	}
+ 
+-	slot_info.ownerid = ownerid;
+-	slot_info.slot = slot;
+-	slot_info.key = black_data;
+-	slot_info.key_length = key_length;
++	if (header & 0x80) {
++		output_count += add_literal("OPad ");
++	}
+ 
+-	ret = sah_service_request(SAHARA_SCC_SLOT_ENC, &slot_info, user_ctx);
+-	if (ret == FSL_RETURN_OK_S) {
+-		ret = slot_info.code;
++	if (header & 0x200) {
++		output_count += add_literal("MacFull ");
+ 	}
+ 
+-	return ret;
++	if (header & 0x400) {
++		output_count += add_literal("SSL ");
++	}
++
++	if (header & 0x1000) {
++		output_count += add_literal("ICV ");
++	}
++
++	return output_count;
+ }
+ 
+-/*!
+- * Decrypt a slot on the SCC
+- *
+- * @param   user_ctx
+- * @param   ownerid
+- * @param   slot
+- * @param   key_length
+- * @param   black_data
+- *
+- * @return    A return code of type #fsl_shw_return_t.
+- */
+-fsl_shw_return_t do_scc_slot_decrypt(fsl_shw_uco_t * user_ctx, uint64_t ownerid,
+-				     uint32_t slot, uint32_t key_length,
+-				     const uint8_t * black_data)
++static int interpret_rng_modes(uint32_t header, char *buffer, int count)
+ {
+-	scc_slot_t slot_info;
+-	fsl_shw_return_t ret;
++	unsigned output_count = 0;
++	unsigned mode = header & 0xF;
++
++	switch (mode) {
++	case 0:
++		output_count += add_literal("Normal ");
++		break;
++	case 1:
++		output_count += add_literal("GenSeed ");
++		break;
++	case 2:
++#ifdef FSL_HAVE_SAHARA2
++		output_count += add_literal("GenEntropy ");
++#else
++		output_count += add_literal("Reserved ");
++#endif
++		break;
++	case 4:
++		output_count += add_literal("SelfTest ");
++		break;
++#ifdef FSL_HAVE_SAHAR4
++	case 8:
++		/* fall through */
++	case 9:
++		output_count += add_literal("NoZeroBytes ");
++		break;
++#endif
++	default:
++		output_count += add_literal("Garbage ");
++	}
+ 
+-	slot_info.ownerid = ownerid;
+-	slot_info.slot = slot;
+-	slot_info.key = (uint8_t *) black_data;
+-	slot_info.key_length = key_length;
++	return output_count;
++}
+ 
+-	ret = sah_service_request(SAHARA_SCC_SLOT_DEC, &slot_info, user_ctx);
+-	if (ret == FSL_RETURN_OK_S) {
+-		ret = slot_info.code;
++static int interpret_pkha_modes(uint32_t header, char *buffer, int count)
++{
++	unsigned output_count = 0;
++
++	switch (header & 0x3F) {
++	case 0x00:
++		output_count += add_literal("reserved ");
++		break;
++	case 0x01:
++		output_count += add_literal("clr_mem ");
++		break;
++	case 0x02:
++		output_count += add_literal("clr_eram ");
++		break;
++	case 0x03:
++		output_count += add_literal("mod_exp ");
++		break;
++	case 0x04:
++		output_count += add_literal("mod_r2modn ");
++		break;
++	case 0x05:
++		output_count += add_literal("mod_rrmodp ");
++		break;
++	case 0x06:
++		output_count += add_literal("ec_fp_aff_ptmult ");
++		break;
++	case 0x07:
++		output_count += add_literal("ec_f2m_aff_ptmult ");
++		break;
++	case 0x08:
++		output_count += add_literal("ec_fp_proj_ptmult ");
++		break;
++	case 0x09:
++		output_count += add_literal("ec_f2m_proj_ptmult ");
++		break;
++	case 0x0a:
++		output_count += add_literal("ec_fp_add ");
++		break;
++	case 0x0b:
++		output_count += add_literal("ec_fp_double ");
++		break;
++	case 0x0c:
++		output_count += add_literal("ec_f2m_add ");
++		break;
++	case 0x0d:
++		output_count += add_literal("ec_f2m_double ");
++		break;
++	case 0x0e:
++		output_count += add_literal("f2m_r2 ");
++		break;
++	case 0x0f:
++		output_count += add_literal("f2m_inv ");
++		break;
++	case 0x10:
++		output_count += add_literal("mod_inv ");
++		break;
++	case 0x11:
++		output_count += add_literal("rsa_sstep ");
++		break;
++	case 0x12:
++		output_count += add_literal("mod_emodn ");
++		break;
++	case 0x13:
++		output_count += add_literal("f2m_emodn ");
++		break;
++	case 0x14:
++		output_count += add_literal("ec_fp_ptmul ");
++		break;
++	case 0x15:
++		output_count += add_literal("ec_f2m_ptmul ");
++		break;
++	case 0x16:
++		output_count += add_literal("f2m_gcd ");
++		break;
++	case 0x17:
++		output_count += add_literal("mod_gcd ");
++		break;
++	case 0x18:
++		output_count += add_literal("f2m_dbl_aff ");
++		break;
++	case 0x19:
++		output_count += add_literal("fp_dbl_aff ");
++		break;
++	case 0x1a:
++		output_count += add_literal("f2m_add_aff ");
++		break;
++	case 0x1b:
++		output_count += add_literal("fp_add_aff ");
++		break;
++	case 0x1c:
++		output_count += add_literal("f2m_exp ");
++		break;
++	case 0x1d:
++		output_count += add_literal("mod_exp_teq ");
++		break;
++	case 0x1e:
++		output_count += add_literal("rsa_sstep_teq ");
++		break;
++	case 0x1f:
++		output_count += add_literal("f2m_multn ");
++		break;
++	case 0x20:
++		output_count += add_literal("mod_multn ");
++		break;
++	case 0x21:
++		output_count += add_literal("mod_add ");
++		break;
++	case 0x22:
++		output_count += add_literal("mod_sub ");
++		break;
++	case 0x23:
++		output_count += add_literal("mod_mult1_mont ");
++		break;
++	case 0x24:
++		output_count += add_literal("mod_mult2_deconv ");
++		break;
++	case 0x25:
++		output_count += add_literal("f2m_add ");
++		break;
++	case 0x26:
++		output_count += add_literal("f2m_mult1_mont ");
++		break;
++	case 0x27:
++		output_count += add_literal("f2m_mult2_deconv ");
++		break;
++	case 0x28:
++		output_count += add_literal("miller_rabin ");
++		break;
++	default:
++		output_count += add_literal("unknown ");
++		break;
+ 	}
+ 
+-	return ret;
++	if (header & 0x200) {
++		output_count += add_literal("SoftErrFalse ");
++	}
++
++	if (header & 0x100) {
++		output_count += add_literal("SoftErrTrue ");
++	}
++
++	return output_count;
+ }
+ 
+-#ifdef DIAG_ADAPTOR
++static int interpret_header(uint32_t header, char *buffer, int count)
++{
++	unsigned output_count = 0;
++	unsigned desc_type = ((header >> 24) & 0x70) | ((header >> 16) & 0xF);
++
++	switch (desc_type) {
++	case 0x12:
++		output_count += add_literal("5/SKHA_ST_CTX");
++		break;
++	case 0x13:
++		output_count += add_literal("35/SKHA_LD_MODE_KEY: ");
++		output_count += interpret_skha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x14:
++		output_count += add_literal("38/SKHA_LD_MODE_IN_CPHR_ST_CTX: ");
++		output_count += interpret_skha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x15:
++		output_count += add_literal("4/SKHA_IN_CPHR_OUT");
++		break;
++	case 0x16:
++		output_count += add_literal("34/SKHA_ST_SBOX");
++		break;
++	case 0x18:
++		output_count += add_literal("1/SKHA_LD_MODE_IV_KEY: ");
++		output_count += interpret_skha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x19:
++		output_count += add_literal("33/SKHA_ST_SBOX");
++		break;
++	case 0x1D:
++		output_count += add_literal("2/SKHA_LD_MODE_IN_CPHR_OUT: ");
++		output_count += interpret_skha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x22:
++		output_count += add_literal("11/MDHA_ST_MD");
++		break;
++	case 0x25:
++		output_count += add_literal("10/MDHA_HASH_ST_MD");
++		break;
++	case 0x28:
++		output_count += add_literal("6/MDHA_LD_MODE_MD_KEY: ");
++		output_count += interpret_mdha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x2A:
++		output_count += add_literal("39/MDHA_ICV");
++		break;
++	case 0x2D:
++		output_count += add_literal("8/MDHA_LD_MODE_HASH_ST_MD: ");
++		output_count += interpret_mdha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x3C:
++		output_count += add_literal("18/RNG_GEN: ");
++		output_count += interpret_rng_modes(header,
++						    buffer + output_count,
++						    count - output_count);
++		break;
++	case 0x40:
++		output_count += add_literal("19/PKHA_LD_N_E");
++		break;
++	case 0x41:
++		output_count += add_literal("36/PKHA_LD_A3_B0");
++		break;
++	case 0x42:
++		output_count += add_literal("27/PKHA_ST_A_B");
++		break;
++	case 0x43:
++		output_count += add_literal("22/PKHA_LD_A_B");
++		break;
++	case 0x44:
++		output_count += add_literal("23/PKHA_LD_A0_A1");
++		break;
++	case 0x45:
++		output_count += add_literal("24/PKHA_LD_A2_A3");
++		break;
++	case 0x46:
++		output_count += add_literal("25/PKHA_LD_B0_B1");
++		break;
++	case 0x47:
++		output_count += add_literal("26/PKHA_LD_B2_B3");
++		break;
++	case 0x48:
++		output_count += add_literal("28/PKHA_ST_A0_A1");
++		break;
++	case 0x49:
++		output_count += add_literal("29/PKHA_ST_A2_A3");
++		break;
++	case 0x4A:
++		output_count += add_literal("30/PKHA_ST_B0_B1");
++		break;
++	case 0x4B:
++		output_count += add_literal("31/PKHA_ST_B2_B3");
++		break;
++	case 0x4C:
++		output_count += add_literal("32/PKHA_EX_ST_B1: ");
++		output_count += interpret_pkha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x4D:
++		output_count += add_literal("20/PKHA_LD_A_EX_ST_B: ");
++		output_count += interpret_pkha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x4E:
++		output_count += add_literal("21/PKHA_LD_N_EX_ST_B: ");
++		output_count += interpret_pkha_modes(header,
++						     buffer + output_count,
++						     count - output_count);
++		break;
++	case 0x4F:
++		output_count += add_literal("37/PKHA_ST_B1_B2 ");
++		break;
++	default:
++		output_count +=
++		    snprintf(buffer + output_count, count - output_count,
++			     "%d/UNKNOWN", desc_type);
++		break;
++	}
++
++	return output_count;
++}				/* cvt_desc_name() */
++
+ /*!
+  * Dump chain of descriptors to the log.
+  *
+@@ -686,8 +1468,24 @@ fsl_shw_return_t do_scc_slot_decrypt(fsl_shw_uco_t * user_ctx, uint64_t ownerid,
+  */
+ void um_Dump_Chain(const sah_Desc * chain)
+ {
++	int desc_no = 1;
++
+ 	while (chain != NULL) {
+-		um_Dump_Words("Desc", (unsigned *)chain,
++		const int buf_size = 120;
++		char desc_name[buf_size];
++		int output_bytes = 0;
++
++		output_bytes += snprintf(desc_name, buf_size,
++					 "Desc %02d (", desc_no++);
++
++		output_bytes += interpret_header(chain->header,
++						 desc_name + output_bytes,
++						 buf_size - output_bytes);
++
++		output_bytes += snprintf(desc_name + output_bytes,
++					 buf_size - output_bytes, ")\nDesc  ");
++		
++		um_Dump_Words(desc_name, (unsigned *)chain,
+ 			      6 /*sizeof(*chain)/sizeof(unsigned) */ );
+ 		/* place this definition elsewhere */
+ 		if (chain->ptr1) {
+@@ -727,8 +1525,7 @@ static void um_Dump_Link(const char *prefix, const sah_Link * link)
+ 		um_Dump_Words(prefix, (unsigned *)link,
+ 			      3 /* # words in h/w link */ );
+ 		if (link->flags & SAH_STORED_KEY_INFO) {
+-			sprintf(Diag_msg, "  SCC: Slot %d", link->slot);
+-			LOG_DIAG(Diag_msg);
++			LOG_DIAG_ARGS("  SCC: Slot %d", link->slot);
+ 		} else if (link->data != NULL) {
+ 			um_Dump_Region("  Data", link->data, link->len);
+ 		}
+@@ -756,7 +1553,7 @@ void um_Dump_Region(const char *prefix, const unsigned char *data,
+ 	unsigned data_len;
+ 
+ 	/* Build up the output string with multiple calls to sprintf() */
+-	output += sprintf(Diag_msg, "%s (%08X,%u):", prefix, (uint32_t) data,
++	output += sprintf(output, "%s (%08X,%u):", prefix, (uint32_t) data,
+ 			  length);
+ 
+ 	/* Restrict amount of data to dump */
+-- 
+1.8.0
+

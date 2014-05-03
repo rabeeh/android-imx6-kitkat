@@ -1,0 +1,108 @@
+From e0e650eeff4b0ca9a53c155b922caac43a6460f9 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Wed, 18 Sep 2013 10:11:37 +0800
+Subject: [PATCH 30/50] ENGR00266234 fix wfd source latency is serious under
+ some cases.
+
+The repeaterSource output the raw video source in 30fps.
+If VPU encoding can't get raw video source in 30fps,
+it will accumulated in the InputBufferQueue.
+So, check the InputBufferQueue if its size large than
+the needed, reduce the queue size.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ .../wifi-display/source/Converter.cpp              | 44 +++++++++++++++++++++-
+ .../libstagefright/wifi-display/source/Converter.h |  2 +
+ 2 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/media/libstagefright/wifi-display/source/Converter.cpp b/media/libstagefright/wifi-display/source/Converter.cpp
+index 4482c06..39e674e 100644
+--- a/media/libstagefright/wifi-display/source/Converter.cpp
++++ b/media/libstagefright/wifi-display/source/Converter.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2012, The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -390,7 +391,7 @@ void Converter::onMessageReceived(const sp<AMessage> &msg) {
+ #endif
+ 
+                 mInputBufferQueue.push_back(accessUnit);
+-
++                refineVideoQueue();
+                 feedEncoderInputBuffers();
+ 
+                 scheduleDoMoreWork();
+@@ -491,6 +492,47 @@ void Converter::onMessageReceived(const sp<AMessage> &msg) {
+     }
+ }
+ 
++void Converter::refineVideoQueue()
++{
++    size_t requireSize = mAvailEncoderInputIndices.size();
++    size_t bufSize = mInputBufferQueue.size();
++
++    if (mIsVideo) {
++        ALOGV("Converter: inputQueue size:%d, resize:%d", bufSize, requireSize);
++    }
++    if (!mIsVideo || bufSize <= requireSize) {
++        return;
++    }
++
++    List<sp<ABuffer> >::iterator start = mInputBufferQueue.begin();
++    List<sp<ABuffer> >::iterator end = mInputBufferQueue.end();
++    sp<ABuffer> buffer = *start;
++    List<sp<ABuffer> >::iterator prev = start;
++    sp<ABuffer> prevBuf = *prev;
++    start++;
++    int bufHandle = *(int *)(buffer->data() + 4);
++    int handle = 0;
++    while (start != end) {
++        buffer = *start;
++        handle = *(int *)(buffer->data() + 4);
++        if (bufHandle == handle) {
++            // if buffer repeat, delete it.
++            mInputBufferQueue.erase(prev);
++            // release buffer.
++            ReleaseMediaBufferReference(prevBuf);
++            bufSize --;
++            if (bufSize <= requireSize) break;
++        }
++        else {
++            bufHandle = handle;
++        }
++        prev = start;
++        prevBuf = *prev;
++        start++;
++    }
++    ALOGV("Converter: inputQueue size:%d", mInputBufferQueue.size());
++}
++
+ void Converter::scheduleDoMoreWork() {
+     if (mIsPCMAudio) {
+         // There's no encoder involved in this case.
+diff --git a/media/libstagefright/wifi-display/source/Converter.h b/media/libstagefright/wifi-display/source/Converter.h
+index 5876e07..b45b045 100644
+--- a/media/libstagefright/wifi-display/source/Converter.h
++++ b/media/libstagefright/wifi-display/source/Converter.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2012, The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -147,6 +148,7 @@ private:
+     static bool IsSilence(const sp<ABuffer> &accessUnit);
+ 
+     sp<ABuffer> prependCSD(const sp<ABuffer> &accessUnit) const;
++    void refineVideoQueue();
+ 
+     DISALLOW_EVIL_CONSTRUCTORS(Converter);
+ };
+-- 
+1.8.0
+

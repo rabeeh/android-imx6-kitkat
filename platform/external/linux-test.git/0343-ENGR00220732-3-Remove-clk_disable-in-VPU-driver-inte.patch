@@ -1,0 +1,63 @@
+From 604ae3892c5ac8329414159fa1dba360a8fd6d90 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Mon, 20 Aug 2012 16:32:42 +0800
+Subject: [PATCH 343/435] ENGR00220732-3 Remove clk_disable in VPU driver
+ interrupt handling
+
+Original design is VPU lib API StartOneFrame() enables clock, and VPU
+driver disables clock after codec done interrupt has been received.
+However there are known issues of interrupt handling as below:
+- VPU interrupt handling callback is not scheduled in time causing work
+  queue overflow
+- JPU done interrupt is not received because JPU issues it while JPU
+  buffer empty interrupt is still being served
+- VPU finishes a frame (!vpu_IsBusy) but VPU done interrupt is not
+  received
+
+All above will cause clk_disable in interrupt handling not called,
+thus VPU clock count increases by 1.
+So I plan to resolve clock unbalance issue first by removing
+clk_disable from VPU driver interrupt handling. Interrupt problem
+will not affect clock issue any longer.
+
+1.    Driver: remove clk_disable from vpu_worker_callback
+2.1.  Lib: remove clk_enable from API GetOutputInfo
+2.2.  Lib: avoid disabling VPU clock when VPU is busy in SWReset
+3.    Test: replace GetOutputInfo with SWReset in decoder_close /
+      encoder_close
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/dec.c | 2 +-
+ test/mxc_vpu_test/enc.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index a63f6c0..309104d 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -2098,7 +2098,7 @@ void decoder_close(struct decode *dec)
+ 
+ 	ret = vpu_DecClose(dec->handle);
+ 	if (ret == RETCODE_FRAME_NOT_COMPLETE) {
+-		vpu_DecGetOutputInfo(dec->handle, &outinfo);
++		vpu_SWReset(dec->handle, 0);
+ 		ret = vpu_DecClose(dec->handle);
+ 		if (ret != RETCODE_SUCCESS)
+ 			err_msg("vpu_DecClose failed\n");
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 1d3112c..479f4a6 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -834,7 +834,7 @@ encoder_close(struct encode *enc)
+ 
+ 	ret = vpu_EncClose(enc->handle);
+ 	if (ret == RETCODE_FRAME_NOT_COMPLETE) {
+-		vpu_EncGetOutputInfo(enc->handle, &outinfo);
++		vpu_SWReset(enc->handle, 0);
+ 		vpu_EncClose(enc->handle);
+ 	}
+ }
+-- 
+1.8.0
+

@@ -1,0 +1,252 @@
+From c51eda7d6b4d0297c7de3be21389f9c987f1dc1d Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Wed, 27 Jul 2011 20:44:42 +0800
+Subject: [PATCH 16/38] ENGR00153811 Enable receive sms and sms deliver report
+ for EM770W
+
+add handle for +CDSI and +CMTI unsolicited request
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ reference-ril/atchannel.c     |  12 +++-
+ reference-ril/reference-ril.c | 158 +++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 159 insertions(+), 11 deletions(-)
+
+diff --git a/reference-ril/atchannel.c b/reference-ril/atchannel.c
+index 07887eb..f138482 100644
+--- a/reference-ril/atchannel.c
++++ b/reference-ril/atchannel.c
+@@ -291,7 +291,17 @@ static void processLine(const char *line)
+             if (strStartsWith (line, s_responsePrefix)) {
+                 addIntermediate(line);
+             } else {
+-                handleUnsolicited(line);
++                //handle the case of read sms
++                //<CR><LF>+CMGR:
++                //<stat>,[<reserved>],<length><CR><LF><pdu><CR><LF><C
++                //R><LF>OK<CR><LF>
++                if(!strcmp(s_responsePrefix,"+CMGR:")&& sp_response->p_intermediates && sp_response->p_intermediates->line ) {
++                    addIntermediate(line);
++                }
++                else{
++                    handleUnsolicited(line);
++                }
++                
+             }
+         break;
+ 
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 9506a71..6d40859 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -182,6 +182,8 @@ static SIM_Status getSIMStatus();
+ static int getCardStatus(RIL_CardStatus_v6 **pp_card_status);
+ static void freeCardStatus(RIL_CardStatus_v6 *p_card_status);
+ static void onDataCallListChanged(void *param);
++static void onNewSmsArrived(void *param);
++static void onNewSmsReportArrived(void *param);
+ 
+ extern const char * requestToString(int request);
+ 
+@@ -224,6 +226,9 @@ static int s_closed = 0;
+ static int sFD;     /* file desc of AT channel */
+ static char sATBuffer[MAX_AT_RESPONSE+1];
+ static char *sATBufferCur = NULL;
++static int smsStorageIndex = 0;
++//"SM", "ME", "SR"
++static char smsReadStorage[3];
+ 
+ static const struct timeval TIMEVAL_SIMPOLL = {1,0};
+ static const struct timeval TIMEVAL_CALLSTATEPOLL = {0,500000};
+@@ -373,9 +378,13 @@ static void onSIMReady()
+      * ds = 1   // Status reports routed to TE
+      * bfr = 1  // flush buffer
+      */
+-at_send_command("AT+CNMI=1,2,2,1,1", NULL);
+-at_send_command("AT+CPMS=\"ME\",\"ME\",\"ME\"",NULL);
+-at_send_command("AT+CMGD=1,4",NULL);
++    if (current_modem_type != HUAWEI_MODEM)
++        at_send_command("AT+CNMI=1,2,2,1,1", NULL);
++    else
++        at_send_command("AT+CNMI=2,1,2,2,0", NULL);
++
++    at_send_command("AT+CPMS=\"ME\",\"ME\",\"ME\"",NULL);
++    at_send_command("AT+CMGD=1,4",NULL);
+ }
+ 
+ static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
+@@ -426,6 +435,99 @@ static void onDataCallListChanged(void *param)
+     requestOrSendDataCallList(NULL);
+ }
+ 
++static void readNewSms(void *param, int response_index)
++{
++    ATResponse *p_response;
++    ATLine *p_cur;
++    int err;
++    int index = *(int *)param;
++    char *cmd;
++    char *line;
++    char oldReadStorage[3];
++    char *storage;
++    int setStorage = 0;
++    //Fetch current read storage
++    //Set the prefer read storage
++    err = at_send_command_singleline("AT+CPMS?", "+CPMS:", &p_response);
++    if (err != 0 || p_response->success == 0) {
++        LOGE("Cannot read prefer SMS storage");
++        return;
++    }
++    line = p_response->p_intermediates->line;
++    err = at_tok_start(&line);
++    if (err < 0)
++        goto error;
++    err = at_tok_nextstr(&line, &storage);
++    if (err < 0)
++        goto error;
++    memset(oldReadStorage, 0, 3);
++    memcpy(oldReadStorage, storage, 2);
++    LOGI("oldReadStorage %s, current storage %s",oldReadStorage,smsReadStorage);
++    
++    //Set the prefer read storage
++    asprintf(&cmd, "AT+CPMS=\"%s\"", smsReadStorage);
++    at_send_command(cmd,NULL);
++    setStorage = 1;
++
++    asprintf(&cmd, "AT+CMGR=%d", index);
++    err = at_send_command_multiline(cmd, "+CMGR:", &p_response);
++    if (err != 0 || p_response->success == 0) {
++        LOGE("No sms store in ME");
++        return;
++    }
++    
++    //Read the sms pdu
++    //<CR><LF>+CMGR:<stat>,[<reserved>],<length><CR><LF><pdu><CR><LF><CR><LF>OK<CR><LF>
++    p_cur = p_response->p_intermediates;
++    if(p_cur != NULL) {
++        int state = 0;
++        char *reserved = NULL;
++        int lenght = 0;
++        line = p_cur->line;
++
++        err = at_tok_start(&line);
++        if (err < 0)
++            goto error;
++        err = at_tok_nextint(&line, &state);
++        if (err < 0)
++            goto error;
++
++        p_cur = p_cur->p_next;
++        if(p_cur != NULL) {
++            char *sms_pdu = NULL;
++            sms_pdu = p_cur->line;
++            if(sms_pdu != NULL) {
++                RIL_onUnsolicitedResponse (
++                    response_index,
++                    sms_pdu, strlen(sms_pdu));
++            }
++        }
++    }
++
++    //Delete the sms in storage
++    asprintf(&cmd, "AT+CMGD=%d", index);
++    at_send_command(cmd,NULL);
++
++error:
++    //Need recover after read 
++    if(setStorage){
++        asprintf(&cmd, "AT+CPMS=\"%s\"", oldReadStorage);
++        at_send_command(cmd,NULL);
++    }
++
++    at_response_free(p_response);
++}
++
++static void onNewSmsReportArrived(void *param)
++{
++    readNewSms(param,RIL_UNSOL_RESPONSE_NEW_SMS_STATUS_REPORT);
++}
++
++static void onNewSmsArrived(void *param)
++{
++    readNewSms(param,RIL_UNSOL_RESPONSE_NEW_SMS);
++}
++
+ static void requestDataCallList(void *data, size_t datalen, RIL_Token t)
+ {
+     requestOrSendDataCallList(&t);
+@@ -3319,10 +3421,46 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
+         RIL_onUnsolicitedResponse (
+             RIL_UNSOL_RESPONSE_NEW_SMS,
+             sms_pdu, strlen(sms_pdu));
++    } else if (strStartsWith(s, "+CMTI:")) {
++        char *storage = NULL;
++        //read the sms in ME
++        line = strdup(s);
++        at_tok_start(&line);
++
++        //+CMTI: "ME",1
++        err = at_tok_nextstr(&line, &storage);
++        if (err < 0) return;
++
++        err = at_tok_nextint(&line, &smsStorageIndex);
++        if (err < 0) return;
++
++        memset(smsReadStorage, 0, 3);
++        //"SM","ME","SR"
++        strncpy(smsReadStorage, storage, 2);
++
++        RIL_requestTimedCallback (onNewSmsArrived, &smsStorageIndex, NULL);
++        free(line);
+     } else if (strStartsWith(s, "+CDS:")) {
+         RIL_onUnsolicitedResponse (
+             RIL_UNSOL_RESPONSE_NEW_SMS_STATUS_REPORT,
+             sms_pdu, strlen(sms_pdu));
++    } else if (strStartsWith(s, "+CDSI:")) {
++        char *storage = NULL;
++        //read the sms in ME
++        line = strdup(s);
++        at_tok_start(&line);
++        //+CDSI: "SM",8
++        err = at_tok_nextstr(&line, &storage);
++        if (err < 0) return;
++        
++        err = at_tok_nextint(&line, &smsStorageIndex);
++        if (err < 0) return;
++
++        memset(smsReadStorage, 0, 3);
++        //"SM","ME","SR"
++        strncpy(smsReadStorage, storage, 2);
++        RIL_requestTimedCallback (onNewSmsReportArrived, &smsStorageIndex, NULL);
++        free(line);
+     } else if (strStartsWith(s, "+CGEV:")) {
+         /* Really, we can ignore NW CLASS and ME CLASS events here,
+          * but right now we don't since extranous
+@@ -3563,17 +3701,17 @@ mainLoop(void *param)
+            Delay RIL init so that we can always get correct network status (i.e. +COPS?).
+            FIX ME: this should be removed in future. Service layer should be responsible to handle "late" attach.
+         */
+-	property_get(RIL_DELAY_TIME, delay_init, "0");
++        property_get(RIL_DELAY_TIME, delay_init, "0");
+         delay = strtol(delay_init, NULL, 10);
+         if(delay > 120) {
+-	    LOGW ("Should not delay RIL init too long (%d seconds). Please set %s properly", delay, RIL_DELAY_TIME);
++            LOGW ("Should not delay RIL init too long (%d seconds). Please set %s properly", delay, RIL_DELAY_TIME);
+             delay = 0;
+         }
+-	if (current_modem_type == HUAWEI_MODEM) {
+-		TIMEVAL_DELAYINIT.tv_sec = delay;
+-		LOGD ("Will delay RIL initialization for %d seconds", TIMEVAL_DELAYINIT.tv_sec); 
+-	} else			/* Found other modem don't need delay */
+-		TIMEVAL_DELAYINIT.tv_sec = 0;
++        if (current_modem_type == HUAWEI_MODEM) {
++            TIMEVAL_DELAYINIT.tv_sec = delay;
++            LOGD ("Will delay RIL initialization for %d seconds", TIMEVAL_DELAYINIT.tv_sec); 
++        } else			/* Found other modem don't need delay */
++            TIMEVAL_DELAYINIT.tv_sec = 0;
+ 
+ 
+         RIL_requestTimedCallback(initializeCallback, NULL, &TIMEVAL_DELAYINIT);
+-- 
+1.8.0
+

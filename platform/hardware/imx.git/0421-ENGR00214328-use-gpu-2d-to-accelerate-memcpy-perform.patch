@@ -1,0 +1,111 @@
+From fd9f5aa045fe1bf6662829720d059a754a8dc07b Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Tue, 5 Mar 2013 16:10:12 +0800
+Subject: [PATCH 421/486] ENGR00214328 use gpu 2d to accelerate memcpy
+ performance.
+
+use gpu 2d to accelerate memcpy performance.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera2/Android.mk        |  6 ++++--
+ mx6/libcamera2/StreamAdapter.cpp | 22 +++++++++++++++++++++-
+ mx6/libcamera2/StreamAdapter.h   |  4 +++-
+ 3 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/mx6/libcamera2/Android.mk b/mx6/libcamera2/Android.mk
+index 518b45b..16f5f51 100755
+--- a/mx6/libcamera2/Android.mk
++++ b/mx6/libcamera2/Android.mk
+@@ -55,7 +55,8 @@ LOCAL_SHARED_LIBRARIES:= \
+     libjpeg \
+     libexif \
+     libion \
+-    libcamera_metadata
++    libcamera_metadata \
++    libg2d
+ 
+ LOCAL_C_INCLUDES += \
+ 	frameworks/base/include/binder \
+@@ -64,7 +65,8 @@ LOCAL_C_INCLUDES += \
+ 	hardware/imx/mx6/libgralloc_wrapper \
+ 	system/media/camera/include \
+ 	external/jpeg \
+-	external/jhead
++	external/jhead \
++        device/fsl-proprietary/include
+ 
+ ifeq ($(HAVE_FSL_IMX_CODEC),true)
+     #LOCAL_SHARED_LIBRARIES += libfsl_jpeg_enc_arm11_elinux
+diff --git a/mx6/libcamera2/StreamAdapter.cpp b/mx6/libcamera2/StreamAdapter.cpp
+index f3f20ff..cb00f5b 100755
+--- a/mx6/libcamera2/StreamAdapter.cpp
++++ b/mx6/libcamera2/StreamAdapter.cpp
+@@ -21,6 +21,15 @@ StreamAdapter::StreamAdapter(int id)
+     : mPrepared(false), mStarted(false), mStreamId(id), mWidth(0), mHeight(0), mFormat(0), mUsage(0),
+       mMaxProducerBuffers(0), mNativeWindow(NULL), mStreamState(STREAM_INVALID)
+ {
++    g2dHandle = NULL;
++    g2d_open(&g2dHandle);
++}
++
++StreamAdapter::~StreamAdapter()
++{
++    if (g2dHandle != NULL) {
++        g2d_close(g2dHandle);
++    }
+ }
+ 
+ int StreamAdapter::initialize(int width, int height, int format, int usage, int bufferNum)
+@@ -234,7 +243,18 @@ int StreamAdapter::processFrame(CameraFrame *frame)
+     }
+ 
+     size = (frame->mSize > buffer.mSize) ? buffer.mSize : frame->mSize;
+-    memcpy(buffer.mVirtAddr, (void *)frame->mVirtAddr, size);
++    if (g2dHandle != NULL) {
++        struct g2d_buf s_buf, d_buf;
++        s_buf.buf_paddr = frame->mPhyAddr;
++        s_buf.buf_vaddr = frame->mVirtAddr;
++        d_buf.buf_paddr = buffer.mPhyAddr;
++        d_buf.buf_vaddr = buffer.mVirtAddr;
++        g2d_copy(g2dHandle, &d_buf, &s_buf, size);
++    }
++    else {
++        memcpy(buffer.mVirtAddr, (void *)frame->mVirtAddr, size);
++    }
++
+     buffer.mTimeStamp = frame->mTimeStamp;
+     ret = renderBuffer(&buffer);
+     if (ret != NO_ERROR) {
+diff --git a/mx6/libcamera2/StreamAdapter.h b/mx6/libcamera2/StreamAdapter.h
+index 73a01ca..f9ed45d 100755
+--- a/mx6/libcamera2/StreamAdapter.h
++++ b/mx6/libcamera2/StreamAdapter.h
+@@ -22,6 +22,7 @@
+ #include "PhysMemAdapter.h"
+ #include "JpegBuilder.h"
+ #include "DeviceAdapter.h"
++#include "g2d.h"
+ 
+ using namespace android;
+ 
+@@ -30,7 +31,7 @@ class StreamAdapter : public LightRefBase<StreamAdapter>,
+ {
+ public:
+     StreamAdapter(int id);
+-    virtual ~StreamAdapter() {}
++    virtual ~StreamAdapter();
+ 
+     virtual int initialize(int width, int height, int format,
+                            int usage, int bufferNum);
+@@ -125,6 +126,7 @@ protected:
+     nsecs_t mTime2;
+     int mTotalFrames;
+     int mFps;
++    void *g2dHandle;
+ };
+ 
+ 
+-- 
+1.8.0
+

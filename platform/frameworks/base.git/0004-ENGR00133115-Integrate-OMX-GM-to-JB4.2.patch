@@ -1,0 +1,263 @@
+From b5bf55f7c2e294e1a0c9becd52b745857c19e68a Mon Sep 17 00:00:00 2001
+From: Song Bing <b06498@freescale.com>
+Date: Mon, 31 Dec 2012 13:52:35 +0800
+Subject: [PATCH 04/32] ENGR00133115 Integrate OMX GM to JB4.2.
+
+Integrate OMX GM to JB4.2.
+extend setPlaySpeed() for control playback speed.
+extend FLV format support.
+
+Signed-off-by: Song Bing b06498@freescale.com
+---
+ api/current.txt                             |   2 +
+ media/java/android/media/MediaFile.java     |  40 +++++++++-
+ media/java/android/media/MediaPlayer.java   | 110 ++++++++++++++++++++++++++++
+ media/java/android/media/MediaRecorder.java |   4 +
+ 4 files changed, 155 insertions(+), 1 deletion(-)
+
+diff --git a/api/current.txt b/api/current.txt
+index 8e69592..f6ccc18 100644
+--- a/api/current.txt
++++ b/api/current.txt
+@@ -12579,6 +12579,7 @@ package android.media {
+     method public void setOnSeekCompleteListener(android.media.MediaPlayer.OnSeekCompleteListener);
+     method public void setOnTimedTextListener(android.media.MediaPlayer.OnTimedTextListener);
+     method public void setOnVideoSizeChangedListener(android.media.MediaPlayer.OnVideoSizeChangedListener);
++    method public void setPlaySpeed(int);
+     method public void setScreenOnWhilePlaying(boolean);
+     method public void setSurface(android.view.Surface);
+     method public void setVideoScalingMode(int);
+@@ -12698,6 +12699,7 @@ package android.media {
+     field public static final int AMR_WB = 2; // 0x2
+     field public static final int DEFAULT = 0; // 0x0
+     field public static final int HE_AAC = 4; // 0x4
++    field public static final int MP3 = 6; // 0x6
+   }
+ 
+   public final class MediaRecorder.AudioSource {
+diff --git a/media/java/android/media/MediaFile.java b/media/java/android/media/MediaFile.java
+index 761ecca..3921be3 100644
+--- a/media/java/android/media/MediaFile.java
++++ b/media/java/android/media/MediaFile.java
+@@ -14,6 +14,8 @@
+  * limitations under the License.
+  */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ package android.media;
+ 
+ import android.content.ContentValues;
+@@ -29,6 +31,8 @@ import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Locale;
++import android.os.SystemProperties;
++import android.util.Log;
+ 
+ /**
+  * MediaScanner helper class.
+@@ -74,8 +78,9 @@ public class MediaFile {
+     
+     // More video file types
+     public static final int FILE_TYPE_MP2PS   = 200;
++    public static final int FILE_TYPE_FLV     = 201;
+     private static final int FIRST_VIDEO_FILE_TYPE2 = FILE_TYPE_MP2PS;
+-    private static final int LAST_VIDEO_FILE_TYPE2 = FILE_TYPE_MP2PS;
++    private static final int LAST_VIDEO_FILE_TYPE2 = FILE_TYPE_FLV;
+ 
+     // Image file types
+     public static final int FILE_TYPE_JPEG    = 31;
+@@ -216,6 +221,39 @@ public class MediaFile {
+             addFileType("ASF", FILE_TYPE_ASF, "video/x-ms-asf");
+         }
+ 
++        String value= SystemProperties.get("ro.FSL_AVI_PARSER");	
++        //Check FSL_AVI_PARSER property
++        if ("1".equals(value)) {
++            addFileType("DIVX", FILE_TYPE_AVI, "video/avi");
++        }
++
++        //Check FSL_AAC_PARSER property
++        value = SystemProperties.get("ro.FSL_AAC_PARSER");
++        if ("1".equals(value)) {
++        addFileType("ADTS", FILE_TYPE_AAC, "audio/aac-adts", MtpConstants.FORMAT_AAC);
++        }
++
++        //Check FSL_FLV_PARSER property
++        value = SystemProperties.get("ro.FSL_FLV_PARSER");
++        if ("1".equals(value)) {
++            addFileType("FLV", FILE_TYPE_FLV, "video/flv");
++            addFileType("F4V", FILE_TYPE_FLV, "video/flv");
++    	}
++
++        //Check FSL_MPG2_PARSER property
++        value = SystemProperties.get("ro.FSL_MPG2_PARSER");
++        if ("1".equals(value)) {
++            addFileType("VOB", FILE_TYPE_MP2PS, "video/mp2p");
++        }
++
++        //Check FSL_ASF_PARSER property
++        value = SystemProperties.get("ro.FSL_ASF_PARSER");
++        if ("1".equals(value)) {
++            addFileType("WMA", FILE_TYPE_WMA, "audio/x-ms-wma", MtpConstants.FORMAT_WMA);
++            addFileType("WMV", FILE_TYPE_WMV, "video/x-ms-wmv", MtpConstants.FORMAT_WMV);
++            addFileType("ASF", FILE_TYPE_WMV, "video/x-ms-asf");
++        }
++  
+         addFileType("JPG", FILE_TYPE_JPEG, "image/jpeg", MtpConstants.FORMAT_EXIF_JPEG);
+         addFileType("JPEG", FILE_TYPE_JPEG, "image/jpeg", MtpConstants.FORMAT_EXIF_JPEG);
+         addFileType("GIF", FILE_TYPE_GIF, "image/gif", MtpConstants.FORMAT_GIF);
+diff --git a/media/java/android/media/MediaPlayer.java b/media/java/android/media/MediaPlayer.java
+index 706258a..e3f8690 100644
+--- a/media/java/android/media/MediaPlayer.java
++++ b/media/java/android/media/MediaPlayer.java
+@@ -14,6 +14,8 @@
+  * limitations under the License.
+  */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ package android.media;
+ 
+ import android.content.BroadcastReceiver;
+@@ -1493,6 +1495,114 @@ public class MediaPlayer implements SubtitleController.Listener
+      */
+     public native void attachAuxEffect(int effectId);
+ 
++    /* Do not change these values (starting with KEY_PARAMETER) without updating
++     * their counterparts in include/media/mediaplayer.h!
++     */
++
++    // There are currently no defined keys usable from Java with get*Parameter.
++    // But if any keys are defined, the order must be kept in sync with include/media/mediaplayer.h.
++    // private static final int KEY_PARAMETER_... = ...;
++    private static final int KEY_PARAMETER_PLAYBACK_RATE_PERMILLE = 1300;
++
++    /**
++     * Sets the parameter indicated by key.
++     * @param key key indicates the parameter to be set.
++     * @param value value of the parameter to be set.
++     * @return true if the parameter is set successfully, false otherwise
++     * {@hide}
++     */
++    public native boolean setParameter(int key, Parcel value);
++
++    /**
++     * Sets the parameter indicated by key.
++     * @param key key indicates the parameter to be set.
++     * @param value value of the parameter to be set.
++     * @return true if the parameter is set successfully, false otherwise
++     * {@hide}
++     */
++    public boolean setParameter(int key, String value) {
++        Parcel p = Parcel.obtain();
++        p.writeString(value);
++        boolean ret = setParameter(key, p);
++        p.recycle();
++        return ret;
++    }
++
++    /**
++     * Sets the parameter indicated by key.
++     * @param key key indicates the parameter to be set.
++     * @param value value of the parameter to be set.
++     * @return true if the parameter is set successfully, false otherwise
++     * {@hide}
++     */
++    public boolean setParameter(int key, int value) {
++        Parcel p = Parcel.obtain();
++        p.writeInt(value);
++        boolean ret = setParameter(key, p);
++        p.recycle();
++        return ret;
++    }
++
++    /**
++     * Set play speed.
++     *
++     * @param Speed is normalized speed multiplied by 0x10000
++     * Range of normalized speed is:
++     *         [-16,-2] means rewind, [0.1, 16] means forward, step is 0.1
++     * When normalized speed is [0.1, 1.9] audio is outputted, otherwise audio
++     * is not outputted.
++     */
++    public void setPlaySpeed(int Speed) {
++        setParameter(KEY_PARAMETER_PLAYBACK_RATE_PERMILLE, Speed);
++    }
++
++    /*
++     * Gets the value of the parameter indicated by key.
++     * @param key key indicates the parameter to get.
++     * @param reply value of the parameter to get.
++     */
++    private native void getParameter(int key, Parcel reply);
++
++    /**
++     * Gets the value of the parameter indicated by key.
++     * The caller is responsible for recycling the returned parcel.
++     * @param key key indicates the parameter to get.
++     * @return value of the parameter.
++     * {@hide}
++     */
++    public Parcel getParcelParameter(int key) {
++        Parcel p = Parcel.obtain();
++        getParameter(key, p);
++        return p;
++    }
++
++    /**
++     * Gets the value of the parameter indicated by key.
++     * @param key key indicates the parameter to get.
++     * @return value of the parameter.
++     * {@hide}
++     */
++    public String getStringParameter(int key) {
++        Parcel p = Parcel.obtain();
++        getParameter(key, p);
++        String ret = p.readString();
++        p.recycle();
++        return ret;
++    }
++
++    /**
++     * Gets the value of the parameter indicated by key.
++     * @param key key indicates the parameter to get.
++     * @return value of the parameter.
++     * {@hide}
++     */
++    public int getIntParameter(int key) {
++        Parcel p = Parcel.obtain();
++        getParameter(key, p);
++        int ret = p.readInt();
++        p.recycle();
++        return ret;
++    }
+ 
+     /**
+      * Sets the send level of the player to the attached auxiliary effect
+diff --git a/media/java/android/media/MediaRecorder.java b/media/java/android/media/MediaRecorder.java
+index 8dcbd6b..20edc92 100644
+--- a/media/java/android/media/MediaRecorder.java
++++ b/media/java/android/media/MediaRecorder.java
+@@ -14,6 +14,8 @@
+  * limitations under the License.
+  */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ package android.media;
+ 
+ import android.app.ActivityThread;
+@@ -293,6 +295,8 @@ public class MediaRecorder
+         public static final int HE_AAC = 4;
+         /** Enhanced Low Delay AAC (AAC-ELD) audio codec */
+         public static final int AAC_ELD = 5;
++        /** MP3 audio codec */
++        public static final int MP3 = 6;
+     }
+ 
+     /**
+-- 
+1.8.0
+

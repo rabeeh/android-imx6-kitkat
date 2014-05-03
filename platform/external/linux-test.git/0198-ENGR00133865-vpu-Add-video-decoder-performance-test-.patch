@@ -1,0 +1,401 @@
+From 549d67a5c6a96b26bf152f6537c2e8f0303dc42e Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 3 Dec 2010 20:39:42 +0800
+Subject: [PATCH 198/435] ENGR00133865 vpu: Add video decoder performance test
+ with v4l display
+
+Add video decoder performance test with v4l display.
+Use environment VIDEO_PERFORMANCE_TEST to control the test mode.
+It didn't cover vpu rotation and dering feature enabled test.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      |  37 ++++++++---
+ test/mxc_vpu_test/display.c  | 146 ++++++++++++++++++++++++++++++++++++-------
+ test/mxc_vpu_test/vpu_test.h |  13 +++-
+ 3 files changed, 161 insertions(+), 35 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 1772f68..8656c49 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -25,6 +25,8 @@
+ 
+ extern int quitflag;
+ 
++int vpu_v4l_performance_test;
++
+ static FILE *fpFrmStatusLogfile = NULL;
+ static FILE *fpErrMapLogfile = NULL;
+ static FILE *fpQpLogfile = NULL;
+@@ -1029,7 +1031,8 @@ decoder_start(struct decode *dec)
+ 			dprintf(3, "VPU doesn't have picture to be displayed.\n"
+ 				"\toutinfo.indexFrameDisplay = %d\n",
+ 						outinfo.indexFrameDisplay);
+-			if (dec->cmdl->dst_scheme != PATH_IPU) {
++
++			if (!vpu_v4l_performance_test && (dec->cmdl->dst_scheme != PATH_IPU)) {
+ 				if (dec->cmdl->format != STD_MJPG && disp_clr_index >= 0) {
+ 					err = vpu_DecClrDispFlag(handle, disp_clr_index);
+ 					if (err)
+@@ -1070,11 +1073,13 @@ decoder_start(struct decode *dec)
+ 				return -1;
+ 
+ 			if (dec->cmdl->dst_scheme == PATH_V4L2) {
+-				if (dec->cmdl->format != STD_MJPG && disp_clr_index >= 0) {
+-					err = vpu_DecClrDispFlag(handle, disp_clr_index);
+-					if (err)
+-						err_msg("vpu_DecClrDispFlag failed Error code"
++				if (!vpu_v4l_performance_test) {
++					if (dec->cmdl->format != STD_MJPG && disp_clr_index >= 0) {
++						err = vpu_DecClrDispFlag(handle, disp_clr_index);
++						if (err)
++							err_msg("vpu_DecClrDispFlag failed Error code"
+ 								" %d\n", err);
++					}
+ 				}
+ 
+ 				if (dec->cmdl->format == STD_MJPG) {
+@@ -1456,8 +1461,9 @@ decoder_parse(struct decode *dec)
+ {
+ 	DecInitialInfo initinfo = {0};
+ 	DecHandle handle = dec->handle;
+-	int align, profile, level;
++	int align, profile, level, extended_fbcount;
+ 	RetCode ret;
++	char *count;
+ 
+ 	/*
+ 	 * If userData report is enabled, buffer and comamnd need to be set
+@@ -1650,10 +1656,17 @@ decoder_parse(struct decode *dec)
+ 	 *
+ 	 * Two more buffers may be needed for interlace stream from IPU DVI view
+ 	 */
++	dec->minFrameBufferCount = initinfo.minFrameBufferCount;
++	count = getenv("VPU_EXTENDED_BUFFER_COUNT");
++	if (count)
++		extended_fbcount = atoi(count);
++	else
++		extended_fbcount = 2;
++
+ 	if (initinfo.interlace)
+-		dec->fbcount = initinfo.minFrameBufferCount + 2 + 2;
++		dec->fbcount = initinfo.minFrameBufferCount + extended_fbcount + 2;
+ 	else
+-		dec->fbcount = initinfo.minFrameBufferCount + 2;
++		dec->fbcount = initinfo.minFrameBufferCount + extended_fbcount;
+ 
+ 	dec->picwidth = ((initinfo.picWidth + 15) & ~15);
+ 
+@@ -1734,8 +1747,6 @@ decoder_parse(struct decode *dec)
+ 			err_msg("malloc_error\n");
+ 	}
+ 
+-	if (dec->cmdl->fps == 0)
+-		dec->cmdl->fps = 30;
+ 	info_msg("Display fps will be %d\n", dec->cmdl->fps);
+ 
+ 	return 0;
+@@ -1812,6 +1823,8 @@ decode_test(void *arg)
+ 	struct decode *dec;
+ 	int ret, eos = 0, fill_end_bs = 0, fillsize = 0;
+ 
++	vpu_v4l_performance_test = 0;
++
+ 	dec = (struct decode *)calloc(1, sizeof(struct decode));
+ 	if (dec == NULL) {
+ 		err_msg("Failed to allocate decode structure\n");
+@@ -1900,6 +1913,10 @@ decode_test(void *arg)
+ 	if (ret)
+ 		goto err1;
+ 
++	/* Not set fps when doing performance test default */
++        if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test)
++                dec->cmdl->fps = 30;
++
+ 	/* start decoding */
+ 	ret = decoder_start(dec);
+ err1:
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 19364f3..1ef7cdb 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -129,7 +129,54 @@ static inline void wakeup_queue()
+ }
+ 
+ extern int quitflag;
+-void * disp_loop_thread(void *arg)
++extern int vpu_v4l_performance_test;
++
++static pthread_mutex_t v4l_mutex;
++
++/* The thread for display in performance test with v4l */
++void v4l_disp_loop_thread(void *arg)
++{
++	struct decode *dec = (struct decode *)arg;
++	struct vpu_display *disp = dec->disp;
++	pthread_attr_t attr;
++	struct timeval ts;
++	int error_status = 0, ret;
++	struct v4l2_buffer buffer;
++
++	pthread_attr_init(&attr);
++	pthread_attr_setschedpolicy(&attr, SCHED_RR);
++
++	while (!error_status && !quitflag) {
++		/* Use timed wait here */
++		do {
++			gettimeofday(&ts, NULL);
++			ts.tv_usec +=100000; // 100ms
++		} while ((sem_timedwait(&disp->avaiable_dequeue_frame,
++			 &ts) != 0) && !quitflag);
++
++		if (quitflag)
++			break;
++
++		buffer.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++		buffer.memory = V4L2_MEMORY_MMAP;
++		ret = ioctl(disp->fd, VIDIOC_DQBUF, &buffer);
++		if (ret < 0) {
++			err_msg("VIDIOC_DQBUF failed\n");
++			error_status = 1;
++		}
++		/* Clear the flag after showing */
++		ret = vpu_DecClrDispFlag(dec->handle, buffer.index);
++
++		pthread_mutex_lock(&v4l_mutex);
++		disp->queued_count--;
++		pthread_mutex_unlock(&v4l_mutex);
++		sem_post(&disp->avaiable_decoding_frame);
++	}
++	pthread_attr_destroy(&attr);
++	return;
++}
++
++void ipu_disp_loop_thread(void *arg)
+ {
+ 	struct decode *dec = (struct decode *)arg;
+ 	DecHandle handle = dec->handle;
+@@ -171,7 +218,7 @@ void * disp_loop_thread(void *arg)
+ 			if (err < 0) {
+ 				err_msg("mxc_ipu_lib_task_init failed, err %d\n", err);
+ 				quitflag = 1;
+-				return NULL;
++				return;
+ 			}
+ 			/* it only enable ipu task and finish first frame */
+ 			err = mxc_ipu_lib_task_buf_update(&(disp->ipu_handle), 0, 0, 0, NULL, NULL);
+@@ -216,7 +263,7 @@ void * disp_loop_thread(void *arg)
+ 	pthread_attr_destroy(&attr);
+ 	info_msg("Disp loop thread exit\n");
+ 	ipu_running = 0;
+-	return NULL;
++	return;
+ }
+ 
+ struct vpu_display *
+@@ -353,7 +400,7 @@ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	pthread_cond_init(&ipu_cond, NULL);
+ 
+ 	/* start disp loop thread */
+-	pthread_create(&(disp->disp_loop_thread), NULL, disp_loop_thread, (void *)dec);
++	pthread_create(&(disp->ipu_disp_loop_thread), NULL, ipu_disp_loop_thread, (void *)dec);
+ 
+ 	return disp;
+ }
+@@ -368,7 +415,7 @@ void ipu_display_close(struct vpu_display *disp)
+ 	if (ipu_running) {
+ 		wakeup_queue();
+ 		info_msg("Join disp loop thread\n");
+-		pthread_join(disp->disp_loop_thread, NULL);
++		pthread_join(disp->ipu_disp_loop_thread, NULL);
+ 	}
+ 	pthread_mutex_destroy(&ipu_mutex);
+ 	pthread_cond_destroy(&ipu_cond);
+@@ -460,7 +507,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	struct v4l2_mxc_offset off = {0};
+ 	struct vpu_display *disp;
+ 	int fd_fb;
+-	char *tv_mode;
++	char *tv_mode, *test_mode;
+ 	char motion_mode = dec->cmdl->vdi_motion;
+ 	struct mxcfb_gbl_alpha alpha;
+ 
+@@ -753,6 +800,28 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	disp->fd = fd;
+ 	disp->nframes = nframes;
+ 
++	/*
++	 * Use environment VIDEO_PERFORMANCE_TEST to select different mode.
++	 * When doing performance test, video decoding and display are in different
++	 * threads and default display fps is controlled by cmd. Display will
++	 * show the frame immediately if user doesn't input fps with -a option.
++	 * This is different from normal unit test.
++	 */
++	test_mode = getenv("VIDEO_PERFORMANCE_TEST");
++	if (test_mode && !strcmp(test_mode, "1") && (dec->cmdl->dst_scheme == PATH_V4L2))
++		vpu_v4l_performance_test = 1;
++
++	if (vpu_v4l_performance_test) {
++		dec->disp = disp;
++		sem_init(&disp->avaiable_decoding_frame, 0,
++			    dec->fbcount - dec->minFrameBufferCount);
++		sem_init(&disp->avaiable_dequeue_frame, 0, 0);
++		pthread_mutex_init(&v4l_mutex, NULL);
++		/* start v4l disp loop thread */
++		pthread_create(&(disp->v4l_disp_loop_thread), NULL,
++				    v4l_disp_loop_thread, (void *)dec);
++	}
++
+ 	return disp;
+ err:
+ 	close(fd);
+@@ -765,6 +834,13 @@ void v4l_display_close(struct vpu_display *disp)
+ 	int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 
+ 	if (disp) {
++		if (vpu_v4l_performance_test) {
++			quitflag = 1;
++			pthread_join(disp->v4l_disp_loop_thread, NULL);
++			sem_destroy(&disp->avaiable_decoding_frame);
++			sem_destroy(&disp->avaiable_dequeue_frame);
++		}
++
+ 		while (disp->queued_count > 0) {
+ 			disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 			disp->buf.memory = V4L2_MEMORY_MMAP;
+@@ -806,25 +882,38 @@ int v4l_put_data(struct vpu_display *disp, int index, int field, int fps)
+ 	}
+ 
+ 	if (disp->ncount > 0) {
+-		disp->usec += (1000000 / fps);
+-		if (disp->usec >= 1000000) {
+-			disp->sec += 1;
+-			disp->usec -= 1000000;
+-		}
+-
+-		disp->buf.timestamp.tv_sec = disp->sec;
+-		disp->buf.timestamp.tv_usec = disp->usec;
++		if (fps != 0) {
++			disp->usec += (1000000 / fps);
++			if (disp->usec >= 1000000) {
++				disp->sec += 1;
++				disp->usec -= 1000000;
++			}
+ 
++			disp->buf.timestamp.tv_sec = disp->sec;
++			disp->buf.timestamp.tv_usec = disp->usec;
++		} else {
++			gettimeofday(&tv, 0);
++			disp->buf.timestamp.tv_sec = tv.tv_sec;
++			disp->buf.timestamp.tv_usec = tv.tv_usec;
++		}
+ 	}
+ 
+ 	disp->buf.index = index;
+ 	disp->buf.field = field;
++
+ 	err = ioctl(disp->fd, VIDIOC_QBUF, &disp->buf);
+ 	if (err < 0) {
+ 		err_msg("VIDIOC_QBUF failed\n");
+ 		goto err;
+ 	}
+-	disp->queued_count++;
++
++	if (vpu_v4l_performance_test) {
++		/* Use mutex to protect queued_count in multi-threads */
++		pthread_mutex_lock(&v4l_mutex);
++		disp->queued_count++;
++		pthread_mutex_unlock(&v4l_mutex);
++	} else
++		disp->queued_count++;
+ 
+ 	if (disp->ncount == 1) {
+ 		if ((disp->buf.field == V4L2_FIELD_TOP) ||
+@@ -864,18 +953,31 @@ int v4l_put_data(struct vpu_display *disp, int index, int field, int fps)
+ 	if (disp->buf.field == V4L2_FIELD_ANY || disp->buf.field == V4L2_FIELD_NONE)
+ 		threshold = 1;
+ 	if (disp->queued_count > threshold) {
+-		disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-		disp->buf.memory = V4L2_MEMORY_MMAP;
+-		err = ioctl(disp->fd, VIDIOC_DQBUF, &disp->buf);
+-		if (err < 0) {
+-			err_msg("VIDIOC_DQBUF failed\n");
+-			goto err;
++		if (vpu_v4l_performance_test) {
++			sem_post(&disp->avaiable_dequeue_frame);
++		} else {
++			disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++			disp->buf.memory = V4L2_MEMORY_MMAP;
++			err = ioctl(disp->fd, VIDIOC_DQBUF, &disp->buf);
++			if (err < 0) {
++				err_msg("VIDIOC_DQBUF failed\n");
++				goto err;
++			}
++			disp->queued_count--;
+ 		}
+-		disp->queued_count--;
+ 	}
+ 	else
+ 		disp->buf.index = -1;
+ 
++	/* Block here to wait avaiable_decoding_frame */
++	if (vpu_v4l_performance_test) {
++		do {
++			gettimeofday(&tv, NULL);
++			tv.tv_usec +=100000; // 100ms
++		} while ((sem_timedwait(&disp->avaiable_decoding_frame,
++			    &tv) != 0) && !quitflag);
++	}
++
+ 	return 0;
+ 
+ err:
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index c472d48..57a4c92 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -20,6 +20,7 @@
+ #include <pthread.h>
+ #include <errno.h>
+ #include <stdint.h>
++#include <semaphore.h>
+ #include "mxc_ipu_hl_lib.h"
+ #include "vpu_lib.h"
+ #include "vpu_io.h"
+@@ -45,8 +46,8 @@
+ typedef unsigned short u16;
+ typedef unsigned char u8;
+ 
+-#define STREAM_BUF_SIZE		0x80000
+-#define STREAM_FILL_SIZE	0x10000
++#define STREAM_BUF_SIZE		0x200000
++#define STREAM_FILL_SIZE	0x40000
+ #define STREAM_READ_SIZE	(512 * 8)
+ #define STREAM_END_SIZE		0
+ #define PS_SAVE_SIZE		0x080000
+@@ -121,7 +122,12 @@ struct vpu_display {
+ 	ipu_lib_handle_t ipu_handle;
+ 	ipu_lib_input_param_t input;
+ 	ipu_lib_output_param_t output;
+-	pthread_t disp_loop_thread;
++	pthread_t ipu_disp_loop_thread;
++	pthread_t v4l_disp_loop_thread;
++
++	sem_t avaiable_decoding_frame;
++	sem_t avaiable_dequeue_frame;
++
+ 	struct ipu_queue ipu_q;
+ 	struct ipu_buf ipu_bufs[MAX_BUF_NUM];
+ 	int stopping;
+@@ -188,6 +194,7 @@ struct decode {
+ 	int stride;
+ 	int mjpg_fmt;
+ 	int fbcount;
++	int minFrameBufferCount;
+ 	int rot_buf_count;
+ 	int extrafb;
+ 	FrameBuffer *fb;
+-- 
+1.8.0
+

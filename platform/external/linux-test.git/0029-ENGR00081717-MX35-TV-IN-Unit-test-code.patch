@@ -1,0 +1,362 @@
+From 139cc67da0d888383505daff13166cfaf3d0e2d3 Mon Sep 17 00:00:00 2001
+From: Miao Yu <r65093@freescale.com>
+Date: Wed, 25 Jun 2008 14:39:52 +0800
+Subject: [PATCH 029/435] ENGR00081717 MX35: TV IN Unit test code
+
+Add unit test code for mx35 tvin feature
+
+Signed-off-by: Miao Yu <r65093@freescale.com>
+---
+ test/mxc_v4l2_test/Makefile        |   7 +-
+ test/mxc_v4l2_test/mxc_v4l2_tvin.c | 315 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 319 insertions(+), 3 deletions(-)
+ create mode 100644 test/mxc_v4l2_test/mxc_v4l2_tvin.c
+
+diff --git a/test/mxc_v4l2_test/Makefile b/test/mxc_v4l2_test/Makefile
+index b4f617b..2dc60ef 100644
+--- a/test/mxc_v4l2_test/Makefile
++++ b/test/mxc_v4l2_test/Makefile
+@@ -1,15 +1,16 @@
+ # list of platforms which did not want this test case
+-EXCLUDE_LIST:= 
++EXCLUDE_LIST:=
+ 
+ ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
+ OBJS = 	$(OBJDIR)/autorun-v4l2.sh \
+ 	$(OBJDIR)/mxc_v4l2_overlay.out \
+ 	$(OBJDIR)/mxc_v4l2_capture.out \
+ 	$(OBJDIR)/mxc_v4l2_output.out \
+-	$(OBJDIR)/mxc_v4l2_still.out
++	$(OBJDIR)/mxc_v4l2_still.out \
++	$(OBJDIR)/mxc_v4l2_tvin.out
+ 
+ else
+-OBJS = 
++OBJS =
+ endif
+ 
+ all : $(OBJS)
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_tvin.c b/test/mxc_v4l2_test/mxc_v4l2_tvin.c
+new file mode 100644
+index 0000000..b8b016b
+--- /dev/null
++++ b/test/mxc_v4l2_test/mxc_v4l2_tvin.c
+@@ -0,0 +1,315 @@
++/*
++ * Copyright 2007-2008 Freescale Semiconductor, Inc. All rights reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*
++ * @file mxc_v4l2_tvin.c
++ *
++ * @brief Mxc TVIN For Linux 2 driver test application
++ *
++ */
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++/*=======================================================================
++                                        INCLUDE FILES
++=======================================================================*/
++/* Standard Include Files */
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++    
++/* Verification Test Environment Include Files */
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <asm/types.h>
++#include <linux/compiler.h>
++#include <linux/videodev.h>
++#include <linux/videodev2.h>
++#include <linux/fb.h>
++#include <sys/mman.h>
++#include <math.h>
++#include <string.h>
++#include <malloc.h>
++
++#include <asm/arch/mxcfb.h>
++
++#define TFAIL -1
++#define TPASS 0
++
++char v4l_device[100] = "/dev/video0";
++int fd_v4l = 0;
++int g_cap_mode = 0;
++v4l2_std_id g_current_std = V4L2_STD_PAL;
++
++/* PAL active frame size is 720 * 576, output is interlaced mode */
++#define PAL_WIDTH             720
++#define PAL_HEIGHT            288
++/* Display area on LCD */
++#define DISPLAY_WIDTH         720
++#define DISPLAY_HEIGHT        464
++#define DISPLAY_TOP           12
++#define DISPLAY_LEFT          40
++
++int
++mxc_v4l_tvin_test(void)
++{
++        int overlay = 1;
++	v4l2_std_id id;
++	struct v4l2_streamparm parm;
++	 
++        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        parm.parm.capture.timeperframe.numerator = 1;
++        parm.parm.capture.timeperframe.denominator = 0;
++        parm.parm.capture.capturemode = 0;
++        if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0)
++        {
++                printf("VIDIOC_OVERLAY start failed\n");
++		return TFAIL;
++        }
++
++       /* Detect standard monitor, the default video standard is PAL when the test programe is started */
++
++       while (1) {
++		if (ioctl(fd_v4l, VIDIOC_G_STD, &id) < 0)
++                {
++                    printf("overlay test programe: VIDIOC_G_STD failed\n");
++                    return TFAIL;
++                }
++		if (g_current_std == id)
++		{
++                    sleep(1);
++		    continue;
++		}
++		else
++		{
++		    printf("overlay test programe: video standard changed ... \n");
++		    ioctl(fd_v4l, VIDIOC_S_STD, &id);
++		    g_cap_mode = (g_cap_mode + 1) % 2;
++		    parm.parm.capture.capturemode = g_cap_mode;
++		    ioctl(fd_v4l, VIDIOC_S_PARM, &parm);
++		    g_current_std = id;
++                    sleep(1);
++		    continue;
++		 }
++		
++       }
++
++    return 0;
++}
++
++int
++mxc_v4l_tvin_setup(struct v4l2_format *fmt)
++{
++        struct v4l2_streamparm parm;
++        struct v4l2_control ctl;
++        struct v4l2_crop crop;
++	 int display_lcd = 0;
++
++        if (ioctl(fd_v4l, VIDIOC_S_OUTPUT, &display_lcd) < 0)
++        {
++                printf("VIDIOC_S_OUTPUT failed\n");
++                return TFAIL;
++        }
++
++        ctl.id = V4L2_CID_PRIVATE_BASE;
++	ctl.value = 0;
++        if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctl) < 0)
++        {
++                printf("set control failed\n");
++                return TFAIL;
++        }
++
++        crop.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
++        crop.c.left = 0;
++        crop.c.top = 0;
++        crop.c.width = PAL_WIDTH;
++        crop.c.height = PAL_HEIGHT;
++        if (ioctl(fd_v4l, VIDIOC_S_CROP, &crop) < 0)
++        {
++                printf("set cropping failed\n");
++                return TFAIL;
++        }
++
++        if (ioctl(fd_v4l, VIDIOC_S_FMT, fmt) < 0)
++        {
++                printf("set format failed\n");
++                return TFAIL;
++        }
++
++        if (ioctl(fd_v4l, VIDIOC_G_FMT, fmt) < 0)
++        {
++                printf("get format failed\n");
++                return TFAIL;
++        }
++		
++        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        parm.parm.capture.timeperframe.numerator = 1;
++        parm.parm.capture.timeperframe.denominator = 0;
++        parm.parm.capture.capturemode = 0;
++         
++        if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0)
++        {
++                printf("VIDIOC_S_PARM failed\n");
++                return TFAIL;
++        }
++
++        parm.parm.capture.timeperframe.numerator = 0;
++        parm.parm.capture.timeperframe.denominator = 0;
++
++        if (ioctl(fd_v4l, VIDIOC_G_PARM, &parm) < 0)
++        {
++                printf("get frame rate failed\n");
++                return TFAIL;
++        }
++        g_cap_mode = parm.parm.capture.capturemode;
++        printf("cap_mode is %d\n", parm.parm.capture.capturemode);
++        return TPASS;
++}
++
++int
++main(int argc, char **argv)
++{
++        struct v4l2_format fmt;
++        struct v4l2_framebuffer fb_v4l2;
++        char fb_device[100] = "/dev/fb0";
++        int fd_fb = 0;
++        struct fb_fix_screeninfo fix;
++        struct fb_var_screeninfo var;
++        struct mxcfb_color_key color_key;
++        struct mxcfb_gbl_alpha alpha;
++        unsigned short * fb0;
++        unsigned char * cur_fb8;
++        unsigned short * cur_fb16;
++        unsigned int * cur_fb32;
++        __u32 screen_size;
++        int h, w;
++	int ret = 0;
++
++        if ((fd_v4l = open(v4l_device, O_RDWR, 0)) < 0) {
++                printf("Unable to open %s\n", v4l_device);
++                return TFAIL;
++        }
++
++        fmt.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
++        fmt.fmt.win.w.top =  DISPLAY_TOP ;
++        fmt.fmt.win.w.left = DISPLAY_LEFT;
++        fmt.fmt.win.w.width = DISPLAY_WIDTH;
++        fmt.fmt.win.w.height = DISPLAY_HEIGHT;
++
++        if (mxc_v4l_tvin_setup(&fmt) < 0) {
++                printf("Setup tvin failed.\n");
++                return TFAIL;
++	}
++
++        memset(&fb_v4l2, 0, sizeof(fb_v4l2));
++
++        if ((fd_fb = open(fb_device, O_RDWR )) < 0)	{
++                printf("Unable to open frame buffer\n");
++                return TFAIL;
++        }
++
++        if (ioctl(fd_fb, FBIOGET_VSCREENINFO, &var) < 0) {
++                close(fd_fb);
++                return TFAIL;
++        }
++        if (ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix) < 0) {
++                close(fd_fb);
++                return TFAIL;
++        }
++
++        /* Overlay setting */
++        alpha.alpha = 255;
++	alpha.enable = 1;
++	if ( ioctl(fd_fb, MXCFB_SET_GBL_ALPHA, &alpha) < 0) {
++                close(fd_fb);
++                return TFAIL;
++	}
++
++        color_key.color_key = 0x00080808;
++        color_key.enable = 1;
++        if ( ioctl(fd_fb, MXCFB_SET_CLR_KEY, &color_key) < 0) {
++                close(fd_fb);
++                return TFAIL;
++        }
++
++        screen_size = var.yres * fix.line_length; // 480*800
++
++        /* Map the device to memory*/
++        fb0 = (unsigned short *)mmap(0, screen_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_fb, 0);
++        if ((int)fb0 == -1)
++        {
++                printf("\nError: failed to map framebuffer device 0 to memory.\n");
++                close(fd_fb);
++                return TFAIL;
++	 }
++
++        if (var.bits_per_pixel == 16) {
++                for (h = DISPLAY_TOP; h < (DISPLAY_HEIGHT+ DISPLAY_TOP); h++) {
++                        cur_fb16 = (unsigned short *)((__u32)fb0 + h*fix.line_length);
++                        for (w = DISPLAY_LEFT; w < DISPLAY_WIDTH + DISPLAY_LEFT; w++) {
++                                cur_fb16[w] = 0x0841;
++                        }
++                }
++        }
++        else if (var.bits_per_pixel == 24) {
++                for (h = DISPLAY_TOP; h < (DISPLAY_HEIGHT + DISPLAY_TOP); h++) {
++                        cur_fb8 = (unsigned char *)((__u32)fb0 + h*fix.line_length);
++                        for (w = DISPLAY_LEFT; w < DISPLAY_WIDTH + DISPLAY_LEFT; w++) {
++                                *cur_fb8++ = 8;
++                                *cur_fb8++ = 8;
++                                *cur_fb8++ = 8;
++                        }
++                }
++        }
++        else if (var.bits_per_pixel == 32) {
++                for (h = DISPLAY_TOP; h < (DISPLAY_HEIGHT + DISPLAY_TOP); h++) {
++                        cur_fb32 = (unsigned int *)((__u32)fb0 + h*fix.line_length);
++                        for (w = DISPLAY_LEFT; w < DISPLAY_WIDTH + DISPLAY_LEFT; w++) {
++                                cur_fb32[w] = 0x00080808;
++                        }
++                }
++        }
++        if (ioctl(fd_v4l, VIDIOC_G_FBUF, &fb_v4l2) < 0) {
++                printf("Get framebuffer failed\n");
++                return TFAIL;
++        }
++        fb_v4l2.flags = V4L2_FBUF_FLAG_OVERLAY;
++
++        close(fd_fb);
++
++        if (ioctl(fd_v4l, VIDIOC_S_FBUF, &fb_v4l2) < 0)
++        {
++                printf("set framebuffer failed\n");
++                return TFAIL;
++        }
++
++        if (ioctl(fd_v4l, VIDIOC_G_FBUF, &fb_v4l2) < 0) {
++                printf("set framebuffer failed\n");
++                return TFAIL;
++        }
++
++        printf("\n frame buffer width %d, height %d, bytesperline %d\n",
++                fb_v4l2.fmt.width, fb_v4l2.fmt.height, fb_v4l2.fmt.bytesperline); // 800 480 1600
++        ret = mxc_v4l_tvin_test();
++
++        close(fd_v4l);
++        return ret;
++}
++
+-- 
+1.8.0
+

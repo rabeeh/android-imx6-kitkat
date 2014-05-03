@@ -1,0 +1,246 @@
+From 28275ec772c4fa6c43b4b4e75c156d6cfc6e672f Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Tue, 13 Sep 2011 17:55:06 +0800
+Subject: [PATCH 177/486] ENGR00156626 fix camera display abnormally when
+ switch between capture and camcorder
+
+add refresh black colour when display area changed in hardware composer.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx5x/hwcomposer/Android.mk        |  2 +-
+ mx5x/hwcomposer/FG_device.cpp     |  4 +++-
+ mx5x/hwcomposer/blit_ipu.cpp      |  3 ++-
+ mx5x/hwcomposer/hwc_common.h      |  9 +++++++++
+ mx5x/hwcomposer/hwcomposer.cpp    | 27 ++++++++++++++++++++++++---
+ mx5x/hwcomposer/output_device.cpp | 34 +++++++++++++++++++++++++++++++++-
+ 6 files changed, 72 insertions(+), 7 deletions(-)
+
+diff --git a/mx5x/hwcomposer/Android.mk b/mx5x/hwcomposer/Android.mk
+index eac0fd2..4939d3e 100755
+--- a/mx5x/hwcomposer/Android.mk
++++ b/mx5x/hwcomposer/Android.mk
+@@ -20,7 +20,7 @@ LOCAL_PATH := $(call my-dir)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libEGL libipu libcutils libutils
++LOCAL_SHARED_LIBRARIES := liblog libEGL libipu libcutils libutils libui
+ LOCAL_SRC_FILES := hwcomposer.cpp BG_device.cpp FG_device.cpp hwc_common.cpp blit_gpu.cpp blit_ipu.cpp output_device.cpp
+ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+ LOCAL_C_INCLUDES += hardware/imx/mx5x/libgralloc
+diff --git a/mx5x/hwcomposer/FG_device.cpp b/mx5x/hwcomposer/FG_device.cpp
+index 5625948..6da50ef 100755
+--- a/mx5x/hwcomposer/FG_device.cpp
++++ b/mx5x/hwcomposer/FG_device.cpp
+@@ -281,7 +281,9 @@ HWCOMPOSER_LOG_RUNTIME("-------------FG_device::init()---open fb0-------------")
+ 		(mbuffers[i]).size = fbSize/DEFAULT_BUFFERS;
+ 		(mbuffers[i]).virt_addr = (void *)((unsigned long)vaddr + i * (mbuffers[i]).size);
+ 		(mbuffers[i]).phy_addr = finfo.smem_start + i * (mbuffers[i]).size;
+-		(mbuffers[i]).format = m_format;
++		(mbuffers[i]).width = m_width;
++        (mbuffers[i]).height = m_height;
++        (mbuffers[i]).format = m_format;
+   	}
+ 
+   	//pthread_mutex_init(&dev->buf_mutex, NULL);
+diff --git a/mx5x/hwcomposer/blit_ipu.cpp b/mx5x/hwcomposer/blit_ipu.cpp
+index 718e86b..738d007 100755
+--- a/mx5x/hwcomposer/blit_ipu.cpp
++++ b/mx5x/hwcomposer/blit_ipu.cpp
+@@ -126,6 +126,7 @@ HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= RGBP");
+ #endif
+     mIPUInputParam.user_def_paddr[0] = handle->phys;
+     //out_buf should has width and height to be checked with the display_frame.
++//HWCOMPOSER_LOG_ERR("^^^^^^^^in^^paddr=%x^^^^^^left=%d, top=%d, right=%d, bottom=%d", handle->phys, src_crop->left, src_crop->top, src_crop->right, src_crop->bottom);
+     mIPUOutputParam.fmt = out_buf->format;//v4l2_fourcc('U', 'Y', 'V', 'Y');
+     mIPUOutputParam.show_to_fb = 0;
+ //HWCOMPOSER_LOG_RUNTIME("^^^^^^^^out_buf->format= %x, out->phy_addr=%x, in->phys=%x", out_buf->format, out_buf->phy_addr, handle->phys);
+@@ -145,7 +146,7 @@ HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= RGBP");
+ 	    mIPUOutputParam.output_win.win_w = ((disp_frame->right - disp_frame->left) >> 3) << 3;
+ 	    mIPUOutputParam.output_win.win_h = ((disp_frame->bottom - disp_frame->top) >> 3) << 3;
+   	}
+-//HWCOMPOSER_LOG_RUNTIME("^^^^^^^^^^^^^^^^right=%d, left=%d, bottom=%d, top=%d", disp_frame->right, disp_frame->left, disp_frame->bottom, disp_frame->top);
++//HWCOMPOSER_LOG_ERR("^^^^^^^^out^^paddr=%x^^^^^^left=%d, top=%d, right=%d, bottom=%d", out_buf->phy_addr, disp_frame->left, disp_frame->top, disp_frame->right, disp_frame->bottom);
+     mIPUOutputParam.rot = layer->transform;
+     mIPUOutputParam.user_def_paddr[0] = out_buf->phy_addr;
+ HWCOMPOSER_LOG_RUNTIME("------mxc_ipu_lib_task_init-----in blit_ipu::blit()------\n");
+diff --git a/mx5x/hwcomposer/hwc_common.h b/mx5x/hwcomposer/hwc_common.h
+index fd9311a..4016df1 100755
+--- a/mx5x/hwcomposer/hwc_common.h
++++ b/mx5x/hwcomposer/hwc_common.h
+@@ -16,6 +16,8 @@
+ #include <EGL/egl.h>
+ #include "gralloc_priv.h"
+ #include <asm/page.h>
++#include <ui/Rect.h>
++#include <ui/Region.h>
+ 
+ #undef LOG_TAG
+ #define LOG_TAG "FslHwcomposer"
+@@ -103,6 +105,7 @@ typedef struct{
+     int width;
+     int height;
+     int usage;
++    Region disp_region;
+ }hwc_buffer;
+ 
+ class output_device
+@@ -115,6 +118,9 @@ public:
+ 		int getUsage();
+ 		int getWidth();
+ 		int getHeight();
++        void setDisplayFrame(hwc_rect_t *disFrame);
++        int needFillBlack(hwc_buffer *buf);
++        void fillBlack(hwc_buffer *buf);
+ 
+ 		output_device(const char *dev_name, int usage);
+ 		virtual ~output_device();
+@@ -135,6 +141,9 @@ protected:
+ 		int m_format;
+ //		int is_overlay;
+ 
++        //Region orignRegion;
++        Region currenRegion;
++
+ 		mutable Mutex mLock;
+ 		hwc_buffer mbuffers[DEFAULT_BUFFERS];
+ 		unsigned long mbuffer_count;
+diff --git a/mx5x/hwcomposer/hwcomposer.cpp b/mx5x/hwcomposer/hwcomposer.cpp
+index c4f7ba1..ed6b1f8 100755
+--- a/mx5x/hwcomposer/hwcomposer.cpp
++++ b/mx5x/hwcomposer/hwcomposer.cpp
+@@ -144,7 +144,7 @@ static int hwc_check_property(hwc_context_t *dev)
+ 		if(dev->display_mode ^ orignMode) {
+ 				dev->display_mode_changed = 1;
+ 		}
+-//HWCOMPOSER_LOG_RUNTIME("*********display_mode=%x, display_mode_changed=%d\n", dev->display_mode, dev->display_mode_changed);
++HWCOMPOSER_LOG_RUNTIME("*********display_mode=%x, display_mode_changed=%d\n", dev->display_mode, dev->display_mode_changed);
+ 		return 0;
+ }
+ 
+@@ -173,7 +173,7 @@ static int hwc_modify_property(hwc_context_t *dev, private_handle_t *handle)
+ 	else if(dev->display_mode & DISPLAY_MODE_OVERLAY_DISP3)
+ 			handle->usage |= GRALLOC_USAGE_HWC_OVERLAY_DISP3;
+ 
+-//HWCOMPOSER_LOG_RUNTIME("************handle->usage=%x", handle->usage);
++//HWCOMPOSER_LOG_ERR("************handle->usage=%x", handle->usage);
+ 	return 0;
+ }
+ 
+@@ -299,6 +299,24 @@ static int validate_displayFrame(hwc_layer_t *layer)
+     return isValid;
+ }
+ 
++static void checkDisplayFrame(struct hwc_context_t *ctx, hwc_layer_t *layer, int usage)
++{
++    output_device *out;
++    int usg;
++    hwc_rect_t *disFrame = &(layer->displayFrame);
++
++    for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
++        if(ctx->m_using[i] && ctx->m_out[i] && (usage & (GRALLOC_USAGE_OVERLAY0_MASK | GRALLOC_USAGE_OVERLAY1_MASK))) {
++            out = ctx->m_out[i];
++            usg = out->getUsage();
++            if(usg & usage) {
++                out->setDisplayFrame(disFrame);
++            }
++        }
++    }//end for
++
++}
++
+ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ //#if 1
+ 		//HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---1>>>>>>>>>>>>>>>>>\n");
+@@ -351,7 +369,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+             int retv = 0;
+             int m_usage = 0;
+             int i_usage = handle->usage & GRALLOC_USAGE_OVERLAY_DISPLAY_MASK;
+-            //HWCOMPOSER_LOG_ERR("<<<<<<<<<<<<<<<hwc_prepare---3-3>>>>>>>>>>>>>>>>\n");
++            //HWCOMPOSER_LOG_ERR("<<<<<<<<<<<<<<<hwc_prepare---3-3>>>>>usage=%x>>>i_usage=%x>>>>>>>>\n", handle->usage, i_usage);
+             retv = checkOutputDevice(ctx, out_using, i_usage, &m_usage);
+             while(retv && m_usage) {
+ 		        int ruse = 0;
+@@ -383,6 +401,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 		        ctx->m_using[index] = 1;
+ 		        //setLayerFrame(layer, ctx->m_out[index], ruse);
+             }//end while
++            checkDisplayFrame(ctx, layer, i_usage);
+ #endif
+         }//end for
+ #if 1
+@@ -487,6 +506,7 @@ static int hwc_set(hwc_composer_device_t *dev,
+             int m_usage = 0;
+             int i_usage = handle->usage & GRALLOC_USAGE_OVERLAY_DISPLAY_MASK;
+     	    HWCOMPOSER_LOG_RUNTIME("==============hwc_set=5==============\n");
++            if(!i_usage) continue;
+             do {
+     			output_device *outdev = NULL;
+     			int index = 0;
+@@ -495,6 +515,7 @@ static int hwc_set(hwc_composer_device_t *dev,
+                 	outdev = ctx->m_out[index];
+                 }
+     			if(outdev != NULL) {
++    	    //HWCOMPOSER_LOG_ERR("======hwc_set===retv=%x===i_usage=%x, index=%d\n", retv, i_usage, index);
+     				status = bltdev->blit(layer, &(out_buffer[index]));
+     				if(status < 0){
+     					HWCOMPOSER_LOG_ERR("Error! bltdev->blit() failed!");
+diff --git a/mx5x/hwcomposer/output_device.cpp b/mx5x/hwcomposer/output_device.cpp
+index ceff1be..3ae381e 100755
+--- a/mx5x/hwcomposer/output_device.cpp
++++ b/mx5x/hwcomposer/output_device.cpp
+@@ -85,10 +85,36 @@ HWCOMPOSER_LOG_INFO("output_device::isFGDevice===%s, %s, %s", dev_name, fb_name,
+  	return 0;
+ }
+ 
++void output_device::setDisplayFrame(hwc_rect_t *disFrame)
++{
++    if(disFrame == NULL) {
++        HWCOMPOSER_LOG_ERR("Error! output_device::setDisplayFrame invalid parameter!");
++    }
++    Rect disRect(disFrame->left, disFrame->top, disFrame->right, disFrame->bottom);
++    currenRegion.orSelf(disRect);
++}
++
++int output_device::needFillBlack(hwc_buffer *buf)
++{
++    Rect orignBound(buf->disp_region.getBounds());
++    Rect currentBound(currenRegion.getBounds());
++    return currentBound != orignBound;
++}
++
++void output_device::fillBlack(hwc_buffer *buf)
++{
++    if(buf == NULL) {
++        HWCOMPOSER_LOG_ERR("Error! output_device::fillBlack invalid parameter!");
++        return;
++    }
++
++    hwc_fill_frame_back((char *)buf->virt_addr, buf->size, buf->width, buf->height, buf->format);
++}
++
+ int output_device::fetch(hwc_buffer *buf)
+ {
+ 	  //int status = -EINVAL;
+-    if(m_dev <= 0) {
++    if(m_dev <= 0 || buf == NULL) {
+         HWCOMPOSER_LOG_ERR("Error! output_device::fetch invalid parameter! usage=%x", m_usage);
+         return -1;
+     }
+@@ -102,6 +128,12 @@ int output_device::fetch(hwc_buffer *buf)
+ 	  buf->usage = m_usage;
+ 	  buf->format = m_format;
+ 	  //dev->buffer_cur = (dev->buffer_cur + 1) % DEFAULT_BUFFERS;
++      if((m_usage & (GRALLOC_USAGE_OVERLAY0_MASK | GRALLOC_USAGE_OVERLAY1_MASK)) && needFillBlack(&mbuffers[mbuffer_cur])) {
++          fillBlack(&mbuffers[mbuffer_cur]);
++          mbuffers[mbuffer_cur].disp_region = currenRegion;
++      }
++      //orignRegion = currenRegion;
++      currenRegion.clear();
+ 
+ 	  return 0;
+ }
+-- 
+1.8.0
+

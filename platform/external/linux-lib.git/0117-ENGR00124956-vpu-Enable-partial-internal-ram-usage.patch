@@ -1,0 +1,381 @@
+From d5a9e0383187766ffe260de6b3e3cb8e17f7972d Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 8 Jul 2010 11:13:23 +0800
+Subject: [PATCH 117/249] ENGR00124956 vpu: Enable partial internal ram usage
+
+Enable partial internal ram usage when iram isn't
+enough on MX51 and MX53
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c  |  13 +++-
+ vpu/vpu_lib.h  |   2 +-
+ vpu/vpu_util.c | 191 +++++++++++++++++++++++++++++++++++----------------------
+ vpu/vpu_util.h |  57 +++--------------
+ 4 files changed, 138 insertions(+), 125 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 305fae2..df27c3b 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -578,6 +578,7 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	int picHeight;
+ 	Uint32 data, *tableBuf;
+ 	int i;
++	SetIramParam iramParam;
+ 	RetCode ret;
+ 
+ 	ENTER_FUNC();
+@@ -741,7 +742,8 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	}
+ 
+ 	/* Set secondAXI IRAM */
+-	SetEncSecondAXIIRAM(&pEncInfo->secAxiUse, encOP.picWidth);
++	iramParam.width = encOP.picWidth;
++	SetEncSecondAXIIRAM(&pEncInfo->secAxiUse, &iramParam);
+ 
+ 	VpuWriteReg(CMD_ENC_SEARCH_BASE, pEncInfo->secAxiUse.searchRamAddr);
+ 	VpuWriteReg(CMD_ENC_SEARCH_SIZE, pEncInfo->secAxiUse.searchRamSize);
+@@ -2015,6 +2017,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	CodecInst *pCodecInst;
+ 	DecInfo *pDecInfo;
+ 	Uint32 val, val2;
++	SetIramParam iramParam;
+ 	RetCode ret;
+ 
+ 	ENTER_FUNC();
+@@ -2255,8 +2258,12 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	pDecInfo->initialInfoObtained = 1;
+ 
+ 	/* Set secondAXI IRAM */
+-	if (!cpu_is_mx37())
+-		SetDecSecondAXIIRAM(&pDecInfo->secAxiUse, (info->picWidth + 15) & ~15);
++	if (!cpu_is_mx37()) {
++		iramParam.width = (info->picWidth + 15) & ~15;
++		iramParam.profile = info->profile;
++		iramParam.codecMode = pCodecInst->codecMode;
++		SetDecSecondAXIIRAM(&pDecInfo->secAxiUse, &iramParam);
++	}
+ 
+ 	return RETCODE_SUCCESS;
+ }
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 5c2d4af..5ac8c0c 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -500,7 +500,7 @@ typedef struct vpu_versioninfo {
+  * v4.1.2 [2008.08.22] update MX37 VPU firmware to V1.0.5
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 0, 5)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 1, 0)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 81844c1..eb16cc7 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -821,98 +821,145 @@ RetCode SetHecMode(EncHandle handle, int mode)
+ 	return RETCODE_SUCCESS;
+ }
+ 
+-void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width)
++void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm)
+ {
+ 	iram_t iram;
++	int size, dbk_size, bitram_size, ipacdc_size, ovl_size;
++
++	if (!parm->width) {
++		err_msg("Width is zero when calling SetDecSecondAXIIRAM function\n");
++		return;
++	}
+ 
+ 	memset(psecAxiIramInfo, 0, sizeof(SecAxiUse));
+ 
+ 	IOGetIramBase(&iram);
++	size = iram.end - iram.start + 1;
+ 
+-	if ((width > DEC_MAX_WIDTH_IRAM_SUPPORT) ||
+-	    (iram.end - iram.start) < VPU_DEC_TOTAL_IRAM_SIZE) {
+-		warn_msg("VPU iram is less than needed, not use iram\n");
+-	} else {
+-		if (cpu_is_mx51()) {
+-			/* i.MX51 has no secondary AXI memory, but use on chip RAM
+-			   Set the useHoseXXX as 1 to enable corresponding IRAM
+-			   Set the useXXXX as 0 at the same time to use IRAM  */
+-			psecAxiIramInfo->useHostBitEnable = 1;
+-			psecAxiIramInfo->useHostIpEnable = 1;
+-			psecAxiIramInfo->useHostDbkEnable = 1;
+-			psecAxiIramInfo->useHostOvlEnable = 1;
+-		} else if (cpu_is_mx53()) {
+-			/* i.MX53 uses secondary AXI for IRAM access */
+-			psecAxiIramInfo->useBitEnable = 1;
+-			psecAxiIramInfo->useIpEnable = 1;
+-			psecAxiIramInfo->useDbkEnable = 1;
+-			psecAxiIramInfo->useOvlEnable = 1;
+-
+-			psecAxiIramInfo->useHostBitEnable = 1;
+-			psecAxiIramInfo->useHostIpEnable = 1;
+-			psecAxiIramInfo->useHostDbkEnable = 1;
+-			psecAxiIramInfo->useHostOvlEnable = 1;
+-		}
+-
+-		psecAxiIramInfo->bufBitUse = iram.start + VPU_DEC_BIT_IRAM_OFFSET;
+-		psecAxiIramInfo->bufIpAcDcUse = iram.start + VPU_DEC_IP_IRAM_OFFSET;
+-		psecAxiIramInfo->bufDbkYUse = iram.start + VPU_DEC_DBKY_IRAM_OFFSET;
+-		psecAxiIramInfo->bufDbkCUse = iram.start + VPU_DEC_DBKC_IRAM_OFFSET;
+-		psecAxiIramInfo->bufOvlUse = iram.start + VPU_DEC_OVL_IRAM_OFFSET;
++	/* Setting internal iram usage per priority when iram isn't enough */
++	if ((parm->codecMode == VC1_DEC) && (parm->profile == 2))
++		dbk_size = (512 * parm->width / 16 + 1023) & ~1023;
++	else
++		dbk_size = (256 * parm->width / 16 + 1023) & ~1023;
++
++	if (size >= dbk_size) {
++		psecAxiIramInfo->useHostDbkEnable = 1;
++		psecAxiIramInfo->bufDbkYUse = iram.start;
++		psecAxiIramInfo->bufDbkCUse = iram.start + dbk_size / 2;
++		size -= dbk_size;
++	} else
++		goto out;
++
++	bitram_size = (128 * parm->width / 16 + 1023) & ~1023;
++	if (size >= bitram_size) {
++		psecAxiIramInfo->useHostBitEnable = 1;
++		psecAxiIramInfo->bufBitUse = psecAxiIramInfo->bufDbkCUse + dbk_size / 2;
++		size -= bitram_size;
++	} else
++		goto out;
++
++	ipacdc_size = (128 * parm->width / 16 + 1023) & ~1023;
++	if (size >= ipacdc_size) {
++		psecAxiIramInfo->useHostIpEnable = 1;
++		psecAxiIramInfo->bufIpAcDcUse = psecAxiIramInfo->bufBitUse + bitram_size;
++		size -= ipacdc_size;
++	} else
++		goto out;
++
++	ovl_size = (80 * parm->width / 16 + 1023) & ~1023;
++	if ((parm->codecMode == VC1_DEC) && (size >= ovl_size)) {
++		psecAxiIramInfo->useHostOvlEnable = 1;
++		psecAxiIramInfo->bufOvlUse = psecAxiIramInfo->bufIpAcDcUse + ipacdc_size;
++		size -= ovl_size;
+ 	}
++out:
++	/* i.MX51 has no secondary AXI memory, but use on chip RAM
++	   Set the useHoseXXX as 1 to enable corresponding IRAM
++	   Set the useXXXX as 0 at the same time to use IRAM,
++	   i.MX53 uses secondary AXI for IRAM access, also needs to
++	   set the useXXXX. */
++	if (cpu_is_mx53()) {
++		/* i.MX53 uses secondary AXI for IRAM access */
++		psecAxiIramInfo->useBitEnable = psecAxiIramInfo->useHostDbkEnable;
++		psecAxiIramInfo->useIpEnable = psecAxiIramInfo->useHostBitEnable;
++		psecAxiIramInfo->useDbkEnable = psecAxiIramInfo->useHostIpEnable;
++		psecAxiIramInfo->useOvlEnable = psecAxiIramInfo->useHostOvlEnable;
++	}
++
++	if (((parm->codecMode == VC1_DEC) && !psecAxiIramInfo->useHostOvlEnable) ||
++	    !psecAxiIramInfo->useHostIpEnable)
++		warn_msg("VPU iram is less than needed, some parts don't use iram\n");
+ }
+ 
+-void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width)
++void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm)
+ {
+ 	iram_t iram;
++	int size, dbk_size, bitram_size, ipacdc_size;
++
++	if (!parm->width) {
++		err_msg("Width is zero when calling SetEncSecondAXIIRAM function\n");
++		return;
++	}
+ 
+ 	memset(psecAxiIramInfo, 0, sizeof(SecAxiUse));
+ 
+ 	IOGetIramBase(&iram);
+-	if (width > ENC_MAX_WIDTH_IRAM_SUPPORT ||
+-	   (iram.end - iram.start + 1) < VPU_ENC_TOTAL_IRAM_SIZE) {
+-		/* Only search ram use iram */
+-		if ((iram.end - iram.start + 1) < VPU_ENC_SEARCH_IRAM_SIZE)
+-			err_msg("vpu iram is less than search ram size.\n");
+-		else {
+-			psecAxiIramInfo->searchRamAddr = iram.start;
+-			psecAxiIramInfo->searchRamSize = VPU_ENC_SEARCH_IRAM_SIZE;
+-		}
+-		warn_msg("VPU iram is less than needed, not use iram\n");
++	size = iram.end - iram.start + 1;
++
++	/* Setting internal iram usage per priority when iram isn't enough */
++	psecAxiIramInfo->searchRamSize = (parm->width * 36 + 2048 + 1023) & ~1023;
++	if (size >= psecAxiIramInfo->searchRamSize) {
++		psecAxiIramInfo->useHostMeEnable = 1;
++		psecAxiIramInfo->searchRamAddr = iram.start;
++		size -= psecAxiIramInfo->searchRamSize;
+ 	} else {
+-		if (cpu_is_mx51()) {
+-			/* i.MX51 has no secondary AXI memory, but use on chip RAM
+-			   Set the useHoseXXX as 1 to enable corresponding IRAM
+-			   Set the useXXXX as 0 at the same time to use IRAM  */
+-			psecAxiIramInfo->useHostBitEnable = 1;
+-			psecAxiIramInfo->useHostIpEnable = 1;
+-			psecAxiIramInfo->useHostDbkEnable = 1;
+-			psecAxiIramInfo->useHostOvlEnable = 0; /* no need to enable ovl in encoder */
+-			psecAxiIramInfo->useHostMeEnable = 1; /* For ME search */
+-		} else if (cpu_is_mx53()) {
+-			/* i.MX53 uses secondary AXI for IRAM access */
+-			psecAxiIramInfo->useBitEnable = 1;
+-			psecAxiIramInfo->useIpEnable = 1;
+-			psecAxiIramInfo->useDbkEnable = 1;
+-			psecAxiIramInfo->useOvlEnable = 0;  /* no need to enable ovl in encoder */
+-			psecAxiIramInfo->useMeEnable = 1;
+-
+-			psecAxiIramInfo->useHostBitEnable = 1;
+-			psecAxiIramInfo->useHostIpEnable = 1;
+-			psecAxiIramInfo->useHostDbkEnable = 1;
+-			psecAxiIramInfo->useHostOvlEnable = 0;
+-			psecAxiIramInfo->useHostMeEnable = 1;
+-		}
++		err_msg("VPU iram is less than search ram size\n");
++		goto out;
++	}
+ 
+-		psecAxiIramInfo->bufBitUse = iram.start + VPU_ENC_BIT_IRAM_OFFSET;
+-		psecAxiIramInfo->bufIpAcDcUse = iram.start + VPU_ENC_IP_IRAM_OFFSET;
+-		psecAxiIramInfo->bufDbkYUse = iram.start + VPU_ENC_DBKY_IRAM_OFFSET;
+-		psecAxiIramInfo->bufDbkCUse = iram.start + VPU_ENC_OVL_IRAM_OFFSET;
+-		psecAxiIramInfo->bufOvlUse = 0;
++	/* Only H.264BP and H.263P3 are considered */
++	dbk_size = (128 * parm->width / 16 + 1023) & ~1023;
++	if (size >= dbk_size) {
++		psecAxiIramInfo->useHostDbkEnable = 1;
++		psecAxiIramInfo->bufDbkYUse = iram.start + psecAxiIramInfo->searchRamSize;
++		psecAxiIramInfo->bufDbkCUse = psecAxiIramInfo->bufDbkYUse + dbk_size / 2;
++		size -= dbk_size;
++	} else
++		goto out;
++
++	bitram_size = (128 * parm->width / 16 + 1023) & ~1023;
++	if (size >= bitram_size) {
++		psecAxiIramInfo->useHostBitEnable = 1;
++		psecAxiIramInfo->bufBitUse = psecAxiIramInfo->bufDbkCUse + dbk_size / 2;
++		size -= bitram_size;
++	} else
++		goto out;
++
++	ipacdc_size = (128 * parm->width / 16 + 1023) & ~1023;
++	if (size >= ipacdc_size) {
++		psecAxiIramInfo->useHostIpEnable = 1;
++		psecAxiIramInfo->bufIpAcDcUse = psecAxiIramInfo->bufBitUse + bitram_size;
++		size -= ipacdc_size;
++	}
+ 
+-		psecAxiIramInfo->searchRamAddr = iram.start + VPU_ENC_SEARCH_IRAM_OFFSET;
+-		psecAxiIramInfo->searchRamSize = VPU_ENC_SEARCH_IRAM_SIZE;
++	psecAxiIramInfo->useHostOvlEnable = 0; /* no need to enable ovl in encoder */
++
++out:
++	/* i.MX51 has no secondary AXI memory, but use on chip RAM
++	   Set the useHoseXXX as 1 to enable corresponding IRAM
++	   Set the useXXXX as 0 at the same time to use IRAM,
++	   i.MX53 uses secondary AXI for IRAM access, also needs to set
++	   useXXXX. */
++	if (cpu_is_mx53()) {
++		/* i.MX53 uses secondary AXI for IRAM access */
++		psecAxiIramInfo->useBitEnable = psecAxiIramInfo->useHostBitEnable;
++		psecAxiIramInfo->useIpEnable = psecAxiIramInfo->useHostIpEnable;
++		psecAxiIramInfo->useDbkEnable = psecAxiIramInfo->useHostDbkEnable;
++		psecAxiIramInfo->useMeEnable = psecAxiIramInfo->useHostMeEnable;
+ 	}
++
++	if (!psecAxiIramInfo->useHostIpEnable)
++		warn_msg("VPU iram is less than needed, some parts don't use iram\n");
+ }
+ 
+ semaphore_t *vpu_semaphore_open(void)
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index aa86496..5fba9db 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -42,53 +42,6 @@
+ #define ENC_ADDR_END_OF_RPT_BUF         ADDR_FRAME_BUF_STAT_BASE_OFFSET + SIZE_SLICE_INFO
+ #define DEC_ADDR_END_OF_RPT_BUF         ADDR_FRAME_BUF_STAT_BASE_OFFSET + SIZE_FRAME_BUF_STAT
+ 
+-/* This is calculated by reserved iram size for vpu and requirement */
+-#if defined(IMX51) || defined(IMX53)
+-/* 720P for decoder, D1 for encoder on i.MX51 */
+-#define DEC_MAX_WIDTH_IRAM_SUPPORT      1280
+-#define ENC_MAX_WIDTH_IRAM_SUPPORT      720
+-#else
+-#define DEC_MAX_WIDTH_IRAM_SUPPORT      1920
+-#define ENC_MAX_WIDTH_IRAM_SUPPORT      1280
+-#endif
+-
+-/* Following IRAM setting is for max size for Decoder */
+-/* To save intermediate data such as MB prediction data */
+-#define VPU_DEC_BIT_IRAM_OFFSET         0
+-#define VPU_DEC_BIT_IRAM_SIZE           ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-/* To save intermediate data such as intra/ACDC prediction */
+-#define VPU_DEC_IP_IRAM_OFFSET          (VPU_DEC_BIT_IRAM_OFFSET + VPU_DEC_BIT_IRAM_SIZE)
+-#define VPU_DEC_IP_IRAM_SIZE            ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-/* To save intermediate data for deblocking filter */
+-#define VPU_DEC_DBKY_IRAM_OFFSET        (VPU_DEC_IP_IRAM_OFFSET + VPU_DEC_IP_IRAM_SIZE)
+-#define VPU_DEC_DBKY_IRAM_SIZE          ((256 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-#define VPU_DEC_DBKC_IRAM_OFFSET        (VPU_DEC_DBKY_IRAM_OFFSET + VPU_DEC_DBKY_IRAM_SIZE)
+-#define VPU_DEC_DBKC_IRAM_SIZE          ((256 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-/* To save intermediate data for overlap filter */
+-#define VPU_DEC_OVL_IRAM_OFFSET         (VPU_DEC_DBKC_IRAM_OFFSET + VPU_DEC_DBKC_IRAM_SIZE)
+-#define VPU_DEC_OVL_IRAM_SIZE           ((80 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-#define VPU_DEC_TOTAL_IRAM_SIZE         (VPU_DEC_OVL_IRAM_OFFSET + VPU_DEC_OVL_IRAM_SIZE)
+-
+-/* Following IRAM setting is for max size for Encoder */
+-#define VPU_ENC_SEARCH_IRAM_OFFSET      0
+-#define VPU_ENC_SEARCH_IRAM_SIZE        ((ENC_MAX_WIDTH_IRAM_SUPPORT * 36 + 2048 + 1023) & ~1023)
+-/* To save intermediate data such as MB prediction data */
+-#define VPU_ENC_BIT_IRAM_OFFSET         (VPU_ENC_SEARCH_IRAM_OFFSET + VPU_ENC_SEARCH_IRAM_SIZE)
+-#define VPU_ENC_BIT_IRAM_SIZE           ((128 * ENC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-/* To save intermediate data such as intra/ACDC prediction */
+-#define VPU_ENC_IP_IRAM_OFFSET          (VPU_ENC_BIT_IRAM_OFFSET + VPU_ENC_BIT_IRAM_SIZE)
+-#define VPU_ENC_IP_IRAM_SIZE            ((128 * ENC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-/* To save intermediate data for deblocking filter */
+-/* Max size is calculated by H264/H263 encoder */
+-#define VPU_ENC_DBKY_IRAM_OFFSET        (VPU_ENC_IP_IRAM_OFFSET + VPU_ENC_IP_IRAM_SIZE)
+-#define VPU_ENC_DBKY_IRAM_SIZE          ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-#define VPU_ENC_DBKC_IRAM_OFFSET        (VPU_ENC_DBKY_IRAM_OFFSET + VPU_ENC_DBKY_IRAM_SIZE)
+-#define VPU_ENC_DBKC_IRAM_SIZE          ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
+-/* No need for overlap filter for encoder */
+-#define VPU_ENC_OVL_IRAM_OFFSET         (VPU_ENC_DBKC_IRAM_OFFSET + VPU_ENC_DBKC_IRAM_SIZE)
+-#define VPU_ENC_OVL_IRAM_SIZE           0
+-#define VPU_ENC_TOTAL_IRAM_SIZE         (VPU_ENC_OVL_IRAM_OFFSET + VPU_ENC_OVL_IRAM_SIZE)
+-
+ #if defined(IMX37_3STACK)
+ enum {
+ 	AVC_DEC = 0,
+@@ -176,6 +129,12 @@ typedef struct {
+ } SecAxiUse;
+ 
+ typedef struct {
++	int width;
++	int codecMode;
++	int profile;
++} SetIramParam;
++
++typedef struct {
+ 	EncOpenParam openParam;
+ 	EncInitialInfo initialInfo;
+ 
+@@ -310,8 +269,8 @@ RetCode SetIntraRefreshNum(EncHandle handle, Uint32 *pIntraRefreshNum);
+ RetCode SetSliceMode(EncHandle handle, EncSliceMode *pSliceMode);
+ RetCode SetHecMode(EncHandle handle, int mode);
+ 
+-void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width);
+-void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width);
++void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm);
++void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm);
+ 
+ semaphore_t *vpu_semaphore_open(void);
+ void semaphore_post(semaphore_t *semap, int mutex);
+-- 
+1.8.0
+

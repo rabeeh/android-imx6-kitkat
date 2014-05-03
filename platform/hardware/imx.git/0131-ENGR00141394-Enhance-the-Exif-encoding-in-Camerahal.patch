@@ -1,0 +1,209 @@
+From 071030a6dd85a34eac4ea1194ca92fc899096de0 Mon Sep 17 00:00:00 2001
+From: Yaoming Qin <b10945@freescale.com>
+Date: Thu, 31 Mar 2011 11:42:43 +0800
+Subject: [PATCH 131/486] ENGR00141394  Enhance the Exif encoding in Camerahal
+
+Add the support for rotation, whitebalance mode, flash mode in exif
+header encode.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ libcamera/Android.mk              |  1 -
+ libcamera/CameraHal.cpp           | 32 ++++++++++++++++++++++++++++++
+ libcamera/JpegEncoderInterface.h  | 41 ++++++++++++++++++++++++++++++++-------
+ libcamera/JpegEncoderSoftware.cpp | 10 ++++++++--
+ libcamera/V4l2CapDeviceBase.cpp   |  3 ++-
+ 5 files changed, 76 insertions(+), 11 deletions(-)
+
+diff --git a/libcamera/Android.mk b/libcamera/Android.mk
+index 0c6dd22..4b397c6 100755
+--- a/libcamera/Android.mk
++++ b/libcamera/Android.mk
+@@ -52,7 +52,6 @@ ifeq ($(HAVE_FSL_IMX_CODEC),true)
+     LOCAL_SHARED_LIBRARIES += libfsl_jpeg_enc_arm11_elinux
+     LOCAL_CPPFLAGS += -DUSE_FSL_JPEG_ENC
+     LOCAL_C_INCLUDES +=	\
+-					external/fsl_imx_codec/fsl_mad_multimedia_codec/ghdr \
+ 					device/fsl/proprietary/codec/ghdr
+ endif
+ ifeq ($(BOARD_CAMERA_NV12),true)
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index e63d5f0..1252d00 100755
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -889,6 +889,10 @@ Pic_out:
+         struct jpeg_enc_datetime_info_t datetime_info;
+         struct jpeg_enc_focallength_t focallength_info;
+         struct jpeg_enc_gps_param gps_info;
++        JPEG_ENCODER_ROTATION rotate_info;
++        JPEG_ENCODER_WHITEBALANCE whitebalance_info;
++        JPEG_ENCODER_FLASH flash_info;
++        const char * pWhiteBalanceStr, *pFlashStr;
+ 
+         char temp_string[30], gps_datetime_string[11];
+         char format[30] = "%Y:%m:%d %k:%M:%S";
+@@ -932,6 +936,34 @@ Pic_out:
+         memcpy((char *)datetime_info.datetime, temp_string, sizeof(datetime_info.datetime));
+         mJpegEncCfg.pDatetimeInfo = &datetime_info;
+ 
++        rotate_info = (JPEG_ENCODER_ROTATION)mParameters.getInt(CameraParameters::KEY_ROTATION);
++        mJpegEncCfg.RotationInfo = rotate_info; //the android and the jpeg has the same define
++        CAMERA_HAL_LOG_INFO("ratate info is %d", rotate_info);
++
++        pWhiteBalanceStr = mParameters.get(CameraParameters::KEY_WHITE_BALANCE);
++        CAMERA_HAL_LOG_INFO("white balance is %s",pWhiteBalanceStr);
++        if (strcmp(pWhiteBalanceStr, CameraParameters::WHITE_BALANCE_AUTO) == 0){
++            whitebalance_info = WHITEBALANCE_AUTO;
++        }else{
++            whitebalance_info = WHITEBALANCE_MANUAL;
++        }
++        mJpegEncCfg.WhiteBalanceInfo = whitebalance_info;
++
++        pFlashStr = mParameters.get(CameraParameters::KEY_FLASH_MODE);
++        CAMERA_HAL_LOG_INFO("flash mode is %s", pFlashStr);
++        if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_OFF) == 0){
++            flash_info = FLASH_NOT_FIRE;
++        }else if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_AUTO) == 0){
++            flash_info = FLASH_FIRED_AUTO;
++        }else if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_ON) == 0){
++            flash_info = FLASH_FIRED;
++        }else if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_RED_EYE) == 0){
++            flash_info = FLASH_FIRED_RED_EYE_REDUCE;
++        }
++        else if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_TORCH) == 0){
++            flash_info = FLASH_FIRED_COMPULOSORY;
++        }
++        mJpegEncCfg.FlashInfo = flash_info;
+ 
+         cLatitude   = (char *)mParameters.get(CameraParameters::KEY_GPS_LATITUDE);
+         cLongtitude = (char *)mParameters.get(CameraParameters::KEY_GPS_LONGITUDE);
+diff --git a/libcamera/JpegEncoderInterface.h b/libcamera/JpegEncoderInterface.h
+index c7b43c0..b515757 100755
+--- a/libcamera/JpegEncoderInterface.h
++++ b/libcamera/JpegEncoderInterface.h
+@@ -46,6 +46,30 @@ namespace android{
+ #define TIME_FMT_LENGTH 20
+ #define MAX_GPS_PROCESSING_BYTES	256
+ 
++    typedef enum{
++    ORIENTATION_UNDEFINED = 0,
++    ORIENTATION_NORMAL = 1,
++    ORIENTATION_FLIP_HORIZONTAL = 2,
++    ORIENTATION_ROTATE_180 = 3,
++    ORIENTATION_FLIP_VERTICAL = 4,
++    ORIENTATION_TRANSPOSE = 5,
++    ORIENTATION_ROTATE_90 = 6,
++    ORIENTATION_TRANSVERSE = 7,
++    ORIENTATION_ROTATE_270 = 8
++    }JPEG_ENCODER_ROTATION;
++
++    typedef enum{
++    WHITEBALANCE_AUTO = 0,
++    WHITEBALANCE_MANUAL = 1
++    }JPEG_ENCODER_WHITEBALANCE;
++
++    typedef enum{
++    FLASH_NOT_FIRE = 0x00,
++    FLASH_FIRED    = 0x01,
++    FLASH_FIRED_AUTO = 0x19,
++    FLASH_FIRED_RED_EYE_REDUCE = 0x41,
++    FLASH_FIRED_COMPULOSORY = 0x09
++    }JPEG_ENCODER_FLASH;
+ 
+     typedef enum{
+         SOFTWARE_JPEG_ENC = 0,
+@@ -66,7 +90,7 @@ namespace android{
+     struct jpeg_enc_focallength_t
+     {
+         unsigned int numerator;
+-        unsigned int denominator;	
++        unsigned int denominator;
+     };
+ 
+     struct jpeg_enc_make_info_t
+@@ -92,8 +116,8 @@ namespace android{
+     };
+ 
+     struct jpeg_enc_gps_param{
+-        unsigned int version;			//GPSVersionID
+-        char latitude_ref[2];		//GPSLatitudeRef: "N " is positive; "S " is negative
++        unsigned int version;//GPSVersionID
++        char latitude_ref[2];//GPSLatitudeRef: "N " is positive; "S " is negative
+         char longtitude_ref[2];	//GPSLongtitudeRef: "E " is positive; "W " is negative
+         unsigned int latitude_degree[2];//GPSLatitude
+         unsigned int latitude_minute[2];
+@@ -101,14 +125,14 @@ namespace android{
+         unsigned int longtitude_degree[2];//GPSLongitude
+         unsigned int longtitude_minute[2];
+         unsigned int longtitude_second[2];
+-        char altitude_ref;		//GPSAltitudeRef: 0 or 1(negative)
+-        unsigned int altitude[2];		//GPSAltitude: unit is meters
+-        unsigned int hour[2];			//GPSTimeStamp
++        char altitude_ref;//GPSAltitudeRef: 0 or 1(negative)
++        unsigned int altitude[2];//GPSAltitude: unit is meters
++        unsigned int hour[2];//GPSTimeStamp
+         unsigned int minute[2];
+         unsigned int seconds[2];
+         char processmethod[MAX_GPS_PROCESSING_BYTES]; //GPSProcessingMethod
+         char processmethod_bytes;
+-        char datestamp[11];		//GPSDateStamp: "YYYY:MM:DD "
++        char datestamp[11];//GPSDateStamp: "YYYY:MM:DD "
+     };
+ 
+     typedef struct{
+@@ -117,6 +141,9 @@ namespace android{
+         unsigned int ThumbWidth;
+         unsigned int ThumbHeight;
+         unsigned int BufFmt;
++        JPEG_ENCODER_ROTATION RotationInfo;
++        JPEG_ENCODER_WHITEBALANCE WhiteBalanceInfo;
++        JPEG_ENCODER_FLASH FlashInfo;
+         struct jpeg_enc_focallength_t *pFoclLength;
+         struct jpeg_enc_make_info_t *pMakeInfo;
+         struct jpeg_enc_makernote_info_t *pMakeNote;
+diff --git a/libcamera/JpegEncoderSoftware.cpp b/libcamera/JpegEncoderSoftware.cpp
+index fbc9485..0b6e926 100755
+--- a/libcamera/JpegEncoderSoftware.cpp
++++ b/libcamera/JpegEncoderSoftware.cpp
+@@ -465,8 +465,8 @@ encodeframe:
+         }
+ 
+         CAMERA_HAL_LOG_RUNTIME("jpeg_enc_init success");
+-
+-        createJpegExifTags(obj_ptr);
++        if(params->mode == JPEG_ENC_THUMB)
++            createJpegExifTags(obj_ptr);
+ 
+         return_val = jpeg_enc_encodeframe(obj_ptr, i_buff,
+                 y_buff, u_buff, v_buff);
+@@ -573,6 +573,12 @@ done:
+ 
+     void JpegEncoderSoftware::createJpegExifTags(jpeg_enc_object * obj_ptr)
+     {
++        CAMERA_HAL_LOG_RUNTIME("version: %s\n", jpege_CodecVersionInfo());
++
++        jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_ORIENTATION, (unsigned int)(&(pEncCfgLocal->RotationInfo)));
++        jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_WHITEBALANCE, (unsigned int)(&(pEncCfgLocal->WhiteBalanceInfo)));
++        jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_FLASH, (unsigned int)(&(pEncCfgLocal->FlashInfo)));
++
+         if(pEncCfgLocal->pMakeInfo)
+             jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_MAKE, (unsigned int)(pEncCfgLocal->pMakeInfo));
+         if(pEncCfgLocal->pMakeNote)
+diff --git a/libcamera/V4l2CapDeviceBase.cpp b/libcamera/V4l2CapDeviceBase.cpp
+index d396b98..3280b16 100755
+--- a/libcamera/V4l2CapDeviceBase.cpp
++++ b/libcamera/V4l2CapDeviceBase.cpp
+@@ -501,8 +501,9 @@ namespace android{
+         if (ioctl (mCameraDevice, VIDIOC_STREAMON, &type) < 0) {
+             CAMERA_HAL_ERR("VIDIOC_STREAMON error\n");
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+-        } else
++        } else{
+             CAMERA_HAL_LOG_RUNTIME("VIDIOC_STREAMON ok\n");
++        }
+         return CAPTURE_DEVICE_ERR_NONE;
+     }
+ 
+-- 
+1.8.0
+

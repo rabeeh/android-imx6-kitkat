@@ -1,0 +1,443 @@
+From 3e863fa2bbf33d2293ca4914ca2e6e437465cddb Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 18 Aug 2011 01:06:58 +0800
+Subject: [PATCH 232/435] ENGR00153838 vpu: Add tiled map type test for mx6q
+
+MX6 VPU supports frame tile type for progressive stream and
+field tile type for interlace stream. Add unit test for the two
+new type test.
+
+The test only covers to save to file for tiled type support now,
+We will add the test for LCD display after VDOA driver is ready.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 129 +++++++++++++++++++++++++++++++++++--------
+ test/mxc_vpu_test/fb.c       |  62 +++++++++++++++++++++
+ test/mxc_vpu_test/main.c     |   8 ++-
+ test/mxc_vpu_test/vpu_test.h |   3 +
+ 4 files changed, 177 insertions(+), 25 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index f454872..3386d04 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -35,7 +35,6 @@ static FILE *fpMvLogfile = NULL;
+ static FILE *fpUserDataLogfile = NULL;
+ 
+ static int isInterlacedMPEG4 = 0;
+-static JpegHeaderBufInfo jpgHeaderInfo;
+ 
+ #define FN_FRAME_BUFFER_STATUS "dec_frame_buf_status.log"
+ #define FN_ERR_MAP_DATA "dec_error_map.log"
+@@ -418,6 +417,66 @@ saveCropYuvImageHelper(struct decode *dec, u8 *buf, Rect cropRect)
+ }
+ 
+ /*
++ *YUV image copy from on-board memory of tiled YUV to host buffer
++ */
++int SaveTiledYuvImageHelper(struct decode *dec, int yuvFp,
++                              int picWidth, int picHeight, int index)
++{
++	int frameSize, pix_addr, offset;
++	int y, x, nY, nCb, j, n;
++	Uint8 *puc, *pYuv = 0, *dstAddrCb, *dstAddrCr;
++	Uint32 addrY, addrCb, addrCr;
++	Uint8 temp_buf[8];
++	struct frame_buf *pfb = NULL;
++
++	frameSize = picWidth * picHeight * 3 / 2;
++	pfb = dec->pfbpool[index];
++
++	pYuv = malloc(frameSize);
++	if (!pYuv) {
++		err_msg("Fail to allocate memory\n");
++		return -1;
++	}
++
++	puc = pYuv;
++	nY = picHeight;
++	nCb = picHeight / 2;
++	addrY = pfb->addrY;
++	addrCb = pfb->addrCb;
++	addrCr = pfb->addrCr;
++	offset = pfb->desc.virt_uaddr - pfb->desc.phy_addr;
++
++	for (y = 0; y < nY; y++) {
++		for (x = 0; x < picWidth; x += 8) {
++			pix_addr = vpu_GetXY2AXIAddr(0, y, x, picWidth,
++                                        addrY, addrCb, addrCr);
++			pix_addr += offset;
++			memcpy(puc + y * picWidth + x, (Uint8 *)pix_addr, 8);
++		}
++	}
++
++	dstAddrCb = (Uint8 *)(puc + picWidth * nY);
++	dstAddrCr = (Uint8 *)(puc + picWidth * nY * 5 / 4);
++
++	for (y = 0; y < nCb ; y++) {
++		for (x = 0; x < picWidth; x += 8) {
++			pix_addr = vpu_GetXY2AXIAddr(2, y, x, picWidth,
++					addrY, addrCb, addrCr);
++			pix_addr += offset;
++			memcpy(temp_buf, (Uint8 *)pix_addr, 8);
++			for (j = 0; j < 4; j++) {
++				*dstAddrCb++ = *(temp_buf + j * 2);
++				*dstAddrCr++ = *(temp_buf + j * 2 + 1);
++			}
++		}
++	}
++
++	n = fwriten(yuvFp, (u8 *)pYuv, frameSize);
++	free(pYuv);
++
++	return 0;
++}
++/*
+  * This function is to swap the cropping left/top/right/bottom
+  * when there's cropping information, under rotation case.
+  *
+@@ -591,23 +650,31 @@ swapCropRect(struct decode *dec, Rect *rotCrop)
+  * or both.
+  */
+ static void
+-write_to_file(struct decode *dec, u8 *buf, Rect cropRect)
++write_to_file(struct decode *dec, Rect cropRect, int index)
+ {
+ 	int height = dec->picheight;
+ 	int stride = dec->stride;
+ 	int chromaInterleave = dec->cmdl->chromaInterleave;
+ 	int img_size;
+-	u8 *pYuv = NULL, *pYuv0 = NULL;
++	u8 *pYuv = NULL, *pYuv0 = NULL, *buf;
++	struct frame_buf *pfb = NULL;
+ 	int cropping;
+ 
+ 	dprintf(3, "left/top/right/bottom = %lu/%lu/%lu/%lu\n", cropRect.left,
+ 			cropRect.top, cropRect.right, cropRect.bottom);
+ 	cropping = cropRect.left | cropRect.top | cropRect.bottom | cropRect.right;
+ 
+-	img_size = stride * height * 3 / 2;
++	if (cpu_is_mx6q() && (dec->cmdl->mapType != LINEAR_FRAME_MAP) &&
++	    !dec->tiled2LinearEnable) {
++		SaveTiledYuvImageHelper(dec, dec->cmdl->dst_fd, stride, height, index);
++		goto out;
++	}
+ 
++	pfb = dec->pfbpool[index];
++	buf = (u8 *)(pfb->addrY + pfb->desc.virt_uaddr - pfb->desc.phy_addr);
++	img_size = stride * height * 3 / 2;
+ 	if (chromaInterleave == 0 && cropping == 0) {
+-		fwriten(dec->cmdl->dst_fd, (u8 *)buf, img_size);
++		fwriten(dec->cmdl->dst_fd, buf, img_size);
+ 		goto out;
+ 	}
+ 
+@@ -668,11 +735,11 @@ decoder_start(struct decode *dec)
+ 	struct frame_buf **pfbpool = dec->pfbpool;
+ 	struct frame_buf *pfb = NULL;
+ 	struct vpu_display *disp = dec->disp;
+-	int err, eos = 0, fill_end_bs = 0, decodefinish = 0;
++	int err = 0, eos = 0, fill_end_bs = 0, decodefinish = 0;
+ 	struct timeval tdec_begin,tdec_end, total_start, total_end;
+ 	RetCode ret;
+ 	int sec, usec, loop_id;
+-	u32 yuv_addr, img_size;
++	u32 img_size;
+ 	double tdec_time = 0, frame_id = 0, total_time=0;
+ 	int decIndex = 0;
+ 	int rotid = 0, dblkid = 0, mirror;
+@@ -680,6 +747,7 @@ decoder_start(struct decode *dec)
+ 	int totalNumofErrMbs = 0;
+ 	int disp_clr_index = -1, actual_display_index = -1, field = V4L2_FIELD_NONE;
+ 	int is_waited_int = 0;
++	int tiled2LinearEnable = dec->tiled2LinearEnable;
+ 	char *delay_ms, *endptr;
+ 
+ 	if (((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU))
+@@ -687,7 +755,7 @@ decoder_start(struct decode *dec)
+ 		rot_en = 0;
+ 
+ 	/* deblock_en is zero on none mx27 since it is cleared in decode_open() function. */
+-	if (rot_en || dering_en) {
++	if (rot_en || dering_en || tiled2LinearEnable) {
+ 		rotid = dec->fbcount;
+ 		if (deblock_en) {
+ 			dblkid = dec->fbcount + dec->rot_buf_count;
+@@ -714,7 +782,7 @@ decoder_start(struct decode *dec)
+ 	fwidth = ((dec->picwidth + 15) & ~15);
+ 	fheight = ((dec->picheight + 15) & ~15);
+ 
+-	if (rot_en || dering_en || (dec->cmdl->format == STD_MJPG)) {
++	if (rot_en || dering_en || tiled2LinearEnable || (dec->cmdl->format == STD_MJPG)) {
+ 		/*
+ 		 * VPU is setting the rotation angle by counter-clockwise.
+ 		 * We convert it to clockwise, which is consistent with V4L2
+@@ -761,7 +829,7 @@ decoder_start(struct decode *dec)
+ 
+ 	while (1) {
+ 
+-		if (rot_en || dering_en || (dec->cmdl->format == STD_MJPG)) {
++		if (rot_en || dering_en || tiled2LinearEnable || (dec->cmdl->format == STD_MJPG)) {
+ 			vpu_DecGiveCommand(handle, SET_ROTATOR_OUTPUT,
+ 						(void *)&fb[rotid]);
+ 			if (frame_id == 0) {
+@@ -831,7 +899,6 @@ decoder_start(struct decode *dec)
+ 				      (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
+ 				      dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
+ 				      &eos, &fill_end_bs);
+-
+ 			if (err < 0) {
+ 				err_msg("dec_fill_bsbuffer failed\n");
+ 				return -1;
+@@ -1044,7 +1111,7 @@ decoder_start(struct decode *dec)
+ 			continue;
+ 		}
+ 
+-		if (rot_en || dering_en || (dec->cmdl->format == STD_MJPG))
++		if (rot_en || dering_en || tiled2LinearEnable || (dec->cmdl->format == STD_MJPG))
+ 			actual_display_index = rotid;
+ 		else
+ 			actual_display_index = outinfo.indexFrameDisplay;
+@@ -1085,7 +1152,7 @@ decoder_start(struct decode *dec)
+ 				if (dec->cmdl->format == STD_MJPG) {
+ 					rotid++;
+ 					rotid %= dec->fbcount;
+-				} else if (rot_en || dering_en) {
++				} else if (rot_en || dering_en || tiled2LinearEnable) {
+ 					disp_clr_index = outinfo.indexFrameDisplay;
+ 					if (disp->buf.index != -1)
+ 						rotid = disp->buf.index; /* de-queued buffer as next rotation buffer */
+@@ -1096,18 +1163,12 @@ decoder_start(struct decode *dec)
+ 					disp_clr_index = disp->buf.index;
+ 			}
+ 		} else {
+-			pfb = pfbpool[actual_display_index];
+-
+-			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr -
+-					pfb->desc.phy_addr;
+-
+ 			if (rot_en) {
+ 				Rect rotCrop;
+ 				swapCropRect(dec, &rotCrop);
+-				write_to_file(dec, (u8 *)yuv_addr, rotCrop);
++				write_to_file(dec, rotCrop, actual_display_index);
+ 			} else {
+-				write_to_file(dec, (u8 *)yuv_addr,
+-							dec->picCropRect);
++				write_to_file(dec, dec->picCropRect, actual_display_index);
+ 			}
+ 
+ 			if (dec->cmdl->format != STD_MJPG && disp_clr_index >= 0) {
+@@ -1266,6 +1327,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+        	int dst_scheme = dec->cmdl->dst_scheme, rot_en = dec->cmdl->rot_en;
+ 	int deblock_en = dec->cmdl->deblock_en;
+ 	int dering_en = dec->cmdl->dering_en;
++	int tiled2LinearEnable =  dec->tiled2LinearEnable;
+ 	struct rot rotation = {0};
+ 	RetCode ret;
+ 	DecHandle handle = dec->handle;
+@@ -1280,7 +1342,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			&& (dec->cmdl->ipu_rot_en))
+ 		rot_en = 0;
+ 
+-	if (rot_en || dering_en) {
++	if (rot_en || dering_en || tiled2LinearEnable) {
+ 		/*
+ 		 * At least 1 extra fb for rotation(or dering) is needed, two extrafb
+ 		 * are allocated for rotation if path is V4L,then we can delay 1 frame
+@@ -1320,7 +1382,16 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			(((dst_scheme == PATH_V4L2) || (dst_scheme == PATH_IPU)) && deblock_en)) {
+ 
+ 		for (i = 0; i < totalfb; i++) {
+-			pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++			/*
++			 * Tiled framebuffer allocation is needed for decoding
++			 * buffers for none linear frame map type on mx6q platform.
++			 */
++			if (cpu_is_mx6q() && (i < fbcount) &&
++			    (dec->cmdl->mapType != LINEAR_FRAME_MAP))
++				pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++							dec->stride, dec->picheight);
++			else
++				pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
+ 						    dec->stride, dec->picheight);
+ 			if (pfbpool[i] == NULL) {
+ 				totalfb = i;
+@@ -1501,7 +1572,7 @@ decoder_parse(struct decode *dec)
+ 	ret = vpu_DecGetInitialInfo(handle, &initinfo);
+ 	vpu_DecSetEscSeqInit(handle, 0);
+ 	if (ret != RETCODE_SUCCESS) {
+-		err_msg("vpu_DecGetInitialInfo failed, ret:%d, errorcode:%d\n",
++		err_msg("vpu_DecGetInitialInfo failed, ret:%d, errorcode:%ld\n",
+ 		         ret, initinfo.errorcode);
+ 		return -1;
+ 	}
+@@ -1778,6 +1849,12 @@ decoder_open(struct decode *dec)
+ 	DecHandle handle = {0};
+ 	DecOpenParam oparam = {0};
+ 
++	if (dec->cmdl->mapType == LINEAR_FRAME_MAP)
++		dec->tiled2LinearEnable = 0;
++	else
++		/* CbCr interleave must be enabled for tiled map */
++		dec->cmdl->chromaInterleave = 1;
++
+ 	oparam.bitstreamFormat = dec->cmdl->format;
+ 	oparam.bitstreamBuffer = dec->phy_bsbuf_addr;
+ 	oparam.bitstreamBufferSize = STREAM_BUF_SIZE;
+@@ -1786,6 +1863,9 @@ decoder_open(struct decode *dec)
+ 	oparam.chromaInterleave = dec->cmdl->chromaInterleave;
+ 	oparam.mp4Class = dec->cmdl->mp4Class;
+ 	oparam.mjpg_thumbNailDecEnable = 0;
++	oparam.mapType = dec->cmdl->mapType;
++	oparam.tiled2LinearEnable = dec->tiled2LinearEnable;
++
+ 	/*
+ 	 * mp4 deblocking filtering is optional out-loop filtering for image
+ 	 * quality. In other words, mpeg4 deblocking is post processing.
+@@ -1868,6 +1948,7 @@ decode_test(void *arg)
+ 	dec->virt_bsbuf_addr = mem_desc.virt_uaddr;
+ 
+ 	dec->reorderEnable = 1;
++	dec->tiled2LinearEnable = 0;
+ 
+ 	dec->userData.enable = 0;
+ 	dec->mbInfo.enable = 0;
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index 19712b7..aee3220 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -110,6 +110,68 @@ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int heigh
+ 	return fb;
+ }
+ 
++struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height)
++{
++	struct frame_buf *fb;
++	int err;
++	int divX, divY;
++	Uint32 lum_top_base, lum_bot_base, chr_top_base, chr_bot_base;
++	Uint32 lum_top_20bits, lum_bot_20bits, chr_top_20bits, chr_bot_20bits;
++	int luma_aligned_size, chroma_aligned_size;
++
++	fb = get_framebuf();
++	if (fb == NULL)
++		return NULL;
++
++	divX = (format == MODE420 || format == MODE422) ? 2 : 1;
++	divY = (format == MODE420 || format == MODE224) ? 2 : 1;
++
++	memset(&(fb->desc), 0, sizeof(vpu_mem_desc));
++
++	/*
++	 * The buffers is luma top, chroma top, luma bottom and chroma bottom for
++	 * tiled map type, and only 20bits for the address description, so we need
++	 * to do 1K page align for each buffer.
++	 */
++	luma_aligned_size = (((strideY * height / 2 + 4095) >> 12) << 12) * 2;
++	chroma_aligned_size = ((strideY / divX * height / divY + 4095) >> 12) << 12;
++	fb->desc.size = luma_aligned_size + chroma_aligned_size * 2;
++	fb->desc.size += strideY / divX * height / divY;
++
++	err = IOGetPhyMem(&fb->desc);
++	if (err) {
++		printf("Frame buffer allocation failure\n");
++		memset(&(fb->desc), 0, sizeof(vpu_mem_desc));
++		return NULL;
++	}
++
++	fb->desc.virt_uaddr = IOGetVirtMem(&(fb->desc));
++	if (fb->desc.virt_uaddr <= 0) {
++		IOFreePhyMem(&fb->desc);
++		memset(&(fb->desc), 0, sizeof(vpu_mem_desc));
++		return NULL;
++	}
++
++	lum_top_base = fb->desc.phy_addr;
++	lum_bot_base = lum_top_base + luma_aligned_size / 2;
++	chr_top_base = lum_top_base + luma_aligned_size;
++	chr_bot_base = chr_top_base + chroma_aligned_size;
++
++	lum_top_20bits = lum_top_base >> 12;
++	lum_bot_20bits = lum_bot_base >> 12;
++	chr_top_20bits = chr_top_base >> 12;
++	chr_bot_20bits = chr_bot_base >> 12;
++
++	fb->addrY = (lum_top_20bits << 12) + (chr_top_20bits >> 8);
++	fb->addrCb = (chr_top_20bits << 24) + (lum_bot_20bits << 4) + (chr_bot_20bits >> 16);
++	fb->addrCr = chr_bot_20bits << 16;
++	fb->strideY = strideY;
++	fb->strideC = strideY / divX;
++	fb->mvColBuf = chr_bot_base + chroma_aligned_size;
++
++    return fb;
++}
++
+ void framebuf_free(struct frame_buf *fb)
+ {
+ 	if (fb->desc.virt_uaddr) {
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 0a23a2a..9c53ba0 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -73,6 +73,9 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "        default is none-interleave(0). \n "\
+ 	       "  -s <prescan> Enable prescan in decoding - 1. enabled \n "\
+ 	       "        default is disabled. \n "\
++	       "  -y <maptype> Map type for GDI interface \n "\
++	       "        0 - Linear frame map, 1 - frame MB map, 2 - field MB map \n "\
++	       "        default is 0. \n "\
+ 	       "\n"\
+ 	       "encode options \n "\
+ 	       "  -i <input file> Read input from file (yuv) \n "\
+@@ -135,7 +138,7 @@ int encdec_test(void *arg);
+ static char *mainopts = "HE:D:L:C:";
+ 
+ /* Options for encode and decode */
+-static char *options = "i:o:x:n:p:r:f:c:w:h:g:b:d:e:m:u:t:s:l:j:k:a:v:";
++static char *options = "i:o:x:n:p:r:f:c:w:h:g:b:d:e:m:u:t:s:l:j:k:a:v:y:";
+ 
+ int
+ parse_config_file(char *file_name)
+@@ -329,6 +332,9 @@ parse_args(int argc, char *argv[], int i)
+ 		case 'a':
+ 			input_arg[i].cmd.fps = atoi(optarg);
+ 			break;
++		case 'y':
++			input_arg[i].cmd.mapType = atoi(optarg);
++			break;
+ 		case -1:
+ 			break;
+ 		default:
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index aed09d5..08275ed 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -182,6 +182,7 @@ struct cmd_line {
+ 	int mp4Class;
+ 	char vdi_motion;	/* VDI motion algorithm */
+ 	int fps;
++	int mapType;
+ };
+ 
+ struct decode {
+@@ -205,6 +206,7 @@ struct decode {
+ 	vpu_mem_desc *mvcol_memdesc;
+ 	Rect picCropRect;
+ 	int reorderEnable;
++	int tiled2LinearEnable;
+ 
+ 	DecReportInfo mbInfo;
+ 	DecReportInfo mvInfo;
+@@ -253,6 +255,7 @@ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ int v4l_put_data(struct vpu_display *disp, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height);
++struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height);
+ void framebuf_free(struct frame_buf *fb);
+ 
+ struct vpu_display *
+-- 
+1.8.0
+

@@ -1,0 +1,1400 @@
+From 87632b5a30b00104e22032c553f06c3d321c5207 Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Fri, 16 Mar 2012 20:18:20 +0800
+Subject: [PATCH 02/52] ENGR00177076 App: FSLOta: add OTA App.
+
+this app is only enter by Setting,
+after enter, it will query the version of the server
+in config file, if config file not present it will
+use default configure hard coding...
+
+then will start download and verify, it user quit the
+application during start, it will quit, since it
+was simple, needs more days to implement background upgrade.
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ Android.mk                                         |   2 +
+ FSLOta/Android.mk                                  |  16 +
+ FSLOta/AndroidManifest.xml                         |  32 ++
+ FSLOta/lint.xml                                    |   3 +
+ FSLOta/proguard.cfg                                |  40 +++
+ FSLOta/project.properties                          |  11 +
+ FSLOta/res/drawable-hdpi/ic_launcher.png           | Bin 0 -> 4147 bytes
+ FSLOta/res/drawable-ldpi/ic_launcher.png           | Bin 0 -> 1723 bytes
+ FSLOta/res/drawable-mdpi/ic_launcher.png           | Bin 0 -> 2574 bytes
+ FSLOta/res/layout/main.xml                         |  99 ++++++
+ FSLOta/res/values/strings.xml                      |  19 ++
+ .../src/com/fsl/android/ota/BuildPropParser.java   | 105 ++++++
+ .../src/com/fsl/android/ota/OTAServerConfig.java   |  78 +++++
+ .../src/com/fsl/android/ota/OTAServerManager.java  | 353 +++++++++++++++++++++
+ FSLOta/src/com/fsl/android/ota/OtaAppActivity.java | 325 +++++++++++++++++++
+ 15 files changed, 1083 insertions(+)
+ create mode 100644 Android.mk
+ create mode 100644 FSLOta/Android.mk
+ create mode 100644 FSLOta/AndroidManifest.xml
+ create mode 100644 FSLOta/lint.xml
+ create mode 100644 FSLOta/proguard.cfg
+ create mode 100644 FSLOta/project.properties
+ create mode 100644 FSLOta/res/drawable-hdpi/ic_launcher.png
+ create mode 100644 FSLOta/res/drawable-ldpi/ic_launcher.png
+ create mode 100644 FSLOta/res/drawable-mdpi/ic_launcher.png
+ create mode 100644 FSLOta/res/layout/main.xml
+ create mode 100644 FSLOta/res/values/strings.xml
+ create mode 100644 FSLOta/src/com/fsl/android/ota/BuildPropParser.java
+ create mode 100644 FSLOta/src/com/fsl/android/ota/OTAServerConfig.java
+ create mode 100644 FSLOta/src/com/fsl/android/ota/OTAServerManager.java
+ create mode 100644 FSLOta/src/com/fsl/android/ota/OtaAppActivity.java
+
+diff --git a/Android.mk b/Android.mk
+new file mode 100644
+index 0000000..59a75de
+--- /dev/null
++++ b/Android.mk
+@@ -0,0 +1,2 @@
++#Copyright (c) 2011 Freescale Semiconductor, Inc.
++include $(call all-subdir-makefiles)
+diff --git a/FSLOta/Android.mk b/FSLOta/Android.mk
+new file mode 100644
+index 0000000..e2d61de
+--- /dev/null
++++ b/FSLOta/Android.mk
+@@ -0,0 +1,16 @@
++LOCAL_PATH:= $(call my-dir)
++include $(CLEAR_VARS)
++
++LOCAL_MODULE_TAGS := optional
++
++LOCAL_SRC_FILES := $(call all-java-files-under, src)
++
++LOCAL_PACKAGE_NAME := FSLOta
++LOCAL_CERTIFICATE := platform
++
++#LOCAL_PROGUARD_FLAG_FILES := proguard.flags
++
++include $(BUILD_PACKAGE)
++
++# Use the folloing include to make our test apk.
++include $(call all-makefiles-under,$(LOCAL_PATH))
+diff --git a/FSLOta/AndroidManifest.xml b/FSLOta/AndroidManifest.xml
+new file mode 100644
+index 0000000..3907c1e
+--- /dev/null
++++ b/FSLOta/AndroidManifest.xml
+@@ -0,0 +1,32 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android"
++    coreApp="true"
++    package="com.fsl.android.ota"
++   android:sharedUserId="android.uid.system"
++    android:versionCode="1"
++    android:versionName="1.0" >
++
++    <uses-sdk android:minSdkVersion="15" />
++    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
++    <uses-permission android:name="android.permission.INTERNET" />
++    <uses-permission android:name="android.permission.REBOOT" />
++    <uses-permission android:name="android.permission.WAKE_LOCK" />
++    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
++
++    <application
++        android:icon="@drawable/ic_launcher"
++        android:label="@string/app_name" >
++        <activity
++            android:name=".OtaAppActivity"
++            android:theme="@android:style/Theme.Holo.Dialog"
++            android:exported="true"
++            android:label="@string/app_name" >
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                
++                
++            </intent-filter>
++        </activity>
++    </application>
++
++</manifest>
+diff --git a/FSLOta/lint.xml b/FSLOta/lint.xml
+new file mode 100644
+index 0000000..ee0eead
+--- /dev/null
++++ b/FSLOta/lint.xml
+@@ -0,0 +1,3 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<lint>
++</lint>
+\ No newline at end of file
+diff --git a/FSLOta/proguard.cfg b/FSLOta/proguard.cfg
+new file mode 100644
+index 0000000..b1cdf17
+--- /dev/null
++++ b/FSLOta/proguard.cfg
+@@ -0,0 +1,40 @@
++-optimizationpasses 5
++-dontusemixedcaseclassnames
++-dontskipnonpubliclibraryclasses
++-dontpreverify
++-verbose
++-optimizations !code/simplification/arithmetic,!field/*,!class/merging/*
++
++-keep public class * extends android.app.Activity
++-keep public class * extends android.app.Application
++-keep public class * extends android.app.Service
++-keep public class * extends android.content.BroadcastReceiver
++-keep public class * extends android.content.ContentProvider
++-keep public class * extends android.app.backup.BackupAgentHelper
++-keep public class * extends android.preference.Preference
++-keep public class com.android.vending.licensing.ILicensingService
++
++-keepclasseswithmembernames class * {
++    native <methods>;
++}
++
++-keepclasseswithmembers class * {
++    public <init>(android.content.Context, android.util.AttributeSet);
++}
++
++-keepclasseswithmembers class * {
++    public <init>(android.content.Context, android.util.AttributeSet, int);
++}
++
++-keepclassmembers class * extends android.app.Activity {
++   public void *(android.view.View);
++}
++
++-keepclassmembers enum * {
++    public static **[] values();
++    public static ** valueOf(java.lang.String);
++}
++
++-keep class * implements android.os.Parcelable {
++  public static final android.os.Parcelable$Creator *;
++}
+diff --git a/FSLOta/project.properties b/FSLOta/project.properties
+new file mode 100644
+index 0000000..8da376a
+--- /dev/null
++++ b/FSLOta/project.properties
+@@ -0,0 +1,11 @@
++# This file is automatically generated by Android Tools.
++# Do not modify this file -- YOUR CHANGES WILL BE ERASED!
++#
++# This file must be checked in Version Control Systems.
++#
++# To customize properties used by the Ant build system use,
++# "ant.properties", and override values to adapt the script to your
++# project structure.
++
++# Project target.
++target=android-15
+diff --git a/FSLOta/res/drawable-hdpi/ic_launcher.png b/FSLOta/res/drawable-hdpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..8074c4c571b8cd19e27f4ee5545df367420686d7
+GIT binary patch
+literal 4147
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/FSLOta/res/drawable-ldpi/ic_launcher.png b/FSLOta/res/drawable-ldpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..1095584ec21f71cd0afc9e0993aa2209671b590c
+GIT binary patch
+literal 1723
+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
+Rn%e*X002ovPDHLkV1g`*Fem^3
+
+literal 0
+HcmV?d00001
+
+diff --git a/FSLOta/res/drawable-mdpi/ic_launcher.png b/FSLOta/res/drawable-mdpi/ic_launcher.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..a07c69fa5a0f4da5d5efe96eea12a543154dbab6
+GIT binary patch
+literal 2574
+zcmV+p3i0)cP)<h;3K|Lk000e1NJLTq001xm001xu1^@s6R|5Hm000TqNkl<ZXa((A
+zTaXl28UDI^W_OsGWtUy{!Y<c^KmeB|0kUGyGA1FG<+Tz*5iPC6veb&P)Rg5*9;h-e
+z3TmlIsSioYk{F{DmNAwkFOUEcA|RU$mk^d6F3YkP_BQuRcl-T4)62|GPtQQe^5S3h
+z&*?tr^nd>Q`Og{P|8RRXpj5bgrSmEzSMfBn+{{vpNxw?;5UX;iv9<g8_@RM8%EGu#
+zOyw}c*6!!ybr1%fK$!Ou1DhVH>sYxy_`IQHs$i<61a_iv^L>h8s-`D(`e@|IgS*Fj
+zNGM876Gf;3D8*1UX9a%v>yJKD*QkCwW2AirU(L{qNA)JghmGItc<S)8TvCJ(ixjw3
+zDGP|(1X`9Un_CtJe5P6O4Tok16h-k}y%^cd)qX(~3y1&(;3R-pMJy1U42MmBECtgL
+z_oL_(B#i{Bm05*qutp_76zFCKsv;ifWL$-`=mi{76bUH<88Zp5;&Y~_s+bHXMSDSF
+zJckkwQy?ojfl&9Fx}jNKXK+QzP_5SD&ic<$5P277Obe~>;(H<$!ABY&g<qQoV`}XB
+zymTgs1$FnL&bJu4p0VhC=8or(5d~RmWa&;lQ&x+IY&_aYq<~*13&;c!tSXaIRAEF=
+zB<NcF6z2Nxz(jNa!_iZ?yY1^}3a-Li7k-IIVgR3A@f`f#Ip`ZXfIAz$i21em;CTN_
+z=xEu3VAVXlcIsQuGdfb46xxDaSk?R`H2PP;NRz%=?4~pTga_dz#}k`EC}jbv!cw~B
+zHsU&lZlE=|p3FXv_J;eB)>By1vJIEUj-b8%el*o|VkG)LqNx#TG>Jvj^jIte!!+RY
+z)T4j$7+PoF1AkRBf}R#^T=-q|PaK1$c<4UH)H<?OK4zWQV%p-Vko~Ntr}xRbH946I
+zBbJy%oM;*<Qu-v?>pq3$4WA|xtr!ZQLC=*vNE>O6E9kp+5X0eKB$6>C(lPwI@3#oY
+zhS_%x7e|j!$yG?ECXmh~EH~^OeuK}+sWoJse3Z3?ha3n`MM9KvA?uqpEnBg4Q46)7
+zM$p%a$@l;+O}vfvx%XjH`}a{(-HHth9!JaUwV0*VqGR48^gWNYN<&~7x)y$e!X>e`
+zZ5!6KZoxbKuV9XUDI%#M1~IVh?pNSdeb~6@$y`v|yk=XK+fHxnDqnUK4&=QRNyIVf
+zYbDM*cI>~qIy*a7=z7uqkw@agd(<=y-Q7L!ty_23SGdXmahO<;N=wB+j;lNm%=OHC
+z<IaPt3t7R-6esQN0HcDnT?G)P?Tm0c1gJ!Dt^$bfixvcL7nF-XR{?CME762Kcc$C2
+z0^CXqusEZ9EG@XXRRY=h?lWDp(5=?IC?k=XaOY^+XgMBS1rS=c1#U%~*5f!7`iWIr
+zm7^!xPp7$o27|RVH8pa$a)h!jBpN8E1xL!$I)x$2C0IsF*=^G#^@5r9yhtR1D_5>y
+zU|>La6h%92y4IPufI$9>Xu!@y`TaNgtg&41@PwMwBdmSm7)xAWDLoqjZ==P2#*k7!
+z3o1)cVSI3KP_!?d8G^Lg0FtLXC~JYdxi|c%h~lXEixY=%VSFF@!*3&&9>(R<hk59!
+zW=XvsOXl2%B`grF;AT}St~EM33K2wrmQn?+2@Y0p6+pBvrWT^^V6rHyhHhkp1z8pz
+zbryOC|A-TVzh@Pjttc&ls7T$Eawdh)_?r~$O&m~viVgF=iIq(c^GhAcWD*{aheGlU
+zQ|MtuY-GhO>b|iK54Cx5;s~PY5iaV1het%w`dgQFBAJ;aF<C~nc##zP@rBRelZ&>K
+zImQC}(|QaCFYUm1JVfzSc)ebv=)ObI)0jwJb``<Z0-}AfLb=^g=Q+9A---7|U+2N)
+zKd9DfaQ52Yps9ZGfvJGaszssZ->}Zj9J0n0Xgn*Zc(rFM9$xh_makZbm-at_v5^SW
+zM1y1SW@%+FuIy*WR)i3A2N_q;(YO`O!A|Ts^%z}9ZepCj3ytlw#x%N_fNrKKtPh`<
+z|1{UqF`4LxHaCQ79+E=uUXCOZ35jAMRz%R%0(P!0FMv=sk>Nr8%+Oz<nLfHjoFa)k
+z@jh(Yx+=2QOc~A*As$?^lQRq)3_XjOK8~%cccZ0x1Js6YG`2CYa;IA-0bFCCGVPNr
+zL2`REIf(P4`>Y^c-M9@+fz=G`q<GOZlu*|(zvf<SUix$Njqk_ab5A3#M<oK#J@_)#
+zF{tIXf^lqXzDWDBuB!!Pf<XB!Bm$@iO&ma&w-a(qOl6{s9o|LdEh}1<fL$^7^H|-u
+z1t+e)h<}~^0jEeP^C~Jg_vF<-^N3oHdfzhiXHHlwSd2LQxLQEw+g2#o8dP&Q$@42i
+zPEox$JMwp2i=E|*xKLK(8ne@y=C5MuoQH7e;!Xzh0gHKS9qUO%VG7oKI61tVw;qp?
+zT%HD|M7%DEs|AE<I}WaY;`}73!Vq_rZ9p-ZSF##4B|tSl?rMG<)t)-MGqejQhyFs1
+zOYY$u$1R38AVwJR<T&GF2Y!V|ofl<qSqqf>a@v4sF5u-2289-#$**LWnyNNDwDf1(
+zkUiMnw|y$tn>pQP=Vn!#|17L^5AGrjtBkN$D@v)Z7LXc5EFhLB4<;7Wehh)CMqX|W
+zqsiZaO^benJ_hwa&V0ub$-_HUk**?g6fm9|!@kguU6*zhK)$qn-<3*kFrYPIaqR=V
+zUaUvk>@F_89b@tHs8R!*QKY;INJ<2_U+K6Ca3e9Gsl2{qY0%a7J?uICWgHuLfj+MB
+z=GkAN1&ifT#2u}B+2S#~$5jA(Qn^;H%CCmIae4AE-Dsng|Hl*Ov!z72k3ZnJs{pp|
+z+pW`DDueC#mEWOf=ucJ!dTL}hzOeiS-i?m2E;`EKz4<&Lu~NnW?peqVU^@<+T3KKu
+z{yrI%Qy-Z%HEvLUz}n^~m?7x`xuCtNR#L2En!T>dQtIKdS#V-Hzt3RtwTeYtmQ&dR
+z6qXZvac*oc@BUYEH%@Ylv_1&tSjkbzzU6*h1(3^C`;1z;g_S<r>mOtclS?KWk2VYE
+zM*oS<=C483Xc<XBH-T2(vVJUXr<9s6L8%y!+?6<f{P<XJZ|@}c0}+%-f$DVxIixSf
+zyZx`_jp~RryiOnPLN6^M#a^XAPNg`KKXr{n)Ewh?38G^@b)qVL^*LP6b}_MzC^c}&
+z>kW?GN|1jfh3Ro(h<KDZN|fWBj7@=)05T}o0kZov5oZ%?h%8)~*k=Yr+YBDaVOp3T
+zBFg{7f(5Qr%7ttVh}3fDAw-1vQZd7!TMCkUL<sw@Rk22a=Izx=SwI*ShDAWTmANx1
+kfM{AOIT6Hei<0X907#l7&=u{JbN~PV07*qoM6N<$f*QKj`~Uy|
+
+literal 0
+HcmV?d00001
+
+diff --git a/FSLOta/res/layout/main.xml b/FSLOta/res/layout/main.xml
+new file mode 100644
+index 0000000..571c314
+--- /dev/null
++++ b/FSLOta/res/layout/main.xml
+@@ -0,0 +1,99 @@
++<?xml version="1.0" encoding="utf-8"?>
++<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
++    android:layout_width="wrap_content"
++    android:layout_height="wrap_content"
++    android:baselineAligned="false"
++    android:gravity="center|center_horizontal|center_vertical"
++    android:orientation="horizontal" >
++
++    <GridLayout
++        android:id="@+id/gridLayout1"
++        android:layout_width="match_parent"
++        android:layout_height="match_parent"
++        android:layout_marginBottom="20dp"
++        android:layout_marginLeft="20dp"
++        android:layout_marginRight="20dp"
++        android:layout_marginTop="20dp" >
++
++        <TextView
++            android:id="@+id/message_text_view"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_column="2"
++            android:layout_columnSpan="3"
++            android:layout_gravity="left"
++            android:layout_row="0"
++            android:text="@string/check_for_upgrade"
++            android:textAppearance="?android:attr/textAppearanceMedium" />
++
++        <TextView
++            android:id="@+id/version_text_view"
++            android:layout_width="match_parent"
++            android:layout_height="38dp"
++            android:layout_column="2"
++            android:layout_columnSpan="5"
++            android:layout_gravity="bottom"
++            android:layout_row="1"
++            android:layout_rowSpan="2"
++            />
++
++        <ProgressBar
++            android:id="@+id/spinner"
++            android:layout_column="4"
++            android:layout_row="2"
++            android:layout_rowSpan="5" />
++
++        <ProgressBar
++            android:id="@+id/download_progress_bar"
++            style="?android:attr/progressBarStyleHorizontal"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_column="1"
++            android:layout_columnSpan="5"
++            android:layout_gravity="right"
++            android:layout_row="3"
++            android:layout_rowSpan="3" />
++
++        <Button
++            android:id="@+id/upgrade_button"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:layout_column="2"
++            android:layout_columnSpan="3"
++            android:layout_row="5"
++            android:layout_rowSpan="2"
++            android:text="@string/upgrade" />
++
++        <Space
++            android:layout_width="1dp"
++            android:layout_height="23dp"
++            android:layout_column="0"
++            android:layout_gravity="fill_horizontal"
++            android:layout_row="1" />
++
++        <Space
++            android:layout_width="30dp"
++            android:layout_height="1dp"
++            android:layout_column="2"
++            android:layout_gravity="fill_horizontal"
++            android:layout_row="0" />
++
++        <Space
++            android:layout_width="21dp"
++            android:layout_height="1dp"
++            android:layout_column="0"
++            android:layout_row="0" />
++
++        <Space
++            android:layout_width="1dp"
++            android:layout_height="14dp"
++            android:layout_column="0"
++            android:layout_row="4" />
++    </GridLayout>
++
++        android:id="@+id/linearLayout1"
++        android:layout_width="318dp"
++        android:layout_height="match_parent"
++        android:layout_gravity="center_horizontal"
++        android:orientation="vertical" >
++</LinearLayout>
+\ No newline at end of file
+diff --git a/FSLOta/res/values/strings.xml b/FSLOta/res/values/strings.xml
+new file mode 100644
+index 0000000..35907e5
+--- /dev/null
++++ b/FSLOta/res/values/strings.xml
+@@ -0,0 +1,19 @@
++
++    <resources>
++        <string name="upgrade">Upgrade</string>
++        <string name="version">Version</string>
++        <string name="check_for_upgrade">Checking Upgrade</string>
++        <string name="app_name">Freescale OTA System Update</string>
++        <string name="error_package_verify_failed">package verify failed, incomplete package</string>
++        <string name="download_upgrade_package">Downloading Upgrade Package</string>
++        <string name="error_server_no_package">Error: server don\'t have upgrade package</string>
++        <string name="error_write_file">Error: write file error</string>
++        <string name="already_up_to_date">\nYour software is up to date</string>
++        <string name="have_new">Have new release</string>
++        <string name="error_package_install_failed">package install failed</string>
++        <string name="error_needs_wifi">Error: needs wifi network.</string>
++        <string name="error_cannot_connect_server">Error: Can not connect to server</string>
++        <string name="size">Size </string>
++        <string name="length_unknown">Unknown</string>
++        <string name="verify_package">Verifing package</string>
++    </resources>
+diff --git a/FSLOta/src/com/fsl/android/ota/BuildPropParser.java b/FSLOta/src/com/fsl/android/ota/BuildPropParser.java
+new file mode 100644
+index 0000000..cb6e6ce
+--- /dev/null
++++ b/FSLOta/src/com/fsl/android/ota/BuildPropParser.java
+@@ -0,0 +1,105 @@
++/*
++/* Copyright 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.fsl.android.ota;
++
++import java.io.*;
++import java.util.*;
++
++import android.content.Context;
++import android.util.Log;
++
++public class BuildPropParser {
++    private HashMap<String, String> propHM = null;
++    File tmpFile;
++    Context mContext;
++    
++    final String TAG = "OTA";
++
++    BuildPropParser(ByteArrayOutputStream out, Context context) {
++    	mContext = context;
++        propHM = new HashMap<String, String>();
++        setByteArrayStream(out);
++    }
++
++    BuildPropParser(File file, Context context) throws IOException {
++    	mContext = context;
++        propHM = new HashMap<String, String>();
++        setFile(file);
++    }
++
++    public HashMap<String, String> getPropMap()         { return propHM;};
++    public String getProp(String propname) { 
++    	if (propHM != null)
++    		return (String) propHM.get(propname); 
++    	else 
++    		return null;
++    }
++
++    private void setByteArrayStream(ByteArrayOutputStream out) {
++        try {
++        	File tmpDir = null;
++        	if (mContext != null)
++        		tmpDir = mContext.getFilesDir();
++        	Log.d(TAG, "tmpDir:"  + tmpDir.toString() +  "\n");
++            tmpFile = File.createTempFile("buildprop", "ss", tmpDir);
++            
++            tmpFile.deleteOnExit();
++            FileOutputStream o2 = new FileOutputStream(tmpFile);
++            out.writeTo(o2);
++            o2.close();
++            setFile(tmpFile);
++            tmpFile.delete();
++        } catch (IOException e) {
++            e.printStackTrace();
++        }
++    }
++
++    private void setFile(File file) throws IOException {
++        try {
++            FileReader reader = new FileReader(file);
++            BufferedReader in = new BufferedReader(reader);
++            String string;
++            while ((string = in.readLine()) != null) {
++                Scanner scan = new Scanner(string);
++                scan.useDelimiter("=");
++                try {
++                    propHM.put(scan.next(), scan.next());
++                } catch (NoSuchElementException e) {
++                    continue;
++                }
++            }
++            in.close();
++        } catch (IOException e) {
++            e.printStackTrace();
++            throw e;
++        }
++    }
++    
++    public String getRelease() { 
++    	if (propHM != null) 
++    		return propHM.get("ro.build.version.release"); 
++    	else 
++    		return null;
++    }
++    public String getNumRelease()  {
++    	if (propHM != null) 
++    		return propHM.get("ro.build.version.incremental");
++    	else
++    		return null;
++    }
++
++}
+diff --git a/FSLOta/src/com/fsl/android/ota/OTAServerConfig.java b/FSLOta/src/com/fsl/android/ota/OTAServerConfig.java
+new file mode 100644
+index 0000000..e2a5eed
+--- /dev/null
++++ b/FSLOta/src/com/fsl/android/ota/OTAServerConfig.java
+@@ -0,0 +1,78 @@
++/*
++/* Copyright 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.fsl.android.ota;
++
++import java.io.File;
++import java.net.MalformedURLException;
++import java.net.URL;
++
++import android.util.Log;
++
++// TODO: get the configure from a configure file.
++public class OTAServerConfig {
++	
++	final String default_serveraddr = "10.192.224.88";
++	final String default_protocol = "http";
++	final int default_port = 10888;
++	URL updatePackageURL;
++	URL buildpropURL;
++	String product;
++	final String TAG = "OTA";
++	final String configFile = "/system/etc/ota.conf";
++	final String server_ip_config = "server";
++	final String port_config_str = "port";
++	
++	public OTAServerConfig (String productname) throws MalformedURLException {
++		
++		if (loadConfigureFromFile(configFile, productname) == false)
++			defaultConfigure(productname);
++	}
++	
++	boolean loadConfigureFromFile (String configFile, String product) {
++		try {
++			BuildPropParser parser = new BuildPropParser(new File(configFile), null);
++			String server = parser.getProp(server_ip_config);
++			String port_str = parser.getProp(port_config_str);
++			int port = new Long(port_str).intValue();
++			String fileaddr = new String(product + "/" + product + ".ota.zip");
++			String buildconfigAddr = new String(product + "/" + "build.prop"); 
++			updatePackageURL = new URL(default_protocol, server, port, fileaddr);
++			buildpropURL = new URL(default_protocol, server, port, buildconfigAddr);
++		} catch (Exception e) {
++			Log.e(TAG, "wrong format/error of OTA configure file.");
++			e.printStackTrace();
++			return false;
++		}
++		
++		return false;
++	}
++	
++	void defaultConfigure(String productname) throws MalformedURLException
++	{
++		product = productname;
++		String fileaddr = new String(product + "/" + product + ".ota.zip");
++		String buildconfigAddr = new String(product + "/" + "build.prop"); 
++		updatePackageURL = new URL(default_protocol, default_serveraddr, default_port, fileaddr );
++		buildpropURL = new URL(default_protocol, default_serveraddr, default_port, buildconfigAddr);
++		Log.d(TAG, "create a new server config: package url " + updatePackageURL.toString() + "port:" + updatePackageURL.getPort());
++		Log.d(TAG, "build.prop URL:" + buildpropURL.toString());
++	}
++	
++	public URL getPackageURL () { return updatePackageURL; }
++	public URL getBuildPropURL() { return buildpropURL; }
++	
++}
+diff --git a/FSLOta/src/com/fsl/android/ota/OTAServerManager.java b/FSLOta/src/com/fsl/android/ota/OTAServerManager.java
+new file mode 100644
+index 0000000..c4aa90b
+--- /dev/null
++++ b/FSLOta/src/com/fsl/android/ota/OTAServerManager.java
+@@ -0,0 +1,353 @@
++/*
++/* Copyright 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.fsl.android.ota;
++
++import java.net.*;
++import java.security.GeneralSecurityException;
++import java.io.*;
++
++import android.content.*;
++import android.net.ConnectivityManager;
++import android.os.Build;
++import android.os.Handler;
++import android.os.Message;
++import android.os.PowerManager;
++import android.os.PowerManager.WakeLock;
++import android.os.RecoverySystem;
++import android.util.Log;
++
++
++public class OTAServerManager  {
++	public interface OTAStateChangeListener {
++		
++		final int STATE_IN_IDLE = 0;
++		final int STATE_IN_CHECKED = 1; // state in checking whether new available.
++		final int STATE_IN_DOWNLOADING = 2; // state in download upgrade package
++		final int STATE_IN_UPGRADING = 3;  // In upgrade state
++		
++		final int MESSAGE_DOWNLOAD_PROGRESS = 4;
++		final int MESSAGE_VERIFY_PROGRESS = 5;
++		final int MESSAGE_STATE_CHANGE = 6;
++		final int MESSAGE_ERROR = 7;
++		
++		// should be raise exception ? but how to do exception in async mode ?
++		final int NO_ERROR = 0;
++		final int ERROR_WIFI_NOT_AVALIBLE = 1;  // require wifi network, for OTA app.
++		final int ERROR_CANNOT_FIND_SERVER = 2;
++		final int ERROR_PACKAGE_VERIFY_FALIED = 3;
++		final int ERROR_WRITE_FILE_ERROR = 4;
++		final int ERROR_NETWORK_ERROR = 5;
++		final int ERROR_PACKAGE_INSTALL_FAILED = 6;
++		final int ERROR_PACKAGE_VERIFY_FAILED = 7;
++		
++		// results
++		final int RESULTS_ALREADY_LATEST = 1;
++
++		public void onStateOrProgress(int message, int error, Object info);
++		
++	}
++
++	private OTAStateChangeListener mListener;	
++	private OTAServerConfig mConfig;
++	private BuildPropParser parser = null;
++	long mCacheProgress = -1;
++	boolean mStop = false;
++	Context mContext;
++	String mUpdatePackageLocation = "/cache/update.zip";
++	String TAG = "OTA";
++	Handler mSelfHandler;
++	WakeLock mWakelock;
++	
++	
++	public OTAServerManager(Context context) throws MalformedURLException {
++		mConfig = new OTAServerConfig(Build.PRODUCT);
++		PowerManager pm = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
++		mWakelock = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "OTA Wakelock");
++		mContext = context;
++	}
++
++	public OTAStateChangeListener getmListener() {
++		return mListener;
++	}
++
++	public void setmListener(OTAStateChangeListener mListener) {
++		this.mListener = mListener;
++	}
++	
++	public boolean checkNetworkOnline() {
++		ConnectivityManager conMgr =  (ConnectivityManager)mContext.getSystemService(Context.CONNECTIVITY_SERVICE);
++		
++		if ((conMgr.getNetworkInfo(ConnectivityManager.TYPE_WIFI)).isConnectedOrConnecting()) {
++			return true;
++		} else {
++			return false;
++		}
++	}
++	
++	public void startCheckingVersion() {
++		
++		Log.v(TAG, "startCheckingVersion");
++		
++		if (checkURLOK(mConfig.getBuildPropURL()) == false) {
++			if (this.mListener != null) {
++				if (this.checkNetworkOnline())
++					reportCheckingError(OTAStateChangeListener.ERROR_CANNOT_FIND_SERVER);
++				else
++					reportCheckingError(OTAStateChangeListener.ERROR_WIFI_NOT_AVALIBLE);
++			}
++			
++			return;
++		}
++		
++		parser = getTargetPackagePropertyList(mConfig.getBuildPropURL());
++		
++		if (parser != null) {
++			if (this.mListener != null)
++				this.mListener.onStateOrProgress(OTAStateChangeListener.STATE_IN_CHECKED, 
++						OTAStateChangeListener.NO_ERROR, parser);
++		} else {
++			reportCheckingError(OTAStateChangeListener.ERROR_WRITE_FILE_ERROR);
++		}
++	}
++	
++	// return 0 means equal
++	// return 1 means remote is updated
++	// return -1 means you are the latest or the network error
++	public int compareLocalVersionToServer() {
++		if (parser == null)
++			return -1;
++		String localNumVersion = Build.VERSION.INCREMENTAL;
++		Log.d(TAG, "Local Version:" + Build.VERSION.INCREMENTAL + "server Version:" + parser.getNumRelease());
++		return parser.getNumRelease().compareTo(localNumVersion);
++	}
++	
++	void publishDownloadProgress(long total, long downloaded) {
++		//Log.v(TAG, "download Progress: total: " + total + "download:" + downloaded);
++		Long progress = new Long((downloaded*100)/total);
++		if (this.mListener != null && progress.longValue() != mCacheProgress) {
++			this.mListener.onStateOrProgress(OTAStateChangeListener.MESSAGE_DOWNLOAD_PROGRESS,
++					0, progress);
++			mCacheProgress = progress.longValue();
++		}
++	}
++	
++	void reportCheckingError(int error) {
++		if (this.mListener != null)
++			this.mListener.onStateOrProgress(OTAStateChangeListener.STATE_IN_CHECKED, error, null);
++	}
++	
++	void reportDownloadError(int error) {
++		if (this.mListener != null)
++			this.mListener.onStateOrProgress(OTAStateChangeListener.STATE_IN_DOWNLOADING, error, null);
++	}
++	
++	void reportInstallError(int error) {
++		if (this.mListener != null)
++			this.mListener.onStateOrProgress(OTAStateChangeListener.STATE_IN_UPGRADING, error, null);
++	}
++	
++	public long getUpgradePackageSize() {
++		if (checkURLOK(mConfig.getPackageURL()) == false) {
++			Log.e(TAG, "getUpgradePckageSize Failed");
++			return -1;
++		}
++		
++		URL url = mConfig.getPackageURL();
++		URLConnection con;
++		try {
++			con = url.openConnection();
++			return con.getContentLength();
++		} catch (IOException e) {
++			e.printStackTrace();
++			return -1;
++		}
++	}
++	
++	public void onStop() {
++		mStop = true;
++	}
++	
++	public void startDownloadUpgradePackage() {
++		
++		Log.v(TAG, "startDownloadUpgradePackage()");
++
++		if (checkURLOK(mConfig.getPackageURL()) == false) {
++			if (this.mListener != null)
++				reportDownloadError(OTAStateChangeListener.ERROR_CANNOT_FIND_SERVER);
++			return;
++		}
++
++
++		File targetFile = new File(mUpdatePackageLocation);
++		try {
++			targetFile.createNewFile();
++		} catch (IOException e) {
++			e.printStackTrace();
++			reportDownloadError(OTAStateChangeListener.ERROR_WRITE_FILE_ERROR);
++			return;
++		}
++
++		try {
++			mWakelock.acquire();
++			
++			URL url = mConfig.getPackageURL();
++			Log.d(TAG, "start downoading package:" + url.toString());
++			URLConnection conexion = url.openConnection();
++			conexion.setReadTimeout(10000);
++			// this will be useful so that you can show a topical 0-100% progress bar
++
++			int lengthOfFile = 96038693;
++			lengthOfFile = conexion.getContentLength();			
++			// download the file
++			InputStream input = new BufferedInputStream(url.openStream());
++			OutputStream output = new FileOutputStream(targetFile);
++			
++			Log.d(TAG, "file size:" + lengthOfFile);
++			byte data[] = new byte[100 * 1024];
++			long total = 0, count;
++			while ((count = input.read(data)) >= 0 && !mStop) {
++				total += count;
++				
++				// publishing the progress....
++				publishDownloadProgress(lengthOfFile, total);
++				output.write(data, 0, (int)count);
++			}
++			
++			output.flush();
++			output.close();
++			input.close();
++			if (this.mListener != null && !mStop)
++				this.mListener.onStateOrProgress(OTAStateChangeListener.STATE_IN_DOWNLOADING, 0, null);
++		} catch (IOException e) {
++			e.printStackTrace();
++			reportDownloadError(OTAStateChangeListener.ERROR_WRITE_FILE_ERROR);
++		} finally {
++			mWakelock.release();
++			mWakelock.acquire(2);
++		}
++	}
++	
++	RecoverySystem.ProgressListener recoveryVerifyListener = new RecoverySystem.ProgressListener() {
++		public void onProgress(int progress) {
++			Log.d(TAG, "verify progress" + progress);
++			if (mListener != null)
++				mListener.onStateOrProgress(OTAStateChangeListener.MESSAGE_VERIFY_PROGRESS, 
++						0, new Long(progress));
++		}
++	};
++	
++	public void startInstallUpgradePackage() {
++		File recoveryFile = new File(mUpdatePackageLocation);
++		
++		// first verify package
++         try {
++        	 mWakelock.acquire();
++        	 RecoverySystem.verifyPackage(recoveryFile, recoveryVerifyListener, null);
++         } catch (IOException e1) {
++        	 reportInstallError(OTAStateChangeListener.ERROR_PACKAGE_VERIFY_FALIED);
++        	 e1.printStackTrace();
++        	 return;
++         } catch (GeneralSecurityException e1) {
++        	 reportInstallError(OTAStateChangeListener.ERROR_PACKAGE_VERIFY_FALIED);
++        	 e1.printStackTrace();
++        	 return;
++         } finally {
++        	 mWakelock.release();
++         }
++
++         // then install package
++         try {
++        	 mWakelock.acquire();
++      	   RecoverySystem.installPackage(mContext, recoveryFile);
++         } catch (IOException e) {
++      	   // TODO Auto-generated catch block
++        	 reportInstallError(OTAStateChangeListener.ERROR_PACKAGE_INSTALL_FAILED);
++        	 e.printStackTrace();
++        	 return;
++         } catch (SecurityException e){
++        	 e.printStackTrace();
++        	 reportInstallError(OTAStateChangeListener.ERROR_PACKAGE_INSTALL_FAILED);
++        	 return;
++         } finally {
++        	 mWakelock.release();
++         }
++         // cannot reach here...
++
++	}
++
++	boolean checkURLOK(URL url) {
++		try {
++			HttpURLConnection.setFollowRedirects(false);
++			
++			HttpURLConnection con =  (HttpURLConnection) url.openConnection();
++			
++			con.setRequestMethod("HEAD");
++			
++			return (con.getResponseCode() == HttpURLConnection.HTTP_OK);
++		} catch (Exception e) {
++			e.printStackTrace();
++			return false;
++		}
++	}
++	
++	
++	// function: 
++	// download the property list from remote site, and parse it to peroerty list.
++	// the caller can parser this list and get information.
++	BuildPropParser getTargetPackagePropertyList(URL configURL) {
++		
++		// first try to download the property list file. the build.prop of target image.
++		try {
++			URL url =  configURL;
++			url.openConnection();
++			InputStream reader = url.openStream();
++			ByteArrayOutputStream writer = new ByteArrayOutputStream();
++			byte[] buffer = new byte[153600];
++			int totalBufRead = 0;
++			int bytesRead;
++			
++			Log.d(TAG, "start download: " + url.toString() + "to buffer");
++		
++			while ((bytesRead = reader.read(buffer)) > 0) {
++				writer.write(buffer, 0, bytesRead);
++				buffer = new byte[153600];
++				totalBufRead += bytesRead;
++			}
++			
++		
++		Log.d(TAG, "download finish:" + (new Integer(totalBufRead).toString()) + "bytes download");
++		reader.close();
++		
++		BuildPropParser parser = new BuildPropParser(writer, mContext);
++		
++		return parser;
++		
++		} catch (IOException e) {
++			e.printStackTrace();
++			return null;
++		} catch (Exception e) {
++			e.printStackTrace();
++			return null;
++		}
++	}
++
++	public boolean handleMessage(Message arg0) {
++		// TODO Auto-generated method stub
++		return false;
++	}
++
++}
+diff --git a/FSLOta/src/com/fsl/android/ota/OtaAppActivity.java b/FSLOta/src/com/fsl/android/ota/OtaAppActivity.java
+new file mode 100644
+index 0000000..6f3199e
+--- /dev/null
++++ b/FSLOta/src/com/fsl/android/ota/OtaAppActivity.java
+@@ -0,0 +1,325 @@
++/*
++/* Copyright 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.fsl.android.ota;
++import java.net.MalformedURLException;
++import android.app.Activity;
++import android.content.Context;
++import android.os.Build;
++import android.os.Bundle;
++import com.fsl.android.ota.R;
++import android.util.Log;
++import android.view.View;
++import android.view.View.OnClickListener;
++import android.widget.*;
++
++
++// Controller of OTA Activity
++public class OtaAppActivity extends Activity implements OTAServerManager.OTAStateChangeListener {
++	
++	Button mUpgradeButton;
++	TextView mMessageTextView;
++	TextView mVersionTextView;
++	ProgressBar mSpinner;
++	ProgressBar mDownloadProgress;
++	
++	Context mContext; 
++	
++	OTAServerManager mOTAManager;
++	int mState = 0;
++	
++	/* state change will be 0 -> Checked -> Downloading -> upgrading.  */
++	
++	final String TAG = "OTA";
++	
++    /** Called when the activity is first created. */
++    @Override
++    public void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++        
++        Log.d(TAG, "OTAAppActivity : onCreate");
++        setContentView(R.layout.main);
++        (mUpgradeButton = (Button) findViewById(R.id.upgrade_button)) 
++        		.setOnClickListener(mUpgradeListener);
++        mMessageTextView = (TextView) findViewById(R.id.message_text_view);
++        mVersionTextView = ((TextView) findViewById(R.id.version_text_view)); 
++        mSpinner = (ProgressBar) findViewById(R.id.spinner);
++        mDownloadProgress = (ProgressBar) findViewById(R.id.download_progress_bar);
++        mContext = getBaseContext();
++        
++        try {
++			mOTAManager = new OTAServerManager(mContext);
++		} catch (MalformedURLException e) {
++			mOTAManager = null;
++			Log.e(TAG, "meet not a mailformat URL... should not happens.");
++			e.printStackTrace();
++		}
++        mOTAManager.setmListener(this);
++
++    }
++    
++    @Override
++    public void onStart() {
++    	super.onStart();
++    	
++    	Log.d(TAG, "OTAAppActivity : onStart");
++    	// default state is checking, if resume from any pervious state,
++    	// resume the state
++    	onStateChangeUI(mState);
++
++    	if (mState == 0) {
++        	new Thread(new Runnable() {
++        		public void run() {
++        			mOTAManager.startCheckingVersion();		
++        		}
++        	}).start();
++        }
++    }
++    
++    @Override
++    public void onRestart() {
++    	super.onRestart();
++    	Log.d(TAG, "OTAAppActivity : onRestart");
++    }
++    
++    
++    @Override
++    public void onPause() 
++    {
++    	super.onPause();
++    	Log.d(TAG, "OTAAppActivity : onPause");
++    }
++    
++    @Override
++    public void onStop() {
++    	super.onStop();
++    	mOTAManager.onStop();
++    	Log.d(TAG, "OTAAppActivity : onStop");
++    }
++
++    OnClickListener mUpgradeListener = new OnClickListener() {
++		public void onClick(View v) {
++			Log.v(TAG, "upgrade button clicked.");
++			new Thread(new Runnable() {
++				public void run() {
++					mOTAManager.startDownloadUpgradePackage();
++				}
++			}).start();
++			onStateChangeUI(STATE_IN_DOWNLOADING);
++		}
++		
++	};
++	
++	public void onStateOrProgress(int message, int error, Object info)
++	{
++		Log.v(TAG, "onStateOrProgress: " + "message: " + message + " error:" + error + " info: " + info );
++		switch (message) {
++		case STATE_IN_CHECKED:
++			onStateChangeUI(message);
++			onStateInChecked(error, info);
++			break;
++		case STATE_IN_DOWNLOADING:
++			onStateChangeUI(message);
++			mState = STATE_IN_DOWNLOADING;
++			onStateDownload(error, info);
++			break;
++		case STATE_IN_UPGRADING:
++			onStateChangeUI(message);
++			mState = STATE_IN_UPGRADING;
++			onStateUpgrade(error, info);
++			break;
++		case MESSAGE_DOWNLOAD_PROGRESS:
++		case MESSAGE_VERIFY_PROGRESS:
++			onProgress(message, error, info);
++			break;
++		}
++	}
++
++	// this state change function only change
++	// Attributes of UI elements
++	// other will control the model(download). 
++	void onStateChangeUI(int newstate)
++	{
++		mState = newstate;
++		if (newstate == STATE_IN_IDLE) {
++			   mVersionTextView.setVisibility(View.INVISIBLE);
++			   mDownloadProgress.setVisibility(View.INVISIBLE);
++			   mUpgradeButton.setVisibility(View.INVISIBLE);
++		}
++		else if (newstate == STATE_IN_CHECKED) {
++			mVersionTextView.post(new Runnable() {
++				public void run() {
++					mVersionTextView.setVisibility(View.VISIBLE);
++					mUpgradeButton.setVisibility(View.VISIBLE);
++				}
++			});
++		} else if (newstate == STATE_IN_DOWNLOADING) {
++			// from start download, it start hide the version again.
++			mVersionTextView.post(new Runnable() {
++				public void run() {
++					mVersionTextView.setVisibility(View.INVISIBLE);
++					mUpgradeButton.setVisibility(View.INVISIBLE);
++					mSpinner.setVisibility(View.INVISIBLE);
++					mDownloadProgress.setVisibility(View.VISIBLE);
++				}
++			});
++		} 
++	}
++	
++	void onStateUpgrade(int error, Object info) {
++		
++		if (error == ERROR_PACKAGE_VERIFY_FAILED) {
++			Log.v(TAG, "package verify failed, signaure not match");
++			mMessageTextView.post(new Runnable() {
++				public void run() {
++					mMessageTextView.setText(getText(R.string.error_package_verify_failed));
++				}
++			});
++			// meet error in Verify, fall back to check.
++			// TODO which state should ?
++		} else if (error == ERROR_PACKAGE_INSTALL_FAILED) {
++			mMessageTextView.post(new Runnable() {
++				public void run() {
++					mMessageTextView.setText(getText(R.string.error_package_install_failed));
++				}
++			});
++		}
++	}
++	
++	void onProgress(int message, int error, Object info) {
++		final Long progress = new Long((Long)info); 
++		mDownloadProgress.post(new Runnable() {
++			public void run() {
++				mDownloadProgress.setProgress(progress.intValue());
++			}
++		});
++		
++		Log.v(TAG, "progress : " + progress);
++		if (message == MESSAGE_DOWNLOAD_PROGRESS) {
++			onStateChangeUI(STATE_IN_DOWNLOADING);
++			mMessageTextView.post(new Runnable() {
++				
++				public void run() {
++					mMessageTextView.setText(getText(R.string.download_upgrade_package));
++				}
++			});
++		} else if (message == MESSAGE_VERIFY_PROGRESS) {
++			onStateChangeUI(STATE_IN_UPGRADING);
++			mMessageTextView.post(new Runnable() {
++				public void run() {
++					mMessageTextView.setText(getText(R.string.verify_package));
++				}
++			});
++		}
++	}
++	
++	void onStateDownload(int error, Object info) {
++		if (error == ERROR_CANNOT_FIND_SERVER) {
++			// in this case, the build.prop already found but the server don't have upgrade package
++			// report as "Server Error: Not have upgrade package";
++			mMessageTextView.post(new Runnable() {
++				
++				public void run() {
++					mMessageTextView.setText(getText(R.string.error_server_no_package));
++				}
++			});
++		} else if (error == ERROR_WRITE_FILE_ERROR) {
++			mMessageTextView.post(new Runnable() {
++				
++				public void run() {
++					mMessageTextView.setText(getText(R.string.error_write_file));
++					mUpgradeButton.setVisibility(View.VISIBLE);
++				}
++			});
++			onStateChangeUI(STATE_IN_CHECKED);
++		}
++		
++		if (error == 0) {
++			// success download, let try to start with install package...
++			// we should already in another thread, no needs to create a thread.
++			mOTAManager.startInstallUpgradePackage();
++		}
++	}
++	
++	public static String byteCountToDisplaySize(long bytes, boolean si) {
++		int unit = si ? 1000 : 1024;
++		if (bytes < unit) return bytes + " B";
++		int exp = (int) (Math.log(bytes) / Math.log(unit));
++		String pre = (si ? "KMGTPE" : "KMGTPE").charAt(exp - 1) + (si ? "" : "i");
++		return String.format("%.1f %sB", bytes / Math.pow(unit, exp), pre);
++	}
++	
++	void onStateInChecked(int error, Object info) {
++		
++		mSpinner.post(new Runnable() {	
++			public void run() {
++				mSpinner.setVisibility(View.INVISIBLE);
++			}
++		});
++		
++		if (error == 0) {
++			// return no error, usually means have a version info from remote server, release name is in @info
++			// needs check here whether the local version is newer then remote version
++			if (mOTAManager.compareLocalVersionToServer() <= 0) {
++				// we are already latest...
++				mMessageTextView.post(new Runnable() {
++					public void run() {
++						mMessageTextView.setText(Build.VERSION.RELEASE + getText(R.string.already_up_to_date));
++					}
++				});
++				
++			} else if (mOTAManager.compareLocalVersionToServer() > 0) {
++				final BuildPropParser parser = (BuildPropParser) info;
++				final long bytes = mOTAManager.getUpgradePackageSize();
++				mMessageTextView.post(new Runnable() {
++					public void run() {
++						onStateChangeUI(STATE_IN_CHECKED);
++						mMessageTextView.setText(getText(R.string.have_new));
++
++						String length = (String) getText(R.string.length_unknown);
++						
++						if (bytes > 0)
++							length = byteCountToDisplaySize(bytes, false);
++						mVersionTextView.setText(getText(R.string.version) +  " " +
++								parser.getProp("ro.build.description") + "\n" +
++								getText(R.string.size) + " " + length);
++						mUpgradeButton.setVisibility(View.VISIBLE);
++					}
++				});
++			}
++		} else if (error == ERROR_WIFI_NOT_AVALIBLE) {
++			mMessageTextView.post(new Runnable() {
++				
++				public void run() {
++					mMessageTextView.setText(getText(R.string.error_needs_wifi));
++				}
++			});
++		} else if (error == ERROR_CANNOT_FIND_SERVER) {
++			mMessageTextView.post(new Runnable() {
++				public void run() {
++					mMessageTextView.setText(getText(R.string.error_cannot_connect_server));
++				}
++			});
++		} else if (error == ERROR_WRITE_FILE_ERROR ) {
++			mMessageTextView.post(new Runnable() {
++				public void run() {
++					mMessageTextView.setText(getText(R.string.error_write_file));
++				}
++			});
++		}
++	}
++	
++}
+\ No newline at end of file
+-- 
+1.8.0
+

@@ -1,0 +1,544 @@
+From 55084d85400ef38ec5277bc5d9cc2630b8ebc873 Mon Sep 17 00:00:00 2001
+From: Rob Herring <r.herring@freescale.com>
+Date: Wed, 12 Mar 2008 22:09:00 -0500
+Subject: [PATCH 016/435] ENGR00057358 Update fb and v4l2 tests for IPUv3
+
+Update fb and v4l2 tests for IPUv3
+
+Signed-off-by: Rob Herring <r.herring@freescale.com>
+---
+ test/mxc_fb_test/Makefile            |  2 +-
+ test/mxc_fb_test/autorun-fb.sh       | 46 ++++++++---------
+ test/mxc_fb_test/mxc_fb_setbpp.c     | 99 ------------------------------------
+ test/mxc_fb_test/mxc_fb_vsync_test.c | 91 +++++++++++++++++++++++++++++++++
+ test/mxc_fb_test/mxc_tve_test.sh     | 28 ++++++++++
+ test/mxc_v4l2_test/mxc_v4l2_output.c | 52 ++++++++++---------
+ 6 files changed, 167 insertions(+), 151 deletions(-)
+ delete mode 100644 test/mxc_fb_test/mxc_fb_setbpp.c
+ create mode 100644 test/mxc_fb_test/mxc_fb_vsync_test.c
+ create mode 100755 test/mxc_fb_test/mxc_tve_test.sh
+
+diff --git a/test/mxc_fb_test/Makefile b/test/mxc_fb_test/Makefile
+index 97e368e..1b2476e 100644
+--- a/test/mxc_fb_test/Makefile
++++ b/test/mxc_fb_test/Makefile
+@@ -2,7 +2,7 @@
+ EXCLUDE_LIST:=
+ 
+ ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
+-OBJS = $(OBJDIR)/autorun-fb.sh $(OBJDIR)/mxc_fb_test.out $(OBJDIR)/mxc_tvout_test.out
++OBJS = $(OBJDIR)/autorun-fb.sh $(OBJDIR)/mxc_tve_test.sh $(OBJDIR)/mxc_fb_test.out $(OBJDIR)/mxc_tvout_test.out $(OBJDIR)/mxc_fb_vsync_test.out
+ else
+ OBJS =
+ endif
+diff --git a/test/mxc_fb_test/autorun-fb.sh b/test/mxc_fb_test/autorun-fb.sh
+index 3be5ed7..9c914e6 100755
+--- a/test/mxc_fb_test/autorun-fb.sh
++++ b/test/mxc_fb_test/autorun-fb.sh
+@@ -13,7 +13,7 @@ check_devnode "/dev/fb0"
+ export TERM=linux
+ 
+ # Turn off blanking
+-setterm -blank 0 > /dev/vc/0
++setterm -blank 0 > /dev/tty0
+ 
+ 
+ # Blank test
+@@ -26,9 +26,9 @@ echo -n 0 > /sys/class/graphics/fb0/blank
+ # Color tests
+ echo FB Color test
+ if [ "$(platform)" = MXC27530EVB ]; then
+-	bpp_list="16 24" 
++	bpp_list="16 24"
+ else
+-	bpp_list="16 24 32" 
++	bpp_list="16 24 32"
+ fi
+ for bpp in $bpp_list;
+ do
+@@ -39,29 +39,23 @@ do
+ 		echo FAIL - Unable to set bpp
+ 		STATUS=1
+ 	fi
+-	setterm -inversescreen on > /dev/vc/0
+-	setterm -foreground red > /dev/vc/0
+-	setterm -clear all > /dev/vc/0
+-	echo Screen is Red > /dev/vc/0
++	setterm -inversescreen on > /dev/tty0
++	setterm -foreground red > /dev/tty0
++	setterm -clear all > /dev/tty0
++	echo Screen is Red > /dev/tty0
+ 	sleep 1
+-	setterm -foreground blue > /dev/vc/0
+-	setterm -clear all > /dev/vc/0
+-	echo Screen is Blue > /dev/vc/0
++	setterm -foreground blue > /dev/tty0
++	setterm -clear all > /dev/tty0
++	echo Screen is Blue > /dev/tty0
+ 	sleep 1
+-	setterm -foreground green > /dev/vc/0
+-	setterm -clear all > /dev/vc/0
+-	echo Screen is Green > /dev/vc/0
++	setterm -foreground green > /dev/tty0
++	setterm -clear all > /dev/tty0
++	echo Screen is Green > /dev/tty0
+ 	sleep 1
+ done
+ 
+-# FB Suspend Test
+-echo -n 3 > /sys/class/graphics/fb0/device/power/state
+-echo Framebuffer is in state \(0 - run, 2 - suspend\):
+-cat /sys/class/graphics/fb0/device/power/state
+-echo -n 0 > /sys/class/graphics/fb0/device/power/state
+-
+ # Pan test
+-# 
++#
+ echo FB panning test
+ echo 240,640 > /sys/class/graphics/fb0/virtual_size
+ if ! grep -sq 240,640 /sys/class/graphics/fb0/virtual_size;
+@@ -76,15 +70,15 @@ then
+ fi
+ 
+ for i in $(seq 1 50); do
+-	echo This is line $i. > /dev/vc/0
++	echo This is line $i. > /dev/tty0
+ done
+ for i in $(seq 1 320); do
+ 	echo 0,$i > /sys/class/graphics/fb0/pan
+-#	if ! grep -sq $i /sys/class/graphics/fb0/pan;
+-#	then
+-		# KERNEL BUG!!! echo FAIL - Unable to pan
+-		# STATUS=1
+-#	fi
++	if ! grep -sq $i /sys/class/graphics/fb0/pan;
++	then
++		echo FAIL - Unable to pan
++		STATUS=1
++	fi
+ done
+ 
+ print_status
+diff --git a/test/mxc_fb_test/mxc_fb_setbpp.c b/test/mxc_fb_test/mxc_fb_setbpp.c
+deleted file mode 100644
+index 6f10b14..0000000
+--- a/test/mxc_fb_test/mxc_fb_setbpp.c
++++ /dev/null
+@@ -1,99 +0,0 @@
+-/*
+- * Copyright 2004-2006 Freescale Semiconductor, Inc. All rights reserved.
+- */
+-
+-/*
+- * The code contained herein is licensed under the GNU General Public
+- * License. You may obtain a copy of the GNU General Public License
+- * Version 2 or later at the following locations:
+- *
+- * http://www.opensource.org/licenses/gpl-license.html
+- * http://www.gnu.org/copyleft/gpl.html
+- */
+-
+-/*
+- * @file mxc_fb_setbpp.c
+- * 
+- * @brief Mxc FB test application to set bits per pixel of FB
+- * 
+- */
+-
+-#ifdef __cplusplus
+-extern "C"{
+-#endif
+-
+-/*=======================================================================
+-                                        INCLUDE FILES
+-=======================================================================*/
+-/* Standard Include Files */
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <errno.h>
+-    
+-/* Verification Test Environment Include Files */
+-#include <sys/types.h>  
+-#include <sys/stat.h>   
+-#include <fcntl.h>
+-#include <sys/ioctl.h>
+-#include <unistd.h>    
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <asm/types.h>
+-#include <linux/compiler.h>
+-#include <linux/fb.h>
+-#include <math.h>
+-#include <string.h>
+-#include <malloc.h>
+-
+-#define TFAIL -1
+-#define TPASS 0
+-
+-int fd_fb = 0;
+-
+-
+-
+-int 
+-main(int argc, char **argv)
+-{
+-        int bpp;
+-        int retval = TPASS;
+-        char fbdev[] = "/dev/fb0";
+-        struct fb_var_screeninfo screen_info;
+-
+-        if (argc != 3) {
+-                printf("Usage:\n\nmxc_fb_setbpp <bpp> <fb #>\n\n");
+-                return -1;
+-        }
+-
+-        bpp = atoi(argv[1]);
+-        fbdev[7] = argv[2][0];
+-        
+-        if ((fd_fb = open(fbdev, O_RDWR, 0)) < 0)
+-        {
+-                printf("Unable to open %s\n", fbdev);
+-                retval = TFAIL;
+-                goto err0;
+-        }
+-
+-        retval = ioctl(fd_fb, FBIOGET_VSCREENINFO, &screen_info);
+-        if (retval < 0)
+-        {
+-                goto err1;
+-        }
+-        printf("Changing fb%s bits per pixel from %d-bpp to %d-bpp\n", 
+-                argv[2], screen_info.bits_per_pixel, bpp);
+-        screen_info.activate = FB_ACTIVATE_NOW;
+-        screen_info.bits_per_pixel = bpp;
+-        retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
+-        if (retval < 0)
+-        {
+-                printf("Error setting bpp - %d\n", retval);
+-                goto err1;
+-        }
+-
+-err1:
+-        close(fd_fb);
+-err0:
+-        return retval;
+-}
+-
+diff --git a/test/mxc_fb_test/mxc_fb_vsync_test.c b/test/mxc_fb_test/mxc_fb_vsync_test.c
+new file mode 100644
+index 0000000..cbfa3c0
+--- /dev/null
++++ b/test/mxc_fb_test/mxc_fb_vsync_test.c
+@@ -0,0 +1,91 @@
++/*
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All rights reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*=======================================================================
++                                        INCLUDE FILES
++=======================================================================*/
++/* Standard Include Files */
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <unistd.h>
++
++/* Verification Test Environment Include Files */
++#include <sys/ioctl.h>
++#include <sys/fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <linux/compiler.h>
++#include <math.h>
++#include <string.h>
++
++#include <asm/arch/mxcfb.h>
++
++
++int fd_fb = 0;
++
++
++
++int
++main(int argc, char **argv)
++{
++        int count;
++	int i;
++
++        int retval = 0;
++	unsigned int fps;
++	unsigned int total_time;
++        char fbdev[] = "/dev/fb0";
++        struct timeval tv_start, tv_current;
++
++        if (argc != 3) {
++                printf("Usage:\n\n%s <fb #> <count>\n\n", argv[0]);
++                return -1;
++        }
++
++        count = atoi(argv[2]);
++        fbdev[7] = argv[1][0];
++
++        if ((fd_fb = open(fbdev, O_RDWR, 0)) < 0)
++        {
++                printf("Unable to open %s\n", fbdev);
++                retval = -1;
++                goto err0;
++        }
++
++	gettimeofday(&tv_start, 0);
++	for (i = 0; i < count; i++) {
++	        retval = ioctl(fd_fb, MXCFB_WAIT_FOR_VSYNC, &i);
++        	if (retval < 0)
++        	{
++                	goto err1;
++        	}
++	}
++	gettimeofday(&tv_current, 0);
++
++        total_time = (tv_current.tv_sec - tv_start.tv_sec) * 1000000L;
++        total_time += tv_current.tv_usec - tv_start.tv_usec;
++	fps = (i * 1000000ULL) / total_time;
++        printf("total time for %u frames = %u us =  %lld fps\n", i, total_time, (i * 1000000ULL) / total_time);
++
++	if (fps > 45 && fps < 80)
++		retval = 0;
++	else
++		retval = -1;
++
++err1:
++        close(fd_fb);
++err0:
++        return retval;
++}
++
+diff --git a/test/mxc_fb_test/mxc_tve_test.sh b/test/mxc_fb_test/mxc_tve_test.sh
+new file mode 100755
+index 0000000..172d150
+--- /dev/null
++++ b/test/mxc_fb_test/mxc_tve_test.sh
+@@ -0,0 +1,28 @@
++#!/bin/sh
++
++echo Setting TV to NTSC mode
++echo U:720x480i-60 > /sys/class/graphics/fb1/mode
++echo 0 > /sys/class/graphics/fb1/blank
++/unit_tests/mxc_v4l2_output.out -iw 720 -ih 480 -d 5
++sleep 3
++
++echo Blank the display
++echo 3 > /sys/class/graphics/fb1/blank
++sleep 1
++echo Unblank the display
++echo 0 > /sys/class/graphics/fb1/blank
++
++
++echo Setting TV to PAL mode
++echo U:720x576i-50 > /sys/class/graphics/fb1/mode
++/unit_tests/mxc_v4l2_output.out -iw 720 -ih 576 -d 5
++sleep 3
++
++echo Blank the display
++echo 3 > /sys/class/graphics/fb1/blank
++sleep 1
++echo Unblank the display
++echo 0 > /sys/class/graphics/fb1/blank
++
++echo 3 > /sys/class/graphics/fb1/blank
++
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_output.c b/test/mxc_v4l2_test/mxc_v4l2_output.c
+index 8ad7560..11a55c9 100644
+--- a/test/mxc_v4l2_test/mxc_v4l2_output.c
++++ b/test/mxc_v4l2_test/mxc_v4l2_output.c
+@@ -13,9 +13,9 @@
+ 
+ /*
+  * @file mxc_v4l2_overlay.c
+- * 
++ *
+  * @brief Mxc Video For Linux 2 driver test application
+- * 
++ *
+  */
+ 
+ #ifdef __cplusplus
+@@ -31,10 +31,10 @@ extern "C"{
+ #include <errno.h>
+ #include <sys/types.h>
+ #include <stdint.h>
+-#include <sys/stat.h>	
++#include <sys/stat.h>
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
+-#include <unistd.h>    
++#include <unistd.h>
+ #include <linux/videodev.h>
+ #include <sys/mman.h>
+ #include <math.h>
+@@ -142,7 +142,7 @@ void gen_fill_pattern(char * buf, int frame_num)
+ 			if (rgb > 255)
+ 				rgb = 0;
+ 		}
+-		
++
+ 	}
+ 	if (inc_alpha) {
+ 		alpha+=4;
+@@ -188,8 +188,8 @@ mxc_v4l_output_test(FILE *in)
+                 buffers[i].length = buf.length;
+                 buffers[i].offset = (size_t) buf.m.offset;
+                 printf("VIDIOC_QUERYBUF: length = %d, offset = %d\n",  buffers[i].length, buffers[i].offset);
+-                buffers[i].start = mmap (NULL, buffers[i].length, 
+-                                         PROT_READ | PROT_WRITE, MAP_SHARED, 
++                buffers[i].start = mmap (NULL, buffers[i].length,
++                                         PROT_READ | PROT_WRITE, MAP_SHARED,
+                                          fd_v4l, buffers[i].offset);
+                 if (buffers[i].start == NULL) {
+                         printf("v4l2_out test: mmap failed\n");
+@@ -257,7 +257,7 @@ mxc_v4l_output_test(FILE *in)
+                 buf.timestamp.tv_usec = tv_start.tv_usec + (g_frame_period * i);
+                 //printf("buffer timestamp = %d s, %d us\n", buf.timestamp.tv_sec, buf.timestamp.tv_usec);
+                 if (g_extra_pixel) {
+-                	buf.m.offset = buffers[buf.index].offset + g_extra_pixel * 
++                	buf.m.offset = buffers[buf.index].offset + g_extra_pixel *
+                 		(g_in_width + 2 * g_extra_pixel) + g_extra_pixel;
+ 				}
+                 if (ioctl(fd_v4l, VIDIOC_QBUF, &buf) < 0)
+@@ -293,16 +293,16 @@ cleanup:
+ 	return retval;
+ }
+ 
+-int 
++int
+ mxc_v4l_output_setup(struct v4l2_format *fmt)
+ {
+         struct v4l2_requestbuffers buf_req;
+-        
++
+         if (ioctl(fd_v4l, VIDIOC_S_FMT, fmt) < 0)
+         {
+                 printf("set format failed\n");
+                 return TFAIL;
+-        } 
++        }
+ 
+         if (ioctl(fd_v4l, VIDIOC_G_FMT, fmt) < 0)
+         {
+@@ -354,7 +354,9 @@ int fb_setup(void)
+                 if ( ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix) < 0) {
+                         goto err1;
+                 }
+-		if ((g_output == 4) && (strcmp(fb_fix.id, "DISP3 BG") == 0)) {
++		if ((g_output == 5) && (strcmp(fb_fix.id, "DISP3 BG - DI1") == 0)) {
++			break;
++		} else if ((g_output == 4) && (strcmp(fb_fix.id, "DISP3 BG") == 0)) {
+ 			break;
+ 		} else if ((g_output == 3) && (strcmp(fb_fix.id, "DISP3 FG") == 0)) {
+ 			break;
+@@ -403,7 +405,7 @@ int fb_setup(void)
+                 goto err1;
+         }
+ 
+-        
++
+         if (fb_var.bits_per_pixel == 16) {
+                 for (h = g_display_top; h < (g_display_height + g_display_top); h++) {
+                         cur_fb16 = (unsigned short *)((__u32)fb0 + h*fb_fix.line_length);
+@@ -438,13 +440,13 @@ err1:
+ err0:
+         return retval;
+ }
+-        
++
+ 
+ 
+ int process_cmdline(int argc, char **argv)
+ {
+         int i;
+-        
++
+         for (i = 1; i < argc; i++) {
+                 if (strcmp(argv[i], "-iw") == 0) {
+                         g_in_width = atoi(argv[++i]);
+@@ -487,7 +489,7 @@ int process_cmdline(int argc, char **argv)
+                         i++;
+                         g_in_fmt = v4l2_fourcc(argv[i][0], argv[i][1],argv[i][2],argv[i][3]);
+ 
+-                        if ( (g_in_fmt != V4L2_PIX_FMT_BGR24) && 
++                        if ( (g_in_fmt != V4L2_PIX_FMT_BGR24) &&
+                              (g_in_fmt != V4L2_PIX_FMT_BGR32) &&
+                              (g_in_fmt != V4L2_PIX_FMT_RGB565) &&
+                              (g_in_fmt != 'PMBW') &&
+@@ -504,14 +506,14 @@ int process_cmdline(int argc, char **argv)
+ 
+         printf("g_in_width = %d, g_in_height = %d\n", g_in_width, g_in_height);
+         printf("g_display_width = %d, g_display_height = %d\n", g_display_width, g_display_height);
+-        
++
+         if ((g_in_width == 0) || (g_in_height == 0)) {
+                 return -1;
+         }
+         return 0;
+ }
+ 
+-int 
++int
+ main(int argc, char **argv)
+ {
+         struct v4l2_control ctrl;
+@@ -551,7 +553,7 @@ main(int argc, char **argv)
+         {
+                 printf("set output failed\n");
+                 return TFAIL;
+-        } 
++        }
+ 
+         memset(&cropcap, 0, sizeof(cropcap));
+         cropcap.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+@@ -595,7 +597,7 @@ main(int argc, char **argv)
+         else
+                 fb.flags = V4L2_FBUF_FLAG_PRIMARY;
+         ioctl(fd_v4l, VIDIOC_S_FBUF, &fb);
+-        
++
+         memset(&fmt, 0, sizeof(fmt));
+         fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+         fmt.fmt.pix.width=g_in_width;
+@@ -604,12 +606,12 @@ main(int argc, char **argv)
+ 		if (g_extra_pixel) {
+ 			off.u_offset = (2 * g_extra_pixel + g_in_width) * (g_in_height + g_extra_pixel)
+ 				 - g_extra_pixel + (g_extra_pixel / 2) * ((g_in_width / 2)
+-				 + g_extra_pixel) + g_extra_pixel / 2;  
+-			off.v_offset = off.u_offset + (g_extra_pixel + g_in_width / 2) * 
+-				((g_in_height / 2) + g_extra_pixel);  
++				 + g_extra_pixel) + g_extra_pixel / 2;
++			off.v_offset = off.u_offset + (g_extra_pixel + g_in_width / 2) *
++				((g_in_height / 2) + g_extra_pixel);
+         	fmt.fmt.pix.bytesperline = g_in_width + g_extra_pixel * 2;
+ 			fmt.fmt.pix.priv = (uint32_t) &off;
+-        	fmt.fmt.pix.sizeimage = (g_in_width + g_extra_pixel * 2 ) 
++        	fmt.fmt.pix.sizeimage = (g_in_width + g_extra_pixel * 2 )
+         		* (g_in_height + g_extra_pixel * 2) * 3 / 2;
+         } else {
+         	fmt.fmt.pix.bytesperline = g_in_width;
+@@ -629,7 +631,7 @@ main(int argc, char **argv)
+         */
+         if (fd_in)
+                 fseek(fd_in, 0, SEEK_SET);
+-        
++
+         retval = mxc_v4l_output_test(fd_in);
+ 
+         if (fd_in)
+-- 
+1.8.0
+

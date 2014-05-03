@@ -1,0 +1,593 @@
+From 28507a31d84b1384af16ce890e7067fd04f02f95 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Wed, 5 Dec 2012 13:56:24 +0800
+Subject: [PATCH 390/486] ENGR00236896 add esai support
+
+support esai and multichannel for esai
+
+Change-Id: Icc5ab1676cf591c5ab1af4c67978205deab819e7
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/audio_hardware.h |  10 ++-
+ alsa/config_cs42888.h |  61 +++++++++++++++
+ alsa/tinyalsa_hal.c   | 206 +++++++++++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 248 insertions(+), 29 deletions(-)
+ create mode 100644 alsa/config_cs42888.h
+
+diff --git a/alsa/audio_hardware.h b/alsa/audio_hardware.h
+index 8b1e55f..014a065 100644
+--- a/alsa/audio_hardware.h
++++ b/alsa/audio_hardware.h
+@@ -36,6 +36,7 @@ enum tty_modes {
+ enum pcm_type {
+     PCM_NORMAL = 0,
+     PCM_HDMI,
++    PCM_ESAI,
+     PCM_TOTAL,
+ };
+ 
+@@ -43,6 +44,7 @@ enum output_type {
+     OUTPUT_DEEP_BUF,      // deep PCM buffers output stream
+     OUTPUT_PRIMARY,   // low latency output stream
+     OUTPUT_HDMI,
++    OUTPUT_ESAI,
+     OUTPUT_TOTAL
+ };
+ 
+@@ -70,9 +72,9 @@ struct audio_card{
+     struct route_setting *vx_bt_mic_input;
+     struct route_setting *mm_bt_mic_input;
+     int  card;
+-    int  out_rate;
++    unsigned int  out_rate;
+     int  out_channels;
+-    int  in_rate;
++    unsigned int  in_rate;
+     int  in_channels;
+ };
+ 
+@@ -98,12 +100,14 @@ struct imx_audio_device {
+     int tty_mode;
+     struct echo_reference_itfe *echo_reference;
+     bool bluetooth_nrec;
+-    bool device_is_imx;
++    bool device_is_auto;
+     int  wb_amr;
+     bool low_power;
+     struct audio_card *card_list[MAX_AUDIO_CARD_NUM];
+     struct mixer *mixer[MAX_AUDIO_CARD_NUM];
+     int audio_card_num;
++    unsigned int default_rate;               /*HAL input samplerate*/
++    unsigned int mm_rate;                    /*HAL hardware output samplerate*/
+ };
+ 
+ struct imx_stream_out {
+diff --git a/alsa/config_cs42888.h b/alsa/config_cs42888.h
+new file mode 100644
+index 0000000..78ed0e3
+--- /dev/null
++++ b/alsa/config_cs42888.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++/* Copyright (C) 2012 Freescale Semiconductor, Inc. */
++
++#ifndef ANDROID_INCLUDE_IMX_CONFIG_CS42888_H
++#define ANDROID_INCLUDE_IMX_CONFIG_CS42888_H
++
++#include "audio_hardware.h"
++
++/* ALSA cards for IMX, these must be defined according different board / kernel config*/
++static struct audio_card  cs42888_card = {
++    .name = "cs42888-audio",
++    .driver_name = "cs42888-audio",
++    .supported_devices = (AUDIO_DEVICE_OUT_EARPIECE |
++            AUDIO_DEVICE_OUT_SPEAKER |
++            AUDIO_DEVICE_OUT_WIRED_HEADSET |
++            AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
++            AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET |
++            AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET |
++            AUDIO_DEVICE_OUT_ALL_SCO |
++            AUDIO_DEVICE_OUT_DEFAULT |
++            /* IN */
++            AUDIO_DEVICE_IN_COMMUNICATION |
++            AUDIO_DEVICE_IN_AMBIENT |
++            AUDIO_DEVICE_IN_BUILTIN_MIC |
++            AUDIO_DEVICE_IN_WIRED_HEADSET |
++            AUDIO_DEVICE_IN_BACK_MIC |
++            AUDIO_DEVICE_IN_ALL_SCO |
++            AUDIO_DEVICE_IN_DEFAULT),
++    .defaults            = NULL,
++    .bt_output           = NULL,
++    .speaker_output      = NULL,
++    .hs_output           = NULL,
++    .earpiece_output     = NULL,
++    .vx_hs_mic_input     = NULL,
++    .mm_main_mic_input   = NULL,
++    .vx_main_mic_input   = NULL,
++    .mm_hs_mic_input     = NULL,
++    .vx_bt_mic_input     = NULL,
++    .mm_bt_mic_input     = NULL,
++    .card                = 0,
++    .out_rate            = 0,
++    .out_channels        = 0,
++    .in_rate             = 0,
++    .in_channels         = 0,
++};
++
++#endif  /* ANDROID_INCLUDE_IMX_CONFIG_CS42888_H */
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index a0728c3..812e71a 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -16,7 +16,7 @@
+ /* Copyright (C) 2012 Freescale Semiconductor, Inc. */
+ 
+ #define LOG_TAG "audio_hw_primary"
+-#define LOG_NDEBUG 0
++//#define LOG_NDEBUG 0
+ 
+ #include <errno.h>
+ #include <pthread.h>
+@@ -45,6 +45,7 @@
+ #include "config_usbaudio.h"
+ #include "config_nullcard.h"
+ #include "config_spdif.h"
++#include "config_cs42888.h"
+ 
+ 
+ /* ALSA ports for IMX */
+@@ -57,6 +58,9 @@
+ #define HDMI_PERIOD_SIZE       192
+ #define PLAYBACK_HDMI_PERIOD_COUNT      8
+ 
++#define ESAI_PERIOD_SIZE       192
++#define PLAYBACK_ESAI_PERIOD_COUNT      8
++
+ /* number of frames per short period (low latency) */
+ /* align other card with hdmi, same latency*/
+ #define SHORT_PERIOD_SIZE       384
+@@ -87,7 +91,8 @@
+ #define PRODUCT_DEVICE_PROPERTY "ro.product.device"
+ #define PRODUCT_NAME_PROPERTY   "ro.product.name"
+ #define PRODUCT_DEVICE_IMX      "imx"
+-#define SUPPORT_CARD_NUM        6
++#define PRODUCT_DEVICE_AUTO     "sabreauto"
++#define SUPPORT_CARD_NUM        7
+ 
+ /*"null_card" must be in the end of this array*/
+ struct audio_card *audio_card_list[SUPPORT_CARD_NUM] = {
+@@ -96,6 +101,7 @@ struct audio_card *audio_card_list[SUPPORT_CARD_NUM] = {
+     &hdmi_card,
+     &usbaudio_card,
+     &spdif_card,
++    &cs42888_card,
+     &null_card,
+ };
+ 
+@@ -118,6 +124,15 @@ struct pcm_config pcm_config_hdmi_multi = {
+     .start_threshold = 0,
+     .avail_min = 0,
+ };
++struct pcm_config pcm_config_esai_multi = {
++    .channels = 8, /* changed when the stream is opened */
++    .rate = MM_FULL_POWER_SAMPLING_RATE, /* changed when the stream is opened */
++    .period_size = ESAI_PERIOD_SIZE,
++    .period_count = PLAYBACK_ESAI_PERIOD_COUNT,
++    .format = PCM_FORMAT_S16_LE,
++    .start_threshold = 0,
++    .avail_min = 0,
++};
+ 
+ struct pcm_config pcm_config_mm_in = {
+     .channels = 2,
+@@ -151,15 +166,15 @@ static void release_buffer(struct resampler_buffer_provider *buffer_provider,
+ static int adev_get_rate_for_device(struct imx_audio_device *adev, uint32_t devices, unsigned int flag);
+ static int adev_get_channels_for_device(struct imx_audio_device *adev, uint32_t devices, unsigned int flag);
+ 
+-/* Returns true on devices that are toro, false otherwise */
+-static int is_device_imx(void)
++/* Returns true on devices that are sabreauto, false otherwise */
++static int is_device_auto(void)
+ {
+     char property[PROPERTY_VALUE_MAX];
+ 
+-    property_get(PRODUCT_DEVICE_PROPERTY, property, PRODUCT_DEVICE_IMX);
++    property_get(PRODUCT_DEVICE_PROPERTY, property, PRODUCT_DEVICE_AUTO);
+ 
+     /* return true if the property matches the given value */
+-    return strcmp(property, PRODUCT_DEVICE_IMX) == 0;
++    return strstr(property, PRODUCT_DEVICE_AUTO) != NULL;
+ }
+ 
+ /* The enable flag when 0 makes the assumption that enums are disabled by
+@@ -307,7 +322,7 @@ static void select_output_device(struct imx_audio_device *adev)
+         }
+     }
+     /*if mode = AUDIO_MODE_IN_CALL*/
+-    ALOGW("headphone %d ,headset %d ,speaker %d, earpiece %d, \n", headphone_on, headset_on, speaker_on, earpiece_on);
++    ALOGV("headphone %d ,headset %d ,speaker %d, earpiece %d, \n", headphone_on, headset_on, speaker_on, earpiece_on);
+     /* select output stage */
+     for(i = 0; i < MAX_AUDIO_CARD_NUM; i++)
+         set_route_by_array(adev->mixer[i], adev->card_list[i]->bt_output, bt_on);
+@@ -422,9 +437,9 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+     unsigned int port = 0;
+     int i;
+     int pcm_device;
+-    bool success = true;
++    bool success = false;
+ 
+-    ALOGW("start_output_stream... %d, device %d",(int)out, out->device);
++    ALOGV("start_output_stream... %d, device %d",(int)out, out->device);
+ 
+     if (adev->mode != AUDIO_MODE_IN_CALL) {
+         /* FIXME: only works if only one output can be active at a time */
+@@ -433,7 +448,7 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+ 
+     pcm_device = out->device & (AUDIO_DEVICE_OUT_ALL &
+                          ~(AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET | AUDIO_DEVICE_OUT_AUX_DIGITAL));
+-    if (pcm_device) {
++    if (pcm_device && (adev->active_output[OUTPUT_ESAI] == NULL || adev->active_output[OUTPUT_ESAI]->standby)) {
+         out->write_flags[PCM_NORMAL]            = PCM_OUT | PCM_MMAP;
+         out->write_threshold[PCM_NORMAL]        = PLAYBACK_LONG_PERIOD_COUNT * LONG_PERIOD_SIZE;
+         out->config[PCM_NORMAL] = pcm_config_mm_out;
+@@ -442,10 +457,11 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+         out->pcm[PCM_NORMAL] = pcm_open(card, port,out->write_flags[PCM_NORMAL], &out->config[PCM_NORMAL]);
+         ALOGW("card %d, port %d device 0x%x", card, port, out->device);
+         ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_NORMAL].rate, out->config[PCM_NORMAL].channels, out->config[PCM_NORMAL].period_size);
++        success = true;
+     }
+ 
+     pcm_device = out->device & AUDIO_DEVICE_OUT_AUX_DIGITAL;
+-    if(pcm_device && (adev->active_output[OUTPUT_HDMI] == NULL || adev->active_output[OUTPUT_HDMI]->standby) ) {
++    if(pcm_device && (adev->active_output[OUTPUT_HDMI] == NULL || adev->active_output[OUTPUT_HDMI]->standby)) {
+         out->write_flags[PCM_HDMI]            = PCM_OUT;
+         out->write_threshold[PCM_HDMI]        = HDMI_PERIOD_SIZE * PLAYBACK_HDMI_PERIOD_COUNT;
+         out->config[PCM_HDMI] = pcm_config_mm_out;
+@@ -453,6 +469,7 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+         out->pcm[PCM_HDMI] = pcm_open(card, port,out->write_flags[PCM_HDMI], &out->config[PCM_HDMI]);
+         ALOGW("card %d, port %d device 0x%x", card, port, out->device);
+         ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_HDMI].rate, out->config[PCM_HDMI].channels, out->config[PCM_HDMI].period_size);
++        success = true;
+     }
+     /* default to low power: will be corrected in out_write if necessary before first write to
+      * tinyalsa.
+@@ -515,6 +532,37 @@ static int start_output_stream_hdmi(struct imx_stream_out *out)
+     return 0;
+ }
+ 
++static int start_output_stream_esai(struct imx_stream_out *out)
++{
++    struct imx_audio_device *adev = out->dev;
++    unsigned int card = -1;
++    unsigned int port = 0;
++    int i = 0;
++
++    /* force standby on low latency output stream to close HDMI driver in case it was in use */
++    if (adev->active_output[OUTPUT_PRIMARY] != NULL &&
++            !adev->active_output[OUTPUT_PRIMARY]->standby) {
++        struct imx_stream_out *p_out = adev->active_output[OUTPUT_PRIMARY];
++        pthread_mutex_lock(&p_out->lock);
++        do_output_standby(p_out);
++        pthread_mutex_unlock(&p_out->lock);
++    }
++
++    card = get_card_for_device(adev, out->device & AUDIO_DEVICE_OUT_SPEAKER);
++    ALOGW("card %d, port %d device 0x%x", card, port, out->device);
++    ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_ESAI].rate, out->config[PCM_ESAI].channels, out->config[PCM_ESAI].period_size);
++
++    out->pcm[PCM_ESAI] = pcm_open(card, port, PCM_OUT, &out->config[PCM_ESAI]);
++
++    if (out->pcm[PCM_ESAI] && !pcm_is_ready(out->pcm[PCM_ESAI])) {
++        ALOGE("cannot open pcm_out driver: %s", pcm_get_error(out->pcm[PCM_ESAI]));
++        pcm_close(out->pcm[PCM_ESAI]);
++        out->pcm[PCM_ESAI] = NULL;
++        return -ENOMEM;
++    }
++    return 0;
++}
++
+ static int check_input_parameters(uint32_t sample_rate, int format, int channel_count)
+ {
+     if (format != AUDIO_FORMAT_PCM_16_BIT)
+@@ -625,6 +673,7 @@ static int get_playback_delay(struct imx_stream_out *out,
+     size_t kernel_frames;
+     int status;
+     int primary_pcm = 0;
++    struct imx_audio_device *adev = out->dev;
+ 
+     /* Find the first active PCM to act as primary */
+     while ((primary_pcm < PCM_TOTAL) && !out->pcm[primary_pcm])
+@@ -646,7 +695,7 @@ static int get_playback_delay(struct imx_stream_out *out,
+      * Add the duration of current frame as we want the render time of the last
+      * sample being written. */
+     buffer->delay_ns = (long)(((int64_t)(kernel_frames + frames)* 1000000000)/
+-                            MM_FULL_POWER_SAMPLING_RATE);
++                            adev->mm_rate);
+ 
+     return 0;
+ }
+@@ -663,6 +712,12 @@ static uint32_t out_get_sample_rate_hdmi(const struct audio_stream *stream)
+     return out->config[PCM_HDMI].rate;
+ }
+ 
++static uint32_t out_get_sample_rate_esai(const struct audio_stream *stream)
++{
++    struct imx_stream_out *out = (struct imx_stream_out *)stream;
++    return out->config[PCM_ESAI].rate;
++}
++
+ static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
+ {
+     ALOGE("out_set_sample_rate %d", rate);
+@@ -672,11 +727,12 @@ static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
+ static size_t out_get_buffer_size_primary(const struct audio_stream *stream)
+ {
+     struct imx_stream_out *out = (struct imx_stream_out *)stream;
++    struct imx_audio_device *adev = out->dev;
+ 
+     /* take resampling into account and return the closest majoring
+     multiple of 16 frames, as audioflinger expects audio buffers to
+     be a multiple of 16 frames */
+-    size_t size = (pcm_config_mm_out.period_size * DEFAULT_OUT_SAMPLING_RATE) / pcm_config_mm_out.rate;
++    size_t size = (pcm_config_mm_out.period_size * adev->default_rate) / pcm_config_mm_out.rate;
+     size = ((size + 15) / 16) * 16;
+     return size * audio_stream_frame_size((struct audio_stream *)stream);
+ }
+@@ -688,7 +744,19 @@ static size_t out_get_buffer_size_hdmi(const struct audio_stream *stream)
+     /* take resampling into account and return the closest majoring
+     multiple of 16 frames, as audioflinger expects audio buffers to
+     be a multiple of 16 frames */
+-    size_t size = (pcm_config_hdmi_multi.period_size * DEFAULT_OUT_SAMPLING_RATE) / pcm_config_hdmi_multi.rate;
++    size_t size = pcm_config_hdmi_multi.period_size;
++    size = ((size + 15) / 16) * 16;
++    return size * audio_stream_frame_size((struct audio_stream *)stream);
++}
++
++static size_t out_get_buffer_size_esai(const struct audio_stream *stream)
++{
++    struct imx_stream_out *out = (struct imx_stream_out *)stream;
++
++    /* take resampling into account and return the closest majoring
++    multiple of 16 frames, as audioflinger expects audio buffers to
++    be a multiple of 16 frames */
++    size_t size = pcm_config_esai_multi.period_size;
+     size = ((size + 15) / 16) * 16;
+     return size * audio_stream_frame_size((struct audio_stream *)stream);
+ }
+@@ -895,6 +963,13 @@ static uint32_t out_get_latency_hdmi(const struct audio_stream_out *stream)
+     return (pcm_config_hdmi_multi.period_size * pcm_config_hdmi_multi.period_count * 1000) / pcm_config_hdmi_multi.rate;
+ }
+ 
++static uint32_t out_get_latency_esai(const struct audio_stream_out *stream)
++{
++    struct imx_stream_out *out = (struct imx_stream_out *)stream;
++
++    return (pcm_config_esai_multi.period_size * pcm_config_esai_multi.period_count * 1000) / pcm_config_esai_multi.rate;
++}
++
+ static int out_set_volume(struct audio_stream_out *stream, float left,
+                           float right)
+ {
+@@ -967,7 +1042,7 @@ static ssize_t out_write_primary(struct audio_stream_out *stream, const void* bu
+     /* only use resampler if required */
+     for (i = 0; i < PCM_TOTAL; i++) {
+         /* only use resampler if required */
+-        if (out->pcm[i] && (out->config[i].rate != DEFAULT_OUT_SAMPLING_RATE)) {
++        if (out->pcm[i] && (out->config[i].rate != adev->default_rate)) {
+             out_frames = out->buffer_frames;
+             out->resampler->resample_from_input(out->resampler,
+                                                 (int16_t *)buffer,
+@@ -986,12 +1061,11 @@ static ssize_t out_write_primary(struct audio_stream_out *stream, const void* bu
+         get_playback_delay(out, out_frames, &b);
+         out->echo_reference->write(out->echo_reference, &b);
+     }
+-
+     /* do not allow more than out->write_threshold frames in kernel pcm driver buffer */
+     /* Write to all active PCMs */
+     for (i = 0; i < PCM_TOTAL; i++) {
+         if (out->pcm[i]) {
+-            if (out->config[i].rate == DEFAULT_OUT_SAMPLING_RATE) {
++            if (out->config[i].rate == adev->default_rate) {
+                 /* PCM uses native sample rate */
+                 ret = pcm_write_wrapper(out->pcm[i], (void *)buffer, bytes, out->write_flags[i]);
+             } else {
+@@ -1007,7 +1081,7 @@ exit:
+     pthread_mutex_unlock(&out->lock);
+ 
+     if (ret != 0) {
+-        ALOGW("write error, sleep few ms");
++        ALOGV("write error, sleep few ms");
+         usleep(bytes * 1000000 / audio_stream_frame_size(&stream->common) /
+                out_get_sample_rate(&stream->common));
+     }
+@@ -1059,7 +1133,49 @@ exit:
+     pthread_mutex_unlock(&out->lock);
+ 
+     if (ret != 0) {
+-        ALOGW("write error, sleep few ms");
++        ALOGV("write error, sleep few ms");
++        usleep(bytes * 1000000 / audio_stream_frame_size(&stream->common) /
++               out_get_sample_rate(&stream->common));
++    }
++
++    return bytes;
++}
++
++static ssize_t out_write_esai(struct audio_stream_out *stream, const void* buffer,
++                         size_t bytes)
++{
++    int ret;
++    struct imx_stream_out *out = (struct imx_stream_out *)stream;
++    struct imx_audio_device *adev = out->dev;
++    size_t frame_size = audio_stream_frame_size(&out->stream.common);
++    size_t in_frames = bytes / frame_size;
++    size_t out_frames = RESAMPLER_BUFFER_SIZE / frame_size;
++
++    /* acquiring hw device mutex systematically is useful if a low priority thread is waiting
++     * on the output stream mutex - e.g. executing select_mode() while holding the hw device
++     * mutex
++     */
++    pthread_mutex_lock(&adev->lock);
++    pthread_mutex_lock(&out->lock);
++    if (out->standby) {
++        ret = start_output_stream_esai(out);
++        if (ret != 0) {
++            pthread_mutex_unlock(&adev->lock);
++            goto exit;
++        }
++        out->standby = 0;
++    }
++    pthread_mutex_unlock(&adev->lock);
++
++    /* do not allow more than out->write_threshold frames in kernel pcm driver buffer */
++
++    ret = pcm_write_wrapper(out->pcm[PCM_ESAI], (void *)buffer, bytes, out->write_flags[PCM_ESAI]);
++
++exit:
++    pthread_mutex_unlock(&out->lock);
++
++    if (ret != 0) {
++        ALOGV("write error, sleep few ms");
+         usleep(bytes * 1000000 / audio_stream_frame_size(&stream->common) /
+                out_get_sample_rate(&stream->common));
+     }
+@@ -1117,6 +1233,7 @@ static int start_input_stream(struct imx_stream_in *in)
+         }
+     }
+     ALOGW("card %d, port %d device 0x%x", card, port, in->device);
++    ALOGW("rate %d, channel %d period_size 0x%x", in->config.rate, in->config.channels, in->config.period_size);
+ 
+     in->config.stop_threshold = in->config.period_size * in->config.period_count;
+ 
+@@ -1128,7 +1245,7 @@ static int start_input_stream(struct imx_stream_in *in)
+            return -EINVAL;
+         }
+     }else {
+-        if(in->config.rate != MM_FULL_POWER_SAMPLING_RATE ||
++        if(in->config.rate != adev->mm_rate ||
+            in->config.channels != 2) {
+            ALOGE("Input 1 does not support this format!");
+            return -EINVAL;
+@@ -1880,7 +1997,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+     if (!out)
+         return -ENOMEM;
+ 
+-    out->sup_rates[0] = MM_FULL_POWER_SAMPLING_RATE;
++    out->sup_rates[0] = ladev->mm_rate;
+     out->sup_channel_masks[0] = AUDIO_CHANNEL_OUT_STEREO;
+     out->channel_mask = AUDIO_CHANNEL_OUT_STEREO;
+ 
+@@ -1899,7 +2016,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+ 
+         output_type = OUTPUT_HDMI;
+         if (config->sample_rate == 0)
+-            config->sample_rate = MM_FULL_POWER_SAMPLING_RATE;
++            config->sample_rate = ladev->mm_rate;
+         if (config->channel_mask == 0)
+             config->channel_mask = AUDIO_CHANNEL_OUT_5POINT1;
+         out->channel_mask = config->channel_mask;
+@@ -1910,6 +2027,27 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+         out->config[PCM_HDMI] = pcm_config_hdmi_multi;
+         out->config[PCM_HDMI].rate = config->sample_rate;
+         out->config[PCM_HDMI].channels = popcount(config->channel_mask);
++    } else if (flags & AUDIO_OUTPUT_FLAG_DIRECT &&
++                   devices == AUDIO_DEVICE_OUT_SPEAKER && ladev->device_is_auto) {
++        ALOGW("adev_open_output_stream() ESAI multichannel");
++        if (ladev->active_output[OUTPUT_ESAI] != NULL) {
++            ret = -ENOSYS;
++            goto err_open;
++        }
++
++        output_type = OUTPUT_ESAI;
++        if (config->sample_rate == 0)
++            config->sample_rate = ladev->mm_rate;
++        if (config->channel_mask == 0)
++            config->channel_mask = AUDIO_CHANNEL_OUT_5POINT1;
++        out->channel_mask = config->channel_mask;
++        out->stream.common.get_buffer_size = out_get_buffer_size_esai;
++        out->stream.common.get_sample_rate = out_get_sample_rate_esai;
++        out->stream.get_latency = out_get_latency_esai;
++        out->stream.write = out_write_esai;
++        out->config[PCM_ESAI] = pcm_config_esai_multi;
++        out->config[PCM_ESAI].rate = config->sample_rate;
++        out->config[PCM_ESAI].channels = popcount(config->channel_mask);
+     } else {
+         ALOGV("adev_open_output_stream() normal buffer");
+         if (ladev->active_output[OUTPUT_PRIMARY] != NULL) {
+@@ -1923,8 +2061,8 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+         out->stream.write = out_write_primary;
+     }
+ 
+-    ret = create_resampler(DEFAULT_OUT_SAMPLING_RATE,
+-                           MM_FULL_POWER_SAMPLING_RATE,
++    ret = create_resampler(ladev->default_rate,
++                           ladev->mm_rate,
+                            2,
+                            RESAMPLER_QUALITY_DEFAULT,
+                            NULL,
+@@ -2349,8 +2487,17 @@ static int scan_available_device(struct imx_audio_device *adev)
+                          return -EINVAL;
+                     }
+                 }
++
++                rate = 44100;
++                if( pcm_get_near_param(i, 0, PCM_OUT, PCM_HW_PARAM_RATE, &rate) == 0)
++                        adev->card_list[n]->out_rate = rate;
++                ALOGW("out rate %d",adev->card_list[n]->out_rate);
++
++                if(adev->card_list[n]->out_rate > adev->mm_rate)
++                    adev->mm_rate = adev->card_list[n]->out_rate;
++
+                 rate = 8000;
+-                if( pcm_get_near_param(i, 0, PCM_IN,PCM_HW_PARAM_RATE, &rate) == 0)
++                if( pcm_get_near_param(i, 0, PCM_IN, PCM_HW_PARAM_RATE, &rate) == 0)
+                         adev->card_list[n]->in_rate = rate;
+                 ALOGW("in rate %d",adev->card_list[n]->in_rate);
+ 
+@@ -2422,6 +2569,7 @@ static int adev_open(const hw_module_t* module, const char* name,
+     adev->hw_device.open_input_stream       = adev_open_input_stream;
+     adev->hw_device.close_input_stream      = adev_close_input_stream;
+     adev->hw_device.dump                    = adev_dump;
++    adev->mm_rate                           = 44100;
+ 
+     ret = scan_available_device(adev);
+     if (ret != 0) {
+@@ -2429,6 +2577,12 @@ static int adev_open(const hw_module_t* module, const char* name,
+         return ret;
+     }
+ 
++    adev->default_rate                      = adev->mm_rate;
++    pcm_config_mm_out.rate                  = adev->mm_rate;
++    pcm_config_mm_in.rate                   = adev->mm_rate;
++    pcm_config_hdmi_multi.rate              = adev->mm_rate;
++    pcm_config_esai_multi.rate              = adev->mm_rate;
++
+     /* Set the default route before the PCM stream is opened */
+     pthread_mutex_lock(&adev->lock);
+     for(i = 0; i < MAX_AUDIO_CARD_NUM; i++)
+@@ -2441,7 +2595,7 @@ static int adev_open(const hw_module_t* module, const char* name,
+     adev->pcm_modem_ul  = NULL;
+     adev->voice_volume  = 1.0f;
+     adev->tty_mode      = TTY_MODE_OFF;
+-    adev->device_is_imx = is_device_imx();
++    adev->device_is_auto = is_device_auto();
+     adev->bluetooth_nrec = true;
+     adev->wb_amr = 0;
+     pthread_mutex_unlock(&adev->lock);
+-- 
+1.8.0
+

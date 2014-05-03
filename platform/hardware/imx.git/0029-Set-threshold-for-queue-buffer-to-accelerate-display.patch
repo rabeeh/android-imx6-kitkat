@@ -1,0 +1,234 @@
+From 1c6dc33ceeb01ba9035c4fc73c295d794cad7427 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Tue, 30 Mar 2010 10:39:06 -0400
+Subject: [PATCH 029/486] Set threshold for queue buffer to accelerate display
+ speed Signed-off-by: guoyin.chen
+ <guoyin.chen@freescale.com>
+
+---
+ liboverlay/overlay.cpp       | 38 +++++++++++++++++++++++++++++++-------
+ liboverlay/overlay_pmem.cpp  | 15 +++++++++++++++
+ liboverlay/overlay_pmem.h    | 15 +++++++++++++++
+ liboverlay/overlay_thread.h  | 20 +++++++++++++++++++-
+ liboverlay/overlay_utils.h   | 18 +++++++++++++++++-
+ liboverlay/overlays_test.cpp | 15 +++++++++++++++
+ 6 files changed, 112 insertions(+), 9 deletions(-)
+
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+index 0792990..4a7d76c 100755
+--- a/liboverlay/overlay.cpp
++++ b/liboverlay/overlay.cpp
+@@ -130,6 +130,7 @@ struct overlay_data_context_t {
+     int height;
+     int32_t format;
+     int num_buffer;//Number of buffers for overlay
++    int queue_threshold;
+     int buf_size;
+     int buf_queued;
+     OverlayAllocator *allocator;
+@@ -1272,6 +1273,7 @@ int overlay_data_initialize(struct overlay_data_device_t *dev,
+         ctx->data_shared->free_tail++;
+         pOverlayBuf++;
+     }
++    ctx->queue_threshold = OVERLAY_QUEUE_THRESHOLD;
+     pthread_mutex_unlock(&ctx->data_shared->obj_lock);
+     OVERLAY_LOG_INFO("Overlay init success for Id %d",ctx->data_shared->instance_id);
+     
+@@ -1329,9 +1331,11 @@ int overlay_data_dequeueBuffer(struct overlay_data_device_t *dev,
+             //fetch the buffer handle
+             //return the buffer handle
+             unsigned int phy_addr = data_shared->free_bufs[data_shared->free_head];
+-            OVERLAY_LOG_RUNTIME("Id %d:Have free buffer %d,head %d, phy 0x%x",
++            OVERLAY_LOG_RUNTIME("Id %d:Have free buffer %d,head %d, tail %d,phy 0x%x",
+                                 data_shared->instance_id,
+-                                data_shared->free_count,data_shared->free_head,
++                                data_shared->free_count,
++                                data_shared->free_head,
++                                data_shared->free_tail,
+                                 phy_addr);
+             data_shared->free_bufs[data_shared->free_head] = 0;
+             data_shared->free_head++;
+@@ -1392,11 +1396,22 @@ int overlay_data_queueBuffer(struct overlay_data_device_t *dev,
+ 
+     pthread_mutex_lock(&data_shared->obj_lock);
+     //Insert buffer to display buffer queue
+-    if(data_shared->queued_count >= ctx->num_buffer) {
+-        OVERLAY_LOG_ERR("Error!Id %d:Queued overlay buffer is out of number buffers supported",
+-                        data_shared->instance_id);
+-        pthread_mutex_unlock(&data_shared->obj_lock);
+-        return -EINVAL;
++    if(data_shared->queued_count >= ctx->queue_threshold) {
++        //Wait a buffer be mixered
++        data_shared->wait_buf_flag = 1;
++        //post sempore to notify mixer thread, give mixer thread a chance to free a buffer
++        if(ctx->control_shared) {
++            sem_post(&ctx->control_shared->overlay_sem);
++        }
++        pthread_cond_wait(&data_shared->free_cond, &data_shared->obj_lock);
++        if(data_shared->wait_buf_flag != 0) {
++            OVERLAY_LOG_ERR("Error!Id %d:Queued overlay buffer is out of number buffers supported",
++                    data_shared->instance_id);
++            pthread_mutex_unlock(&data_shared->obj_lock);
++            return -EINVAL;
++
++        }
++        OVERLAY_LOG_RUNTIME("Id %d:Wait a free slot for queue buffer",data_shared->instance_id);
+     }
+ 
+     int phy_addr = overlay_buf->phy_addr;
+@@ -1404,6 +1419,15 @@ int overlay_data_queueBuffer(struct overlay_data_device_t *dev,
+                         data_shared->instance_id,
+                         phy_addr,data_shared->queued_tail,data_shared->queued_count+1);
+ 
++    //Check whether it is duplicated in the queue
++    for(int i= 0;i < data_shared->queued_count;i++) {
++        if(phy_addr == data_shared->queued_bufs[(data_shared->queued_head+i)%MAX_OVERLAY_BUFFER_NUM]) {
++            OVERLAY_LOG_WARN("Warning!This buffer is duplicated at queue,will be ignored");
++            pthread_mutex_unlock(&data_shared->obj_lock);
++            return -EINVAL;
++        }
++    }
++
+     data_shared->queued_bufs[data_shared->queued_tail] = phy_addr;
+     data_shared->queued_tail++;
+     data_shared->queued_tail = data_shared->queued_tail%MAX_OVERLAY_BUFFER_NUM;
+diff --git a/liboverlay/overlay_pmem.cpp b/liboverlay/overlay_pmem.cpp
+index 4b25cf6..ff26c2b 100755
+--- a/liboverlay/overlay_pmem.cpp
++++ b/liboverlay/overlay_pmem.cpp
+@@ -1,3 +1,18 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
+diff --git a/liboverlay/overlay_pmem.h b/liboverlay/overlay_pmem.h
+index ff310b8..e7e7d65 100755
+--- a/liboverlay/overlay_pmem.h
++++ b/liboverlay/overlay_pmem.h
+@@ -1,3 +1,18 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
+ #ifndef __OVERLAY_H__
+ #define __OVERLAY_H__
+ 
+diff --git a/liboverlay/overlay_thread.h b/liboverlay/overlay_thread.h
+index cd8e793..f89fe32 100755
+--- a/liboverlay/overlay_thread.h
++++ b/liboverlay/overlay_thread.h
+@@ -1,3 +1,18 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
+ #ifndef __OVERLAY_THREAD_H__
+ #define __OVERLAY_THREAD_H__
+ 
+@@ -533,7 +548,10 @@ free_buf_exit:
+                 dataShared0->free_tail++;
+                 dataShared0->free_tail = dataShared0->free_tail%MAX_OVERLAY_BUFFER_NUM;
+                 dataShared0->free_count++;
+-
++                if(dataShared0->free_count > dataShared0->num_buffer) {
++                    OVERLAY_LOG_ERR("Error!free_count %d is greater the total number %d",
++                                    dataShared0->free_count,dataShared0->num_buffer);
++                }
+ 
+                 if(dataShared0->wait_buf_flag) {
+                     dataShared0->wait_buf_flag = 0;
+diff --git a/liboverlay/overlay_utils.h b/liboverlay/overlay_utils.h
+index 446ed71..7ab785e 100755
+--- a/liboverlay/overlay_utils.h
++++ b/liboverlay/overlay_utils.h
+@@ -1,4 +1,18 @@
+-
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
+ 
+ #ifndef __OVERLAY_UTILS_H__
+ #define __OVERLAY_UTILS_H__
+@@ -19,6 +33,8 @@
+ #define MAX_OVERLAY_INPUT_W 1280
+ #define MAX_OVERLAY_INPUT_H 720
+ 
++#define OVERLAY_QUEUE_THRESHOLD 2
++
+ #define FULL_TRANSPARANT_VALUE 255
+ 
+ #define SHARED_CONTROL_MARKER             (0x4F564354) //OVCT
+diff --git a/liboverlay/overlays_test.cpp b/liboverlay/overlays_test.cpp
+index bdca120..79cb925 100755
+--- a/liboverlay/overlays_test.cpp
++++ b/liboverlay/overlays_test.cpp
+@@ -1,3 +1,18 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
+ #include <binder/IPCThreadState.h>
+ #include <binder/ProcessState.h>
+ #include <binder/IServiceManager.h>
+-- 
+1.8.0
+

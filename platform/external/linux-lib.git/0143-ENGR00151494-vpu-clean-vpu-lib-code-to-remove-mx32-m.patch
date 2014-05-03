@@ -1,0 +1,1029 @@
+From 9961759e4ed35af3fb0d21cf3e03c23ffbc31b70 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 15 Jun 2011 21:28:07 +0800
+Subject: [PATCH 143/249] ENGR00151494 vpu: clean vpu lib code to remove
+ mx32/mx37 vpu
+
+The vpu for mx32/mx37 is out of date and we havn't supported
+the platforms for long time. So removing the code to make it easier
+for reading.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/Makefile   |  11 +--
+ vpu/vpu_io.c   | 131 +--------------------------------
+ vpu/vpu_io.h   |   8 +-
+ vpu/vpu_lib.c  | 226 +++++++++++----------------------------------------------
+ vpu/vpu_lib.h  |  16 +---
+ vpu/vpu_reg.h  |  62 ++--------------
+ vpu/vpu_util.c |  44 +----------
+ vpu/vpu_util.h |  18 +----
+ 8 files changed, 60 insertions(+), 456 deletions(-)
+
+diff --git a/vpu/Makefile b/vpu/Makefile
+index 75582e3..1e964e5 100644
+--- a/vpu/Makefile
++++ b/vpu/Makefile
+@@ -2,7 +2,7 @@ CC=$(CROSS_COMPILE)gcc
+ AR=$(CROSS_COMPILE)ar
+ 
+ # list of platforms which want this test case
+-INCLUDE_LIST:= IMX27ADS IMX31ADS IMX32ADS IMX37_3STACK IMX51 IMX53
++INCLUDE_LIST:= IMX27ADS IMX51 IMX53
+ 
+ OBJ = vpu_io.o vpu_util.o vpu_lib.o
+ 
+@@ -10,15 +10,6 @@ LIBNAME = libvpu
+ 
+ ifeq ($(PLATFORM), $(findstring $(PLATFORM), $(INCLUDE_LIST)))
+ 
+-# Same platform ID is used when building for imx31ads and imx32ads.
+-# Change version number in bin filename to imx32 if passed platform is
+-# imx31ads since there is no VPU module in imx31ads.
+-ifeq ($(PLATFORM), IMX31ADS)
+-PLATFORM_STR = IMX32ADS
+-else
+-PLATFORM_STR = $(PLATFORM)
+-endif
+-
+ ifeq ($(findstring IMX5, $(PLATFORM)), IMX5)
+ VERSION = imx5
+ else
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index eb43ab8..7cbbf00 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -52,97 +52,6 @@ vpu_mem_desc user_data_addr;
+ 
+ int _IOGetPhyMem(int which, vpu_mem_desc *buff);
+ 
+-/*
+- * Note: the order does not correspond to the bit order in BIT_AXI_SRAM_USE
+- * register, but correspond to the items in use_iram_table array.
+- * So if there's any IRAM size change in use_iram_table array, may consider
+- * change this enumeration accordingly.
+- */
+-enum {
+-	USE_DBK_INTERNAL_BUF,	/* MPEG-4 and MPEG-2 output deblocking */
+-	USE_OVL_INTERNAL_BUF,	/* overlap filter */
+-	USE_IP_INTERNAL_BUF,	/* intra/ACDC prediction */
+-	USE_BIT_INTERNAL_BUF,	/* MB prediction */
+-};
+-
+-/* MX37 MAX Resolution: D1 */
+-#define NR_ENTRY	3
+-Uint32 use_iram_table[][NR_ENTRY] = {
+-	/*
+-	 * NOTE: Sorted in the descending order of IRAM usage in bytes.
+-	 *
+-	 * The effect of each option is in proportion to the necessary
+-	 * SRAM size of each option. Currently VPU will get the free space of
+-	 * IRAM from kernel via ioctl interface, and set the corresponding one
+-	 * (to satisfy the bigger one first, since it'll impact VPU performance
+-	 * most).
+-	 *
+-	 * {VPU Register Address Offset, IRAM Size, Flag indicating used or not}
+-	 */
+-	{0x19C, 25600, 0},
+-	{0x1A0, 8000, 0},
+-	{0x198, 6400, 0},
+-	{0x190, 6400, 0},
+-};
+-
+-int get_iram_setting(struct iram_t iram, Uint32 array[][NR_ENTRY],
+-						int array_size)
+-{
+-	int i;
+-	int total = iram.end - iram.start + 1;
+-
+-	dprintf(3, "VPU uses IRAM starting @ 0x%08lx\n", iram.start);
+-
+-	/* Clear the Flag first */
+-	for (i = 0; i < array_size; i++)
+-		use_iram_table[i][2] = 0;
+-
+-	i = array_size - 1;
+-	if (total < array[i][1])
+-		return  -1;
+-
+-	while ((total > array[i][1]) && i > 0) {
+-		i--;
+-	}
+-
+-	while (total > array[i][1] && i < array_size) {
+-		use_iram_table[i][2] = 1;
+-
+-		total -= array[i][1];
+-		i++;
+-	}
+-
+-	return 0;
+-}
+-
+-int set_iram(struct iram_t iram, Uint32 array[][NR_ENTRY], int array_size)
+-{
+-	int i, j, offset;
+-	int use_iram_bits;
+-
+-	use_iram_bits = array[USE_OVL_INTERNAL_BUF][2] << 3 |
+-			array[USE_DBK_INTERNAL_BUF][2] << 2 |
+-			array[USE_IP_INTERNAL_BUF][2] << 1 |
+-			array[USE_BIT_INTERNAL_BUF][2];
+-	IOClkGateSet(true);
+-	VpuWriteReg(BIT_AXI_SRAM_USE, use_iram_bits);
+-	dprintf(3, "use iram_bits:%08x\n", use_iram_bits);
+-
+-	for (i = 0; i < array_size; i++) {
+-		offset = 0;
+-		for (j = 0; j < i; j++)
+-			offset += array[j][1];
+-
+-		/* Set the corresponding IRAM address in VPU register */
+-		if (array[i][2]) {
+-			VpuWriteReg(array[i][0], iram.start + offset);
+-		}
+-	}
+-	IOClkGateSet(false);
+-
+-	return 0;
+-}
+-
+ int isVpuInitialized(void)
+ {
+ 	int val;
+@@ -283,19 +192,6 @@ int IOSystemInit(void *callback)
+ 	return -1;
+ }
+ 
+-void vpu_setting_iram()
+-{
+-	struct iram_t iram;
+-	int ret;
+-
+-	if (cpu_is_mx37()) {
+-		IOGetIramBase(&iram);
+-		ret = get_iram_setting(iram, use_iram_table, 4);
+-		if (ret != -1)
+-			set_iram(iram, use_iram_table, 4);
+-	}
+-}
+-
+ /*!
+  * @brief IO system shut down.
+  *
+@@ -412,16 +308,6 @@ int IOGetPhyShareMem(vpu_mem_desc * buff)
+         return _IOGetPhyMem(VPU_IOC_GET_SHARE_MEM, buff);
+ }
+ 
+-int IOGetPhyPicParaMem(vpu_mem_desc * buff)
+-{
+-	return _IOGetPhyMem(VPU_IOC_GET_PIC_PARA_ADDR, buff);
+-}
+-
+-int IOGetPhyUserDataMem(vpu_mem_desc * buff)
+-{
+-	return _IOGetPhyMem(VPU_IOC_GET_USER_DATA_ADDR, buff);
+-}
+-
+ /*!
+  * @brief Free specified memory
+  * When user wants to free massive memory for the system,
+@@ -453,16 +339,6 @@ int IOFreePhyMem(vpu_mem_desc * buff)
+ 	return _IOFreePhyMem(VPU_IOC_PHYMEM_FREE, buff);
+ }
+ 
+-int IOFreePhyPicParaMem(vpu_mem_desc * buff)
+-{
+-	return _IOFreePhyMem(VPU_IOC_GET_PIC_PARA_ADDR, buff);
+-}
+-
+-int IOFreePhyUserDataMem(vpu_mem_desc * buff)
+-{
+-	return _IOFreePhyMem(VPU_IOC_GET_USER_DATA_ADDR, buff);
+-}
+-
+ /*!
+  * @brief Map physical memory to user space.
+  *
+@@ -526,11 +402,6 @@ int IOGetIramBase(iram_t * iram)
+ 	return ret;
+ }
+ 
+-void vl2cc_flush()
+-{
+-	ioctl(vpu_fd, VPU_IOC_VL2CC_FLUSH, NULL);
+-}
+-
+ /*!
+  * @brief turn off(/on) the VPU core clock and serial clock to save power
+  *
+diff --git a/vpu/vpu_io.h b/vpu/vpu_io.h
+index 92f52f1..f3e21eb 100644
+--- a/vpu/vpu_io.h
++++ b/vpu/vpu_io.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -53,12 +53,9 @@ typedef struct iram_t {
+ #define VPU_IOC_WAIT4INT	_IO(VPU_IOC_MAGIC, 2)
+ #define	VPU_IOC_PHYMEM_DUMP	_IO(VPU_IOC_MAGIC, 3)
+ #define	VPU_IOC_REG_DUMP	_IO(VPU_IOC_MAGIC, 4)
+-#define	VPU_IOC_VL2CC_FLUSH	_IO(VPU_IOC_MAGIC, 5)
+ #define	VPU_IOC_IRAM_BASE	_IO(VPU_IOC_MAGIC, 6)
+ #define	VPU_IOC_CLKGATE_SETTING	_IO(VPU_IOC_MAGIC, 7)
+ #define VPU_IOC_GET_WORK_ADDR   _IO(VPU_IOC_MAGIC, 8)
+-#define VPU_IOC_GET_PIC_PARA_ADDR   _IO(VPU_IOC_MAGIC, 9)
+-#define VPU_IOC_GET_USER_DATA_ADDR   _IO(VPU_IOC_MAGIC, 10)
+ #define VPU_IOC_SYS_SW_RESET	_IO(VPU_IOC_MAGIC, 11)
+ #define VPU_IOC_GET_SHARE_MEM   _IO(VPU_IOC_MAGIC, 12)
+ 
+@@ -74,8 +71,6 @@ int IOWaitForInt(int timeout_in_ms);
+ int IOGetIramBase(iram_t * iram);
+ int IOClkGateSet(int on);
+ int IOGetPhyShareMem(vpu_mem_desc * buff);
+-int IOFreePhyPicParaMem(vpu_mem_desc * buff);
+-int IOFreePhyUserDataMem(vpu_mem_desc * buff);
+ int IOSysSWReset(void);
+ 
+ unsigned long VpuWriteReg(unsigned long addr, unsigned int data);
+@@ -83,6 +78,5 @@ unsigned long VpuReadReg(unsigned long addr);
+ 
+ void ResetVpu(void);
+ int isVpuInitialized(void);
+-void vl2cc_flush(void);
+ 
+ #endif
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index ec3e77f..a3ffa20 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -33,13 +33,8 @@
+ #include "vpu_io.h"
+ #include "vpu_debug.h"
+ 
+-#if defined(IMX37_3STACK)
+-#define IMAGE_ENDIAN			1
+-#define STREAM_ENDIAN			1
+-#else
+ #define IMAGE_ENDIAN			0
+ #define STREAM_ENDIAN			0
+-#endif
+ 
+ static PhysicalAddress rdPtrRegAddr[] = {
+ 	BIT_RD_PTR_0,
+@@ -159,7 +154,7 @@ RetCode vpu_Init(void *cb)
+ 		VpuWriteReg(BIT_PARA_BUF_ADDR, paraBuffer);
+ 		VpuWriteReg(BIT_CODE_BUF_ADDR, codeBuffer);
+ 
+-		if (!cpu_is_mx5x())
++		if (cpu_is_mx27())
+ 			VpuWriteReg(BIT_RESET_CTRL, 0);
+ 
+ 		VpuWriteReg(BIT_BIT_STREAM_PARAM, 0);
+@@ -191,16 +186,11 @@ RetCode vpu_Init(void *cb)
+ 		VpuWriteReg(BIT_BIT_STREAM_CTRL, data);
+ 		VpuWriteReg(BIT_FRAME_MEM_CTRL, IMAGE_ENDIAN);
+ 		VpuWriteReg(BIT_INT_ENABLE, 8);	/* PIC_RUN irq enable */
+-
+-		if (cpu_is_mx5x())
+-			VpuWriteReg(BIT_AXI_SRAM_USE, 0);	/* init to not use SRAM */
++		VpuWriteReg(BIT_AXI_SRAM_USE, 0);	/* init to not use SRAM */
+ 
+ 		if (cpu_is_mx27()) {
+ 			ResetVpu();
+ 		}
+-		/* TODO currently can not use IRAM on mx37 */
+-		if (cpu_is_mx37())
+-			VpuWriteReg(BIT_AXI_SRAM_USE, 0);
+ 
+ 		VpuWriteReg(BIT_BUSY_FLAG, 1);
+ 		VpuWriteReg(BIT_CODE_RUN, 1);
+@@ -301,10 +291,7 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 		}
+ 	} else {
+ 		for (i = 0; i < 2048; i += 2) {
+-			if (cpu_is_mx37())
+-				data = swab32(p[i / 2]);
+-			else
+-				data = p[i / 2];
++			data = p[i / 2];
+ 			data_hi = (data >> 16) & 0xFFFF;
+ 			data_lo = data & 0xFFFF;
+ 
+@@ -365,15 +352,6 @@ RetCode vpu_GetVersionInfo(vpu_versioninfo * verinfo)
+ 	case PRJ_TRISTAN_REV:
+ 		strcpy(productstr, "i.MX27");
+ 		break;
+-	case PRJ_PRISM_CX:
+-	case PRJ_PRISM_EX:
+-	case PRJ_BODA_CX_4:
+-	case PRJ_BODA_DX_4V:
+-		strcpy(productstr, "i.MX32");
+-		break;
+-	case PRJ_BODADX7X:
+-		strcpy(productstr, "i.MX37");
+-		break;
+ 	case PRJ_CODAHX_14:
+ 		strcpy(productstr, "i.MX51");
+ 		break;
+@@ -1887,12 +1865,6 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	pDecInfo->rotatorStride = 0;
+ 	pDecInfo->deringEnable = 0;
+ 
+-	if (cpu_is_mx37()) {
+-		pDecInfo->dbkOffset.DbkOffsetEnable = 0;
+-		pDecInfo->dbkOffset.DbkOffsetA = 0;
+-		pDecInfo->dbkOffset.DbkOffsetB = 0;
+-	}
+-
+ 	pDecInfo->filePlayEnable = pop->filePlayEnable;
+ 	if (pop->filePlayEnable == 1) {
+ 		pDecInfo->picSrcSize =
+@@ -1922,7 +1894,7 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 		    VpuReadReg(BIT_BIT_STREAM_PARAM) & ~(1 << (instIdx + 2)));
+ 	UnlockVpuReg(vpu_semap);
+ 
+-	bit_offset = cpu_is_mx37() ? (instIdx + 1) : (instIdx + 2);
++	bit_offset = instIdx + 2;
+ 	val = VpuReadReg(BIT_FRAME_MEM_CTRL) & ~(1 << bit_offset);
+ 	VpuWriteReg(BIT_FRAME_MEM_CTRL,
+ 		    val | (pDecInfo->openParam.chromaInterleave << bit_offset));
+@@ -2150,7 +2122,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	}
+ 
+ 	val = VpuReadReg(RET_DEC_SEQ_SRC_SIZE);
+-	if (cpu_is_mx37() || cpu_is_mx5x()) {
++	if (cpu_is_mx5x()) {
+ 		info->picWidth = ((val >> 16) & 0xffff);
+ 		info->picHeight = (val & 0xffff);
+ 	} else {
+@@ -2239,13 +2211,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 			}
+ 	}
+ 
+-	if (cpu_is_mx37()) {
+-		val = VpuReadReg(RET_DEC_SEQ_INFO);
+-		info->profile = (val >> 4) & 0xFF;
+-		info->level = (val >> 12) & 0xFF;
+-		info->interlace = (val >> 20) & 0x0001;
+-		info->vc1_psf = (val >>22) & 0x0001;
+-	} else if (cpu_is_mx5x()) {
++	if (cpu_is_mx5x()) {
+ 		val = VpuReadReg(RET_DEC_SEQ_HEADER_REPORT);
+ 		info->profile =	(val >> 0) & 0xFF;
+ 		info->level = (val >> 8) & 0xFF;
+@@ -2265,7 +2231,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	info->reportBufSize.mbInfoBufSize = SIZE_MB_DATA;
+ 	info->reportBufSize.mvInfoBufSize = SIZE_MV_DATA;
+ 
+-	if (cpu_is_mx37() || cpu_is_mx5x())
++	if (cpu_is_mx5x())
+ 		info->streamInfoObtained = 1;
+ 	else
+ 		info->streamInfoObtained = 0;
+@@ -2276,7 +2242,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	pDecInfo->initialInfoObtained = 1;
+ 
+ 	/* Set secondAXI IRAM */
+-	if (!cpu_is_mx37()) {
++	if (cpu_is_mx5x()) {
+ 		iramParam.width = (info->picWidth + 15) & ~15;
+ 		iramParam.profile = info->profile;
+ 		iramParam.codecMode = pCodecInst->codecMode;
+@@ -2352,28 +2318,15 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+-	if (!cpu_is_mx5x()) {
++	if (cpu_is_mx27()) {
+ 		/* Let the codec know the addresses of the frame buffers. */
+ 		for (i = 0; i < num; ++i) {
+-			if (cpu_is_mx37()) {
+-				virt_paraBuf[i * 3] = swab32(bufArray[i].bufY);
+-				virt_paraBuf[i * 3 + 1] =
+-				    swab32(bufArray[i].bufCb);
+-				virt_paraBuf[i * 3 + 2] =
+-				    swab32(bufArray[i].bufCr);
+-				if (pDecInfo->openParam.bitstreamFormat ==
+-				    STD_AVC) {
+-					virt_paraBuf[i + 96] =
+-					    swab32(bufArray[i].bufMvCol);
+-				}
+-			} else {
+-				virt_paraBuf[i * 3] = bufArray[i].bufY;
+-				virt_paraBuf[i * 3 + 1] = bufArray[i].bufCb;
+-				virt_paraBuf[i * 3 + 2] = bufArray[i].bufCr;
+-			}
++			virt_paraBuf[i * 3] = bufArray[i].bufY;
++			virt_paraBuf[i * 3 + 1] = bufArray[i].bufCb;
++			virt_paraBuf[i * 3 + 2] = bufArray[i].bufCr;
+ 		}
+ 	} else {
+-		/* mx51 case need to swap word */
++		/* mx5x case need to swap word */
+ 		for (i = 0; i < num; i += 2) {
+ 			virt_paraBuf[i * 3] = bufArray[i].bufCb;
+ 			virt_paraBuf[i * 3 + 1] = bufArray[i].bufY;
+@@ -2395,20 +2348,12 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 		    pDecInfo->openParam.bitstreamFormat == STD_RV)
+ 			virt_paraBuf[97] = bufArray[0].bufMvCol;
+ 	}
+-	if (cpu_is_mx37()) {
+-		if (pDecInfo->openParam.bitstreamFormat == STD_VC1 ||
+-		    pDecInfo->openParam.bitstreamFormat == STD_MPEG4) {
+-			virt_paraBuf[96] = swab32(bufArray[0].bufMvCol);
+-		}
+-	}
+ 
+ 	/* Tell the decoder how much frame buffers were allocated. */
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_NUM, num);
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_STRIDE, stride);
+ 
+-	if (cpu_is_mx37() && pDecInfo->openParam.bitstreamFormat != STD_VC1)
+-		vpu_setting_iram();
+-	else if (cpu_is_mx5x()) {
++	if (cpu_is_mx5x()) {
+ 		VpuWriteReg(CMD_SET_FRAME_AXI_BIT_ADDR, pDecInfo->secAxiUse.bufBitUse);
+ 		VpuWriteReg(CMD_SET_FRAME_AXI_IPACDC_ADDR, pDecInfo->secAxiUse.bufIpAcDcUse);
+ 		VpuWriteReg(CMD_SET_FRAME_AXI_DBKY_ADDR, pDecInfo->secAxiUse.bufDbkYUse);
+@@ -2661,7 +2606,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+-	if ((cpu_is_mx37() || cpu_is_mx5x()) && pDecInfo->deringEnable) {
++	if (cpu_is_mx5x() && pDecInfo->deringEnable) {
+ 		rotMir |= 0x20;	/* Enable Dering Filter */
+ 	}
+ 
+@@ -2678,26 +2623,6 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 
+ 	VpuWriteReg(CMD_DEC_PIC_ROT_MODE, rotMir);
+ 
+-	if (cpu_is_mx32()) {
+-		if (pCodecInst->codecMode == MP4_DEC &&
+-		    pDecInfo->openParam.mp4DeblkEnable == 1) {
+-			if (pDecInfo->deBlockingFilterOutputValid) {
+-				VpuWriteReg(CMD_DEC_PIC_DBK_ADDR_Y,
+-					    pDecInfo->deBlockingFilterOutput.
+-					    bufY);
+-				VpuWriteReg(CMD_DEC_PIC_DBK_ADDR_CB,
+-					    pDecInfo->deBlockingFilterOutput.
+-					    bufCb);
+-				VpuWriteReg(CMD_DEC_PIC_DBK_ADDR_CR,
+-					    pDecInfo->deBlockingFilterOutput.
+-					    bufCr);
+-			} else {
+-				UnlockVpu(vpu_semap);
+-				return RETCODE_DEBLOCKING_OUTPUT_NOT_SET;
+-			}
+-		}
+-	}
+-
+ 	if (pDecInfo->decReportMBInfo.enable || pDecInfo->decReportMVInfo.enable ||
+ 	    pDecInfo->decReportFrameBufStat.enable) {
+ 		if (!pDecInfo->picParaBaseMem.phy_addr) {
+@@ -2737,24 +2662,6 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 				*(virt_addr + 4) = phy_addr + ADDR_MV_BASE_OFFSET;
+ 			}
+ 		}
+-		if (cpu_is_mx37()) {
+-			Uint32 *virt_addr, phy_addr;
+-
+-			virt_addr = (Uint32 *)pDecInfo->picParaBaseMem.virt_uaddr;
+-			phy_addr = pDecInfo->picParaBaseMem.phy_addr;
+-			/* Set frameStat buffer address */
+-			if (pDecInfo->decReportFrameBufStat.enable) {
+-				*(virt_addr + 1) = swab32(phy_addr + ADDR_FRAME_BUF_STAT_BASE_OFFSET);
+-			}
+-			/* Set mbParam buffer address */
+-			if (pDecInfo->decReportMBInfo.enable) {
+-				*(virt_addr + 3) = swab32(phy_addr + ADDR_MB_BASE_OFFSET);
+-			}
+-			/* Set mvParam buffer address */
+-			if (pDecInfo->decReportMVInfo.enable) {
+-				*(virt_addr + 5) = swab32(phy_addr + ADDR_MV_BASE_OFFSET);
+-			}
+-		}
+ 	}
+ 
+ 	if (pDecInfo->decReportUserData.enable &&
+@@ -2779,13 +2686,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	}
+ 
+ 	val = 0;
+-	if (cpu_is_mx37())
+-		val |= (pDecInfo->dbkOffset.DbkOffsetEnable << 9);
+-
+-	if (cpu_is_mx37() || cpu_is_mx5x()) {
+-		if (cpu_is_mx37())
+-			val |= (param->skipframeNum << 16);
+-
++	if (cpu_is_mx5x()) {
+ 		val |= (1 << 10); /* hardcode to use interrupt disable mode  */
+ 		val |= (pDecInfo->decReportFrameBufStat.enable << 8);
+ 		val |= (pDecInfo->decReportMBInfo.enable << 7);
+@@ -2815,18 +2716,10 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	}
+ 	VpuWriteReg(CMD_DEC_PIC_OPTION, val);
+ 
+-	if (cpu_is_mx37()) {
+-		VpuWriteReg(CMD_DEC_PIC_DBK_OFFSET,
+-				 ((pDecInfo->dbkOffset.DbkOffsetA & 31) << 5) |
+-				  (pDecInfo->dbkOffset.DbkOffsetB & 31));
+-	}
+-
+-	/* TODO may be removed after next mx51 release be aligned with mx37 */
+ 	if (cpu_is_mx5x())
+ 		VpuWriteReg(CMD_DEC_PIC_SKIP_NUM, param->skipframeNum);
+ 
+-
+-	if (!cpu_is_mx5x()) {
++	if (cpu_is_mx27()) {
+ 		/* clear dispReorderBuf flag firstly */
+ 		val = VpuReadReg(CMD_DEC_DISPLAY_REORDER) & 0xFFFFFFFD;
+ 		val |= (param->dispReorderBuf & 0x1) << 1;
+@@ -2915,10 +2808,6 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		return RETCODE_INVALID_HANDLE;
+ 	}
+ 
+-	if (cpu_is_mx32()) {
+-		vl2cc_flush();
+-	}
+-
+ 	memset(info, 0, sizeof(DecOutputInfo));
+  	/* Clock is gated off when received interrupt in driver, so need to gate on here. */
+ 	IOClkGateSet(true);
+@@ -2946,25 +2835,14 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			info->decPicCrop.top = 0;
+ 			info->decPicCrop.bottom = 0;
+ 		} else {
+-			if (cpu_is_mx5x()) {
+-				info->decPicCrop.left =
+-				    ((val >> 16) & 0xFFFF);
+-				info->decPicCrop.right =
+-				    info->decPicWidth - ((val & 0xFFFF));
+-				info->decPicCrop.top =
+-				    ((val2 >> 16) & 0xFFFF);
+-				info->decPicCrop.bottom =
+-				    info->decPicHeight - ((val2 & 0xFFFF));
+-			} else if (cpu_is_mx37()) {
+-				info->decPicCrop.left =
+-				    ((val>>10) & 0x3FF) * 2;
+-				info->decPicCrop.right =
+-				    info->decPicWidth - ((val & 0x3FF) * 2);
+-				info->decPicCrop.top =
+-				    ((val2>>10) & 0x3FF)*2;
+-				info->decPicCrop.bottom =
+-				    info->decPicHeight - ((val2 & 0x3FF) * 2);
+-			}
++			info->decPicCrop.left =
++			    ((val >> 16) & 0xFFFF);
++			info->decPicCrop.right =
++			    info->decPicWidth - ((val & 0xFFFF));
++			info->decPicCrop.top =
++			    ((val2 >> 16) & 0xFFFF);
++			info->decPicCrop.bottom =
++			    info->decPicHeight - ((val2 & 0xFFFF));
+ 		}
+ 	} else {
+ 		info->decPicCrop.left = 0;
+@@ -2983,7 +2861,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 
+ 	info->interlacedFrame = (val >> 16) & 0x1;
+ 
+-	if (cpu_is_mx37() || cpu_is_mx5x()) {
++	if (cpu_is_mx5x()) {
+ 		info->h264Npf = (val >> 16) & 0x3;
+ 		info->interlacedFrame = (val >> 18) & 0x1;
+ 		info->pictureStructure = (val >> 19) & 0x0003;	/* MbAffFlag[17], FieldPicFlag[16] */
+@@ -3002,13 +2880,8 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 
+ 		virt_addr = pDecInfo->picParaBaseMem.virt_uaddr;
+ 		memcpy((char *)tempBuf, (void *)virt_addr, 8);
+-		if (cpu_is_mx37()) {
+-			val = swab32(*tempBuf);
+-			address = swab32(*(tempBuf + 1));
+-		} else {
+-			val = *(tempBuf + 1);
+-			address = *tempBuf;
+-		}
++		val = *(tempBuf + 1);
++		address = *tempBuf;
+ 
+ 		paraInfo = (val >> 24) & 0xFF;
+ 		size = (val >>  0) & 0xFFFFFF;
+@@ -3036,13 +2909,8 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		virt_addr = pDecInfo->picParaBaseMem.virt_uaddr;
+ 
+ 		memcpy((char *)tempBuf, (void *)(virt_addr + 8), 8);
+-		if (cpu_is_mx37()) {
+-			val = swab32(*tempBuf);
+-			address = swab32(*(tempBuf + 1));
+-		}else {
+-			val = *(tempBuf + 1);
+-			address = *tempBuf;
+-		}
++		val = *(tempBuf + 1);
++		address = *tempBuf;
+ 
+ 		paraInfo = (val >> 24) & 0xFF;
+ 		size = (val >>  0) & 0x00FFFF;
+@@ -3074,13 +2942,8 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 
+ 		virt_addr = pDecInfo->picParaBaseMem.virt_uaddr;
+ 		memcpy((char *)tempBuf, (void *)(virt_addr + 16), 8);
+-		if (cpu_is_mx37()){
+-			val = swab32(*tempBuf);
+-			address = swab32(*(tempBuf + 1));
+-		} else {
+-			val = *(tempBuf + 1);
+-			address = *tempBuf;
+-		}
++		val = *(tempBuf + 1);
++		address = *tempBuf;
+ 
+ 		paraInfo	= (val >> 24) & 0xFF;
+ 		mvNumPerMb	= (val >> 16) & 0xFF;
+@@ -3116,7 +2979,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 
+ 		memcpy((char *)tempBuf, (void *)virt_addr, 8);
+ 
+-		val = cpu_is_mx37() ? swab32(*tempBuf) : *(tempBuf + 1);
++		val = *(tempBuf + 1);
+ 		userDataNum = (val >> 16) & 0xFFFF;
+ 		userDataSize = (val >> 0) & 0xFFFF;
+ 		if (userDataNum == 0)
+@@ -3125,7 +2988,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		info->userData.userDataNum = userDataNum;
+ 		info->userData.size = userDataSize;
+ 
+-		val = cpu_is_mx37() ? swab32(*(tempBuf + 1)) : *tempBuf;
++		val = *tempBuf;
+ 		if (userDataNum == 0)
+ 			info->userData.userDataBufFull = 0;
+ 		else
+@@ -3201,16 +3064,13 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		}
+ 	}
+ 
+-	if (cpu_is_mx37() || cpu_is_mx5x()) {
+-		if (pCodecInst->codecMode == VC1_DEC) {
+-			val = VpuReadReg(RET_DEC_PIC_POST);
+-			info->hScaleFlag = (val >> 1) & 1;
+-			info->vScaleFlag = (val >> 2) & 1;
+-			info->indexFrameRangemap = -1;
+-			if (val & 1)
+-				info->indexFrameRangemap = (val >> 3) & 31;
+-
+-		}
++	if (pCodecInst->codecMode == VC1_DEC) {
++		val = VpuReadReg(RET_DEC_PIC_POST);
++		info->hScaleFlag = (val >> 1) & 1;
++		info->vScaleFlag = (val >> 2) & 1;
++		info->indexFrameRangemap = -1;
++		if (val & 1)
++			info->indexFrameRangemap = (val >> 3) & 31;
+ 	}
+ 
+ 	*ppendingInst = 0;
+@@ -3481,7 +3341,7 @@ RetCode vpu_DecGiveCommand(DecHandle handle, CodecCommand cmd, void *param)
+ 
+ 	case DEC_SET_DEBLOCK_OUTPUT:
+ 		{
+-			if (!cpu_is_mx5x()) {
++			if (cpu_is_mx27()) {
+ 				FrameBuffer *frame;
+ 				if (param == 0) {
+ 					return RETCODE_INVALID_PARAM;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 8440185..b7d523d 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -498,20 +498,15 @@ typedef struct vpu_versioninfo {
+ 
+ /*
+  * Revision History:
++ * v5.1.5 [2011.06.16] Remove code for not mx5x platforms
+  * v5.0.1 [2010.03.03] Integrate mx53 vpu
+  * v4.7.1 [2009.09.18] remove share memory file and update SWReset function
+  * v4.7.0 [2009.08.03] upgrade mx51 fw to v1.2.0
+- * v4.6.5 [2009.04.30] upgrade mx37 fw to v1.1.2
+- * v4.5.5 [2009.04.28] upgrade mx51 fw to v1.1.5
+- * v4.5.4 [2009.03.19] upgrade mx37 fw to v1.1.0
+- * v4.4.4 [2009.02.27] support data report and change VPU APIs
+- * v4.4.3 [2009.01.19] support chromaInterleave of encoder on MX51
+  * v4.3.2 [2008.10.28] support loopback on MX51
+  * v4.2.2 [2008.09.03] support encoder on MX51
+- * v4.1.2 [2008.08.22] update MX37 VPU firmware to V1.0.5
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 1, 4)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 1, 5)
+ 
+ extern unsigned int system_rev;
+ 
+@@ -531,16 +526,11 @@ static inline int type## _rev (int rev)         \
+ }
+ 
+ #define cpu_is_mx27()		mxc_is_cpu(0x27)
+-#define cpu_is_mx32()		mxc_is_cpu(0x32)
+-#define cpu_is_mx37()		mxc_is_cpu(0x37)
+ #define cpu_is_mx51()		mxc_is_cpu(0x51)
+ #define cpu_is_mx53()		mxc_is_cpu(0x53)
+ #define cpu_is_mx5x()		(mxc_is_cpu(0x51) || mxc_is_cpu(0x53))
+ 
+ MXC_REV(cpu_is_mx27);
+-MXC_REV(cpu_is_mx32);
+-MXC_REV(cpu_is_mx37);
+-MXC_REV(cpu_is_mx51);
+ 
+ RetCode vpu_Init(void *);
+ void vpu_UnInit(void);
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 845a7c1..4e7e975 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -134,11 +134,7 @@
+ #define RET_DEC_SEQ_JPG_THUMB_IND	0x1E8
+ #define RET_DEC_SEQ_HEADER_REPORT	0x1EC
+ 
+-#ifdef	IMX37_3STACK
+-#define RET_DEC_SEQ_NEXT_FRAME_NUM	0x1BC
+-#else
+ #define RET_DEC_SEQ_NEXT_FRAME_NUM	0x1E0
+-#endif
+ 
+ /*--------------------------------------------------------------------------
+  * [ENC SEQ INIT] COMMAND
+@@ -202,48 +198,17 @@
+ #define CMD_DEC_PIC_ROT_ADDR_CB		0x188
+ #define CMD_DEC_PIC_ROT_ADDR_CR		0x18C
+ 
+-/* only for IMX32ADS */
+-#define CMD_DEC_PIC_DBK_ADDR_Y		0x190
+-#define CMD_DEC_PIC_DBK_ADDR_CB		0x194
+-#define CMD_DEC_PIC_DBK_ADDR_CR		0x198
+-
+-#if defined(IMX32ADS)
+-#define CMD_DEC_PIC_ROT_STRIDE		0x19C
+-#define CMD_DEC_PIC_OPTION		0x1A0
+-#define CMD_DEC_PIC_SKIP_NUM		0x1A4
+-#define CMD_DEC_PIC_CHUNK_SIZE		0x1A8
+-#define CMD_DEC_PIC_BB_START		0x1AC
+-#define CMD_DEC_PIC_START_BYTE		0x1B0
+-#else /* IMX27ADS, IMX37_3STACK, IMX51 */
+ #define CMD_DEC_PIC_ROT_STRIDE		0x190
+ #define CMD_DEC_PIC_OPTION		0x194
+ #define CMD_DEC_PIC_SKIP_NUM		0x198
+- #if !defined(IMX37_3STACK)
+- #define CMD_DEC_PIC_CHUNK_SIZE		0x19C
+- #define CMD_DEC_PIC_BB_START		0x1A0
+- #define CMD_DEC_PIC_START_BYTE		0x1A4
+- #else
+- #define CMD_DEC_PIC_CHUNK_SIZE		0x198
+- #define CMD_DEC_PIC_BB_START		0x19C
+- #define CMD_DEC_PIC_START_BYTE		0x1A0
+- #endif
+-#endif
++#define CMD_DEC_PIC_CHUNK_SIZE		0x19C
++#define CMD_DEC_PIC_BB_START		0x1A0
++#define CMD_DEC_PIC_START_BYTE		0x1A4
+ 
+-#if !defined(IMX37_3STACK)
+ #define CMD_DEC_PIC_PARA_BASE_ADDR      0x1A8
+ #define CMD_DEC_PIC_USER_DATA_BASE_ADDR 0x1AC
+ #define CMD_DEC_PIC_USER_DATA_BUF_SIZE  0x1B0
+-#else
+-#define CMD_DEC_PIC_PARA_BASE_ADDR      0x1A4
+-#define CMD_DEC_PIC_USER_DATA_BASE_ADDR 0x1A8
+-#define CMD_DEC_PIC_USER_DATA_BUF_SIZE  0x1AC
+-#endif
+-
+-#if defined(IMX37_3STACK)
+-#define CMD_DEC_PIC_DBK_OFFSET		0x1B0
+-#else
+ #define CMD_DEC_PIC_DBK_OFFSET		0x1B4
+-#endif
+ 
+ #define RET_DEC_PIC_SIZE		0x1BC
+ #define RET_DEC_PIC_FRAME_NUM		0x1C0
+@@ -264,13 +229,8 @@
+ #define RET_DEC_PIC_CUR_IDX		0x1DC
+ #define RET_DEC_PIC_FRAME_NEED		0x1EC
+ 
+-#if !defined(IMX37_3STACK)
+ #define RET_DEC_PIC_CROP_LEFT_RIGHT	0x1E0
+ #define RET_DEC_PIC_CROP_TOP_BOTTOM	0x1E4
+-#else
+-#define RET_DEC_PIC_CROP_LEFT_RIGHT	0x1B4
+-#define RET_DEC_PIC_CROP_TOP_BOTTOM	0x1B8
+-#endif
+ 
+ /*---------------------------------------------------------------------------
+  * [ENC PIC RUN] COMMAND
+@@ -339,18 +299,6 @@
+ 	#define WORK_BUF_SIZE			(288 * 1024) + (FMO_SLICE_SAVE_BUF_SIZE * 1024 * 8)
+ 	#define PARA_BUF2_SIZE			(1728)
+ 	#define PARA_BUF_SIZE			(10 * 1024)
+-#elif defined(IMX31ADS)
+-	#define CODE_BUF_SIZE			(80 * 1024)
+-	#define FMO_SLICE_SAVE_BUF_SIZE		(32) /* Not used */
+-	#define WORK_BUF_SIZE			(190 * 1024)
+-	#define PARA_BUF2_SIZE			(1728)
+-	#define PARA_BUF_SIZE			(10 * 1024)
+-#elif defined(IMX37_3STACK)
+-	#define CODE_BUF_SIZE			(96 * 1024)
+-	#define FMO_SLICE_SAVE_BUF_SIZE		(32) /* Not used */
+-	#define WORK_BUF_SIZE			(512 * 1024)
+-	#define PARA_BUF2_SIZE			(0) /* Not used */
+-	#define PARA_BUF_SIZE			(10 * 1024)
+ #elif defined(IMX51) || defined(IMX53)
+         #define CODE_BUF_SIZE			(200 * 1024) /* define max is 200k byte currently */
+         #define FMO_SLICE_SAVE_BUF_SIZE		(32)
+@@ -381,7 +329,7 @@
+ #define BITS_STREAMCTRL_MASK		0x01F
+ #endif
+ 
+-#if defined(IMX51) || defined(IMX53) || defined(IMX37_3STACK)
++#if defined(IMX51) || defined(IMX53)
+ #define BIT_PIC_WIDTH_OFFSET		16
+ #else
+ #define BIT_PIC_WIDTH_OFFSET		10
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 9991f8f..febdf65 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media. All rights reserved.
+  */
+@@ -29,7 +29,7 @@
+ 
+ /*
+  * VPU binary file header format:
+- * 12-byte: platform version, eg, MX27, MX37, and so on.
++ * 12-byte: platform version, eg, MX27, MX51, and so on.
+  * 4-byte:  element numbers, each element is 16bit(unsigned short)
+  */
+ typedef struct {
+@@ -140,8 +140,6 @@ RetCode DownloadBitCodeTable(unsigned long *virtCodeBuf, Uint16 *bit_code)
+ 		for (i = 0; i < size; i += 2) {
+ 			data = (unsigned int)((bit_code[i] << 16) |
+ 					      bit_code[i + 1]);
+-			if (cpu_is_mx37())
+-				data = swab32(data);
+ 			((unsigned int *)virt_codeBuf)[i / 2] = data;
+ 		}
+ 	}
+@@ -197,10 +195,6 @@ RetCode CheckEncInstanceValidity(EncHandle handle)
+ 	CodecInst *pCodecInst;
+ 	RetCode ret;
+ 
+-	if (cpu_is_mx32() || cpu_is_mx37()) {
+-		return RETCODE_NOT_SUPPORTED;
+-	}
+-
+ 	pCodecInst = handle;
+ 	ret = CheckInstanceValidity(pCodecInst);
+ 	if (ret != RETCODE_SUCCESS) {
+@@ -241,18 +235,6 @@ RetCode CheckDecInstanceValidity(DecHandle handle)
+ 		if (pCodecInst->codecMode != MP4_DEC &&
+ 		    pCodecInst->codecMode != AVC_DEC)
+ 			return RETCODE_INVALID_HANDLE;
+-	} else if (cpu_is_mx32()) {
+-		if (pCodecInst->codecMode != MP4_DEC &&
+-		    pCodecInst->codecMode != AVC_DEC &&
+-		    pCodecInst->codecMode != VC1_DEC)
+-			return RETCODE_INVALID_HANDLE;
+-	} else if (cpu_is_mx37()) {
+-		if (pCodecInst->codecMode != MP4_DEC &&
+-		    pCodecInst->codecMode != AVC_DEC &&
+-		    pCodecInst->codecMode != VC1_DEC &&
+-		    pCodecInst->codecMode != MP2_DEC &&
+-		    pCodecInst->codecMode != DV3_DEC)
+-			return RETCODE_INVALID_HANDLE;
+ 	} else if (cpu_is_mx5x()) {
+ 		if (pCodecInst->codecMode != MP4_DEC &&
+ 		    pCodecInst->codecMode != AVC_DEC &&
+@@ -289,10 +271,6 @@ RetCode CheckEncOpenParam(EncOpenParam * pop)
+ 	int picWidth;
+ 	int picHeight;
+ 
+-	if (cpu_is_mx32() || cpu_is_mx37()) {
+-		return RETCODE_NOT_SUPPORTED;
+-	}
+-
+ 	if (pop == 0) {
+ 		return RETCODE_INVALID_PARAM;
+ 	}
+@@ -537,18 +515,6 @@ RetCode CheckDecOpenParam(DecOpenParam * pop)
+ 		if (pop->bitstreamFormat != STD_MPEG4 &&
+ 		    pop->bitstreamFormat != STD_AVC)
+ 			return RETCODE_INVALID_PARAM;
+-	} else if (cpu_is_mx32()) {
+-		if (pop->bitstreamFormat != STD_MPEG4 &&
+-		    pop->bitstreamFormat != STD_AVC &&
+-		    pop->bitstreamFormat != STD_VC1)
+-			return RETCODE_INVALID_PARAM;
+-	} else if (cpu_is_mx37()) {
+-		if (pop->bitstreamFormat != STD_MPEG4 &&
+-		    pop->bitstreamFormat != STD_AVC &&
+-		    pop->bitstreamFormat != STD_VC1 &&
+-		    pop->bitstreamFormat != STD_MPEG2 &&
+-		    pop->bitstreamFormat != STD_DIV3)
+-			return RETCODE_INVALID_PARAM;
+ 	} else if (cpu_is_mx5x()) {
+ 		if (pop->bitstreamFormat != STD_MPEG4 &&
+ 		    pop->bitstreamFormat != STD_AVC &&
+@@ -600,9 +566,7 @@ RetCode CopyBufferData(Uint8 *dst, Uint8 *src, int size)
+ 	if (!dst || !src || !size)
+ 		return RETCODE_FAILURE;
+ 
+-	if (cpu_is_mx37())
+-		memcpy(dst, src, size);
+-	else if (cpu_is_mx5x()) {
++	if (cpu_is_mx5x()) {
+ 		int i;
+ 		for (i = 0; i < size / 8; i++) {
+ 			/* swab odd and even words and swab32 for mx5x */
+@@ -675,7 +639,7 @@ void SetParaSet(DecHandle handle, int paraSetType, DecParamSet * para)
+ 	IOClkGateSet(false);
+ }
+ 
+-// Following are not for MX32 and MX27 TO1
++// Following are not for MX27 TO1
+ RetCode SetGopNumber(EncHandle handle, Uint32 * pGopNumber)
+ {
+ 	CodecInst *pCodecInst;
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 87f3a7f..8392884 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -42,21 +42,7 @@
+ #define ENC_ADDR_END_OF_RPT_BUF         ADDR_FRAME_BUF_STAT_BASE_OFFSET + SIZE_SLICE_INFO
+ #define DEC_ADDR_END_OF_RPT_BUF         ADDR_FRAME_BUF_STAT_BASE_OFFSET + SIZE_FRAME_BUF_STAT
+ 
+-#if defined(IMX37_3STACK)
+-enum {
+-	AVC_DEC = 0,
+-	VC1_DEC = 1,
+-	MP2_DEC = 2,
+-	MP4_DEC = 3,
+-	DV3_DEC = 4,
+-	/* dummy */
+-	AVC_ENC = 0x7F,
+-	MP4_ENC = 0x80,
+-	RV_DEC = 0x81,
+-	MJPG_DEC = 0x82,
+-	MJPG_ENC = 0x83
+-};
+-#elif defined(IMX51) || defined(IMX53)
++#if defined(IMX51) || defined(IMX53)
+ enum {
+ 	AVC_DEC = 0,
+ 	VC1_DEC = 1,
+-- 
+1.8.0
+

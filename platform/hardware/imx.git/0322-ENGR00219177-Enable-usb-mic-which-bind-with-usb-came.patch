@@ -1,0 +1,376 @@
+From 62ea360d8c5f98ba463f99adef10ad482dc48573 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Wed, 1 Aug 2012 10:13:01 +0800
+Subject: [PATCH 322/486] ENGR00219177 Enable usb mic which bind with usb
+ camera
+
+1. change the logic of scanning audio card
+2. enable usb mic as the input
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/audio_hardware.h  |   4 +-
+ alsa/config_usbaudio.h |  43 ++++++++++++++
+ alsa/tinyalsa_hal.c    | 158 ++++++++++++++++++++++++++++++++++---------------
+ 3 files changed, 157 insertions(+), 48 deletions(-)
+ create mode 100644 alsa/config_usbaudio.h
+
+diff --git a/alsa/audio_hardware.h b/alsa/audio_hardware.h
+index fe260e2..4fbd439 100644
+--- a/alsa/audio_hardware.h
++++ b/alsa/audio_hardware.h
+@@ -58,7 +58,7 @@ struct audio_card{
+     int  card;
+ };
+ 
+-#define MAX_AUDIO_CARD_NUM  2
++#define MAX_AUDIO_CARD_NUM  3
+ #define MAX_AUDIO_CARD_SCAN 3
+ 
+ struct imx_audio_device {
+@@ -83,6 +83,7 @@ struct imx_audio_device {
+     struct audio_card *card_list[MAX_AUDIO_CARD_NUM];
+     struct mixer *mixer[MAX_AUDIO_CARD_NUM];
+     int out_stream_num;
++    int audio_card_num;
+ };
+ 
+ struct imx_stream_out {
+@@ -151,6 +152,7 @@ struct imx_stream_in {
+             AUDIO_DEVICE_IN_WIRED_HEADSET |      \
+             AUDIO_DEVICE_IN_AUX_DIGITAL |        \
+             AUDIO_DEVICE_IN_BACK_MIC |           \
++            AUDIO_DEVICE_IN_ANLG_DOCK_MIC |      \
+             AUDIO_DEVICE_IN_ALL_SCO |            \
+             AUDIO_DEVICE_IN_DEFAULT )
+ 
+diff --git a/alsa/config_usbaudio.h b/alsa/config_usbaudio.h
+new file mode 100644
+index 0000000..d9d7233
+--- /dev/null
++++ b/alsa/config_usbaudio.h
+@@ -0,0 +1,43 @@
++
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++/* Copyright (C) 2012 Freescale Semiconductor, Inc. */
++
++#ifndef ANDROID_INCLUDE_IMX_CONFIG_USBAUDIO_H
++#define ANDROID_INCLUDE_IMX_CONFIG_USBAUDIO_H
++
++#include "audio_hardware.h"
++
++/* ALSA cards for IMX, these must be defined according different board / kernel config*/
++static struct audio_card  usbaudio_card = {
++    .name = "USB Device",
++    .supported_devices   = AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET | AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET | 
++                           AUDIO_DEVICE_IN_ANLG_DOCK_MIC,
++    .defaults            = NULL,
++    .bt_output           = NULL,
++    .speaker_output      = NULL,
++    .hs_output           = NULL,
++    .earpiece_output     = NULL,
++    .vx_hs_mic_input     = NULL,
++    .mm_main_mic_input   = NULL,
++    .vx_main_mic_input   = NULL,
++    .mm_hs_mic_input     = NULL,
++    .vx_bt_mic_input     = NULL,
++    .mm_bt_mic_input     = NULL,
++    .card                = 0,
++};
++
++#endif  /* ANDROID_INCLUDE_IMX_CONFIG_USBAUDIO_H */
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index a837ff2..6d28966 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -42,6 +42,7 @@
+ #include "config_wm8962.h"
+ #include "config_wm8958.h"
+ #include "config_hdmi.h"
++#include "config_usbaudio.h"
+ #include "config_nullcard.h"
+ 
+ 
+@@ -79,19 +80,20 @@
+ #define MM_LOW_POWER_SAMPLING_RATE  44100
+ /* sampling rate when using MM full power port */
+ #define MM_FULL_POWER_SAMPLING_RATE 44100
+-
++#define MM_USB_AUDIO_IN_RATE   16000
+ 
+ /* product-specific defines */
+ #define PRODUCT_DEVICE_PROPERTY "ro.product.device"
+ #define PRODUCT_NAME_PROPERTY   "ro.product.name"
+ #define PRODUCT_DEVICE_IMX      "imx"
+-#define SUPPORT_CARD_NUM        4
++#define SUPPORT_CARD_NUM        5
+ 
+ /*"null_card" must be in the end of this array*/
+ struct audio_card *audio_card_list[SUPPORT_CARD_NUM] = {
+     &wm8958_card,
+     &wm8962_card,
+     &hdmi_card,
++    &usbaudio_card,
+     &null_card,
+ };
+ 
+@@ -121,6 +123,11 @@ static void select_input_device(struct imx_audio_device *adev);
+ static int adev_set_voice_volume(struct audio_hw_device *dev, float volume);
+ static int do_input_standby(struct imx_stream_in *in);
+ static int do_output_standby(struct imx_stream_out *out);
++static int scan_available_device(struct imx_audio_device *adev);
++static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
++                                   struct resampler_buffer* buffer);
++static void release_buffer(struct resampler_buffer_provider *buffer_provider,
++                                  struct resampler_buffer* buffer);
+ 
+ /* Returns true on devices that are toro, false otherwise */
+ static int is_device_imx(void)
+@@ -376,7 +383,7 @@ static void select_input_device(struct imx_audio_device *adev)
+ static int start_output_stream(struct imx_stream_out *out)
+ {
+     struct imx_audio_device *adev = out->dev;
+-    unsigned int card = 0;
++    unsigned int card = -1;
+     unsigned int port = 0;
+     int i;
+ 
+@@ -890,9 +897,9 @@ static int start_input_stream(struct imx_stream_in *in)
+     int ret = 0;
+     int i;
+     struct imx_audio_device *adev = in->dev;
+-    unsigned int card = 0;
++    unsigned int card = -1;
+     unsigned int port = 0;
+-
++    LOGW("start_input_stream....");
+     adev->active_input = in;
+ 
+     if (adev->mode != AUDIO_MODE_IN_CALL) {
+@@ -912,6 +919,21 @@ static int start_input_stream(struct imx_stream_in *in)
+             return -EINVAL;
+         }
+     }
++    LOGW("card %d, port %d device %x", card, port, in->device);
++
++    if(in->device & AUDIO_DEVICE_IN_ANLG_DOCK_MIC) {
++        if(in->config.rate != MM_USB_AUDIO_IN_RATE ||
++           in->config.channels != 1) {
++           LOGE("Input 2 does not support this format!");
++           return -EINVAL;
++        }
++    }else {
++        if(in->config.rate != MM_FULL_POWER_SAMPLING_RATE ||
++           in->config.channels != 2) {
++           LOGE("Input 1 does not support this format!");
++           return -EINVAL;
++        }
++    }
+ 
+     if (in->need_echo_reference && in->echo_reference == NULL)
+         in->echo_reference = get_echo_reference(adev,
+@@ -993,6 +1015,7 @@ static int do_input_standby(struct imx_stream_in *in)
+     struct imx_audio_device *adev = in->dev;
+ 
+     if (!in->standby) {
++        LOGW("do_in_standby..");
+         pcm_close(in->pcm);
+         in->pcm = NULL;
+ 
+@@ -1068,6 +1091,11 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
+ 
+     if (do_standby)
+         do_input_standby(in);
++
++    if (in->device & AUDIO_DEVICE_IN_ANLG_DOCK_MIC) {
++        scan_available_device(adev);
++    }
++
+     pthread_mutex_unlock(&in->lock);
+     pthread_mutex_unlock(&adev->lock);
+ 
+@@ -1789,6 +1817,12 @@ static int adev_open_input_stream(struct audio_hw_device *dev, uint32_t devices,
+     /*fix to 2 channel,  caused by the wm8958 driver*/
+     *channel_mask       = AUDIO_CHANNEL_IN_STEREO;
+     in->config.channels = 2;
++ 
++    if(devices == AUDIO_DEVICE_IN_ANLG_DOCK_MIC) {
++        *channel_mask       = AUDIO_CHANNEL_IN_MONO;
++        in->config.channels = 1;
++        in->config.rate     = MM_USB_AUDIO_IN_RATE;
++    }
+ 
+     in->buffer = malloc(in->config.period_size *
+                         audio_stream_frame_size(&in->stream.common));
+@@ -1875,47 +1909,22 @@ static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
+ }
+ 
+ 
+-static int adev_open(const hw_module_t* module, const char* name,
+-                     hw_device_t** device)
++static int scan_available_device(struct imx_audio_device *adev)
+ {
+-    struct imx_audio_device *adev;
+-    int ret;
+-    struct control *imx_control;
+     int i,j,k;
++    int m;
+     bool found;
+-
+-    if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0)
+-        return -EINVAL;
+-
+-    adev = calloc(1, sizeof(struct imx_audio_device));
+-    if (!adev)
+-        return -ENOMEM;
+-
+-    adev->hw_device.common.tag      = HARDWARE_DEVICE_TAG;
+-    adev->hw_device.common.version  = 0;
+-    adev->hw_device.common.module   = (struct hw_module_t *) module;
+-    adev->hw_device.common.close    = adev_close;
+-
+-    adev->hw_device.get_supported_devices   = adev_get_supported_devices;
+-    adev->hw_device.init_check              = adev_init_check;
+-    adev->hw_device.set_voice_volume        = adev_set_voice_volume;
+-    adev->hw_device.set_master_volume       = adev_set_master_volume;
+-    adev->hw_device.set_mode                = adev_set_mode;
+-    adev->hw_device.set_mic_mute            = adev_set_mic_mute;
+-    adev->hw_device.get_mic_mute            = adev_get_mic_mute;
+-    adev->hw_device.set_parameters          = adev_set_parameters;
+-    adev->hw_device.get_parameters          = adev_get_parameters;
+-    adev->hw_device.get_input_buffer_size   = adev_get_input_buffer_size;
+-    adev->hw_device.open_output_stream      = adev_open_output_stream;
+-    adev->hw_device.close_output_stream     = adev_close_output_stream;
+-    adev->hw_device.open_input_stream       = adev_open_input_stream;
+-    adev->hw_device.close_input_stream      = adev_close_input_stream;
+-    adev->hw_device.dump                    = adev_dump;
+-
++    bool scanned;
++    struct control *imx_control;
++    int left_devices = SUPPORTED_DEVICE_IN_MODULE;
+     /* open the mixer for main sound card, main sound cara is like sgtl5000, wm8958, cs428888*/
+     /* note: some platform do not have main sound card, only have auxiliary card.*/
+     /* max num of supported card is 2 */
+-    k = 0;
++    k = adev->audio_card_num;
++    for(i = 0; i < k; i++) {
++        left_devices &= ~adev->card_list[i]->supported_devices;
++    }
++
+     for (i = 0; i < MAX_AUDIO_CARD_SCAN ; i ++) {
+         found = false;
+         imx_control = control_open(i);
+@@ -1923,15 +1932,24 @@ static int adev_open(const hw_module_t* module, const char* name,
+             break;
+         LOGW("card %d, id %s , name %s", i, control_card_info_get_id(imx_control), control_card_info_get_name(imx_control));
+         for(j = 0; j < SUPPORT_CARD_NUM; j++) {
+-            if(!strcmp(control_card_info_get_name(imx_control), audio_card_list[j]->name)){
++            if(strstr(control_card_info_get_name(imx_control), audio_card_list[j]->name) != NULL){
++                // check if the device have been scaned before
++                scanned = false;
++                for (m = 0; m < k; m++) {
++                    if (!strcmp(audio_card_list[j]->name, adev->card_list[m]->name)) {
++                         scanned = true;
++                         found = true;
++                    }
++                }
++                if (scanned) break;
+                 adev->card_list[k]  = audio_card_list[j];
+                 adev->mixer[k] = mixer_open(i);
+                 adev->card_list[k]->card = i;
+                 if (!adev->mixer[k]) {
+-                    free(adev);
+                     LOGE("Unable to open the mixer, aborting.");
+                     return -EINVAL;
+                 }
++                left_devices &= ~audio_card_list[j]->supported_devices;
+                 k ++;
+                 found = true;
+             }
+@@ -1945,18 +1963,64 @@ static int adev_open(const hw_module_t* module, const char* name,
+              break;
+         }
+     }
++    adev->audio_card_num = k;
+     /*must have one card*/
+     if(!adev->card_list[0]) {
+-        free(adev);
+         LOGE("no supported sound card found, aborting.");
+         return  -EINVAL;
+     }
+     /*second card maybe null*/
+-    if(!adev->card_list[1]) {
+-        adev->card_list[1]  = audio_card_list[SUPPORT_CARD_NUM-1];
++    while (k < MAX_AUDIO_CARD_NUM) {
++        adev->card_list[k]  = audio_card_list[SUPPORT_CARD_NUM-1];
+         /*FIXME:This is workaround for some board which only have one card, whose supported device only is not full*/
+-        adev->card_list[1]->supported_devices  = (SUPPORTED_DEVICE_IN_MODULE) &
+-                                                 (~adev->card_list[0]->supported_devices);
++        adev->card_list[k]->supported_devices  = left_devices;
++        k++;
++    }
++
++    return 0;
++}
++
++static int adev_open(const hw_module_t* module, const char* name,
++                     hw_device_t** device)
++{
++    struct imx_audio_device *adev;
++    int ret = 0;
++    struct control *imx_control;
++    int i,j,k;
++    bool found;
++
++    if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0)
++        return -EINVAL;
++
++    adev = calloc(1, sizeof(struct imx_audio_device));
++    if (!adev)
++        return -ENOMEM;
++
++    adev->hw_device.common.tag      = HARDWARE_DEVICE_TAG;
++    adev->hw_device.common.version  = 0;
++    adev->hw_device.common.module   = (struct hw_module_t *) module;
++    adev->hw_device.common.close    = adev_close;
++
++    adev->hw_device.get_supported_devices   = adev_get_supported_devices;
++    adev->hw_device.init_check              = adev_init_check;
++    adev->hw_device.set_voice_volume        = adev_set_voice_volume;
++    adev->hw_device.set_master_volume       = adev_set_master_volume;
++    adev->hw_device.set_mode                = adev_set_mode;
++    adev->hw_device.set_mic_mute            = adev_set_mic_mute;
++    adev->hw_device.get_mic_mute            = adev_get_mic_mute;
++    adev->hw_device.set_parameters          = adev_set_parameters;
++    adev->hw_device.get_parameters          = adev_get_parameters;
++    adev->hw_device.get_input_buffer_size   = adev_get_input_buffer_size;
++    adev->hw_device.open_output_stream      = adev_open_output_stream;
++    adev->hw_device.close_output_stream     = adev_close_output_stream;
++    adev->hw_device.open_input_stream       = adev_open_input_stream;
++    adev->hw_device.close_input_stream      = adev_close_input_stream;
++    adev->hw_device.dump                    = adev_dump;
++
++    ret = scan_available_device(adev);
++    if (ret != 0) {
++        free(adev);
++        return ret;
+     }
+ 
+     /* Set the default route before the PCM stream is opened */
+-- 
+1.8.0
+

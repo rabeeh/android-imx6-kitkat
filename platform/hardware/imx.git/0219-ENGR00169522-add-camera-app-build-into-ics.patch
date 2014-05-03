@@ -1,0 +1,130 @@
+From b24e4ef6394482950cb9abe2d01861481aa46cc4 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Tue, 6 Dec 2011 16:02:14 +0800
+Subject: [PATCH 219/486] ENGR00169522 add camera app build into ics.
+
+add camera app build into ics.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ Android.mk                   |  2 +-
+ mx6/hwcomposer/FG_device.cpp |  2 +-
+ mx6/libcamera/CameraHal.cpp  | 53 ++++++++++++++++++--------------------------
+ 3 files changed, 23 insertions(+), 34 deletions(-)
+
+diff --git a/Android.mk b/Android.mk
+index cfb525b..b1f23f8 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -1,6 +1,6 @@
+ common_imx_dirs := libsensors alsa
+ mx5x_dirs := $(common_imx_dirs) libgps mx5x/libcopybit mx5x/libgralloc  mx5x/hwcomposer mx5x/libcamera
+-mx6_dirs := $(common_imx_dirs) mx6/libgralloc mx6/hwcomposer
++mx6_dirs := $(common_imx_dirs) mx6/libgralloc mx6/hwcomposer mx6/libcamera
+ 
+ ifeq ($(TARGET_BOARD_PLATFORM),imx6)
+   include $(call all-named-subdir-makefiles,$(mx6_dirs))
+diff --git a/mx6/hwcomposer/FG_device.cpp b/mx6/hwcomposer/FG_device.cpp
+index 8274b06..66aae30 100755
+--- a/mx6/hwcomposer/FG_device.cpp
++++ b/mx6/hwcomposer/FG_device.cpp
+@@ -226,7 +226,7 @@ HWCOMPOSER_LOG_RUNTIME("-------------FG_device::init()---open fb0-------------")
+    // m_top = 0;
+     m_width = def_info.xres;//info.xres;
+     m_height = def_info.yres;//info.yres;
+-    m_format = fourcc('R', 'G', 'B', 'P');//('U', 'Y', 'V', 'Y');
++    m_format = fourcc('U', 'Y', 'V', 'Y');
+ 
+   	info.reserved[0] = def_info.reserved[0];
+   	info.reserved[1] = def_info.reserved[0];
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index c1d6640..ae55714 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -962,12 +962,12 @@ namespace android {
+             return ret;            
+         }
+             
+-		if (bDerectInput == true) {
+-			for(i = 0; i < mVideoBufNume; i++) {
+-				mVideoBufferUsing[i] = 0;
+-			}
++	if (bDerectInput == true) {
++		for(i = 0; i < mVideoBufNume; i++) {
++			mVideoBufferUsing[i] = 0;
+ 		}
+-		mEncodeLock.unlock();
++	}
++	mEncodeLock.unlock();
+         mRecordRunning = true;
+ 
+         return NO_ERROR;
+@@ -993,24 +993,19 @@ namespace android {
+     void CameraHal::releaseRecordingFrame(const void* mem)
+     {
+         //CAMERA_HAL_LOG_FUNC;
+-        ssize_t offset;
+-        size_t  size;
+         int index;
+-#if 0
+-        offset = mem->offset();
+-        size   = mem->size();
+-        index = offset / size;
+ 
++        index = ((size_t)mem - (size_t)mVideoMemory->data) / mPreviewFrameSize;
+         mVideoBufferUsing[index] = 0;
+ 
+-		if (bDerectInput == true) {
++	if (bDerectInput == true) {
+             if(mCaptureBuffers[index].refCount == 0) {
+                 CAMERA_HAL_ERR("warning:%s about to release mCaptureBuffers[%d].refcount=%d-", __FUNCTION__, index, mCaptureBuffers[index].refCount);
+                 return;
+             }
+-			putBufferCount(&mCaptureBuffers[index]);
++	putBufferCount(&mCaptureBuffers[index]);
+         }
+-#endif
++
+     }
+ 
+     bool CameraHal::recordingEnabled()
+@@ -2269,24 +2264,18 @@ Pic_out:
+ 
+                 if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+                     nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+-                    //for(i = 0 ; i < mVideoBufNume; i ++) {
+-        			//	if(mVideoBufferUsing[i] == 0) {
+-        					if (bDerectInput == true) {
+-        						memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
+-        								(void*)&mVideoBufferPhy[enc_index], sizeof(VIDEOFRAME_BUFFER_PHY));
+-        					} else {
+-        						memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
+-        								(void*)EncBuf->virt_start, mPreviewFrameSize);
+-        						ret = putBufferCount(EncBuf);
+-        					}
+-        
+-                            mVideoBufferUsing[enc_index] = 1;
+-                            mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoMemory, enc_index, mCallbackCookie);
+-                            break;
+-                    //    }
+-                    //}
+-                    //if (i == mVideoBufNume)
+-                    //    CAMERA_HAL_LOG_INFO("no Buffer can be used for record\n");
++                    if (bDerectInput == true) {
++	                memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
++			          (void*)&mVideoBufferPhy[enc_index], sizeof(VIDEOFRAME_BUFFER_PHY));
++                    } else {
++	                memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
++			          (void*)EncBuf->virt_start, mPreviewFrameSize);
++	                ret = putBufferCount(EncBuf);
++                    }
++
++		    mVideoBufferUsing[enc_index] = 1;
++		    mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoMemory, enc_index, mCallbackCookie);
++		    break;
+                 }else {
+                     ret = putBufferCount(EncBuf);
+                 }
+-- 
+1.8.0
+

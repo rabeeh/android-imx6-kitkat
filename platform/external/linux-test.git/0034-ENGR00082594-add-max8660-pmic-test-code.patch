@@ -1,0 +1,893 @@
+From b16207a7a530239a2730649823459cd5a842fed7 Mon Sep 17 00:00:00 2001
+From: Jingyu Zhou <b02241@freescale.com>
+Date: Fri, 11 Jul 2008 14:43:38 +0800
+Subject: [PATCH 034/435] ENGR00082594 add max8660 pmic test code
+
+add max8660 pmic test code
+
+Signed-off-by: Zhou Jingyu <Jingyu.Zhou@freescale.com>
+---
+ test/max8660_pmic_test/Makefile                    |  38 +++
+ test/max8660_pmic_test/autorun-mcu_pmic.sh         |  21 ++
+ test/max8660_pmic_test/pmic_testapp_rtc/Makefile   |  23 ++
+ .../pmic_testapp_rtc/pmic_rtc_main.c               | 184 +++++++++++
+ .../pmic_testapp_rtc/pmic_rtc_test.c               | 352 +++++++++++++++++++++
+ .../pmic_testapp_rtc/pmic_rtc_test.h               |  65 ++++
+ test/max8660_pmic_test/protocol_tests/Makefile     |  23 ++
+ .../protocol_tests/mcu_pmic_protocol_test.c        | 109 +++++++
+ 8 files changed, 815 insertions(+)
+ create mode 100644 test/max8660_pmic_test/Makefile
+ create mode 100644 test/max8660_pmic_test/autorun-mcu_pmic.sh
+ create mode 100644 test/max8660_pmic_test/pmic_testapp_rtc/Makefile
+ create mode 100644 test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_main.c
+ create mode 100644 test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.c
+ create mode 100644 test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.h
+ create mode 100644 test/max8660_pmic_test/protocol_tests/Makefile
+ create mode 100644 test/max8660_pmic_test/protocol_tests/mcu_pmic_protocol_test.c
+
+diff --git a/test/max8660_pmic_test/Makefile b/test/max8660_pmic_test/Makefile
+new file mode 100644
+index 0000000..1063323
+--- /dev/null
++++ b/test/max8660_pmic_test/Makefile
+@@ -0,0 +1,38 @@
++# list of platforms which did not want this test case
++EXCLUDE_LIST:="IMX37_3STACK IMX31_3STACK IMX31_ADS IMX27_3STACK IMX27_ADS"
++
++
++LTP_DIR = $(TOPDIR)/test/mxc_pmic_test/
++LOADLIBES+= -L$(LTP_DIR)lib -lltp
++
++OBJS = autorun-mcu_pmic.sh libltp.a
++
++CFLAGS+= -Wall -I$(LTP_DIR)/include
++CFLAGS+= $(INC) -I$(LINUXPATH)/include/ -D__CVS_TEST
++
++CFLAGS+= -DCONFIG_MXC_PMIC_MC9SDZ60
++
++export CFLAGS LTP_DIR LOADLIBES
++
++SUBDIRS =       protocol_tests \
++		pmic_testapp_rtc
++
++all: $(OBJS)
++	@set -e; for i in $(SUBDIRS); do $(MAKE) -C $$i ; done
++
++libltp.a:
++	@$(MAKE) -C $(LTP_DIR)lib/ $@
++	mkdir -p $(OBJDIR)
++	@set -e; for i in $(SUBDIRS); do $(MAKE) -C $$i ; done
++
++install:
++	@set -e; for i in $(SUBDIRS); do $(MAKE) -C $$i install ; done
++
++.PHONY: clean
++clean:
++	@$(MAKE) -C lib clean
++	@set -e; for i in $(SUBDIRS); do $(MAKE) -C $$i clean ; done
++#
++# include the Rules
++#
++include ../make.rules
+diff --git a/test/max8660_pmic_test/autorun-mcu_pmic.sh b/test/max8660_pmic_test/autorun-mcu_pmic.sh
+new file mode 100644
+index 0000000..a5873c7
+--- /dev/null
++++ b/test/max8660_pmic_test/autorun-mcu_pmic.sh
+@@ -0,0 +1,21 @@
++#!/bin/sh
++
++source /unit_tests/test-utils.sh
++
++#
++# Exit status is 0 for PASS, nonzero for FAIL
++#
++STATUS=0
++
++# devnode test
++check_devnode "/dev/pmic"
++check_devnode "/dev/pmic_rtc"
++
++# protocol test cases
++run_testcase "./mx35_pmic_testapp"
++
++# RTC test cases
++for CASE in TIME ALARM WAIT_ALARM TEST POLL_TEST; do
++	run_testcase "./mx35_pmic_testapp_rtc -T $CASE"
++done
++
+diff --git a/test/max8660_pmic_test/pmic_testapp_rtc/Makefile b/test/max8660_pmic_test/pmic_testapp_rtc/Makefile
+new file mode 100644
+index 0000000..f6ea3e5
+--- /dev/null
++++ b/test/max8660_pmic_test/pmic_testapp_rtc/Makefile
+@@ -0,0 +1,23 @@
++#
++# Here are a list of OBJS needed
++#
++TARGET=max8660_pmic_testapp_rtc.out
++SRCS=$(wildcard *.c)
++OBJS=$(patsubst %.c,%.o,$(SRCS))
++
++all : $(TARGET)
++	mkdir -p $(OBJDIR)
++	cp -f $(TARGET) $(OBJDIR)
++        
++$(TARGET): $(OBJS)
++	$(CC) $(OBJS) $(LOADLIBES) -o $@
++
++$(OBJS2) : $(SRCS)
++
++.PHONY: clean
++clean:
++	rm -f $(TARGET) $(OBJS)
++#
++# include the Rules
++#
++include ../../make.rules
+diff --git a/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_main.c b/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_main.c
+new file mode 100644
+index 0000000..0ad6a33
+--- /dev/null
++++ b/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_main.c
+@@ -0,0 +1,184 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   pmic_rtc_main.c
++ * @brief  PMIC RTC test main source file.
++ */
++
++/*==============================================================================
++Total Tests: PMIC rtc
++
++Test Name:   Read/Write/Event test
++
++Test Assertion
++& Strategy:  This test is used to test the PMIC protocol.
++==============================================================================*/
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++
++/* Harness Specific Include Files. */
++#include "test.h"
++#include "usctest.h"
++
++/* Verification Test Environment Include Files */
++#include "pmic_rtc_test.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++#if !defined(TRUE) && !defined(FALSE)
++#define TRUE  1
++#define FALSE 0
++#endif
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++/* Extern Global Variables */
++extern int  Tst_count;               /* counter for tst_xxx routines.         */
++extern char *TESTDIR;                /* temporary dir created by tst_tmpdir() */
++
++/* Global Variables */
++char *TCID     = "PMIC_TestApp_rtc"; /* test program identifier.          */
++int  TST_TOTAL = 3;                  /* total number of tests in this file.   */
++
++/*==============================================================================
++                                   GLOBAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++int main(int argc, char **argv);
++void help(void);
++void cleanup(void);
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== main =====*/
++/**
++@brief  Entry point to this test-case. It parses all the command line
++        inputs, calls the global setup and executes the test. It logs
++        the test status and results appropriately using the LTP API's
++        On successful completion or premature failure, cleanup() function
++        is called and test exits with an appropriate return code.
++
++@param  Input : argc - number of command line parameters.
++        Output: **argv - pointer to the array of the command line parameters.
++                Describe input arguments to this test-case
++                -l - Number of iteration
++                -v - Prints verbose output
++                -V - Prints the version number
++
++@return On failure - Exits by calling cleanup().
++        On success - exits with 0 exit value.
++*/
++/*============================================================================*/
++
++void cleanup(void)
++{
++        /* Exit with appropriate return code. */
++        tst_exit();
++}
++
++int main(int argc, char **argv)
++{
++        int VT_rv = TFAIL;
++
++        /* parse options. */
++        int tflag=0;                 /* binary flags: opt or not */
++        char *ch_test_case;  /* option arguments */
++        char *msg;
++
++        option_t options[] = {
++                { "T:", &tflag, &ch_test_case  },       /* argument required */
++                { NULL, NULL, NULL }           /* NULL required to end array */
++        };
++
++        if ( (msg=parse_opts(argc, argv, options, &help)) != NULL ) {
++                tst_brkm(TBROK , cleanup,
++                        "%s test case did NOT work as expected\n", VT_rv);
++        }
++
++        /* Test Case Body. */
++        if(tflag) {
++                /* Print test Assertion using tst_resm() function with
++                   argument TINFO. */
++                tst_resm(TINFO, "Testing if %s_%s test case is OK\n", TCID,
++                        ch_test_case);
++
++                if(!strcmp(ch_test_case,TEST_CASE1)) {
++                        VT_rv = VT_pmic_rtc_test(0);
++                } else if(!strcmp(ch_test_case,TEST_CASE2)) {
++                        VT_rv = VT_pmic_rtc_test(1);
++                } else if(!strcmp(ch_test_case,TEST_CASE3)) {
++                        VT_rv = VT_pmic_rtc_test(2);
++                } else if(!strcmp(ch_test_case,TEST_CASE4)) {
++                        VT_rv = VT_pmic_rtc_test(3);
++                } else if(!strcmp(ch_test_case,TEST_CASE5)) {
++                        VT_rv = VT_pmic_rtc_test(4);
++                }
++
++                if(VT_rv == TPASS) {
++                        tst_resm(TPASS, "%s_%s test case worked as expected\n",
++                                TCID,ch_test_case);
++                } else {
++                        tst_resm(TFAIL, "%s_%s test case did NOT work as "
++                                "expected\n", TCID,ch_test_case);
++                }
++        }
++
++        if(tflag==0) {
++                /* VTE : print results and exit test scenario */
++                help();
++        }
++        return VT_rv;
++}
++
++void help(void)
++{
++        printf("Pmic rtc driver option\n");
++        printf("  -T TEST       Test all Pmic rtc\n");
++        printf("  -T TIME       Test time and date read and write RTC functions\n");
++        printf("  -T ALARM      Test alarm read and write RTC functions\n");
++        printf("  -T WAIT_ALARM Test Alarm IT function\n");
++        printf("  -T POLL_TEST  Test Alarm IT poll function\n");
++}
++
+diff --git a/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.c b/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.c
+new file mode 100644
+index 0000000..2a4ab63
+--- /dev/null
++++ b/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.c
+@@ -0,0 +1,352 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   pmic_rtc_test.c
++ * @brief  Test scenario C source PMIC.
++ */
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++
++/* Harness Specific Include Files. */
++
++#include "test.h"
++#include <time.h>
++#include <poll.h>
++
++/* Verification Test Environment Include Files */
++#include "pmic_rtc_test.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++char *jours[]= {"Sunday",
++                "monday",
++                "tuesday",
++                "Wednesday",
++                "Thursday",
++                "Friday",
++                "Saturday"};
++
++char *mois[]= {"January",
++               "February",
++               "March",
++               "April",
++               "May",
++               "June",
++               "July",
++               "August",
++               "September",
++               "October",
++               "November",
++               "December"};
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/* struct semaphore  timer_sema; */
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_PMIC_TEST_rtc_setup =====*/
++/**
++@brief  assumes the initial condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++int VT_pmic_rtc_test_setup(void)
++{
++    int rv = TFAIL;
++
++    rv=TPASS;
++
++    return rv;
++}
++
++/*============================================================================*/
++/*===== VT_PMIC_TEST_rtc_cleanup =====*/
++/**
++@brief  assumes the post-condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++void VT_pmic_rtc_test_cleanup(void)
++{
++    tst_exit();
++}
++
++/*============================================================================*/
++/*===== VT_PMIC_test_rtc_TEST =====*/
++/**
++@brief  PMIC test scenario X function
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++int VT_pmic_rtc_test(int switch_fct)
++{
++        int fd, ret;
++        struct timeval pmic_time, pmic_time_read;
++        time_t maintenant;
++        struct tm *m;
++        int VT_rv = TFAIL;
++        struct pollfd fds;
++
++        fd = open(PMIC_DEVICE_RTC, O_RDWR);
++        if (fd < 0) {
++                tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                        "Unable to open %s\n", VT_rv);
++        }
++
++        if (switch_fct == 0) {
++                tst_resm(TINFO, "Get PMIC time\n");
++                ret = ioctl(fd, PMIC_RTC_GET_TIME, &pmic_time_read);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                 "Error in rtc test\n", VT_rv);
++                }
++
++                m= localtime(&pmic_time_read.tv_sec);
++
++                tst_resm(TINFO, "%ld seconds between the current time\n\t\t\t"
++                        "and midnight, January 1, 1970 UTC",
++                        pmic_time_read.tv_sec);
++                tst_resm(TINFO, "The PMIC time is : %02d/%02d/%02d %02d:%02d:"
++                        "%02d",m->tm_mon + 1,m->tm_mday, m->tm_year % 100,
++                        m->tm_hour, m->tm_min, m->tm_sec);
++                tst_resm(TINFO, "%s, %s %d, %04d %de day of the year",
++                        jours[m->tm_wday], mois[m->tm_mon], m->tm_mday,
++                        m->tm_year + 1900, m->tm_yday);
++
++        }
++
++        if (switch_fct == 1) {
++                time(&maintenant);
++                pmic_time.tv_sec = maintenant;
++
++                tst_resm(TINFO, "%ld seconds between the current time and "
++                        "midnight, January 1, 1970 UTC\n", maintenant);
++
++                m= localtime(&maintenant);
++
++                tst_resm(TINFO, "The date and time is : %02d/%02d/%02d %02d:"
++                               "%02d:%02d\n",m->tm_mon + 1,m->tm_mday,
++                        m->tm_year % 100, m->tm_hour, m->tm_min, m->tm_sec);
++                tst_resm(TINFO, "%s, %s %d, %04d %de day of the year\n",
++                        jours[m->tm_wday], mois[m->tm_mon], m->tm_mday,
++                        m->tm_year + 1900, m->tm_yday);
++
++                tst_resm(TINFO, "Set PMIC time\n");
++                ret = ioctl(fd, PMIC_RTC_SET_TIME, &pmic_time);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                        "Error in rtc test\n", VT_rv);
++
++                }
++
++                tst_resm(TINFO, "Get PMIC time\n");
++                ret = ioctl(fd, PMIC_RTC_GET_TIME, &pmic_time_read);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                 "Error in rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO, "Return value of PMIC time is %ld\n",
++                        pmic_time_read.tv_sec);
++
++                if (pmic_time.tv_sec > pmic_time_read.tv_sec) {
++                        if ((pmic_time.tv_sec+5) < pmic_time_read.tv_sec) {
++                                tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                        "Error in RTC test\n", VT_rv);
++                        }
++                }
++        }
++        if (switch_fct == 2) {
++                time(&maintenant);
++                pmic_time.tv_sec = maintenant;
++
++                tst_resm(TINFO, "%ld seconds between the current time and "
++                        "midnight, January 1, 1970 UTC\n", maintenant);
++
++                m= localtime(&maintenant);
++
++                tst_resm(TINFO, "The date and time is : %02d/%02d/%02d %02d:"
++                        "%02d:%02d\n",m->tm_mon + 1,m->tm_mday,
++                        m->tm_year % 100, m->tm_hour, m->tm_min, m->tm_sec);
++                tst_resm(TINFO, "%s, %s %d, %04d %de day of the year\n",
++                        jours[m->tm_wday], mois[m->tm_mon], m->tm_mday,
++                        m->tm_year + 1900, m->tm_yday);
++
++                tst_resm(TINFO, "Set PMIC Alarm time\n");
++                ret = ioctl(fd, PMIC_RTC_SET_ALARM, &pmic_time);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO, "Get PMIC Alarm time\n");
++                ret = ioctl(fd, PMIC_RTC_GET_ALARM, &pmic_time_read);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO, "Return value of PMIC Alarm time is %ld\n",
++                        pmic_time_read.tv_sec);
++
++                if (pmic_time.tv_sec != pmic_time_read.tv_sec) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in alarm rtc test\n", VT_rv);
++                }
++        }
++
++        if (switch_fct == 3) {
++                time(&maintenant);
++                pmic_time.tv_sec = maintenant;
++
++                tst_resm(TINFO, "Test PMIC Alarm event\n");
++
++
++                tst_resm(TINFO, "Set PMIC time to local time\n");
++                ret = ioctl(fd, PMIC_RTC_SET_TIME, &pmic_time);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO,
++                        "Set PMIC Alarm time to local time +10 second\n");
++                pmic_time.tv_sec = pmic_time.tv_sec + 10;
++                ret = ioctl(fd, PMIC_RTC_SET_ALARM, &pmic_time);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO, "Wait Alarm event...\n");
++                ret = ioctl(fd, PMIC_RTC_WAIT_ALARM, NULL);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in IT rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO, "*** Alarm event DONE ***\n");
++
++        }
++        if (switch_fct == 4) {
++                time(&maintenant);
++                pmic_time.tv_sec = maintenant;
++
++                tst_resm(TINFO, "Test PMIC Alarm event\n");
++
++                tst_resm(TINFO, "Set PMIC time to local time\n");
++                ret = ioctl(fd, PMIC_RTC_SET_TIME, &pmic_time);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO,
++                        "Set PMIC Alarm time to local time +10 second\n");
++                pmic_time.tv_sec = pmic_time.tv_sec + 10;
++                ret = ioctl(fd, PMIC_RTC_SET_ALARM, &pmic_time);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in rtc test\n", VT_rv);
++                }
++
++                fds.fd = fd;
++                fds.events = POLLIN;
++                fds.revents = 0;
++
++                tst_resm(TINFO, "Call poll function before register\n");
++                ret = poll(&fds,1,0);
++                tst_resm(TINFO, "Poll ret = %d\n",ret);
++
++                tst_resm(TINFO, "Register Alarm\n");
++                ret = ioctl(fd, PMIC_RTC_ALARM_REGISTER,0);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in IT rtc test\n", VT_rv);
++                }
++
++                tst_resm(TINFO, "Call poll until alarm\n");
++
++                do {
++                        ret = poll(&fds,1,0);
++                } while (ret == 0);
++
++
++                tst_resm(TINFO, "Unregister Alarm\n");
++                ret = ioctl(fd, PMIC_RTC_ALARM_UNREGISTER,0);
++                if (ret != 0) {
++                        tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                                "Error in IT rtc test\n", VT_rv);
++                }
++
++        }
++
++        ret = close(fd);
++        if (ret < 0) {
++                tst_resm(TINFO, "Unable to close file descriptor %d", fd);
++                tst_brkm(TBROK , VT_pmic_rtc_test_cleanup,
++                        "Error in rtc test\n", VT_rv);
++        }
++        return TPASS;
++}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.h b/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.h
+new file mode 100644
+index 0000000..eb0d0fd
+--- /dev/null
++++ b/test/max8660_pmic_test/pmic_testapp_rtc/pmic_rtc_test.h
+@@ -0,0 +1,65 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   pmic_rtc_test.h
++ * @brief  Test scenario C header PMIC.
++ */
++
++#ifndef PMIC_TEST_RTC_H
++#define PMIC_TEST_RTC_H
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++#include <sys/types.h>	/* open() */
++#include <sys/stat.h>	/* open() */
++#include <fcntl.h>	/* open() */
++#include <sys/ioctl.h>	/* ioctl() */
++#include <unistd.h>	/* close() */
++#include <stdio.h>	/* sscanf() & perror() */
++#include <stdlib.h>	/* atoi() */
++#include <errno.h>
++#include <linux/wait.h>
++
++#include <asm/arch/pmic_rtc.h>
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++#define    TEST_CASE1	"TEST"
++#define    TEST_CASE2	"TIME"
++#define    TEST_CASE3	"ALARM"
++#define    TEST_CASE4	"WAIT_ALARM"
++#define    TEST_CASE5	"POLL_TEST"
++
++#define PMIC_DEVICE_RTC	"/dev/pmic_rtc"
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++int VT_pmic_rtc_test_setup();
++void VT_pmic_rtc_test_cleanup();
++int VT_pmic_rtc_test(int switch_fct);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // PMIC_TEST_RTC_H //
+diff --git a/test/max8660_pmic_test/protocol_tests/Makefile b/test/max8660_pmic_test/protocol_tests/Makefile
+new file mode 100644
+index 0000000..4ee9c46
+--- /dev/null
++++ b/test/max8660_pmic_test/protocol_tests/Makefile
+@@ -0,0 +1,23 @@
++#
++# Here are a list of OBJS needed
++#
++TARGET=max8660_pmic_testapp.out
++SRCS=$(wildcard *.c)
++OBJS2=$(patsubst %.c,%.o,$(SRCS))
++
++
++all : $(TARGET)
++	mkdir -p $(OBJDIR)
++	cp -f $(TARGET) $(OBJDIR)
++$(TARGET): $(OBJS2)
++	$(CC) $(OBJS2) -o $@
++
++$(OBJS2) : $(SRCS)
++
++.PHONY: clean
++clean:
++	rm -f $(TARGET) $(OBJS2)
++#
++# include the Rules
++#
++include ../../make.rules
+diff --git a/test/max8660_pmic_test/protocol_tests/mcu_pmic_protocol_test.c b/test/max8660_pmic_test/protocol_tests/mcu_pmic_protocol_test.c
+new file mode 100644
+index 0000000..821efb0
+--- /dev/null
++++ b/test/max8660_pmic_test/protocol_tests/mcu_pmic_protocol_test.c
+@@ -0,0 +1,109 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mcu_pmic_protocol_test.c
++ * @brief  mx35 mcu pmic Protocol driver testing.
++ */
++
++/* Standard Include Files */
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++#include <errno.h>
++#include <asm/arch/pmic_external.h>
++
++#define TFAIL -1
++#define TPASS 0
++
++static char* test_name = "mx35 mcu pmic protocol";
++#define tst_log(fmt, arg...) \
++	printf("mx35 mcu pmic protocol test "fmt"\n", ##arg)
++static
++int VT_pmic_read(int fd, int reg, unsigned int *val) {
++	register_info reg_info;
++	reg_info.reg = reg;
++	reg_info.reg_value = 0;
++
++	int rv = ioctl(fd, PMIC_READ_REG, &reg_info);
++	*val = reg_info.reg_value;
++	if (rv != 0)
++		return TFAIL;
++	else
++		return TPASS;
++}
++
++static
++int VT_pmic_write(int fd, int reg, unsigned int val) {
++	register_info reg_info;
++	reg_info.reg = reg;
++	reg_info.reg_value = val;
++
++	int rv = ioctl(fd, PMIC_WRITE_REG, &reg_info);
++
++	if (rv != 0)
++		return TFAIL;
++	else
++		return TPASS;
++}
++
++
++int main(int argc, char **argv) {
++	int VT_rv = TPASS;
++	int fd;
++	int reg;
++	int ret;
++	unsigned int value;
++	tst_log("started");
++
++	fd = open("/dev/pmic", O_RDWR);
++	if (fd < 0) {
++
++		tst_log("fail to open dev");
++		VT_rv = TFAIL;
++	}
++	else {
++	for (reg = REG_MCU_VERSION; reg <= REG_MAX8660_FORCE_PWM; reg ++) {
++
++		ret = VT_pmic_read(fd, reg, &value);
++		if (0 != ret) {
++
++			tst_log("fail to read reg 0x%x", reg);
++			VT_rv = TFAIL;
++			continue;
++		}
++		sleep(1);
++		ret = VT_pmic_write(fd, reg, value);
++		if (0 != ret) {
++
++			tst_log("fail to write reg 0x%x", reg);
++			VT_rv = TFAIL;
++		}
++		tst_log("access reg 0x%x OK", reg);
++		sleep(1);
++
++	}
++	}
++	/* Print test Assertion */
++	if (VT_rv == TPASS) {
++		tst_log("worked as expected");
++	} else {
++		tst_log("did NOT work as expected\n");
++	}
++
++	return VT_rv;
++}
+-- 
+1.8.0
+

@@ -1,0 +1,745 @@
+From 5e6cc41b9115ad9864e4afc1ad3d235e2d91f45f Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Tue, 28 May 2013 17:06:38 +0800
+Subject: [PATCH 395/435] ENGR00264495 VPU unit test enhancement and bug fixes
+
+- enable deblocking by default for AVC/MVC encoder
+- read from file and fill frame buffer separately for y/u/v if they are
+  not contiguous
+- delay display one more frame for decoder postprocessing
+- rectify vp8_mbparam_mem_desc.size
+- make mirror work independantly from rotation
+- set V4L2_PIX_FMT_NV16 for MJPEG422 chroma interleave
+- correct return size of freadn
+- associate numOfErrMBs with decIndex instead of frame_id (for
+  display)
+- remove VC-1 from encode/loopback options
+- check thread return val
+- warn on resolution change
+- add sample code to show DEC_SET_FRAME_DELAY usage
+- clean up building warnings
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/dec.c       | 109 +++++++++++++++++++++++++++++++-----------
+ test/mxc_vpu_test/display.c   |  87 ++++++++++++++++++++-------------
+ test/mxc_vpu_test/enc.c       |  57 +++++++++++++++++-----
+ test/mxc_vpu_test/main.c      |  18 ++++---
+ test/mxc_vpu_test/transcode.c |   8 +---
+ test/mxc_vpu_test/utils.c     |   7 ++-
+ test/mxc_vpu_test/vpu_test.h  |   7 +++
+ 7 files changed, 205 insertions(+), 88 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 586e835..c35173b 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -214,9 +214,11 @@ int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
+ 		return -1;
+ 	}
+ 
+-	/* Decoder bitstream buffer is empty */
+-	if (space <= 0)
++	/* Decoder bitstream buffer is full */
++	if (space <= 0) {
++		warn_msg("space %lu <= 0\n", space);
+ 		return 0;
++	}
+ 
+ 	if (defaultsize > 0) {
+ 		if (space < defaultsize)
+@@ -227,8 +229,10 @@ int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
+ 		size = ((space >> 9) << 9);
+ 	}
+ 
+-	if (size == 0)
++	if (size == 0) {
++		warn_msg("size == 0, space %lu\n", space);
+ 		return 0;
++	}
+ 
+ 	/* Fill the bitstream buffer */
+ 	target_addr = bs_va_startaddr + (pa_write_ptr - bs_pa_startaddr);
+@@ -241,6 +245,7 @@ int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
+ 				if (nread == -EAGAIN)
+ 					return 0;
+ 
++				err_msg("nread %d < 0\n", nread);
+ 				return -1;
+ 			}
+ 
+@@ -260,6 +265,7 @@ int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
+ 					if (nread == -EAGAIN)
+ 						return 0;
+ 
++					err_msg("nread %d < 0\n", nread);
+ 					return -1;
+ 				}
+ 
+@@ -276,6 +282,7 @@ int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
+ 				if (nread == -EAGAIN)
+ 					return 0;
+ 
++				err_msg("nread %d < 0\n", nread);
+ 				return -1;
+ 			}
+ 
+@@ -451,7 +458,7 @@ int SaveTiledYuvImageHelper(struct decode *dec, int yuvFp,
+                               int picWidth, int picHeight, int index)
+ {
+ 	int frameSize, pix_addr, offset;
+-	int y, x, nY, nCb, j, n;
++	int y, x, nY, nCb, j;
+ 	Uint8 *puc, *pYuv = 0, *dstAddrCb, *dstAddrCr;
+ 	Uint32 addrY, addrCb, addrCr;
+ 	Uint8 temp_buf[8];
+@@ -505,7 +512,7 @@ int SaveTiledYuvImageHelper(struct decode *dec, int yuvFp,
+ 		}
+ 	}
+ 
+-	n = fwriten(yuvFp, (u8 *)pYuv, frameSize);
++	fwriten(yuvFp, (u8 *)pYuv, frameSize);
+ 	free(pYuv);
+ 
+ 	return 0;
+@@ -1059,7 +1066,8 @@ decoder_start(struct decode *dec)
+ 			outinfo.indexFrameDisplay = rotid;
+ 		}
+ 
+-		dprintf(4, "frame_id = %d\n", (int)frame_id);
++		dprintf(3, "frame_id %d, decidx %d, disidx %d, rotid %d\n", (int)frame_id,
++				outinfo.indexFrameDecoded, outinfo.indexFrameDisplay, rotid);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("vpu_DecGetOutputInfo failed Err code is %d\n"
+ 				"\tframe_id = %d\n", ret, (int)frame_id);
+@@ -1069,6 +1077,11 @@ decoder_start(struct decode *dec)
+ 		if (outinfo.decodingSuccess == 0) {
+ 			warn_msg("Incomplete finish of decoding process.\n"
+ 				"\tframe_id = %d\n", (int)frame_id);
++			if ((outinfo.indexFrameDecoded >= 0) && (outinfo.numOfErrMBs)) {
++				if (cpu_is_mx6x() && dec->cmdl->format == STD_MJPG)
++					info_msg("Error Mb info:0x%x, in Frame : %d\n",
++							outinfo.numOfErrMBs, decIndex);
++			}
+ 			if (quitflag)
+ 				break;
+ 			else
+@@ -1198,16 +1211,13 @@ decoder_start(struct decode *dec)
+ 			dec->decoded_field[outinfo.indexFrameDecoded]= field;
+ 		}
+ 
+-		if(outinfo.indexFrameDecoded >= 0)
+-			decIndex++;
+-
+ 		if (outinfo.indexFrameDisplay == -1)
+ 			decodefinish = 1;
+ 		else if ((outinfo.indexFrameDisplay > dec->regfbcount) &&
+ 			 (outinfo.prescanresult != 0) && !cpu_is_mx6x())
+ 			decodefinish = 1;
+ 
+-		if (decodefinish)
++		if (decodefinish && (!(rot_en || dering_en || tiled2LinearEnable)))
+ 			break;
+ 
+ 		if (!cpu_is_mx6x() && (outinfo.prescanresult == 0) &&
+@@ -1247,6 +1257,33 @@ decoder_start(struct decode *dec)
+ 		if (quitflag)
+ 			break;
+ 
++		if(outinfo.indexFrameDecoded >= 0) {
++			/* We MUST be careful of sequence param change (resolution change, etc)
++			 * Different frame buffer number or resolution may require vpu_DecClose
++			 * and vpu_DecOpen again to reallocate sufficient resources.
++			 * If you already allocate enough frame buffers of max resolution
++			 * in the beginning, you may not need vpu_DecClose, etc. But sequence
++			 * headers must be ahead of their pictures to signal param change.
++			 */
++			if ((outinfo.decPicWidth != dec->lastPicWidth)
++					||(outinfo.decPicHeight != dec->lastPicHeight)) {
++				warn_msg("resolution changed from %dx%d to %dx%d\n",
++						dec->lastPicWidth, dec->lastPicHeight,
++						outinfo.decPicWidth, outinfo.decPicHeight);
++				dec->lastPicWidth = outinfo.decPicWidth;
++				dec->lastPicHeight = outinfo.decPicHeight;
++			}
++
++			if (outinfo.numOfErrMBs) {
++				totalNumofErrMbs += outinfo.numOfErrMBs;
++				info_msg("Num of Error Mbs : %d, in Frame : %d \n",
++						outinfo.numOfErrMBs, decIndex);
++			}
++		}
++
++		if(outinfo.indexFrameDecoded >= 0)
++			decIndex++;
++
+ 		/* BIT don't have picture to be displayed */
+ 		if ((outinfo.indexFrameDisplay == -3) ||
+ 				(outinfo.indexFrameDisplay == -2)) {
+@@ -1266,8 +1303,14 @@ decoder_start(struct decode *dec)
+ 			continue;
+ 		}
+ 
+-		if (rot_en || dering_en || tiled2LinearEnable || (dec->cmdl->format == STD_MJPG))
++		if (rot_en || dering_en || tiled2LinearEnable || (dec->cmdl->format == STD_MJPG)) {
++			/* delay one more frame for PP */
++			if ((dec->cmdl->format != STD_MJPG) && (disp_clr_index < 0)) {
++				disp_clr_index = outinfo.indexFrameDisplay;
++				continue;
++			}
+ 			actual_display_index = rotid;
++		}
+ 		else
+ 			actual_display_index = outinfo.indexFrameDisplay;
+ 
+@@ -1338,17 +1381,6 @@ decoder_start(struct decode *dec)
+ 			disp_clr_index = outinfo.indexFrameDisplay;
+ 		}
+ 
+-		if (outinfo.numOfErrMBs) {
+-			if (cpu_is_mx6x() && dec->cmdl->format == STD_MJPG)
+-				info_msg("Error Mb info:0x%x, in Frame : %d\n",
+-					    outinfo.numOfErrMBs, (int)frame_id);
+-			else {
+-				totalNumofErrMbs += outinfo.numOfErrMBs;
+-				info_msg("Num of Error Mbs : %d, in Frame : %d \n",
+-					    outinfo.numOfErrMBs, (int)frame_id);
+-			}
+-		}
+-
+ 		frame_id++;
+ 		if ((count != 0) && (frame_id >= count))
+ 			break;
+@@ -1365,9 +1397,12 @@ decoder_start(struct decode *dec)
+ 			}
+ 		}
+ 
+-	delay_ms = getenv("VPU_DECODER_DELAY_MS");
+-	if (delay_ms && strtol(delay_ms, &endptr, 10))
+-		usleep(strtol(delay_ms,&endptr, 10) * 1000);
++		delay_ms = getenv("VPU_DECODER_DELAY_MS");
++		if (delay_ms && strtol(delay_ms, &endptr, 10))
++			usleep(strtol(delay_ms,&endptr, 10) * 1000);
++
++		if (decodefinish)
++			break;
+ 	}
+ 
+ 	if (totalNumofErrMbs) {
+@@ -1501,6 +1536,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	int stride, divX, divY;
+ 	vpu_mem_desc *mvcol_md = NULL;
+ 	Rect rotCrop;
++	int delay = -1;
+ 
+ 	if (((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU))
+ 			&& (dec->cmdl->ipu_rot_en))
+@@ -1528,6 +1564,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	}
+ 
+ 	totalfb = regfbcount + dec->extrafb;
++	dprintf(4, "regfb %d, extrafb %d\n", regfbcount, dec->extrafb);
+ 
+ 	fb = dec->fb = calloc(totalfb, sizeof(FrameBuffer));
+ 	if (fb == NULL) {
+@@ -1683,6 +1720,14 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	bufinfo.maxDecFrmInfo.maxMbX = dec->stride / 16;
+ 	bufinfo.maxDecFrmInfo.maxMbY = dec->picheight / 16;
+ 	bufinfo.maxDecFrmInfo.maxMbNum = dec->stride * dec->picheight / 256;
++
++	/* For H.264, we can overwrite initial delay calculated from syntax.
++	 * delay can be 0,1,... (in unit of frames)
++	 * Set to -1 or do not call this command if you don't want to overwrite it.
++	 * Take care not to set initial delay lower than reorder depth of the clip,
++	 * otherwise, display will be out of order. */
++	vpu_DecGiveCommand(handle, DEC_SET_FRAME_DELAY, &delay);
++
+ 	ret = vpu_DecRegisterFrameBuffer(handle, fb, dec->regfbcount, stride, &bufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed, ret=%d\n", ret);
+@@ -1927,8 +1972,11 @@ decoder_parse(struct decode *dec)
+ 		}
+ 	}
+ 
++	dec->lastPicWidth = initinfo.picWidth;
++	dec->lastPicHeight = initinfo.picHeight;
++
+ 	if (cpu_is_mx6x())
+-		info_msg("Decoder: width = %d, height = %d, frameRateRes = %d, frameRateDiv = %d, count = %u\n",
++		info_msg("Decoder: width = %d, height = %d, frameRateRes = %lu, frameRateDiv = %lu, count = %u\n",
+ 			initinfo.picWidth, initinfo.picHeight,
+ 			initinfo.frameRateRes, initinfo.frameRateDiv,
+ 			initinfo.minFrameBufferCount);
+@@ -1968,6 +2016,7 @@ decoder_parse(struct decode *dec)
+ 		dec->regfbcount = dec->minfbcount + extended_fbcount + 2;
+ 	else
+ 		dec->regfbcount = dec->minfbcount + extended_fbcount;
++	dprintf(4, "minfb %d, extfb %d\n", dec->minfbcount, extended_fbcount);
+ 
+ 	dec->picwidth = ((initinfo.picWidth + 15) & ~15);
+ 
+@@ -2070,7 +2119,7 @@ decoder_open(struct decode *dec)
+ 	oparam.bitstreamFormat = dec->cmdl->format;
+ 	oparam.bitstreamBuffer = dec->phy_bsbuf_addr;
+ 	oparam.bitstreamBufferSize = STREAM_BUF_SIZE;
+-	oparam.pBitStream = dec->virt_bsbuf_addr;
++	oparam.pBitStream = (Uint8 *)dec->virt_bsbuf_addr;
+ 	oparam.reorderEnable = dec->reorderEnable;
+ 	oparam.mp4DeblkEnable = dec->cmdl->deblock_en;
+ 	oparam.chromaInterleave = dec->cmdl->chromaInterleave;
+@@ -2116,7 +2165,6 @@ decoder_open(struct decode *dec)
+ 
+ void decoder_close(struct decode *dec)
+ {
+-	DecOutputInfo outinfo = {0};
+ 	RetCode ret;
+ 
+ 	ret = vpu_DecClose(dec->handle);
+@@ -2223,6 +2271,9 @@ decode_test(void *arg)
+ 		        (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
+ 			dec->phy_bsbuf_addr, fillsize, &eos, &fill_end_bs);
+ 
++	if (fill_end_bs)
++		err_msg("Update 0 before seqinit, fill_end_bs=%d\n", fill_end_bs);
++
+ 	cmdl->complete = 0;
+ 	if (ret < 0) {
+ 		err_msg("dec_fill_bsbuffer failed\n");
+@@ -2248,7 +2299,7 @@ decode_test(void *arg)
+ 	}
+ 
+ 	if (cmdl->format == STD_VP8) {
+-		vp8_mbparam_mem_desc.size = 68 * (dec->stride * dec->picwidth / 256);
++		vp8_mbparam_mem_desc.size = 68 * (dec->picwidth * dec->picheight / 256);
+ 		ret = IOGetPhyMem(&vp8_mbparam_mem_desc);
+ 		if (ret) {
+ 			err_msg("Unable to obtain physical vp8 mbparam mem\n");
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 39f98c7..9fd2020 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -139,7 +139,7 @@ void v4l_disp_loop_thread(void *arg)
+ 	struct decode *dec = (struct decode *)arg;
+ 	struct vpu_display *disp = dec->disp;
+ 	pthread_attr_t attr;
+-	struct timeval ts;
++	struct timespec ts;
+ 	int error_status = 0, ret;
+ 	struct v4l2_buffer buffer;
+ 
+@@ -149,8 +149,13 @@ void v4l_disp_loop_thread(void *arg)
+ 	while (!error_status && !quitflag) {
+ 		/* Use timed wait here */
+ 		do {
+-			gettimeofday(&ts, NULL);
+-			ts.tv_usec +=100000; // 100ms
++			clock_gettime(CLOCK_REALTIME, &ts);
++			ts.tv_nsec +=100000000; // 100ms
++			if (ts.tv_nsec >= 1000000000)
++			{
++				ts.tv_sec += ts.tv_nsec / 1000000000;
++				ts.tv_nsec %= 1000000000;
++			}
+ 		} while ((sem_timedwait(&disp->avaiable_dequeue_frame,
+ 			 &ts) != 0) && !quitflag);
+ 
+@@ -400,7 +405,7 @@ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	pthread_cond_init(&ipu_cond, NULL);
+ 
+ 	/* start disp loop thread */
+-	pthread_create(&(disp->ipu_disp_loop_thread), NULL, ipu_disp_loop_thread, (void *)dec);
++	pthread_create(&(disp->ipu_disp_loop_thread), NULL, (void *)ipu_disp_loop_thread, (void *)dec);
+ 
+ 	return disp;
+ }
+@@ -760,31 +765,41 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 
+ 	fmt.fmt.pix.field = V4L2_FIELD_ANY;
+ 
+-    if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
+-        if (dec->cmdl->chromaInterleave == 0) {
+-            if (dec->mjpg_fmt == MODE420)
+-                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+-            else if (dec->mjpg_fmt == MODE422)
+-                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV422P;
+-            else {
+-                err_msg(" Display cannot support this MJPG format\n");
+-                goto err;
+-            }
+-        } else {
+-            info_msg("Display: NV12\n");
+-            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+-        }
+-    }
+-    else if (dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP) {
+-        fmt.fmt.pix.pixelformat = IPU_PIX_FMT_TILED_NV12;
+-    }
+-    else if (dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP) {
+-        fmt.fmt.pix.pixelformat = IPU_PIX_FMT_TILED_NV12F;
+-    }
+-    else {
+-        err_msg(" Display cannot support mapType = %d\n", dec->cmdl->mapType);
+-        goto err;
+-    }
++	if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
++		if (dec->cmdl->chromaInterleave == 0) {
++			if (dec->mjpg_fmt == MODE420)
++				fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
++			else if (dec->mjpg_fmt == MODE422)
++				fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV422P;
++			else {
++				err_msg("Display cannot support this MJPG format\n");
++				goto err;
++			}
++		} else {
++			if (dec->mjpg_fmt == MODE420) {
++				info_msg("Display: NV12\n");
++				fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
++			}
++			else if (dec->mjpg_fmt == MODE422) {
++				info_msg("Display: NV16\n");
++				fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV16;
++			}
++			else {
++				err_msg("Display cannot support this MJPG format\n");
++				goto err;
++			}
++		}
++	}
++	else if (dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP) {
++		fmt.fmt.pix.pixelformat = IPU_PIX_FMT_TILED_NV12;
++	}
++	else if (dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP) {
++		fmt.fmt.pix.pixelformat = IPU_PIX_FMT_TILED_NV12F;
++	}
++	else {
++		err_msg("Display cannot support mapType = %d\n", dec->cmdl->mapType);
++		goto err;
++	}
+ 	err = ioctl(fd, VIDIOC_S_FMT, &fmt);
+ 	if (err < 0) {
+ 		err_msg("VIDIOC_S_FMT failed\n");
+@@ -885,7 +900,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		pthread_mutex_init(&v4l_mutex, NULL);
+ 		/* start v4l disp loop thread */
+ 		pthread_create(&(disp->v4l_disp_loop_thread), NULL,
+-				    v4l_disp_loop_thread, (void *)dec);
++				    (void *)v4l_disp_loop_thread, (void *)dec);
+ 	}
+ 
+ 	return disp;
+@@ -917,6 +932,7 @@ void v4l_display_close(struct vpu_display *disp)
+ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ {
+ 	struct timeval tv;
++	struct timespec ts;
+ 	int err, type, threshold;
+ 	struct v4l2_format fmt = {0};
+ 	struct vpu_display *disp;
+@@ -1035,10 +1051,15 @@ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ 	/* Block here to wait avaiable_decoding_frame */
+ 	if (vpu_v4l_performance_test) {
+ 		do {
+-			gettimeofday(&tv, NULL);
+-			tv.tv_usec +=100000; // 100ms
++			clock_gettime(CLOCK_REALTIME, &ts);
++			ts.tv_nsec +=100000000; // 100ms
++			if (ts.tv_nsec >= 1000000000)
++			{
++				ts.tv_sec += ts.tv_nsec / 1000000000;
++				ts.tv_nsec %= 1000000000;
++			}
+ 		} while ((sem_timedwait(&disp->avaiable_decoding_frame,
+-			    &tv) != 0) && !quitflag);
++			    &ts) != 0) && !quitflag);
+ 	}
+ 
+ 	return 0;
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index b59d281..0035f75 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright 2004-2013 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -359,6 +359,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	int enc_fbwidth, enc_fbheight, src_fbwidth, src_fbheight;
+ 
+ 	minfbcount = enc->minFrameBufferCount;
++	dprintf(4, "minfb %d\n", minfbcount);
+ 	srcfbcount = 1;
+ 
+ 	enc_fbwidth = (enc->enc_picwidth + 15) & ~15;
+@@ -489,6 +490,48 @@ err1:
+ }
+ 
+ static int
++read_from_file(struct encode *enc)
++{
++	u32 y_addr, u_addr, v_addr;
++	struct frame_buf *pfb = enc->pfbpool[enc->src_fbid];
++	int divX, divY;
++	int src_fd = enc->cmdl->src_fd;
++	int format = enc->mjpg_fmt;
++	int chromaInterleave = enc->cmdl->chromaInterleave;
++	int img_size, y_size, c_size;
++	int ret = 0;
++
++	if (enc->src_picwidth != pfb->strideY) {
++		err_msg("Make sure src pic width is a multiple of 16\n");
++		return -1;
++	}
++
++	divX = (format == MODE420 || format == MODE422) ? 2 : 1;
++	divY = (format == MODE420 || format == MODE224) ? 2 : 1;
++
++	y_size = enc->src_picwidth * enc->src_picheight;
++	c_size = y_size / divX / divY;
++	img_size = y_size + c_size * 2;
++
++	y_addr = pfb->addrY + pfb->desc.virt_uaddr - pfb->desc.phy_addr;
++	u_addr = pfb->addrCb + pfb->desc.virt_uaddr - pfb->desc.phy_addr;
++	v_addr = pfb->addrCr + pfb->desc.virt_uaddr - pfb->desc.phy_addr;
++
++	if (img_size == pfb->desc.size) {
++		ret = freadn(src_fd, (void *)y_addr, img_size);
++	} else {
++		ret = freadn(src_fd, (void *)y_addr, y_size);
++		if (chromaInterleave == 0) {
++			ret = freadn(src_fd, (void *)u_addr, c_size);
++			ret = freadn(src_fd, (void *)v_addr, c_size);
++		} else {
++			ret = freadn(src_fd, (void *)u_addr, c_size * 2);
++		}
++	}
++	return ret;
++}
++
++static int
+ encoder_start(struct encode *enc)
+ {
+ 	EncHandle handle = enc->handle;
+@@ -498,11 +541,7 @@ encoder_start(struct encode *enc)
+ 	RetCode ret = 0;
+ 	int src_fbid = enc->src_fbid, img_size, frame_id = 0;
+ 	FrameBuffer *fb = enc->fb;
+-	struct frame_buf **pfbpool = enc->pfbpool;
+-	struct frame_buf *pfb;
+-	u32 yuv_addr;
+ 	struct v4l2_buffer v4l2_buf;
+-	int src_fd = enc->cmdl->src_fd;
+ 	int src_scheme = enc->cmdl->src_scheme;
+ 	int count = enc->cmdl->count;
+ 	struct timeval tenc_begin,tenc_end, total_start, total_end;
+@@ -598,10 +637,7 @@ encoder_start(struct encode *enc)
+ 			fb[src_fbid].strideY = enc->src_picwidth;
+ 			fb[src_fbid].strideC = enc->src_picwidth / 2;
+ 		} else {
+-			pfb = pfbpool[src_fbid];
+-			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr -
+-					pfb->desc.phy_addr;
+-			ret = freadn(src_fd, (void *)yuv_addr, img_size);
++			ret = read_from_file(enc);
+ 			if (ret <= 0)
+ 				break;
+ 		}
+@@ -829,7 +865,6 @@ encoder_configure(struct encode *enc)
+ void
+ encoder_close(struct encode *enc)
+ {
+-	EncOutputInfo outinfo = {0};
+ 	RetCode ret;
+ 
+ 	ret = vpu_EncClose(enc->handle);
+@@ -1025,7 +1060,7 @@ encoder_open(struct encode *enc)
+ 		encop.EncStdParam.h263Param.h263_annexTEnable = 0;
+ 	} else if (enc->cmdl->format == STD_AVC) {
+ 		encop.EncStdParam.avcParam.avc_constrainedIntraPredFlag = 0;
+-		encop.EncStdParam.avcParam.avc_disableDeblk = 1;
++		encop.EncStdParam.avcParam.avc_disableDeblk = 0;
+ 		encop.EncStdParam.avcParam.avc_deblkFilterOffsetAlpha = 6;
+ 		encop.EncStdParam.avcParam.avc_deblkFilterOffsetBeta = 0;
+ 		encop.EncStdParam.avcParam.avc_chromaQpOffset = 10;
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 775eb50..5fa8e7c 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -96,7 +96,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "  -n <ip address> Send output to this IP address \n "\
+ 	       "  -p <port number> UDP port number at server \n "\
+ 	       "	If no port number is secified, 5555 is used \n "\
+-	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, 7 - MJPG \n "\
++	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 7 - MJPG \n "\
+ 	       "	If no format specified, default is 0 (MPEG4) \n "\
+ 	       "  -l <h264 type> 0 - normal H.264(AVC), 1 - MVC\n "\
+ 	       "  -c <count> Number of frames to encode \n "\
+@@ -118,7 +118,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	default is 20 \n "\
+ 	       "\n"\
+ 	       "loopback options \n "\
+-	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, 7 - MJPG \n "\
++	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 7 - MJPG \n "\
+ 	       "	If no format specified, default is 0 (MPEG4) \n "\
+ 	       "  -w <width> capture image width \n "\
+ 	       "	default is 176. \n "\
+@@ -356,8 +356,9 @@ parse_args(int argc, char *argv[], int i)
+ 			input_arg[i].cmd.port = atoi(optarg);
+ 			break;
+ 		case 'r':
+-			input_arg[i].cmd.rot_en = 1;
+ 			input_arg[i].cmd.rot_angle = atoi(optarg);
++			if (input_arg[i].cmd.rot_angle)
++				input_arg[i].cmd.rot_en = 1;
+ 			break;
+ 		case 'u':
+ 			input_arg[i].cmd.ipu_rot_en = atoi(optarg);
+@@ -406,6 +407,8 @@ parse_args(int argc, char *argv[], int i)
+ 			break;
+ 		case 'm':
+ 			input_arg[i].cmd.mirror = atoi(optarg);
++			if (input_arg[i].cmd.mirror)
++				input_arg[i].cmd.rot_en = 1;
+ 			break;
+ 		case 't':
+ 			input_arg[i].cmd.chromaInterleave = atoi(optarg);
+@@ -437,12 +440,12 @@ parse_args(int argc, char *argv[], int i)
+ static int
+ signal_thread(void *arg)
+ {
+-	int sig, err;
++	int sig;
+ 
+ 	pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+ 
+ 	while (1) {
+-		err = sigwait(&sigset, &sig);
++		sigwait(&sigset, &sig);
+ 		if (sig == SIGINT) {
+ 			warn_msg("Ctrl-C received\n");
+ 		} else {
+@@ -466,6 +469,7 @@ main(int argc, char *argv[])
+ 	char *pargv[32] = {0}, *dbg_env;
+ 	pthread_t sigtid;
+ 	vpu_versioninfo ver;
++	int ret_thr;
+ 
+ #ifndef COMMON_INIT
+ 	srand((unsigned)time(0));     // init seed of rand()
+@@ -597,7 +601,9 @@ main(int argc, char *argv[])
+ 	if (instance > 1) {
+ 		for (i = 0; i < instance; i++) {
+ 			if (input_arg[i].tid != 0) {
+-				pthread_join(input_arg[i].tid, NULL);
++				pthread_join(input_arg[i].tid, (void *)&ret_thr);
++				if (ret_thr)
++					ret = -1;
+ 				close_files(&input_arg[i].cmd);
+ 			}
+ 		}
+diff --git a/test/mxc_vpu_test/transcode.c b/test/mxc_vpu_test/transcode.c
+index 1c049d9..9f5522a 100644
+--- a/test/mxc_vpu_test/transcode.c
++++ b/test/mxc_vpu_test/transcode.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -584,7 +584,6 @@ transcode_start(struct decode *dec, struct encode *enc)
+ 	struct timeval tdec_begin,tdec_end, total_start, total_end;
+ 	RetCode ret = 0;
+ 	int sec, usec, loop_id;
+-	u32 img_size;
+ 	double tdec_time = 0, frame_id = 0, total_time=0;
+ 	int decIndex = 0;
+ 	int rotid = 0, mirror;
+@@ -679,11 +678,6 @@ transcode_start(struct decode *dec, struct encode *enc)
+ 		vpu_DecGiveCommand(handle, SET_ROTATOR_STRIDE, &rot_stride);
+ 	}
+ 
+-	if (dec->cmdl->dst_scheme == PATH_V4L2) {
+-		img_size = dec->stride * dec->picheight;
+-	} else
+-		img_size = dec->picwidth * dec->picheight * 3 / 2;
+-
+ 	gettimeofday(&total_start, NULL);
+ 
+ 	while (1) {
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index 7db4ce2..a59cf44 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright 2004-2013 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -84,7 +84,7 @@ freadn(int fd, void *vptr, size_t n)
+ 		ptr   += nread;
+ 	}
+ 
+-	return (nread);
++	return (n - nleft);
+ }
+ 
+ /* Receive data from udp socket */
+@@ -166,6 +166,8 @@ udp_recv(struct cmd_line *cmd, int sd, char *buf, int n)
+ 
+ 		/* get our custom header */
+ 		net_h = (struct nethdr *)cmd->nbuf;
++		dprintf(4, "RX: seqno %d, neth seqno %d, iframe %d, len %d\n",
++				cmd->seq_no, net_h->seqno, net_h->iframe, net_h->len);
+ 		if (net_h->len == 0) {
+ 			/* zero length data means no more data will be
+ 			 * received */
+@@ -233,6 +235,7 @@ udp_send(struct cmd_line *cmd, int sd, char *buf, int n)
+ 		memcpy(cmd->nbuf, (char *)&net_h, hdrlen);
+ 		memcpy((cmd->nbuf + hdrlen), buf, n);
+ 	}
++	dprintf(4, "TX: neth seqno %d, iframe %d, len %d\n", net_h.seqno, net_h.iframe, net_h.len);
+ 
+ 	n += hdrlen;
+ 	addr.sin_family = AF_INET;
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 3a201c6..8d74c1b 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -45,6 +45,10 @@ extern int vpu_test_dbg_level;
+ 	printf("[WARN]\t" fmt, ## arg);	\
+ 	} while (0)
+ 
++#ifdef u32
++#undef u32
++#endif
++typedef unsigned long u32;
+ typedef unsigned short u16;
+ typedef unsigned char u8;
+ 
+@@ -230,6 +234,8 @@ struct decode {
+ 	struct cmd_line *cmdl;
+ 
+ 	int decoded_field[32];
++	int lastPicWidth;
++	int lastPicHeight;
+ };
+ 
+ struct encode {
+@@ -279,6 +285,7 @@ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ int v4l_put_data(struct decode *dec, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol);
++int tiled_framebuf_base(FrameBuffer *fb, Uint32 frame_base, int strideY, int height, int mapType);
+ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol, int mapType);
+ void framebuf_free(struct frame_buf *fb);
+ 
+-- 
+1.8.0
+

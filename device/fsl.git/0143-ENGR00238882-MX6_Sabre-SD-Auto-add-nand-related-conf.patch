@@ -1,0 +1,199 @@
+From 25f3356ad4663df221c3ed20f5a8cd16369e8044 Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Wed, 9 Jan 2013 11:12:46 +0800
+Subject: [PATCH 143/281] ENGR00238882 MX6_Sabre[SD/Auto] add nand related
+ config and tools.
+
+Add nand related config and tools, since the build system will
+depends on recovery.fstab directly, without any config, so
+we keep nand support related script comment out, and write a
+document to tell user how to porting.
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ imx6/etc/fstab.freescale     |  5 +++++
+ sabreauto_6q/BoardConfig.mk  | 16 +++++++++++++++-
+ sabreauto_6q/recovery.fstab  |  2 ++
+ sabreauto_6q/ubi/ubinize.ini | 33 +++++++++++++++++++++++++++++++++
+ sabresd_6dq/BoardConfig.mk   | 26 +++++++++++++++++---------
+ sabresd_6dq/ubi/ubinize.ini  | 10 +++++++++-
+ 6 files changed, 81 insertions(+), 11 deletions(-)
+ create mode 100644 sabreauto_6q/ubi/ubinize.ini
+
+diff --git a/imx6/etc/fstab.freescale b/imx6/etc/fstab.freescale
+index 685b4ea..48d3ab2 100644
+--- a/imx6/etc/fstab.freescale
++++ b/imx6/etc/fstab.freescale
+@@ -9,3 +9,8 @@
+ /dev/block/mmcblk0p6    /cache   ext4    nosuid,nodev,nomblk_io_submit				                          wait
+ /dev/block/mmcblk0p7    /device  ext4    ro,nosuid,nodev				                                  wait
+ 
++# below is for ubi support, uncomment to support ubifs(NAND)
++#ubi0:system	/system		ubifs 	ro					wait
++#ubi0:data       /data           ubifs   nosuid,nodev,nodiratime,noatime         wait
++#ubi0:cache      /cache          ubifs   nosuid,nodev                            wait
++#ubi0:device     /device         ubifs   ro,nosuid,nodev                         wait
+diff --git a/sabreauto_6q/BoardConfig.mk b/sabreauto_6q/BoardConfig.mk
+index 68e8034..2b2e0b6 100644
+--- a/sabreauto_6q/BoardConfig.mk
++++ b/sabreauto_6q/BoardConfig.mk
+@@ -75,11 +75,25 @@ USE_GPU_ALLOCATOR := true
+ 
+ BOARD_KERNEL_CMDLINE := console=ttymxc3,115200 init=/init video=mxcfb0:dev=ldb,bpp=32 video=mxcfb1:off video=mxcfb2:off fbmem=10M vmalloc=400M androidboot.console=ttymxc3 androidboot.hardware=freescale
+ 
++# uncomment below lins if use NAND
++#TARGET_USERIMAGES_USE_UBIFS = true
+ 
+ ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
+ #UBI boot command line.
+-BOARD_KERNEL_CMDLINE := console=ttymxc3,115200 init=/init video=mxcfb0 video=mxcfb1:off video=mxcfb2:off fbmem=10M vmalloc=400M androidboot.console=ttymxc3  mtdparts=gpmi-nand:20m(bootloader),20m(bootimg),20m(recovery),-(root) gpmi_debug_init ubi.mtd=3 androidboot.hardware=freescale
++UBI_ROOT_INI := device/fsl/sabreauto_6q/ubi/ubinize.ini
++TARGET_MKUBIFS_ARGS := -m 4096 -e 516096 -c 4096 -x none
++TARGET_UBIRAW_ARGS := -m 4096 -p 512KiB $(UBI_ROOT_INI)
++
++# Note: this NAND partition table must align with MFGTool's config.
++BOARD_KERNEL_CMDLINE +=  mtdparts=gpmi-nand:16m(bootloader),16m(bootimg),128m(recovery),-(root) ubi.mtd=3
++endif
++
++ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
++ifeq ($(TARGET_USERIMAGES_USE_EXT4),true)
++$(error "TARGET_USERIMAGES_USE_UBIFS and TARGET_USERIMAGES_USE_EXT4 config open in same time, please only choose one target file system image")
++endif
+ endif
+ 
+ 
++
+ TARGET_BOOTLOADER_CONFIG := mx6q:mx6q_sabreauto_android_config
+diff --git a/sabreauto_6q/recovery.fstab b/sabreauto_6q/recovery.fstab
+index 9c557b8..4c415b7 100644
+--- a/sabreauto_6q/recovery.fstab
++++ b/sabreauto_6q/recovery.fstab
+@@ -6,6 +6,8 @@
+ /misc  emmc /dev/block/mmcblk0p8
+ 
+ # UBI support is under below:
++#/boot mtd bootimg
++#/recovery mtd /dev/mtd/mtd2
+ #/system ubifs /dev/ubi1_0
+ #/data ubifs /dev/ubi1_2
+ #/cache ubifs /dev/ubi1_1
+diff --git a/sabreauto_6q/ubi/ubinize.ini b/sabreauto_6q/ubi/ubinize.ini
+new file mode 100644
+index 0000000..8b98cbb
+--- /dev/null
++++ b/sabreauto_6q/ubi/ubinize.ini
+@@ -0,0 +1,33 @@
++[system]
++mode=ubi
++image=./out/target/product/sabresd_6dq/system.img
++vol_id=0
++vol_size=300MiB
++vol_type=dynamic
++vol_name=system
++vol_alignment=1
++
++[cache]
++mode=ubi
++vol_id=1
++vol_size=200MiB
++vol_type=dynamic
++vol_name=cache
++vol_alignment=1
++
++[device]
++mode=ubi
++vol_id=2
++vol_size=10MiB
++vol_type=dynamic
++vol_name=device
++vol_aligment=1
++
++[data]
++mode=ubi
++vol_id=3
++vol_size=300MiB
++vol_type=dynamic
++vol_name=data
++vol_alignment=1
++vol_flags=autoresize
+diff --git a/sabresd_6dq/BoardConfig.mk b/sabresd_6dq/BoardConfig.mk
+index 3d0786f..4851a05 100755
+--- a/sabresd_6dq/BoardConfig.mk
++++ b/sabresd_6dq/BoardConfig.mk
+@@ -55,12 +55,13 @@ SENSOR_MMA8451 := true
+ # for recovery service
+ TARGET_SELECT_KEY := 28
+ 
+-TARGET_USERIMAGES_USE_EXT4 := true
++#TARGET_USERIMAGES_USE_EXT4 := true
+ # we don't support sparse image.
+ TARGET_USERIMAGES_SPARSE_EXT_DISABLED := true
+ 
+ # uncomment below lins if use NAND
+-#TARGET_USERIMAGES_USE_UBIFS = true
++TARGET_USERIMAGES_USE_UBIFS = true
++
+ 
+ ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
+ UBI_ROOT_INI := device/fsl/sabresd_6dq/ubi/ubinize.ini
+@@ -68,6 +69,20 @@ TARGET_MKUBIFS_ARGS := -m 4096 -e 516096 -c 4096 -x none
+ TARGET_UBIRAW_ARGS := -m 4096 -p 512KiB $(UBI_ROOT_INI)
+ endif
+ 
++ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
++ifeq ($(TARGET_USERIMAGES_USE_EXT4),true)
++$(error "TARGET_USERIMAGES_USE_UBIFS and TARGET_USERIMAGES_USE_EXT4 config open in same time, please only choose one target file system image")
++endif
++endif
++
++BOARD_KERNEL_CMDLINE := console=ttymxc0,115200 init=/init video=mxcfb0:dev=ldb,bpp=32 video=mxcfb1:off video=mxcfb2:off fbmem=10M fb0base=0x27b00000 vmalloc=400M androidboot.console=ttymxc0 androidboot.hardware=freescale
++
++ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
++#UBI boot command line.
++# Note: this NAND partition table must align with MFGTool's config.
++BOARD_KERNEL_CMDLINE +=  mtdparts=gpmi-nand:16m(bootloader),16m(bootimg),128m(recovery),-(root) gpmi_debug_init ubi.mtd=3
++endif
++
+ # atheros 3k BT
+ BOARD_USE_AR3K_BLUETOOTH := true
+ 
+@@ -76,13 +91,6 @@ USE_GPU_ALLOCATOR := true
+ 
+ # define frame buffer count
+ NUM_FRAMEBUFFER_SURFACE_BUFFERS := 3
+-BOARD_KERNEL_CMDLINE := console=ttymxc0,115200 init=/init video=mxcfb0:dev=ldb,bpp=32 video=mxcfb1:off video=mxcfb2:off fbmem=10M fb0base=0x27b00000 vmalloc=400M androidboot.console=ttymxc0 androidboot.hardware=freescale
+-
+-
+-ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
+-#UBI boot command line.
+-BOARD_KERNEL_CMDLINE := console=ttymxc0,115200 init=/init video=mxcfb0 video=mxcfb1:off video=mxcfb2:off fbmem=10M fb0base=0x27b00000 vmalloc=400M androidboot.console=ttymxc0  mtdparts=gpmi-nand:20m(bootloader),20m(bootimg),20m(recovery),-(root) gpmi_debug_init ubi.mtd=3 androidboot.hardware=freescale
+-endif
+ 
+ 
+ TARGET_BOOTLOADER_CONFIG := 6q:mx6q_sabresd_android_config 6dl:mx6dl_sabresd_android_config
+diff --git a/sabresd_6dq/ubi/ubinize.ini b/sabresd_6dq/ubi/ubinize.ini
+index 5f7ff42..8b98cbb 100644
+--- a/sabresd_6dq/ubi/ubinize.ini
++++ b/sabresd_6dq/ubi/ubinize.ini
+@@ -15,9 +15,17 @@ vol_type=dynamic
+ vol_name=cache
+ vol_alignment=1
+ 
+-[data]
++[device]
+ mode=ubi
+ vol_id=2
++vol_size=10MiB
++vol_type=dynamic
++vol_name=device
++vol_aligment=1
++
++[data]
++mode=ubi
++vol_id=3
+ vol_size=300MiB
+ vol_type=dynamic
+ vol_name=data
+-- 
+1.8.0
+

@@ -1,0 +1,334 @@
+From b212a2df75068402e1b149972cecc6e8e774ea4c Mon Sep 17 00:00:00 2001
+From: Brian Liu <brian.liu@freescale.com>
+Date: Fri, 23 Oct 2009 11:02:29 +0800
+Subject: [PATCH 01/10] ENGR00117591 Rework all telephony related code after
+ rebasing to Android SDK1.6r1
+
+Lots of change in pppd and other telephony related components in
+SDK1.6r1. 3G connection is broken with our original change. So decided
+to rework all original changes.
+
+See CQ description for detail.
+
+Revert "ENGR00112182 Enable basic telephony features with HuaWei EM750 module"
+
+This reverts commit 32eda0fa1a6bb7ce5ff617846d6f6ac49cd9c27a.
+---
+ android/Android.mk     |  34 ++++++++++++
+ android/ip-down-ppp0.c |  65 ++++++++++++++++++++++
+ android/ip-up-ppp0.c   | 145 +++++++++++++++++++++++++++++++++++++++++++++++++
+ pppd/Android.mk        |   3 +-
+ pppd/ipcp.c            |   4 +-
+ pppd/main.c            |   5 ++
+ 6 files changed, 254 insertions(+), 2 deletions(-)
+
+diff --git a/android/Android.mk b/android/Android.mk
+new file mode 100644
+index 0000000..e40bb81
+--- /dev/null
++++ b/android/Android.mk
+@@ -0,0 +1,34 @@
++#
++# Copyright (C) 2009 The Android Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++LOCAL_PATH := $(call my-dir)
++include $(CLEAR_VARS)
++
++LOCAL_SRC_FILES := ip-up-ppp0.c
++LOCAL_SHARED_LIBRARIES := libcutils
++LOCAL_MODULE := ip-up-ppp0
++LOCAL_MODULE_PATH := $(TARGET_OUT_ETC)/ppp
++
++include $(BUILD_EXECUTABLE)
++
++include $(CLEAR_VARS)
++
++LOCAL_SRC_FILES := ip-down-ppp0.c
++LOCAL_SHARED_LIBRARIES := libcutils
++LOCAL_MODULE := ip-down-ppp0
++LOCAL_MODULE_PATH := $(TARGET_OUT_ETC)/ppp
++
++include $(BUILD_EXECUTABLE)
+diff --git a/android/ip-down-ppp0.c b/android/ip-down-ppp0.c
+new file mode 100644
+index 0000000..0041896
+--- /dev/null
++++ b/android/ip-down-ppp0.c
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <linux/route.h>
++
++#include <android/log.h>
++#include <cutils/properties.h>
++
++int main(int argc, char **argv)
++{
++/* args is like this:
++    argv[1] = ifname;
++    argv[2] = devnam;
++    argv[3] = strspeed;
++    argv[4] = strlocal;
++    argv[5] = strremote;
++    argv[6] = ipparam;
++*/
++    if (argc < 6)
++	return EINVAL;
++
++    __android_log_print(ANDROID_LOG_INFO, "ip-down-ppp0", "ip-down-ppp0 script is launched with \n");
++    __android_log_print(ANDROID_LOG_INFO, "ip-down-ppp0", "\tInterface\t:\t%s", 	argv[1]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-down-ppp0", "\tTTY device\t:\t%s",	argv[2]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-down-ppp0", "\tTTY speed\t:\t%s",	argv[3]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-down-ppp0", "\tLocal IP\t:\t%s",	argv[4]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-down-ppp0", "\tRemote IP\t:\t%s",	argv[5]);
++
++    /* We don't need delete "default" entry in route table since it will be deleted 
++       automatically by kernel when ppp0 interface is down
++    */
++
++    /* Reset all those properties like net.ppp0.xxx which are set by ip-up-ppp0 */
++    {
++	property_set("net.ppp0.local-ip", "");
++	property_set("net.ppp0.remote-ip", "");
++	property_set("net.ppp0.dns1", "");
++	property_set("net.ppp0.dns2", "");
++	property_set("net.dns1", "");
++	property_set("net.dns2", "");
++    }
++    return 0;
++}
+diff --git a/android/ip-up-ppp0.c b/android/ip-up-ppp0.c
+new file mode 100644
+index 0000000..aede46f
+--- /dev/null
++++ b/android/ip-up-ppp0.c
+@@ -0,0 +1,145 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <linux/route.h>
++
++#include <android/log.h>
++#include <cutils/properties.h>
++
++static char propstr[65]; 	// hold "net.$LINKNAME"
++static char propstr1[128];	// hold "net.$LINKNAME.xxx"
++
++static inline struct in_addr *in_addr(struct sockaddr *sa)
++{
++    return &((struct sockaddr_in *)sa)->sin_addr;
++}
++
++int main(int argc, char **argv)
++{
++    struct rtentry rt;
++    int s, ret;
++
++/* args is like this:
++    argv[1] = ifname;
++    argv[2] = devnam;
++    argv[3] = strspeed;
++    argv[4] = strlocal;
++    argv[5] = strremote;
++    argv[6] = ipparam;
++*/
++    if (argc < 6)
++	return EINVAL;
++
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "ip-up-ppp0 script is launched with \n");
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "\tInterface\t:\t%s", 	argv[1]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "\tTTY device\t:\t%s",	argv[2]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "\tTTY speed\t:\t%s",	argv[3]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "\tLocal IP\t:\t%s",	argv[4]);
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "\tRemote IP\t:\t%s",	argv[5]);
++
++    /* Clean out the RTREQ structure */
++    memset(&rt, 0, sizeof(rt));
++
++    /* Prepare new "default" route entry for ppp0 link 
++       Destination: 0.0.0.0
++       Netmask:     0.0.0.0
++       Gateway:     not specified 
++       Interface:   ifname as argv[1] 
++       Flag:	    RTF_UP
++    */
++    rt.rt_dst.sa_family = AF_INET;
++    ((struct sockaddr_in *)&rt.rt_dst)->sin_addr.s_addr = INADDR_ANY;
++
++    rt.rt_genmask.sa_family = AF_INET;
++    ((struct sockaddr_in *)&rt.rt_genmask)->sin_addr.s_addr = INADDR_ANY;
++
++    rt.rt_dev = argv[1];
++
++    rt.rt_flags = RTF_UP;
++
++    /* Add "default" entry into route table */
++    s = socket(AF_INET, SOCK_DGRAM, 0);
++    if(s == -1) {
++        __android_log_print(ANDROID_LOG_ERROR, "ip-up-ppp0", "Fail to get socket to modify route table");
++	return EPERM;
++    } 	
++    ret = ioctl(s, SIOCADDRT, &rt);
++    if(ret == -1) {
++	if(errno == EEXIST) {
++            __android_log_print(ANDROID_LOG_WARN, "ip-up-ppp0", "Unable to add default entry in route table - Already exist");
++	    return 0;
++	}
++        __android_log_print(ANDROID_LOG_ERROR, "ip-up-ppp0", "Fail to add default entry in route table - %s", strerror(errno));
++	return EPERM;
++    }
++
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "Add default entry into route table");
++
++    {
++	// we need setup lots of property like net.$LINKNAME.[local-ip|remote-ip|dns1|dns2]
++	strcpy(propstr, "net."); 
++	strncat(propstr, getenv("LINKNAME"), 60);  // we never allow $LINKNAME exceed 60 chars
++	strncat(propstr, ".", 1);
++        __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "LINKNAME is %s", propstr);
++
++	// set net.$LINKNAME.local-ip prop to $IPLOCAL
++	strcpy(propstr1, propstr);
++	strcat(propstr1, "local-ip");
++	char *iplocal = getenv("IPLOCAL");
++	property_set(propstr1, iplocal ? iplocal : "");
++        __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "Setprop %s to %s", propstr1, iplocal ? iplocal : "");
++
++	// set net.$LINKNAME.remote-ip prop to $IPREMOTE
++	strcpy(propstr1, propstr);
++	strcat(propstr1, "remote-ip");
++	char *ipremote = getenv("IPREMOTE");
++	property_set(propstr1, ipremote ? ipremote : "");
++        __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "Setprop %s to %s", propstr1, ipremote ? ipremote : "");
++
++	// set net.$LINKNAME.dns1 prop to $DNS1
++	strcpy(propstr1, propstr);
++	strcat(propstr1, "dns1");
++	char *dns1 = getenv("DNS1");
++	property_set(propstr1, dns1 ? dns1 : "");
++	// Fixme:  "net.dns1" should be setup in framework code instead of in ip-up-ppp0 script
++	property_set("net.dns1", dns1 ? dns1 : "");
++        __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "Setprop %s to %s", propstr1, dns1 ? dns1 : "");
++        __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "Setprop %s to %s", "net.dns1", dns1 ? dns1 : "");
++
++	// set net.$LINKNAME.dns2 prop to $DNS2
++	strcpy(propstr1, propstr);
++	strcat(propstr1, "dns2");
++	char *dns2 = getenv("DNS2");
++	property_set(propstr1, dns2 ? dns2 : "");
++	// Fixme:  "net.dns2" should be setup in framework code instead of in ip-up-ppp0 script
++	property_set("net.dns2", dns2 ? dns2 : "");
++        __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "Setprop %s to %s", propstr1, dns2 ? dns2 : "");
++        __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0", "Setprop %s to %s", "net.dns2", dns2 ? dns2 : "");
++    }
++    __android_log_print(ANDROID_LOG_INFO, "ip-up-ppp0",
++                        "All traffic is now redirected to %s", argv[1]);
++
++    return 0;
++}
+diff --git a/pppd/Android.mk b/pppd/Android.mk
+index 6552f11..d3b7020 100644
+--- a/pppd/Android.mk
++++ b/pppd/Android.mk
+@@ -30,7 +30,8 @@ LOCAL_SHARED_LIBRARIES := \
+ LOCAL_C_INCLUDES := \
+ 	$(LOCAL_PATH)/include
+ 
+-LOCAL_CFLAGS := -DANDROID_CHANGES -DCHAPMS=1 -DMPPE=1 -Iexternal/openssl/include
++# Force sizeof(enum)=4
++LOCAL_CFLAGS := -fno-short-enums -DANDROID_CHANGES -DCHAPMS=1 -DMPPE=1 -Iexternal/openssl/include
+ 
+ LOCAL_MODULE:= pppd
+ 
+diff --git a/pppd/ipcp.c b/pppd/ipcp.c
+index 09aebe3..70ef7e5 100644
+--- a/pppd/ipcp.c
++++ b/pppd/ipcp.c
+@@ -1706,7 +1706,9 @@ ipcp_up(f)
+ 	return;
+     }
+     if (ho->hisaddr == 0) {
+-	ho->hisaddr = htonl(0x0a404040 + ifunit);
++        // If no remote IP address, set it to same IP address as local instead of a dummpy address
++        // ho->hisaddr = htonl(0x0a404040 + ifunit);
++        ho->hisaddr = go->ouraddr;
+ 	warn("Could not determine remote IP address: defaulting to %I",
+ 	     ho->hisaddr);
+     }
+diff --git a/pppd/main.c b/pppd/main.c
+index 64efefe..9f4e31b 100644
+--- a/pppd/main.c
++++ b/pppd/main.c
+@@ -887,6 +887,11 @@ create_linkpidfile(pid)
+ 	error("Failed to create pid file %s: %m", linkpidfile);
+ 	linkpidfile[0] = 0;
+     }
++#else
++    /* We still expect LINKNAME is pass to ipcp_up script */
++    if (linkname[0] == 0)
++	return;
++    script_setenv("LINKNAME", linkname, 1);
+ #endif
+ }
+ 
+-- 
+1.8.0
+

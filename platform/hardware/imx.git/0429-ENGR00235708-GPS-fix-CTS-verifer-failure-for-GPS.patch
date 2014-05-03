@@ -1,0 +1,103 @@
+From f9b725da0d3d9525e5a97f1a4ad7bcaba5d11f4f Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Thu, 14 Mar 2013 12:36:42 +0800
+Subject: [PATCH 429/486] ENGR00235708 GPS:fix CTS-verifer failure for GPS
+
+This failure is about changing fix-frequency in updating record.
+This patch add functions for setting different fix intervals to module.
+also change the passive provider notification frequency according to
+upper settings.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ libgps/athr_gps.c | 32 ++++++++++++++++++++++----------
+ 1 file changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/libgps/athr_gps.c b/libgps/athr_gps.c
+index abd5944..2bf7c20 100755
+--- a/libgps/athr_gps.c
++++ b/libgps/athr_gps.c
+@@ -1,7 +1,7 @@
+ /*
+ * Copyright (C) 2011 The Android Open Source Project
+ * Copyright (C) 2011 Atheros Communications, Inc.
+-* Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
++* Copyright (C) 2011-2013 Freescale Semiconductor, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+@@ -1395,8 +1395,6 @@ gps_timer_thread( void*  arg )
+ 
+       //D("gps fix cb: 0x%x", state->reader.fix.flags);
+ 
+-      ath_send_ni_notification(&state->reader);
+-
+       if (state->callbacks.location_cb) {
+           state->callbacks.location_cb( &state->reader.fix );
+           state->reader.fix.flags = 0;
+@@ -1406,7 +1404,6 @@ gps_timer_thread( void*  arg )
+       if (state->fix_freq == 0) {
+         state->fix_freq = -1;
+       }
+-
+     }
+ 
+     if (state->reader.sv_status_changed != 0) {
+@@ -1420,15 +1417,17 @@ gps_timer_thread( void*  arg )
+ 
+     }
+ 
+-    need_sleep = (state->fix_freq != -1 && state->init == STATE_START ? 1 : 0);
++    need_sleep = (state->fix_freq != -1 && (state->init != STATE_QUIT) ? 1 : 0);
+     sleep_val = state->fix_freq;
+ 
+     gps_state_unlock_fix(state);
+ 
+     if (need_sleep) {
+         sleep(sleep_val);
++    } else {
++        D("won't sleep because fix_freq=%d state->init=%d",state->fix_freq, state->init);
+     }
+-
++    ath_send_ni_notification(&state->reader);
+ 	if( state->init == STATE_INIT && lastcmd == CMD_STOP && started == 1)
+ 	{
+ 		int gap = 0;
+@@ -1593,7 +1592,7 @@ gps_state_init( GpsState*  state )
+         ALOGE("could not create gps thread: %s", strerror(errno));
+         goto Fail;
+     }
+-
++        state->callbacks.set_capabilities_cb(GPS_CAPABILITY_SCHEDULING);
+ 	D("gps state initialized");
+ 
+     return;
+@@ -1739,9 +1738,22 @@ static int athr_gps_set_position_mode(GpsPositionMode mode, GpsPositionRecurrenc
+ 	{
+ 		s->fix_freq =1;
+ 	}
+-
+-	D("gps fix frquency set to %d milli-secs", min_interval);
+-
++    D("gps fix frquency set to %d sec", s->fix_freq);
++    switch(s->fix_freq)
++    {
++        case 1:
++            write(s->fd, "$PUNV,SET,28,0,0,0*cc\r\n",23);
++            break;
++        case 5:
++            write(s->fd, "$PUNV,SET,28,5,0,5*cc\r\n",23);
++            break;
++        case 15:
++            write(s->fd, "$PUNV,SET,28,15,0,15*cc\r\n",25);
++            break;
++        default:
++            write(s->fd, "$PUNV,SET,28,0,0,0*cc\r\n",23);
++            break;
++    }
+     return 0;
+ }
+ 
+-- 
+1.8.0
+

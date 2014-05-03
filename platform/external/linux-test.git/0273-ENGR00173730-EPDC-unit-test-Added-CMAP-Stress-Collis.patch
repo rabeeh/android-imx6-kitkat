@@ -1,0 +1,819 @@
+From 9f3dfbe24d296a3e778126274672d7bb146b67ce Mon Sep 17 00:00:00 2001
+From: Danny Nold <dannynold@freescale.com>
+Date: Thu, 2 Feb 2012 17:39:39 -0600
+Subject: [PATCH 273/435] ENGR00173730 - EPDC unit test: Added CMAP, Stress,
+ Collision tests
+
+- Added test for partial->full mode update transitions
+    - Several partial updates followed by FULL updates (was
+    at one point leading to endless updates).
+- Added test for pixel shift issue
+    - With RGB565, AUTO_WAVEFORM, and an X-coordinate
+    that is off in alignment from a 4-pixel boundary by 1
+    pixel (i.e., 5, 9, 13, etc), the resulting image was
+    drawn with a right shift of 1 pixel.
+- Add colormap test
+    - EPDC now support use of 256-entry CMAP to remap
+    8-bit grayscale pixels to alternate values.  PxP
+    is used to do the remapping.
+- Added Collision Test Mode (dry-run mode) test, and changed all
+calls to send update to use the new update marker structure
+- Added Stress Test
+
+Signed-off-by: Danny Nold <dannynold@freescale.com>
+---
+ test/mxc_fb_test/mxc_epdc_fb_test.c | 581 +++++++++++++++++++++++++++++++++---
+ 1 file changed, 538 insertions(+), 43 deletions(-)
+
+diff --git a/test/mxc_fb_test/mxc_epdc_fb_test.c b/test/mxc_fb_test/mxc_epdc_fb_test.c
+index 1237a1b..0731b6e 100644
+--- a/test/mxc_fb_test/mxc_epdc_fb_test.c
++++ b/test/mxc_fb_test/mxc_epdc_fb_test.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2010-2011 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2010-2012 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -77,7 +77,7 @@ extern "C"{
+ #define ALLOW_COLLISIONS	0
+ #define NO_COLLISIONS		1
+ 
+-#define NUM_TESTS		9
++#define NUM_TESTS		14
+ 
+ __u32 pwrdown_delay = 0;
+ __u32 scheme = UPDATE_SCHEME_SNAPSHOT;
+@@ -92,6 +92,7 @@ int g_fb_size;
+ struct fb_var_screeninfo screen_info;
+ __u32 marker_val = 1;
+ int use_animation = 0;
++int num_flashes = 10;
+ 
+ void memset_dword(void *s, int c, size_t count)
+ {
+@@ -136,7 +137,10 @@ static __u32 update_to_display(int left, int top, int width, int height, int wav
+ 	int wait_for_complete, uint flags)
+ {
+ 	struct mxcfb_update_data upd_data;
++	struct mxcfb_update_marker_data upd_marker_data;
+ 	int retval;
++	int wait = wait_for_complete | (flags & EPDC_FLAG_TEST_COLLISION);
++
+ 
+ 	upd_data.update_mode = UPDATE_MODE_PARTIAL;
+ 	upd_data.waveform_mode = wave_mode;
+@@ -147,12 +151,11 @@ static __u32 update_to_display(int left, int top, int width, int height, int wav
+ 	upd_data.temp = TEMP_USE_AMBIENT;
+ 	upd_data.flags = flags;
+ 
+-	if (wait_for_complete) {
++	if (wait)
+ 		/* Get unique marker value */
+ 		upd_data.update_marker = marker_val++;
+-	} else {
++	else
+ 		upd_data.update_marker = 0;
+-	}
+ 
+ 	retval = ioctl(fd_fb_ioctl, MXCFB_SEND_UPDATE, &upd_data);
+ 	while (retval < 0) {
+@@ -162,15 +165,22 @@ static __u32 update_to_display(int left, int top, int width, int height, int wav
+ 		retval = ioctl(fd_fb_ioctl, MXCFB_SEND_UPDATE, &upd_data);
+ 	}
+ 
+-	if (wait_for_complete) {
++	if (wait) {
++		upd_marker_data.update_marker = upd_data.update_marker;
++
+ 		/* Wait for update to complete */
+-		retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++		retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_marker_data);
+ 		if (retval < 0) {
+ 			printf("Wait for update complete failed.  Error = 0x%x", retval);
+ 		}
+ 	}
+ 
+-	return upd_data.waveform_mode;
++	if (flags & EPDC_FLAG_TEST_COLLISION) {
++		printf("Collision test result = %d\n",
++			upd_marker_data.collision_test);
++		return upd_marker_data.collision_test;
++	} else
++		return upd_data.waveform_mode;
+ }
+ 
+ static void draw_rgb_crosshatch(struct fb_var_screeninfo * var, int mode)
+@@ -755,13 +765,13 @@ static int test_auto_waveform(void)
+ 
+ 	/* Draw 0x5 square */
+ 	for (i = 10; i < 50; i++)
+-		for (j = 10; j < 50; j += 2)
+-			*((__u32 *)fb + (i*screen_info.xres_virtual+j)*2/4) = 0x50505050;
++		for (j = 10; j < 50; j++)
++			*((__u8 *)fb + (i*screen_info.xres_virtual+j)) = 0x50;
+ 
+ 	/* Draw 0xA square */
+ 	for (i = 60; i < 100; i++)
+-		for (j = 60; j < 100; j += 2)
+-			*((__u32 *)fb + (i*screen_info.xres_virtual+j)*2/4) = 0xA0A0A0A0;
++		for (j = 60; j < 100; j++)
++			*((__u8 *)fb + (i*screen_info.xres_virtual+j)) = 0xA0;
+ 
+ 	printf("Update auto-selected to GC4\n");
+ 	waveform_used = update_to_display(0, 0, 100, 100, WAVEFORM_MODE_AUTO, FALSE, 0);
+@@ -934,6 +944,61 @@ static int test_pan(void)
+ 		&screen_info);
+ 	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, TRUE, 0);
+ 
++	printf("Panned to colorbar\n");
++	screen_info.yoffset = screen_info.yres;
++	retval = ioctl(fd_fb, FBIOPAN_DISPLAY, &screen_info);
++	if (retval < 0) {
++		printf("Pan fail!\n");
++	}
++
++	printf("Updating (0,0,40,40)\n");
++	update_to_display(0, 0, 40, 40,
++		WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	usleep(100);
++	sleep(1);
++
++	printf("Updating (300,300,40,40)\n");
++	update_to_display(300, 300, 40, 40,
++		WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	usleep(100);
++	sleep(1);
++
++	printf("Updating (15,400,100,100)\n");
++	update_to_display(15, 400, 100, 100,
++		WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	usleep(100);
++	sleep(1);
++
++	printf("Updating (300,21,43,43)\n");
++	update_to_display(300, 21, 43, 43,
++		WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	usleep(100);
++	sleep(1);
++
++	printf("Updating (400,300,399,299)\n");
++	update_to_display(400, 300, 399, 299,
++		WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	usleep(100);
++	sleep(1);
++
++	printf("Updating (400,0,400,600)\n");
++	update_to_display(400, 0, 400, 600,
++		WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	usleep(100);
++	sleep(1);
++
++	printf("Updating (0,0,400,600)\n");
++	update_to_display(0, 0, 400, 600,
++		WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	sleep(5);
++
+ 	for (y = 0; (y + screen_info.yres <= screen_info.yres * 2) &&
+ 		(y + screen_info.yres <= screen_info.yres_virtual); y+=50) {
+ 		screen_info.yoffset = y;
+@@ -1040,6 +1105,7 @@ static int test_pan(void)
+ static int test_overlay(void)
+ {
+ 	struct mxcfb_update_data upd_data;
++	struct mxcfb_update_marker_data update_marker_data;
+ 	int retval;
+ 	struct fb_fix_screeninfo fix_screen_info;
+ 	__u32 ol_phys_addr;
+@@ -1092,7 +1158,8 @@ static int test_overlay(void)
+ 	}
+ 
+ 	/* Wait for update to complete */
+-	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	update_marker_data.update_marker = upd_data.update_marker;
++	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &update_marker_data);
+ 	if (retval < 0) {
+ 		printf("Wait for update complete failed.  Error = 0x%x", retval);
+ 	}
+@@ -1128,7 +1195,8 @@ static int test_overlay(void)
+ 	}
+ 
+ 	/* Wait for update to complete */
+-	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	update_marker_data.update_marker = upd_data.update_marker;
++	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &update_marker_data);
+ 	if (retval < 0) {
+ 		printf("Wait for update complete failed.  Error = 0x%x", retval);
+ 	}
+@@ -1164,7 +1232,8 @@ static int test_overlay(void)
+ 	}
+ 
+ 	/* Wait for update to complete */
+-	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	update_marker_data.update_marker = upd_data.update_marker;
++	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &update_marker_data);
+ 	if (retval < 0) {
+ 		printf("Wait for update complete failed.  Error = 0x%x", retval);
+ 	}
+@@ -1193,7 +1262,8 @@ static int test_overlay(void)
+ 	}
+ 
+ 	/* Wait for update to complete */
+-	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	update_marker_data.update_marker = upd_data.update_marker;
++	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &update_marker_data);
+ 	if (retval < 0) {
+ 		printf("Wait for update complete failed.  Error = 0x%x", retval);
+ 	}
+@@ -1246,7 +1316,8 @@ static int test_overlay(void)
+ 	}
+ 
+ 	/* Wait for update to complete */
+-	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++	update_marker_data.update_marker = upd_data.update_marker;
++	retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &update_marker_data);
+ 	if (retval < 0) {
+ 		printf("Wait for update complete failed.  Error = 0x%x", retval);
+ 	}
+@@ -1271,6 +1342,27 @@ static int test_animation_mode(void)
+ 	int iter;
+ 	int wave_mode = use_animation ? WAVEFORM_MODE_A2 : WAVEFORM_MODE_AUTO;
+ 
++	int i;
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, 800*600*2);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_AUTO, TRUE, 0);
++
++	sleep(2);
++
++	/* Swap quickly back-and-forth between black and white screen */
++	for (i = 0; i < num_flashes; i++) {
++		/* black */
++		memset(fb, 0x00, 800*600*2);
++		update_to_display(0, 0, screen_info.xres, screen_info.yres,
++			wave_mode, TRUE, EPDC_FLAG_FORCE_MONOCHROME);
++		/* white */
++		memset(fb, 0xFF, 800*600*2);
++		update_to_display(0, 0, screen_info.xres, screen_info.yres,
++			wave_mode, TRUE, EPDC_FLAG_FORCE_MONOCHROME);
++	}
++
+ 	draw_rgb_color_squares(&screen_info);
+ 
+ 	printf("Squares update normal\n");
+@@ -1392,22 +1484,20 @@ static int test_fast_square(void)
+ 	while (xpos + side_len <= screen_info.xres)
+ 	{
+ 		/* Clear last square (set area to white) */
+-		if (!first_go)
++		if (!first_go) {
+ 			draw_rectangle(fb, last_pos, ypos, side_len, side_len,
+ 					0xFFFF);
+-
+-		/* Draw new black square */
+-		draw_rectangle(fb, xpos, ypos, side_len, side_len, 0x0000);
+-
+-		/* Send to display */
+-		if (first_go) {
+ 			update_to_display(last_pos, ypos, side_len, side_len,
+-				wave_mode, wait_upd_compl, 0);
+-			first_go = 0;
++				wave_mode,
++				wait_upd_compl, 0);
+ 		}
+-		else
+-			update_to_display(last_pos, ypos, side_len + increment,
+-				side_len, wave_mode, wait_upd_compl, 0);
++
++		first_go = 0;
++
++		/* Draw new grey square */
++		draw_rectangle(fb, xpos, ypos, side_len, side_len, 0x0000);
++		update_to_display(xpos, ypos, side_len, side_len,
++			wave_mode, wait_upd_compl, 0);
+ 
+ 		last_pos = xpos;
+ 		xpos += increment;
+@@ -1417,6 +1507,9 @@ static int test_fast_square(void)
+ 
+ 	/* Clear last square (set area to white) */
+ 	draw_rectangle(fb, last_pos, ypos, side_len, side_len, 0xFFFF);
++	update_to_display(last_pos, ypos, side_len, side_len,
++		WAVEFORM_MODE_DU,
++		wait_upd_compl, 0);
+ 
+ 	xpos = 700;
+ 	ypos = 150;
+@@ -1426,9 +1519,14 @@ static int test_fast_square(void)
+ 	while (ypos + side_len + increment < 600)
+ 	{
+ 		/* Clear last square (set area to white) */
+-		if (!first_go)
++		if (!first_go) {
+ 			draw_rectangle(fb, xpos, last_pos, side_len, side_len,
+ 					0xFFFF);
++			update_to_display(xpos, last_pos, side_len,
++				side_len,
++				wave_mode,
++				wait_upd_compl, 0);
++		}
+ 		else
+ 			first_go = 0;
+ 
+@@ -1436,7 +1534,7 @@ static int test_fast_square(void)
+ 		draw_rectangle(fb, xpos, ypos, side_len, side_len, 0x0000);
+ 
+ 		/* Send to display */
+-		update_to_display(xpos, last_pos, side_len,
++		update_to_display(xpos, ypos, side_len,
+ 			side_len + increment, wave_mode, wait_upd_compl, 0);
+ 
+ 		last_pos = ypos;
+@@ -1445,6 +1543,388 @@ static int test_fast_square(void)
+ 
+ 	return retval;
+ }
++
++
++static int test_partial_to_full(void) {
++	int retval = TPASS;
++	int i, j, k;
++	__u16 greys[16] = {0x0000, 0x1082, 0x2104, 0x3186, 0x4408, 0x548A, 0x630C,
++	0x738E, 0x8410, 0x9492, 0xA514, 0xB596, 0xC618, 0xD69A, 0xE71C, 0xF79E};
++	int grey_cnt = 0;
++	int left, top;
++	struct mxcfb_update_data upd_data;
++	struct mxcfb_update_marker_data update_marker_data;
++	int ret;
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, 800*600*2);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_AUTO, TRUE, 0);
++
++	/* Square 1 - Dark Grey */
++	draw_rectangle(fb, 50, 0, 200, 200, 0x8410);
++
++	for (i = 0; i < 1; i++) {
++		for (j = 0; j * 100 + 109 < 800; j++) {
++			left = 9 + (j * 100);
++			for (k = 0; k * 100 + 109 < 600; k++, grey_cnt++) {
++				grey_cnt = grey_cnt % 16;
++				top = 9 + (k * 100);
++				draw_rectangle(fb, left, top, 100, 100, greys[grey_cnt]);
++				update_to_display(left, top, 100, 100, WAVEFORM_MODE_AUTO,
++					FALSE, 0);
++			}
++		}
++	}
++
++	upd_data.update_mode = UPDATE_MODE_FULL;
++	upd_data.waveform_mode = WAVEFORM_MODE_AUTO;
++	upd_data.update_region.left = 0;
++	upd_data.update_region.width = screen_info.xres;
++	upd_data.update_region.top = 0;
++	upd_data.update_region.height = screen_info.yres;
++	upd_data.temp = TEMP_USE_AMBIENT;
++	upd_data.flags = 0;
++	upd_data.update_marker = marker_val++;
++
++	ret = ioctl(fd_fb_ioctl, MXCFB_SEND_UPDATE, &upd_data);
++	while (ret < 0) {
++		/* We have limited memory available for updates, so wait and
++		 * then try again after some updates have completed */
++		sleep(1);
++		ret = ioctl(fd_fb_ioctl, MXCFB_SEND_UPDATE, &upd_data);
++	}
++
++	/* Wait for update to complete */
++	update_marker_data.update_marker = upd_data.update_marker;
++	ret = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &update_marker_data);
++	if (ret < 0)
++		printf("Wait for update complete failed.  Error = 0x%x", ret);
++
++	return retval;
++}
++
++static int test_shift(void) {
++	int retval = TPASS;
++	int y;
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, 800*600*2);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_AUTO, TRUE, 0);
++
++	/* Draw 2-pixel-wide line at 300,169 down to 300, 278 */
++	for (y = 169; y < 278; y++) {
++		*((__u16 *)fb + y*screen_info.xres + 300) = 0x0000;
++		*((__u16 *)fb + y*screen_info.xres + 301) = 0x0000;
++	}
++
++	update_to_display(300, 169, 141, 109, WAVEFORM_MODE_DU, FALSE, 0);
++
++	printf("Update at 300,169\n");
++	sleep(5);
++
++	update_to_display(301, 200, 141, 109, WAVEFORM_MODE_DU, FALSE, 0);
++
++	printf("Update at 301,169\n");
++
++	return retval;
++}
++
++static __u16 einkfb_8bpp_gray[256] =
++{
++	0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
++	0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
++	0xFFFF,
++
++	/* ..0x10 */
++	0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE,
++	0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE, 0xEEEE,
++	0xEEEE,
++
++	/* ..0x21 */
++	0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD,
++	0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD, 0xDDDD,
++	0xDDDD,
++
++	/* ..0x32 */
++	0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC,
++	0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC, 0xCCCC,
++	0xCCCC,
++
++	/* ..0x43 */
++	0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB,
++	0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB, 0xBBBB,
++	0xBBBB,
++
++	/* ..0x54 */
++	0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA,
++	0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA,
++	0xAAAA,
++
++	/* ..0x65 */
++	0x9999, 0x9999, 0x9999, 0x9999, 0x9999, 0x9999, 0x9999, 0x9999,
++	0x9999, 0x9999, 0x9999, 0x9999, 0x9999, 0x9999, 0x9999, 0x9999,
++	0x9999,
++
++	/* ..0x76 */
++	0x8888, 0x8888, 0x8888, 0x8888, 0x8888, 0x8888, 0x8888, 0x8888,
++	0x8888, 0x8888, 0x8888, 0x8888, 0x8888, 0x8888, 0x8888, 0x8888,
++	0x8888,
++
++	/* ..0x87 */
++	0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777,
++	0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777, 0x7777,
++	0x7777,
++
++	/* ..0x98 */
++	0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
++	0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
++	0x6666,
++
++	/* ..0xA9 */
++	0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555,
++	0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555, 0x5555,
++	0x5555,
++
++	/* ..0xBA */
++	0x4444, 0x4444, 0x4444, 0x4444, 0x4444, 0x4444, 0x4444, 0x4444,
++	0x4444, 0x4444, 0x4444, 0x4444, 0x4444, 0x4444, 0x4444, 0x4444,
++	0x4444,
++
++	/* ..0xCB */
++	0x3333, 0x3333, 0x3333, 0x3333, 0x3333, 0x3333, 0x3333, 0x3333,
++	0x3333, 0x3333, 0x3333, 0x3333, 0x3333, 0x3333, 0x3333, 0x3333,
++	0x3333,
++
++	/* ..0xDC */
++	0x2222, 0x2222, 0x2222, 0x2222, 0x2222, 0x2222, 0x2222, 0x2222,
++	0x2222, 0x2222, 0x2222, 0x2222, 0x2222, 0x2222, 0x2222, 0x2222,
++	0x2222,
++
++	/* ..0xED */
++	0x1111, 0x1111, 0x1111, 0x1111, 0x1111, 0x1111, 0x1111, 0x1111,
++	0x1111, 0x1111, 0x1111, 0x1111, 0x1111, 0x1111, 0x1111, 0x1111,
++	0x1111,
++
++	/* ..0xEF */
++	0x0000,
++};
++
++struct fb_cmap einkfb_8bpp_cmap =
++{
++	.len        = 256,
++	.red        = einkfb_8bpp_gray,
++	.green   = einkfb_8bpp_gray,
++	.blue      = einkfb_8bpp_gray
++};
++
++static int test_colormap(void)
++{
++	int retval = TPASS;
++	int i;
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*screen_info.bits_per_pixel/8);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, 0);
++
++	printf("Changing to Y8 Framebuffer\n");
++	screen_info.rotate = FB_ROTATE_UR;
++	screen_info.bits_per_pixel = 8;
++	screen_info.grayscale = GRAYSCALE_8BIT;
++	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
++	if (retval < 0)
++	{
++		printf("Go to Y8 failed\n");
++		return TFAIL;
++	}
++
++	/* Get default colormap */
++	retval = ioctl(fd_fb, FBIOGETCMAP, &einkfb_8bpp_cmap);
++	if (retval < 0)
++	{
++		printf("Unable to get colormap from FB. ret = %d\n", retval);
++		return TFAIL;
++	}
++
++	/* Create colormap */
++	for (i = 0; i < 256; i++)
++		einkfb_8bpp_cmap.red[i] = ~i;
++
++	retval = ioctl(fd_fb, FBIOPUTCMAP, &einkfb_8bpp_cmap);
++	if (retval < 0)
++	{
++		printf("Unable to set new colormap. ret = %d\n", retval);
++		return TFAIL;
++	}
++
++	/* Make update request using new colormap */
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, EPDC_FLAG_USE_CMAP);
++	printf("Screen should be black\n");
++
++	sleep(2);
++
++	/* Make update request using new colormap */
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, 0);
++	printf("Screen should be white now\n");
++
++	sleep(2);
++
++	/* Make update request using new colormap */
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, EPDC_FLAG_USE_CMAP | EPDC_FLAG_ENABLE_INVERSION);
++	printf("Screen should be white still\n");
++
++	sleep(2);
++
++	/* Draw colorbar */
++	draw_y_colorbar(&screen_info);
++
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, EPDC_FLAG_USE_CMAP);
++	printf("Should be inverted color bar (white to black, left to right)\n");
++
++	sleep(2);
++
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, 0);
++	printf("Colorbar again, with no CMAP (black to white, left to right)\n");
++
++	sleep(2);
++
++	/* Change colormap to black-white posterize */
++	for (i = 0; i < 256; i++)
++		einkfb_8bpp_gray[i] = i < 128 ? 0x0000 : 0xFFFF;
++	retval = ioctl(fd_fb, FBIOPUTCMAP, &einkfb_8bpp_cmap);
++	if (retval < 0)
++	{
++		printf("Unable to set new colormap. ret = %d\n", retval);
++		return TFAIL;
++	}
++
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, EPDC_FLAG_USE_CMAP);
++	printf("Posterized colorbar\n");
++
++	return retval;
++}
++
++static int test_dry_run(void)
++{
++	int retval = TPASS;
++	__u32 coll;
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*2);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_AUTO, TRUE, 0);
++
++	/*
++	 * Draw gray rectangle
++	 * Use dry run first, which should not result in collision
++	 */
++	draw_rectangle(fb, 0, 0, 300, 250, 0x8410);
++	coll = update_to_display(0, 0, 300, 250, WAVEFORM_MODE_AUTO, FALSE, EPDC_FLAG_TEST_COLLISION);
++	if (coll)
++		retval = TFAIL;
++	update_to_display(0, 0, 300, 250, WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	/* Draw overlapping rectangle */
++	draw_rectangle(fb, 250, 200, 300, 250, 0x4104);
++	update_to_display(250, 200, 300, 250, WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	sleep(3);
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*2);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_AUTO, TRUE, 0);
++
++	sleep(1);
++
++	/* Draw gray rectangle */
++	draw_rectangle(fb, 0, 0, 300, 250, 0x8410);
++	update_to_display(0, 0, 300, 250, WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	/* Draw overlapping rectangle, use dry-run test to check for collision */
++	draw_rectangle(fb, 250, 200, 300, 250, 0x4104);
++	coll = update_to_display(250, 200, 300, 250, WAVEFORM_MODE_AUTO, FALSE, EPDC_FLAG_TEST_COLLISION);
++	if (coll)
++		sleep(1);
++	else
++		retval = TFAIL;
++	/* Now that collision resolved, finally submit update */
++	update_to_display(250, 200, 300, 250, WAVEFORM_MODE_AUTO, FALSE, 0);
++
++	return retval;
++}
++
++static int test_stress(void)
++{
++	int retval = TPASS;
++	int x, y, width, height, i, j;
++	__u16 color;
++	__u16 greys[16] = {0x0000, 0x1082, 0x2104, 0x3186, 0x4408, 0x548A, 0x630C,
++	0x738E, 0x8410, 0x9492, 0xA514, 0xB596, 0xC618, 0xD69A, 0xE71C, 0xFFFF};
++	uint flags;
++
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*2);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_AUTO, TRUE, 0);
++
++	for (i = 0; i < 200; i++) {
++
++		screen_info.rotate = i % 4;
++		screen_info.bits_per_pixel = 16;
++		screen_info.grayscale = 0;
++		printf("Rotating FB 90 degrees to %d\n", screen_info.rotate);
++		retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
++		if (retval < 0)
++		{
++			printf("Rotation failed\n");
++			return TFAIL;
++		}
++
++		for (j = 0; j < 1000; j++) {
++			width = (rand() % (screen_info.xres)) + 1;
++			height = (rand() % (screen_info.yres)) + 1;
++			if (width == screen_info.xres)
++				x = 0;
++			else
++				x = rand() % (screen_info.xres - width);
++			if (height == screen_info.yres)
++				y = 0;
++			else
++				y = rand() % (screen_info.yres - height);
++			color = rand() % 32;
++			if (color < 16)
++				color = greys[color];
++			else if (color < 24)
++				color = greys[0];
++			else
++				color = greys[15];
++			/*
++			printf("x = %d, y = %d, w = %d, h = %d, color = 0x%x\n",
++				x, y, width, height, color);
++			*/
++			draw_rectangle(fb, x, y, width, height, color);
++			/* 1 out of 10 updates will be a dry-run */
++			if (rand() / 10 == 1)
++				flags = EPDC_FLAG_TEST_COLLISION;
++			else
++				flags = 0;
++			update_to_display(x, y, width, height,
++				WAVEFORM_MODE_AUTO, FALSE, flags);
++		}
++	}
++
++	return retval;
++}
++
+ void usage(char *app)
+ {
+ 	printf("EPDC framebuffer driver test program.\n");
+@@ -1470,6 +1950,12 @@ void usage(char *app)
+ 	printf("7 - Auto-Updates\n");
+ 	printf("8 - Animation Mode Updates\n");
+ 	printf("9 - Fast Updates\n");
++	printf("10 - Partial to Full Update Transitions\n");
++	printf("11 - Test Pixel Shifting Effect\n");
++	printf("12 - Colormap Updates\n");
++	printf("13 - Minimal Collision Resubmission\n");
++	printf("14 - Collision Test Mode\n");
++	printf("15 - Stress Test\n");
+ }
+ 
+ int parse_test_nums(char *num_str)
+@@ -1525,11 +2011,11 @@ main(int argc, char **argv)
+ 
+ 	int i, rt;
+ 
+-	/* Initialize test map so all tests will run */
+-	for(i = 0; i < NUM_TESTS; i++)
++	/* Initialize test map so all tests (except stress test) will run */
++	for(i = 0; i < NUM_TESTS - 1; i++)
+ 		test_map[i] = TRUE;
+ 
+-	while ((rt = getopt(argc, argv, "hau:n:p:")) >= 0) {
++	while ((rt = getopt(argc, argv, "hau:n:p:f:")) >= 0) {
+ 		switch (rt) {
+ 		case 'h':
+ 			usage(argv[0]);
+@@ -1537,6 +2023,10 @@ main(int argc, char **argv)
+ 		case 'a':
+ 			use_animation = 1;
+ 			break;
++		case 'f':
++			num_flashes = atoi(optarg);
++			printf("number of flashes = %d\n", num_flashes);
++			break;
+ 		case 'u':
+ 			if (strcmp(optarg, "s") == 0) {
+ 				scheme = UPDATE_SCHEME_SNAPSHOT;
+@@ -1586,12 +2076,12 @@ main(int argc, char **argv)
+ 		}
+ 
+ 		/* If we found EPDC, exit loop */
+-		if (!strcmp(EPDC_STR_ID, screen_info_fix.id))
++		if (!strcmp(EPDC_STR_ID, screen_info_fix.id)) {
++			printf("Opened EPDC fb device %s\n", fb_dev);
+ 			break;
++		}
+ 
+ 		fb_num++;
+-
+-		printf("Opened EPDC fb device %s\n", fb_dev);
+ 	}
+ 
+ 	/*
+@@ -1644,12 +2134,12 @@ main(int argc, char **argv)
+ 	}
+ 
+ 	printf("Set waveform modes\n");
+-	wv_modes.mode_init = 0;
+-	wv_modes.mode_du = 1;
+-	wv_modes.mode_gc4 = 3;
+-	wv_modes.mode_gc8 = 2;
+-	wv_modes.mode_gc16 = 2;
+-	wv_modes.mode_gc32 = 2;
++	wv_modes.mode_init = WAVEFORM_MODE_INIT;
++	wv_modes.mode_du = WAVEFORM_MODE_DU;
++	wv_modes.mode_gc4 = WAVEFORM_MODE_GC4;
++	wv_modes.mode_gc8 = WAVEFORM_MODE_GC16;
++	wv_modes.mode_gc16 = WAVEFORM_MODE_GC16;
++	wv_modes.mode_gc32 = WAVEFORM_MODE_GC16;
+ 	retval = ioctl(fd_fb_ioctl, MXCFB_SET_WAVEFORM_MODES, &wv_modes);
+ 	if (retval < 0)
+ 	{
+@@ -1679,6 +2169,11 @@ main(int argc, char **argv)
+ 	testfunc_array[6] = &test_auto_update;
+ 	testfunc_array[7] = &test_animation_mode;
+ 	testfunc_array[8] = &test_fast_square;
++	testfunc_array[9] = &test_partial_to_full;
++	testfunc_array[10] = &test_shift;
++	testfunc_array[11] = &test_colormap;
++	testfunc_array[12] = &test_dry_run;
++	testfunc_array[13] = &test_stress;
+ 
+ 	for (i = 0; i < NUM_TESTS; i++)
+ 		if (test_map[i])
+-- 
+1.8.0
+

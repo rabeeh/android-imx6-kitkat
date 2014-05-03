@@ -1,0 +1,766 @@
+From d5ee006c4b1b7c88d89d46c008290a6c01f55f23 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Fri, 22 Nov 2013 17:46:22 +0800
+Subject: [PATCH 430/435] ENGR00289336 Demo features and refine renderer
+
+1) Demo the usage of MJPEG decoder down sampling
+   - User can allocate smaller frame buffers.
+   - Output image may need to be cropped because frame buffer
+   may be larger due to 16 pixel alignment.
+   - VPU performance of down sampling is approximately same as
+   original size, which implies VPU does full size MCU decoding
+   then down samples the decoded MCU.
+
+2) Demo encoder intra refresh mode selection
+   Add code to show how to use command ENC_SET_INTRA_REFRESH_MODE
+   to select consecutive intra refresh mode. FW v3.1.1 added a new mode:
+   consecutive intra refresh mode. This command must be called before
+   vpu_EncGetInitialInfo to take effect for the initial mode. User
+   cannot switch intra refresh mode on the fly according to current
+   FW implementation.
+
+3) Refine renderer
+   - Refine the data structure of renderer
+   - Modified v4l renderer to not to call vpu_DecClrDispFlag in renderer
+   thread. Added a queue and a counter for released buffers
+
+4) Improve MVC parameter set encoding
+   Skip encoding all parameter sets if parameter set refresh is
+   enabled in FW
+
+5) Fix encoder MV report bug
+   MV should be 16-bit sign extended
+
+6) Add comment for camera
+   ioctl(cap_fd, VIDIOC_S_INPUT, &g_input)
+   use different g_input for each camera
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/capture.c   |   2 +-
+ test/mxc_vpu_test/dec.c       |  67 +++++++++++++++-------
+ test/mxc_vpu_test/display.c   | 125 +++++++++++++++++++++++++-----------------
+ test/mxc_vpu_test/enc.c       |  10 +++-
+ test/mxc_vpu_test/loopback.c  |   3 +-
+ test/mxc_vpu_test/transcode.c |  13 ++---
+ test/mxc_vpu_test/vpu_test.h  |  41 ++++++++++----
+ 7 files changed, 168 insertions(+), 93 deletions(-)
+
+diff --git a/test/mxc_vpu_test/capture.c b/test/mxc_vpu_test/capture.c
+index fa66a67..fee6b12 100644
+--- a/test/mxc_vpu_test/capture.c
++++ b/test/mxc_vpu_test/capture.c
+@@ -108,7 +108,7 @@ v4l_capture_setup(struct encode *enc, int width, int height, int fps)
+ 	struct v4l2_crop crop;
+ 	struct v4l2_dbg_chip_ident chip;
+ 	struct v4l2_frmsizeenum fsize;
+-	int i, g_input = 1, mode = 0;
++	int i, g_input = 1, mode = 0; /* Use different g_input (0 or 1) for each camera */
+ 
+ 	if (cap_fd > 0) {
+ 		warn_msg("capture device already opened\n");
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 17b7140..48646df 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -955,6 +955,7 @@ decoder_start(struct decode *dec)
+ 	struct frame_buf **pfbpool = dec->pfbpool;
+ 	struct frame_buf *pfb = NULL;
+ 	struct vpu_display *disp = dec->disp;
++	struct v4l_specific_data *v4l_rsd;
+ 	int err = 0, eos = 0, fill_end_bs = 0, decodefinish = 0;
+ 	struct timeval tdec_begin,tdec_end, total_start, total_end;
+ 	RetCode ret;
+@@ -970,6 +971,7 @@ decoder_start(struct decode *dec)
+ 	int tiled2LinearEnable = dec->tiled2LinearEnable;
+ 	char *delay_ms, *endptr;
+ 	int mjpgReadChunk = 0;
++	int index;
+ 
+ 	if (((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU))
+ 			&& (dec->cmdl->ipu_rot_en))
+@@ -1140,6 +1142,8 @@ decoder_start(struct decode *dec)
+ 					return -1;
+ 				}
+ 			}
++			decparam.mjpegScaleDownRatioWidth = dec->mjpegScaleDownRatioWidth;
++			decparam.mjpegScaleDownRatioHeight = dec->mjpegScaleDownRatioHeight;
+ 		}
+ 
+ 		gettimeofday(&tdec_begin, NULL);
+@@ -1476,9 +1480,10 @@ decoder_start(struct decode *dec)
+ 			actual_display_index = outinfo.indexFrameDisplay;
+ 
+ 		if ((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU)) {
++			v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
+ 			if (deblock_en) {
+ 				deblock_fb->bufY =
+-					disp->buffers[disp->buf.index]->offset;
++					v4l_rsd->buffers[v4l_rsd->buf.index]->offset;
+ 				deblock_fb->bufCb = deblock_fb->bufY + img_size;
+ 				deblock_fb->bufCr = deblock_fb->bufCb +
+ 							(img_size >> 2);
+@@ -1506,6 +1511,14 @@ decoder_start(struct decode *dec)
+ 							err_msg("vpu_DecClrDispFlag failed Error code"
+ 								" %d\n", err);
+ 					}
++				} else {
++					index = v4l_get_buf(dec);
++					if (index >= 0) {
++						err = vpu_DecClrDispFlag(handle, index);
++						if (err)
++							err_msg("vpu_DecClrDispFlag failed Error code"
++									" %d\n", err);
++					}
+ 				}
+ 
+ 				if (dec->cmdl->format == STD_MJPG) {
+@@ -1513,8 +1526,8 @@ decoder_start(struct decode *dec)
+ 					rotid %= dec->regfbcount;
+ 				} else if (rot_en || dering_en || tiled2LinearEnable) {
+ 					disp_clr_index = outinfo.indexFrameDisplay;
+-					if (disp->buf.index != -1)
+-						rotid = disp->buf.index; /* de-queued buffer as next rotation buffer */
++					if (v4l_rsd->buf.index != -1)
++						rotid = v4l_rsd->buf.index; /* de-queued buffer as next rotation buffer */
+ 					else {
+ 						rotid++;
+ 						rotid = (rotid - dec->regfbcount) % dec->extrafb;
+@@ -1522,7 +1535,7 @@ decoder_start(struct decode *dec)
+ 					}
+ 				}
+ 				else
+-					disp_clr_index = disp->buf.index;
++					disp_clr_index = v4l_rsd->buf.index;
+ 			}
+ 		} else {
+ 			if (rot_en) {
+@@ -1694,6 +1707,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	FrameBuffer *fb;
+ 	struct frame_buf **pfbpool;
+ 	struct vpu_display *disp = NULL;
++	struct v4l_specific_data *v4l_rsd;
+ 	int stride, divX, divY;
+ 	vpu_mem_desc *mvcol_md = NULL;
+ 	Rect rotCrop;
+@@ -1814,6 +1828,16 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			goto err;
+ 		}
+ 
++#ifndef _FSL_VTS_
++		/* Not set fps when doing performance test default */
++		if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test)
++			dec->cmdl->fps = 30;
++#endif
++
++		info_msg("Display fps will be %d\n", dec->cmdl->fps);
++
++		v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
++
+ 		divX = (dec->mjpg_fmt == MODE420 || dec->mjpg_fmt == MODE422) ? 2 : 1;
+ 		divY = (dec->mjpg_fmt == MODE420 || dec->mjpg_fmt == MODE224) ? 2 : 1;
+ 
+@@ -1830,7 +1854,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 
+ 				if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
+ 					if (dst_scheme == PATH_V4L2)
+-						fb[i].bufY = disp->buffers[i]->offset;
++						fb[i].bufY = v4l_rsd->buffers[i]->offset;
+ 					else
+ 						fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
+ 					fb[i].bufCb = fb[i].bufY + img_size;
+@@ -1839,7 +1863,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 				else if ((dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP)
+ 						||(dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP)){
+ 					if (dst_scheme == PATH_V4L2)
+-						tiled_framebuf_base(&fb[i], disp->buffers[i]->offset,
++						tiled_framebuf_base(&fb[i], v4l_rsd->buffers[i]->offset,
+ 							dec->stride, dec->picheight, dec->cmdl->mapType);
+ 					else {
+ 						fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
+@@ -1955,6 +1979,7 @@ decoder_parse(struct decode *dec)
+ 	int align, profile, level, extended_fbcount;
+ 	RetCode ret;
+ 	char *count;
++	int origPicWidth, origPicHeight;
+ 
+ 	/*
+ 	 * If userData report is enabled, buffer and comamnd need to be set
+@@ -2179,7 +2204,15 @@ decoder_parse(struct decode *dec)
+ 		dec->regfbcount = dec->minfbcount + extended_fbcount;
+ 	dprintf(4, "minfb %d, extfb %d\n", dec->minfbcount, extended_fbcount);
+ 
+-	dec->picwidth = ((initinfo.picWidth + 15) & ~15);
++	if (cpu_is_mx6x() && (dec->cmdl->format == STD_MJPG)) {
++		origPicWidth = initinfo.picWidth >> dec->mjpegScaleDownRatioWidth;
++		origPicHeight = initinfo.picHeight >> dec->mjpegScaleDownRatioHeight;
++	} else {
++		origPicWidth = initinfo.picWidth;
++		origPicHeight = initinfo.picHeight;
++	}
++
++	dec->picwidth = ((origPicWidth + 15) & ~15);
+ 
+ 	align = 16;
+ 	if ((dec->cmdl->format == STD_MPEG2 ||
+@@ -2188,7 +2221,7 @@ decoder_parse(struct decode *dec)
+ 	    dec->cmdl->format == STD_VP8) && initinfo.interlace == 1)
+ 		align = 32;
+ 
+-	dec->picheight = ((initinfo.picHeight + align - 1) & ~(align - 1));
++	dec->picheight = ((origPicHeight + align - 1) & ~(align - 1));
+ 
+ #ifdef COMBINED_VIDEO_SUPPORT
+ 	/* Following lines are sample code to support resolution change
+@@ -2217,16 +2250,16 @@ decoder_parse(struct decode *dec)
+ 	 */
+ 
+ 	/* Add non-h264 crop support, assume left=top=0 */
+-	if ((dec->picwidth > initinfo.picWidth ||
+-		dec->picheight > initinfo.picHeight) &&
++	if ((dec->picwidth > origPicWidth ||
++		dec->picheight > origPicHeight) &&
+ 		(!initinfo.picCropRect.left &&
+ 		!initinfo.picCropRect.top &&
+ 		!initinfo.picCropRect.right &&
+ 		!initinfo.picCropRect.bottom)) {
+ 		initinfo.picCropRect.left = 0;
+ 		initinfo.picCropRect.top = 0;
+-		initinfo.picCropRect.right = initinfo.picWidth;
+-		initinfo.picCropRect.bottom = initinfo.picHeight;
++		initinfo.picCropRect.right = origPicWidth;
++		initinfo.picCropRect.bottom = origPicHeight;
+ 	}
+ 
+ 	info_msg("CROP left/top/right/bottom %lu %lu %lu %lu\n",
+@@ -2259,8 +2292,6 @@ decoder_parse(struct decode *dec)
+ 			err_msg("malloc_error\n");
+ 	}
+ 
+-	info_msg("Display fps will be %d\n", dec->cmdl->fps);
+-
+ 	return 0;
+ }
+ 
+@@ -2403,6 +2434,8 @@ decode_test(void *arg)
+ 	dec->mvInfo.enable = 0;
+ 	dec->frameBufStat.enable = 0;
+ 	dec->mjpgLineBufferMode = 0;
++	dec->mjpegScaleDownRatioWidth = 0;  /* 0,1,2,3 */
++	dec->mjpegScaleDownRatioHeight = 0; /* 0,1,2,3 */
+ 
+ 	dec->cmdl = cmdl;
+ 
+@@ -2464,12 +2497,6 @@ decode_test(void *arg)
+ 	}
+ 	cmdl->complete = 0;
+ 
+-#ifndef _FSL_VTS_
+-	/* Not set fps when doing performance test default */
+-        if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test)
+-                dec->cmdl->fps = 30;
+-#endif
+-
+ 	/* parse the bitstream */
+ 	ret = decoder_parse(dec);
+ 	if (ret) {
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 64a04cd..1362272 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -38,7 +38,7 @@
+ #define V4L2_MXC_ROTATE_90_RIGHT_HFLIP          6
+ #define V4L2_MXC_ROTATE_90_LEFT                 7
+ 
+-static __inline int queue_size(struct ipu_queue * q)
++static __inline int queue_size(struct buf_queue * q)
+ {
+         if (q->tail >= q->head)
+                 return (q->tail - q->head);
+@@ -46,7 +46,7 @@ static __inline int queue_size(struct ipu_queue * q)
+                 return ((q->tail + QUEUE_SIZE) - q->head);
+ }
+ 
+-static __inline int queue_buf(struct ipu_queue * q, int idx)
++static __inline int queue_buf(struct buf_queue * q, int idx)
+ {
+         if (((q->tail + 1) % QUEUE_SIZE) == q->head)
+                 return -1;      /* queue full */
+@@ -55,7 +55,7 @@ static __inline int queue_buf(struct ipu_queue * q, int idx)
+         return 0;
+ }
+ 
+-static __inline int dequeue_buf(struct ipu_queue * q)
++static __inline int dequeue_buf(struct buf_queue * q)
+ {
+         int ret;
+         if (q->tail == q->head)
+@@ -65,7 +65,7 @@ static __inline int dequeue_buf(struct ipu_queue * q)
+         return ret;
+ }
+ 
+-static __inline int peek_next_buf(struct ipu_queue * q)
++static __inline int peek_next_buf(struct buf_queue * q)
+ {
+         if (q->tail == q->head)
+                 return -1;      /* queue empty */
+@@ -169,11 +169,11 @@ void v4l_disp_loop_thread(void *arg)
+ 			err_msg("VIDIOC_DQBUF failed\n");
+ 			error_status = 1;
+ 		}
+-		/* Clear the flag after showing */
+-		ret = vpu_DecClrDispFlag(dec->handle, buffer.index);
++		queue_buf(&(disp->released_q), buffer.index);
+ 
+ 		pthread_mutex_lock(&v4l_mutex);
+ 		disp->queued_count--;
++		disp->dequeued_count++;
+ 		pthread_mutex_unlock(&v4l_mutex);
+ 		sem_post(&disp->avaiable_decoding_frame);
+ 	}
+@@ -450,16 +450,19 @@ void v4l_free_bufs(int n, struct vpu_display *disp)
+ {
+ 	int i;
+ 	struct v4l_buf *buf;
++	struct v4l_specific_data *v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
++
+ 	for (i = 0; i < n; i++) {
+-		if (disp->buffers[i] != NULL) {
+-			buf = disp->buffers[i];
++		if (v4l_rsd->buffers[i] != NULL) {
++			buf = v4l_rsd->buffers[i];
+ 			if (buf->start > 0)
+ 				munmap(buf->start, buf->length);
+ 
+ 			free(buf);
+-			disp->buffers[i] = NULL;
++			v4l_rsd->buffers[i] = NULL;
+ 		}
+ 	}
++	free(v4l_rsd);
+ }
+ 
+ static int
+@@ -512,6 +515,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	struct v4l2_mxc_offset off = {0};
+ 	struct v4l2_rect icrop = {0};
+ 	struct vpu_display *disp;
++	struct v4l_specific_data *v4l_rsd;
+ 	int fd_fb;
+ 	char *tv_mode, *test_mode;
+ 	char motion_mode = dec->cmdl->vdi_motion;
+@@ -827,6 +831,9 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		goto err;
+ 	}
+ 
++	v4l_rsd = calloc(1, sizeof(struct v4l_specific_data));
++	disp->render_specific_data = (void *)v4l_rsd;
++
+ 	for (i = 0; i < nframes; i++) {
+ 		struct v4l2_buffer buffer = {0};
+ 		struct v4l_buf *buf;
+@@ -837,7 +844,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 			goto err;
+ 		}
+ 
+-		disp->buffers[i] = buf;
++		v4l_rsd->buffers[i] = buf;
+ 
+ 		buffer.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 		buffer.memory = V4L2_MEMORY_MMAP;
+@@ -894,12 +901,13 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 
+ 	if (vpu_v4l_performance_test) {
+ 		dec->disp = disp;
++		disp->released_q.tail = disp->released_q.head = 0;
+ 		sem_init(&disp->avaiable_decoding_frame, 0,
+ 			    dec->regfbcount - dec->minfbcount);
+ 		sem_init(&disp->avaiable_dequeue_frame, 0, 0);
+ 		pthread_mutex_init(&v4l_mutex, NULL);
+ 		/* start v4l disp loop thread */
+-		pthread_create(&(disp->v4l_disp_loop_thread), NULL,
++		pthread_create(&(disp->disp_loop_thread), NULL,
+ 				    (void *)v4l_disp_loop_thread, (void *)dec);
+ 	}
+ 
+@@ -917,7 +925,7 @@ void v4l_display_close(struct vpu_display *disp)
+ 	if (disp) {
+ 		if (vpu_v4l_performance_test) {
+ 			quitflag = 1;
+-			pthread_join(disp->v4l_disp_loop_thread, NULL);
++			pthread_join(disp->disp_loop_thread, NULL);
+ 			sem_destroy(&disp->avaiable_decoding_frame);
+ 			sem_destroy(&disp->avaiable_dequeue_frame);
+ 		}
+@@ -929,22 +937,53 @@ void v4l_display_close(struct vpu_display *disp)
+ 	}
+ }
+ 
++int v4l_get_buf(struct decode *dec)
++{
++	int index = -1;
++	struct timespec ts;
++	struct vpu_display *disp;
++
++	disp = dec->disp;
++	/* Block here to wait avaiable_decoding_frame */
++	if (vpu_v4l_performance_test) {
++		do {
++			clock_gettime(CLOCK_REALTIME, &ts);
++			ts.tv_nsec +=100000000; // 100ms
++			if (ts.tv_nsec >= 1000000000)
++			{
++				ts.tv_sec += ts.tv_nsec / 1000000000;
++				ts.tv_nsec %= 1000000000;
++			}
++		} while ((sem_timedwait(&disp->avaiable_decoding_frame,
++			    &ts) != 0) && !quitflag);
++	}
++
++	if (disp->dequeued_count > 0) {
++		index = dequeue_buf(&(disp->released_q));
++		pthread_mutex_lock(&v4l_mutex);
++		disp->dequeued_count--;
++		pthread_mutex_unlock(&v4l_mutex);
++	}
++	return index;
++}
++
+ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ {
+ 	struct timeval tv;
+-	struct timespec ts;
+ 	int err, type, threshold;
+ 	struct v4l2_format fmt = {0};
+ 	struct vpu_display *disp;
++	struct v4l_specific_data *v4l_rsd;
+ 
+ 	disp = dec->disp;
++	v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
+ 
+-	disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-	disp->buf.memory = V4L2_MEMORY_MMAP;
++	v4l_rsd->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++	v4l_rsd->buf.memory = V4L2_MEMORY_MMAP;
+ 
+ 	/* query buffer info */
+-	disp->buf.index = index;
+-	err = ioctl(disp->fd, VIDIOC_QUERYBUF, &disp->buf);
++	v4l_rsd->buf.index = index;
++	err = ioctl(disp->fd, VIDIOC_QUERYBUF, &v4l_rsd->buf);
+ 	if (err < 0) {
+ 		err_msg("VIDIOC_QUERYBUF failed\n");
+ 		goto err;
+@@ -952,8 +991,8 @@ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ 
+ 	if (disp->ncount == 0) {
+ 		gettimeofday(&tv, 0);
+-		disp->buf.timestamp.tv_sec = tv.tv_sec;
+-		disp->buf.timestamp.tv_usec = tv.tv_usec;
++		v4l_rsd->buf.timestamp.tv_sec = tv.tv_sec;
++		v4l_rsd->buf.timestamp.tv_usec = tv.tv_usec;
+ 
+ 		disp->sec = tv.tv_sec;
+ 		disp->usec = tv.tv_usec;
+@@ -967,19 +1006,19 @@ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ 				disp->usec -= 1000000;
+ 			}
+ 
+-			disp->buf.timestamp.tv_sec = disp->sec;
+-			disp->buf.timestamp.tv_usec = disp->usec;
++			v4l_rsd->buf.timestamp.tv_sec = disp->sec;
++			v4l_rsd->buf.timestamp.tv_usec = disp->usec;
+ 		} else {
+ 			gettimeofday(&tv, 0);
+-			disp->buf.timestamp.tv_sec = tv.tv_sec;
+-			disp->buf.timestamp.tv_usec = tv.tv_usec;
++			v4l_rsd->buf.timestamp.tv_sec = tv.tv_sec;
++			v4l_rsd->buf.timestamp.tv_usec = tv.tv_usec;
+ 		}
+ 	}
+ 
+-	disp->buf.index = index;
+-	disp->buf.field = field;
++	v4l_rsd->buf.index = index;
++	v4l_rsd->buf.field = field;
+ 
+-	err = ioctl(disp->fd, VIDIOC_QBUF, &disp->buf);
++	err = ioctl(disp->fd, VIDIOC_QBUF, &v4l_rsd->buf);
+ 	if (err < 0) {
+ 		err_msg("VIDIOC_QBUF failed\n");
+ 		goto err;
+@@ -994,10 +1033,10 @@ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ 		disp->queued_count++;
+ 
+ 	if (disp->ncount == 1) {
+-		if ((disp->buf.field == V4L2_FIELD_TOP) ||
+-		    (disp->buf.field == V4L2_FIELD_BOTTOM) ||
+-		    (disp->buf.field == V4L2_FIELD_INTERLACED_TB) ||
+-		    (disp->buf.field == V4L2_FIELD_INTERLACED_BT)) {
++		if ((v4l_rsd->buf.field == V4L2_FIELD_TOP) ||
++		    (v4l_rsd->buf.field == V4L2_FIELD_BOTTOM) ||
++		    (v4l_rsd->buf.field == V4L2_FIELD_INTERLACED_TB) ||
++		    (v4l_rsd->buf.field == V4L2_FIELD_INTERLACED_BT)) {
+ 			/* For interlace feature */
+ 			fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 			err = ioctl(disp->fd, VIDIOC_G_FMT, &fmt);
+@@ -1005,8 +1044,8 @@ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ 				err_msg("VIDIOC_G_FMT failed\n");
+ 				goto err;
+ 			}
+-			if ((disp->buf.field == V4L2_FIELD_TOP) ||
+-			    (disp->buf.field == V4L2_FIELD_BOTTOM))
++			if ((v4l_rsd->buf.field == V4L2_FIELD_TOP) ||
++			    (v4l_rsd->buf.field == V4L2_FIELD_BOTTOM))
+ 				fmt.fmt.pix.field = V4L2_FIELD_ALTERNATE;
+ 			else
+ 				fmt.fmt.pix.field = field;
+@@ -1035,9 +1074,9 @@ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ 		if (vpu_v4l_performance_test) {
+ 			sem_post(&disp->avaiable_dequeue_frame);
+ 		} else {
+-			disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-			disp->buf.memory = V4L2_MEMORY_MMAP;
+-			err = ioctl(disp->fd, VIDIOC_DQBUF, &disp->buf);
++			v4l_rsd->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++			v4l_rsd->buf.memory = V4L2_MEMORY_MMAP;
++			err = ioctl(disp->fd, VIDIOC_DQBUF, &v4l_rsd->buf);
+ 			if (err < 0) {
+ 				err_msg("VIDIOC_DQBUF failed\n");
+ 				goto err;
+@@ -1046,21 +1085,7 @@ int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ 		}
+ 	}
+ 	else
+-		disp->buf.index = -1;
+-
+-	/* Block here to wait avaiable_decoding_frame */
+-	if (vpu_v4l_performance_test) {
+-		do {
+-			clock_gettime(CLOCK_REALTIME, &ts);
+-			ts.tv_nsec +=100000000; // 100ms
+-			if (ts.tv_nsec >= 1000000000)
+-			{
+-				ts.tv_sec += ts.tv_nsec / 1000000000;
+-				ts.tv_nsec %= 1000000000;
+-			}
+-		} while ((sem_timedwait(&disp->avaiable_decoding_frame,
+-			    &ts) != 0) && !quitflag);
+-	}
++		v4l_rsd->buf.index = -1;
+ 
+ 	return 0;
+ 
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index a8d4f9a..dc5e085 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -84,7 +84,7 @@ void SaveEncMvInfo(u8 *mvParaBuf, int size, int MbNumX, int EncNum)
+ 			fprintf(fpEncMvInfo, "MbAddr[%4d:For ]: Avail[0] Mv[%5d:%5d]\n", i, 0, 0);
+ 		} else {
+ 			mvX = (mvX & 0x7FFF) | ((mvX << 1) & 0x8000);
+-			fprintf(fpEncMvInfo, "MbAddr[%4d:For ]: Avail[1] Mv[%5d:%5d]\n", i, mvX, mvY);
++			fprintf(fpEncMvInfo, "MbAddr[%4d:For ]: Avail[1] Mv[%5d:%5d]\n", i, (s16)mvX, (s16)mvY);
+ 		}
+ 		mvParaBuf += 4;
+ 	}
+@@ -271,7 +271,9 @@ put_mp4header:
+ 				return -1;
+ 		}
+ 	} else if (enc->cmdl->format == STD_AVC) {
+-		if (!enc->mvc_extension || !enc->mvc_paraset_refresh_en) {
++		if (enc->mvc_extension && enc->mvc_paraset_refresh_en)
++			goto skip_put_header;
++		{
+ 			enchdr_param.headerType = SPS_RBSP;
+ 			vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
+ 			if (enc->ringBufferEnable == 0 ) {
+@@ -328,6 +330,7 @@ put_mp4header:
+ 		}
+ 	}
+ 
++skip_put_header:
+ 	return 0;
+ }
+ 
+@@ -823,6 +826,7 @@ encoder_configure(struct encode *enc)
+ 	EncInitialInfo initinfo = {0};
+ 	RetCode ret;
+ 	MirrorDirection mirror;
++	int intraRefreshMode = 1;
+ 
+ 	if (cpu_is_mx27()) {
+ 		search_pa.searchRamAddr = 0xFFFF4C00;
+@@ -842,6 +846,8 @@ encoder_configure(struct encode *enc)
+ 		vpu_EncGiveCommand(handle, SET_MIRROR_DIRECTION, &mirror);
+ 	}
+ 
++	vpu_EncGiveCommand(handle, ENC_SET_INTRA_REFRESH_MODE, &intraRefreshMode);
++
+ 	ret = vpu_EncGetInitialInfo(handle, &initinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Encoder GetInitialInfo failed\n");
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index fd9a8a3..26f713f 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -38,6 +38,7 @@ decode(void)
+ 	DecParam decparam = {0};
+ 	DecOutputInfo outinfo = {0};
+ 	struct vpu_display *disp = dec->disp;
++	struct v4l_specific_data *v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
+ 	RetCode ret;
+ 	int loop_id = 0, rot_stride = 0;
+ 
+@@ -130,7 +131,7 @@ decode(void)
+ 			err_msg("vpu_DecClrDispFlag failed Error code"
+ 			     " %d\n", ret);
+ 	}
+-	disp_clr_index = disp->buf.index;
++	disp_clr_index = v4l_rsd->buf.index;
+ 
+ 	if (dec->cmdl->format == STD_MJPG) {
+ 		rotid++;
+diff --git a/test/mxc_vpu_test/transcode.c b/test/mxc_vpu_test/transcode.c
+index 0b3176d..5413aef 100644
+--- a/test/mxc_vpu_test/transcode.c
++++ b/test/mxc_vpu_test/transcode.c
+@@ -580,6 +580,7 @@ transcode_start(struct decode *dec, struct encode *enc)
+ 	int dering_en = dec->cmdl->dering_en;
+ 	FrameBuffer *fb = dec->fb;
+ 	struct vpu_display *disp = dec->disp;
++	struct v4l_specific_data *v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
+ 	int err = 0, eos = 0, fill_end_bs = 0, decodefinish = 0;
+ 	struct timeval tdec_begin,tdec_end, total_start, total_end;
+ 	RetCode ret = 0;
+@@ -792,7 +793,7 @@ transcode_start(struct decode *dec, struct encode *enc)
+ 		enc_img_size = enc->src_picwidth * enc->src_picheight;
+ 		if (outinfo.indexFrameDisplay >= 0) {
+ 			enc_fb[src_fbid].myIndex = enc->src_fbid;
+-			enc_fb[src_fbid].bufY = disp->buffers[outinfo.indexFrameDisplay]->offset;
++			enc_fb[src_fbid].bufY = v4l_rsd->buffers[outinfo.indexFrameDisplay]->offset;
+ 			enc_fb[src_fbid].bufCb = enc_fb[src_fbid].bufY + enc_img_size;
+ 			enc_fb[src_fbid].bufCr = enc_fb[src_fbid].bufCb + (enc_img_size >> 2);
+ 			enc_fb[src_fbid].strideY = enc->src_picwidth;
+@@ -1000,13 +1001,13 @@ transcode_start(struct decode *dec, struct encode *enc)
+ 					rotid %= dec->regfbcount;
+ 				} else if (rot_en || dering_en || tiled2LinearEnable) {
+ 					disp_clr_index = outinfo.indexFrameDisplay;
+-					if (disp->buf.index != -1)
+-						rotid = disp->buf.index; /* de-queued buffer as next rotation buffer */
++					if (v4l_rsd->buf.index != -1)
++						rotid = v4l_rsd->buf.index; /* de-queued buffer as next rotation buffer */
+ 					else
+ 						rotid++;
+ 				}
+ 				else
+-					disp_clr_index = disp->buf.index;
++					disp_clr_index = v4l_rsd->buf.index;
+ 			}
+ 		} else {
+ 			if (rot_en) {
+@@ -1237,10 +1238,6 @@ transcode_test(void *arg)
+ 		goto err1;
+ 	}
+ 
+-	/* Not set fps when doing performance test default */
+-        if (dec->cmdl->fps == 0)
+-                dec->cmdl->fps = 30;
+-
+ 	/* parse the bitstream */
+ 	ret = decoder_parse(dec);
+ 	if (ret) {
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index a05d97b..dc31411 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -48,9 +48,15 @@ extern int vpu_test_dbg_level;
+ #undef u32
+ #undef u16
+ #undef u8
++#undef s32
++#undef s16
++#undef s8
+ typedef unsigned long u32;
+ typedef unsigned short u16;
+ typedef unsigned char u8;
++typedef long s32;
++typedef short s16;
++typedef char s8;
+ 
+ #define SZ_4K			(4 * 1024)
+ 
+@@ -108,7 +114,12 @@ struct v4l_buf {
+ 
+ #define MAX_BUF_NUM	32
+ #define QUEUE_SIZE	(MAX_BUF_NUM + 1)
+-struct ipu_queue {
++struct v4l_specific_data {
++	struct v4l2_buffer buf;
++	struct v4l_buf *buffers[MAX_BUF_NUM];
++};
++
++struct buf_queue {
+ 	int list[MAX_BUF_NUM + 1];
+ 	int head;
+ 	int tail;
+@@ -126,24 +137,29 @@ struct vpu_display {
+ 	int ncount;
+ 	time_t sec;
+ 	int queued_count;
++	int dequeued_count;
+ 	suseconds_t usec;
+-	struct v4l2_buffer buf;
+-	struct v4l_buf *buffers[MAX_BUF_NUM];
+-
+ 	int frame_size;
+-	ipu_lib_handle_t ipu_handle;
+-	ipu_lib_input_param_t input;
+-	ipu_lib_output_param_t output;
+-	pthread_t ipu_disp_loop_thread;
+-	pthread_t v4l_disp_loop_thread;
++
++	pthread_t disp_loop_thread;
+ 
+ 	sem_t avaiable_decoding_frame;
+ 	sem_t avaiable_dequeue_frame;
+ 
+-	struct ipu_queue ipu_q;
+-	struct ipu_buf ipu_bufs[MAX_BUF_NUM];
++	struct buf_queue display_q;
++	struct buf_queue released_q;
+ 	int stopping;
+ 	int deinterlaced;
++	void *render_specific_data;
++
++	/* ipu lib renderer */
++	ipu_lib_handle_t ipu_handle;
++	ipu_lib_input_param_t input;
++	ipu_lib_output_param_t output;
++	pthread_t ipu_disp_loop_thread;
++	struct buf_queue ipu_q;
++	struct ipu_buf ipu_bufs[MAX_BUF_NUM];
++
+ };
+ 
+ struct capture_testbuffer {
+@@ -245,6 +261,8 @@ struct decode {
+ 	int mjpg_sc_state; /* start code FSM state */
+ 	int mjpg_eof;
+ 	u8 *mjpg_cached_bsbuf;
++	int mjpegScaleDownRatioWidth;
++	int mjpegScaleDownRatioHeight;
+ 
+ 	struct frame_buf fbpool[MAX_BUF_NUM];
+ };
+@@ -294,6 +312,7 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode);
+ 
+ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ 					struct rot rotation, Rect rotCrop);
++int v4l_get_buf(struct decode *dec);
+ int v4l_put_data(struct decode *dec, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(struct frame_buf *fb, int stdMode, int format, int strideY, int height, int mvCol);
+-- 
+1.8.0
+

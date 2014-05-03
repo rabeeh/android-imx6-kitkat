@@ -1,0 +1,207 @@
+From f620de9bad8771299039e7e451974d6f2996cf35 Mon Sep 17 00:00:00 2001
+From: Nitin Garg <nitin.garg@freescale.com>
+Date: Sat, 5 May 2012 17:01:53 -0500
+Subject: [PATCH 272/486] ENGR00179835 Mipi 5M size picture color is too dark.
+
+Removed the waiting time after setting the configure in kernel. So need to
+discard some frames when change to 5M and back to VGA.
+
+Signed-off-by: Nitin Garg <nitin.garg@freescale.com>
+---
+ mx5x/libcamera/CameraHal.cpp     | 76 ++++++++++++++++++++++++++--------------
+ mx5x/libcamera/V4l2CsiDevice.cpp |  2 +-
+ 2 files changed, 51 insertions(+), 27 deletions(-)
+
+diff --git a/mx5x/libcamera/CameraHal.cpp b/mx5x/libcamera/CameraHal.cpp
+index 049cf62..fe832fb 100755
+--- a/mx5x/libcamera/CameraHal.cpp
++++ b/mx5x/libcamera/CameraHal.cpp
+@@ -723,7 +723,7 @@ namespace android {
+         android_native_buffer_t *buf;
+         private_handle_t *handle;
+         for(unsigned int i = 0; i < mCaptureBufNum; i++) {
+-            //if(mCaptureBuffers[i].buf_state == WINDOW_BUFS_DEQUEUED) {    
++            if(mCaptureBuffers[i].buf_state == WINDOW_BUFS_DEQUEUED) {
+                 buf = (android_native_buffer_t *)mCaptureBuffers[i].native_buf;
+                 if(mCaptureBuffers[i].virt_start != NULL) {
+                     handle = (private_handle_t *)buf->handle;
+@@ -732,7 +732,9 @@ namespace android {
+                 if(buf != NULL) {
+                     mNativeWindow->cancel_buffer(mNativeWindow, &buf->handle);
+                 }
+-            //}
++            }
++            else
++                continue;
+             mCaptureBuffers[i].buf_state = WINDOW_BUFS_INVALID;//WINDOW_BUFS_QUEUED;
+             mCaptureBuffers[i].refCount = 0;
+             mCaptureBuffers[i].native_buf = NULL;
+@@ -763,14 +765,6 @@ namespace android {
+             return err;
+         }
+ 
+-        err = mNativeWindow->set_usage(mNativeWindow, GRALLOC_USAGE_SW_READ_OFTEN |
+-                GRALLOC_USAGE_SW_WRITE_OFTEN | GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HWC_OVERLAY);
+-        if(err != 0){
+-            CAMERA_HAL_ERR("native_window_set_usage failed:%s(%d)",
+-                    strerror(-err), -err);
+-            return err;
+-        }
+-
+         int minUndequeueBufs = 0;
+         err = mNativeWindow->get_min_undequeued_buffer_count(mNativeWindow,
+                 &minUndequeueBufs);
+@@ -818,7 +812,8 @@ namespace android {
+ 
+             mCaptureBuffers[i].virt_start = (unsigned char *)handle->base;
+             mCaptureBuffers[i].phy_offset = handle->phys;
+-            mCaptureBuffers[i].length = handle->size;
++            //Calculate the buffer size, for GPU doesn't reply this value.
++            mCaptureBuffers[i].length =  mCaptureDeviceCfg.width * mCaptureDeviceCfg.height * 3 / 2;
+             mCaptureBuffers[i].native_buf = (void *)buf;
+             mCaptureBuffers[i].refCount = 0;
+             mCaptureBuffers[i].buf_state = WINDOW_BUFS_DEQUEUED;
+@@ -1094,9 +1089,9 @@ namespace android {
+         unsigned int DeQueBufIdx = 0;
+         struct jpeg_encoding_conf JpegEncConf;
+         DMA_BUFFER *Buf_input, Buf_output;
+-        //sp<MemoryBase> JpegMemBase = NULL;
+-        //sp<MemoryHeapBase> JpegImageHeap = NULL;
+         camera_memory_t* JpegMemBase = NULL;
++        camera_memory_t *RawMemBase = NULL;
++
+         int  max_fps, min_fps;
+ 
+         if (mJpegEncoder == NULL){
+@@ -1146,6 +1141,12 @@ namespace android {
+         if ((ret = PrepareJpegEncoder()) < 0)
+             return ret;
+ 
++        JpegMemBase = mRequestMemory(-1, mCaptureFrameSize, 1, NULL);
++        if (JpegMemBase == NULL || JpegMemBase->data == NULL){
++            ret = NO_MEMORY;
++            goto Pic_out;
++        }
++
+         if (mCaptureDevice->DevStart()<0){
+             CAMERA_HAL_ERR("the capture start up failed !!!!");
+             return INVALID_OPERATION;
+@@ -1157,7 +1158,6 @@ namespace android {
+                 ret = UNKNOWN_ERROR;
+                 goto Pic_out;
+             }
+-
+             if (++i == mCaptureDeviceCfg.picture_waite_number)
+                 break;
+ 
+@@ -1167,12 +1167,6 @@ namespace android {
+             }
+         }
+ 
+-        JpegMemBase = mRequestMemory(-1, mCaptureFrameSize, 1, NULL);
+-        if (JpegMemBase == NULL || JpegMemBase->data == NULL){
+-            ret = NO_MEMORY;
+-            goto Pic_out;
+-        }
+-
+         // do the csc if necessary
+         if (mPPDeviceNeedForPic){
+             mPPInputParam.user_def_paddr = mCaptureBuffers[DeQueBufIdx].phy_offset;
+@@ -1186,13 +1180,40 @@ namespace android {
+         }
+ 
+         Buf_output.virt_start = (unsigned char *)(JpegMemBase->data);
+-        CAMERA_HAL_LOG_INFO("Generated a picture");
++        CAMERA_HAL_LOG_INFO("Generated a picture with mMsgEnabled 0x%x", mMsgEnabled);
+ 
+         if (mMsgEnabled & CAMERA_MSG_SHUTTER) {
+             CAMERA_HAL_LOG_INFO("CAMERA_MSG_SHUTTER");
+             mNotifyCb(CAMERA_MSG_SHUTTER, 0, 0, mCallbackCookie);
+         }
+ 
++        if (mMsgEnabled & CAMERA_MSG_RAW_IMAGE) {
++            CAMERA_HAL_LOG_INFO("CAMERA_MSG_RAW_IMAGE");
++            RawMemBase = mRequestMemory(-1, mCaptureFrameSize, 1, NULL);
++
++            if ( NULL == RawMemBase ) {
++                CAMERA_HAL_LOG_INFO("Raw buffer allocation failed!");
++                ret = UNKNOWN_ERROR;
++                goto Pic_out;
++            }
++            void *dest = RawMemBase->data;
++
++            if (NULL != dest) {
++                void *src = &mCaptureBuffers[DeQueBufIdx];
++                memcpy(dest, src, mCaptureFrameSize);
++            }
++ 
++            mDataCb(CAMERA_MSG_RAW_IMAGE, RawMemBase, 0, NULL, mCallbackCookie);
++
++            RawMemBase->release(RawMemBase);
++        }
++
++        if ( mMsgEnabled & CAMERA_MSG_RAW_IMAGE_NOTIFY ) {
++            CAMERA_HAL_LOG_INFO("CAMERA_MSG_RAW_IMAGE_NOTIFY");
++            if(mNotifyCb)
++                mNotifyCb(CAMERA_MSG_RAW_IMAGE_NOTIFY, 0, 0, mCallbackCookie);
++        }
++ 
+         if (mJpegEncoder->DoEncode(Buf_input,&Buf_output,&JpegEncConf) < 0){
+             ret = UNKNOWN_ERROR;
+             goto Pic_out;
+@@ -1200,16 +1221,12 @@ namespace android {
+ 
+ Pic_out:
+         freeBuffersToNativeWindow();
+-        //JpegMemBase = new MemoryBase(JpegImageHeap, 0, JpegEncConf.output_jpeg_size);
+         if ((JpegMemBase != NULL) &&(JpegMemBase->data != NULL) && (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE)) {
+             CAMERA_HAL_LOG_INFO("==========CAMERA_MSG_COMPRESSED_IMAGE==================");
+             mDataCb(CAMERA_MSG_COMPRESSED_IMAGE, JpegMemBase, 0, NULL, mCallbackCookie);
+         }
+ 
+         mCaptureDevice->DevStop();
+-        //mCaptureDevice->DevDeAllocate();
+-        //freeBuffersToNativeWindow();
+-        //CloseCaptureDevice();
+ 
+         if(JpegMemBase) {
+             JpegMemBase->release(JpegMemBase);
+@@ -1874,6 +1891,14 @@ Pic_out:
+             return INVALID_OPERATION;
+         
+         isCaptureBufsAllocated = 1;
++
++        unsigned int bufIndex = 0;
++        //skip 10 frames when doing preview
++        for (int k = 0; k < 10; k++) {
++            mCaptureDevice->DevDequeue(&bufIndex);
++            mCaptureDevice->DevQueue(bufIndex);
++        }
++
+         for(unsigned int i=0; i < mCaptureBufNum; i++) {
+             mCaptureThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, i));
+         }
+@@ -2229,7 +2254,6 @@ Pic_out:
+         status_t ret = NO_ERROR;
+         while(1) {
+             if(mExitEncodeThread) {
+-                CAMERA_HAL_ERR("%s: encode thread exit normally", __FUNCTION__);
+                 return 0;
+             }
+             ret = encodeframeThread();
+diff --git a/mx5x/libcamera/V4l2CsiDevice.cpp b/mx5x/libcamera/V4l2CsiDevice.cpp
+index 587dce8..9e09367 100755
+--- a/mx5x/libcamera/V4l2CsiDevice.cpp
++++ b/mx5x/libcamera/V4l2CsiDevice.cpp
+@@ -343,7 +343,7 @@ namespace android{
+                 pTimeFrame->denominator = 15;
+             }
+             else if (capturewidth == 2592 && captureheight == 1944) {
+-                pic_waite_buf_num =1;
++                pic_waite_buf_num =3;
+                 capturemode = 6;	/* 2592x1944 mode */
+                 pTimeFrame->numerator = 1;
+                 pTimeFrame->denominator = 15;
+-- 
+1.8.0
+

@@ -1,0 +1,211 @@
+From dee6fda977c32b4856d254d0ad2bc0b2fed1b20a Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Mon, 9 Jul 2012 17:28:44 +0800
+Subject: [PATCH 307/486] ENGR00215174 add always highest mode.
+
+when in highest mode, primary display should get the right mode
+from display modes.
+fix switch between dual display and single HDMI, system incorrect
+action.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libgralloc_wrapper/display_mode.cpp | 60 +++++++++++++++++++++++++++++++--
+ mx6/libgralloc_wrapper/framebuffer.cpp  | 38 ++++++++++++++++-----
+ 2 files changed, 87 insertions(+), 11 deletions(-)
+
+diff --git a/mx6/libgralloc_wrapper/display_mode.cpp b/mx6/libgralloc_wrapper/display_mode.cpp
+index a759758..2e9a7e8 100644
+--- a/mx6/libgralloc_wrapper/display_mode.cpp
++++ b/mx6/libgralloc_wrapper/display_mode.cpp
+@@ -160,6 +160,10 @@ check_mode_end:
+     return 0;
+ }
+ 
++static disp_mode g_config_mode[32];
++static int g_config_len = 0;
++static int read_mode_finished = 0;
++
+ static int read_graphics_fb_mode(int fb)
+ {
+     int size=0;
+@@ -167,6 +171,35 @@ static int read_graphics_fb_mode(int fb)
+     char fb_modes[1024];
+     char temp_name[256];
+ 
++    if (g_config_len == 0) {
++        char conf_modes[1024];
++        //int size;
++        memset(conf_modes, 0, sizeof(conf_modes));
++        memset(&g_config_mode[0], 0, sizeof(g_config_mode));
++        int fd = open("/system/etc/display_mode.conf", O_RDONLY, 0);
++        if(fd < 0) {
++            LOGE("Warning: /system/etc/display_mode.conf not defined");
++        }
++        else {
++            size = read(fd, conf_modes, sizeof(conf_modes));
++            if(size > 0) {
++                char* m_start = conf_modes;
++                int m_len = 0;
++                char *pmode = conf_modes;
++                while(*pmode != '\0') {
++                    if (*pmode == '\n') {
++                        m_len = pmode - m_start + 1;
++                        strncpy(g_config_mode[g_config_len].mode, m_start, m_len);
++                        g_config_len ++;
++                        m_start = pmode + 1;
++                    }
++                    pmode ++;
++                }//while
++            }
++            close(fd);
++        }//else
++    }
++
+     sprintf(temp_name, "/sys/class/graphics/fb%d/modes", fb);
+     fp_modes = open(temp_name,O_RDONLY, 0);
+     if(fp_modes < 0) {
+@@ -188,6 +221,7 @@ static int read_graphics_fb_mode(int fb)
+ 
+     get_available_mode(fb, fb_modes);
+ 
++    read_mode_finished = 1;
+     return 0;
+ 
+ set_graphics_fb_mode_error:
+@@ -203,9 +237,11 @@ int isModeValid(int fb, const char* pMode, int len)
+     int i;
+ 
+     //LOGW("isModeValid:pMode=%s, len=%d", pMode, len);
+-    err = read_graphics_fb_mode(fb);
+-    if(err)
+-        return 0;
++    if(read_mode_finished == 0) {
++        err = read_graphics_fb_mode(fb);
++        if(err)
++            return 0;
++    }
+ 
+     for(i=0; i<disp_class_list[fb].disp_mode_length; i++) {
+         //LOGW("isModeValid:disp_mode_list[%d].mode=%s", i, disp_class_list[fb].disp_mode_list[i].mode);
+@@ -217,4 +253,22 @@ int isModeValid(int fb, const char* pMode, int len)
+     return 0;
+ }
+ 
++char* getHighestMode(int fb)
++{
++    int i = 0;
++
++    if(read_mode_finished == 0) {
++        read_graphics_fb_mode(fb);
++    }
++
++    if(g_config_len > 0) {
++        for(i = 0; i<g_config_len; i++) {
++            if(isModeValid(fb, g_config_mode[i].mode, strlen(g_config_mode[i].mode)))
++                break;
++        }
++        return g_config_mode[i].mode;
++    }
++
++    return disp_class_list[fb].disp_mode_list[i].mode;
++}
+ 
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 8e95f34..4062674 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -76,6 +76,7 @@ struct fb_context_t {
+ 
+ static int nr_framebuffers;
+ static XmlTool* g_xmltool = NULL;
++static int primary_display_type = 0;
+ 
+ sem_t * fslwatermark_sem_open()
+ {
+@@ -223,6 +224,7 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev)
+ 
+ /*****************************************************************************/
+ extern int isModeValid(int fb, const char* pMode, int len);
++extern char* getHighestMode(int fb);
+ 
+ static int set_graphics_fb_mode(int fb, struct configParam* param, int *pColordepth)
+ {
+@@ -236,6 +238,17 @@ static int set_graphics_fb_mode(int fb, struct configParam* param, int *pColorde
+ 
+     //the primary display
+     if(fb == 0){
++        memset(temp_name, 0, sizeof(temp_name));
++        fd_mode = open("/sys/class/graphics/fb0/fsl_disp_dev_property", O_RDONLY, 0);
++        if(fd_mode > 0 && (size = read(fd_mode, temp_name, sizeof(temp_name))) > 0) {
++            LOGI("primary display name %s", temp_name);
++            if(strstr(temp_name, "hdmi")) primary_display_type = 1;
++            else primary_display_type = 0;
++            close(fd_mode);
++        } else {
++            LOGI("open or read /sys/class/graphics/fb0/fsl_disp_dev_property failed");
++        }
++
+         if(g_xmltool == NULL) {
+             g_xmltool = new XmlTool(FSL_SETTINGS_PREFERENCE);
+             if(g_xmltool == NULL) {
+@@ -246,12 +259,24 @@ static int set_graphics_fb_mode(int fb, struct configParam* param, int *pColorde
+ 
+         *pColordepth = g_xmltool->getInt(FSL_PREFERENCE_COLORDEPTH, 0);
+         LOGI("colordepth is %d", *pColordepth);
+-        String8 dispMode = g_xmltool->getString(FSL_PREFERENCE_MODE, String8("0"));
++        String8 dispMode = g_xmltool->getString(FSL_PREFERENCE_MODE, String8(FSL_PREFERENCE_MODE_DEFAULT));
+         disp_mode = dispMode.string();
+-        if(!isModeValid(fb, disp_mode, strlen(disp_mode))) {
++        if(!strcmp(disp_mode, FSL_PREFERENCE_MODE_DEFAULT)) {
++            disp_mode = getHighestMode(fb);
++            memset(fb_mode, 0, sizeof(fb_mode));
++            strcpy(fb_mode, disp_mode);
++        }
++        else if(!isModeValid(fb, disp_mode, strlen(disp_mode))) {
+             LOGI("Warning: display %d does not support mode: %s", fb, disp_mode);
++            delete g_xmltool;
++            g_xmltool = NULL;
+             return -1;
+         }
++        else {
++            memset(fb_mode, 0, sizeof(fb_mode));
++            strcpy(fb_mode, disp_mode);
++            fb_mode[strlen(disp_mode)] = '\n';
++        }
+         LOGI("disp_mode is %s", disp_mode);
+         memset(temp_name, 0, sizeof(temp_name));
+         sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+@@ -261,11 +286,7 @@ static int set_graphics_fb_mode(int fb, struct configParam* param, int *pColorde
+             return -1;
+         }
+ 
+-        memset(fb_mode, 0, sizeof(fb_mode));
+-        strcpy(fb_mode, disp_mode);
+-        fb_mode[strlen(disp_mode)] = '\n';
+-
+-        write(fd_mode, fb_mode, strlen(disp_mode) + 1);
++        write(fd_mode, fb_mode, strlen(fb_mode));
+         close(fd_mode);
+         delete g_xmltool;
+         g_xmltool = NULL;
+@@ -299,7 +320,7 @@ static int set_graphics_fb_mode(int fb, struct configParam* param, int *pColorde
+     size = write(fd_mode, fb_mode, n + 2);
+     if(size <= 0)
+     {
+-        LOGI("Error %d %s! Cannot write %s", errno, strerror(errno), temp_name);
++        LOGI("Error %d %s! Cannot write %s=%s", errno, strerror(errno), temp_name, fb_mode);
+     }
+ 
+     close(fd_mode);
+@@ -730,6 +751,7 @@ int fb_device_open(hw_module_t const* module, const char* name,
+         *device = &dev->device.common;
+         fbdev = (framebuffer_device_t*) *device;
+         fbdev->reserved[0] = nr_framebuffers;
++        fbdev->reserved[1] = primary_display_type;
+     } 
+ 
+     return status;
+-- 
+1.8.0
+

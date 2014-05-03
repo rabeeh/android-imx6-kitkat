@@ -1,0 +1,233 @@
+From 3ca541380cda295c3cea24c3bbcbf47b3ecf9b86 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 8 Feb 2012 15:36:47 +0800
+Subject: [PATCH 194/249] ENGR00173294 vpu: Fix decoding failure due to sos
+ header corrupted in MJPG
+
+Fix decoding failure due to sos header info corrupted in MJPG stream.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_util.c | 83 +++++++++++++++++++++++++++++++++++++++++++++++-----------
+ vpu/vpu_util.h |  1 +
+ 2 files changed, 69 insertions(+), 15 deletions(-)
+
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 613fc49..78d8660 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1623,6 +1623,10 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 	HuffLength = 0;
+ 	for(i = 0; i < 12; i++)
+ 		HuffLength += jpg->huffBits[0][i];
++
++	if (HuffLength > HUFF_VAL_SIZE)
++		HuffLength = HUFF_VAL_SIZE;
++
+ 	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[0][i];
+ 		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
+@@ -1635,6 +1639,8 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 	HuffLength = 0;
+ 	for(i = 0; i < 12; i++)
+ 		HuffLength += jpg->huffBits[2][i];
++	if (HuffLength > HUFF_VAL_SIZE)
++		HuffLength = HUFF_VAL_SIZE;
+ 	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[2][i];
+ 		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
+@@ -1645,8 +1651,10 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 
+ 	/* VAL AC Luma */
+ 	HuffLength = 0;
+-	for(i = 0; i < 162; i++)
++	for(i = 0; i < HUFF_VAL_SIZE; i++)
+ 		HuffLength += jpg->huffBits[1][i];
++	if (HuffLength > HUFF_VAL_SIZE)
++		HuffLength = HUFF_VAL_SIZE;
+ 	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[1][i];
+ 		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
+@@ -1657,8 +1665,10 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 
+ 	/* VAL AC Chroma */
+ 	HuffLength = 0;
+-	for (i = 0; i < 162; i++)
++	for (i = 0; i < HUFF_VAL_SIZE; i++)
+ 		HuffLength += jpg->huffBits[3][i];
++	if (HuffLength > HUFF_VAL_SIZE)
++		HuffLength = HUFF_VAL_SIZE;
+ 	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[3][i];
+ 		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
+@@ -1940,14 +1950,20 @@ int decode_dqt_header(JpgDecInfo *jpg)
+ 
+ 		Pq = get_bits(&jpg->gbc, 4);
+ 		Tq = get_bits(&jpg->gbc, 4);
+-		if (Tq > 3)
+-			return 0;
++		if (Tq > 3) {
++			info_msg("Tq is more than 3\n");
++			jpg->header_status = 1;
++			return 1;
++		}
+ 		for (i = 0; i < 64; i++)
+ 			jpg->qMatTab[Tq][i] = get_bits(&jpg->gbc, 8);
+ 	} while(!check_start_code(jpg));
+ 
+-	if (Pq != 0)
+-		return 0;
++	if (Pq != 0) {
++		info_msg("Pq isn't 0\n");
++		jpg->header_status = 1;
++		return 1;
++	}
+ 
+ 	return 1;
+ }
+@@ -1968,8 +1984,12 @@ int decode_dth_header(JpgDecInfo *jpg)
+ 		Tc = get_bits(&jpg->gbc, 4);
+ 		Th = get_bits(&jpg->gbc, 4);
+ 		ThTc = ((Th & 1) << 1) | (Tc & 1);
+-		if (ThTc > 3)
+-			return 0;
++		if (ThTc > 3) {
++			info_msg("ThTc is more than 3\n");
++			jpg->header_status = 1;
++			return 1;
++		}
++
+ 		bitCnt = 0;
+ 		for (i = 0; i < 16; i++) {
+ 			jpg->huffBits[ThTc][i] = get_bits(&jpg->gbc, 8);
+@@ -2008,25 +2028,29 @@ int decode_sof_header(JpgDecInfo *jpg)
+ 
+ 	if (samplePrecision != 8) {
+ 		info_msg("Sample Precision is not 8\n");
+-		return 0;
++		jpg->header_status = 1;
++		return 1;
+ 	}
+ 
+ 	picY = get_bits(&jpg->gbc, 16);
+ 	if (picY > MAX_VSIZE) {
+ 		info_msg("Picture Vertical Size limits Maximum size\n");
+-		return 0;
++		jpg->header_status = 1;
++		return 1;
+ 	}
+ 
+ 	picX = get_bits(&jpg->gbc, 16);
+ 	if (picX > MAX_HSIZE) {
+ 		info_msg("Picture Horizontal Size limits Maximum size\n");
+-		return 0;
++		jpg->header_status = 1;
++		return 1;
+ 	}
+ 
+ 	numComp = get_bits(&jpg->gbc, 8);
+ 	if (numComp > 3) {
+ 		info_msg("Components number limits Maximum size: numComp %d\n", numComp);
+-		return 0;
++		jpg->header_status = 1;
++		return 1;
+ 	}
+ 
+ 	if (get_bits_left(&jpg->gbc) < (numComp * ( 8 + 4 + 4 + 8) + 24))
+@@ -2048,7 +2072,8 @@ int decode_sof_header(JpgDecInfo *jpg)
+ 	    ((hSampFact[1] != 1) || (hSampFact[2] != 1) ||
+ 	     (vSampFact[1] != 1) || (vSampFact[2] != 1)))) {
+ 		info_msg("Not Supported Sampling Factor\n");
+-		return 0;
++		jpg->header_status = 1;
++		return 1;
+ 	}
+ 
+ 	if (numComp == 1)
+@@ -2104,11 +2129,18 @@ int decode_sos_header(JpgDecInfo *jpg)
+ 	if (((ecsPtr % 256) / 4) & 1)
+ 		jpg->bitPtr += 32;
+ 
+-	if (get_bits_left(&jpg->gbc) < 8)
++	if (get_bits_left(&jpg->gbc) < 8 + 24)
+ 		return 0;
+ 
+ 	numComp = get_bits(&jpg->gbc, 8);
+ 
++	if (numComp > 3) {
++		info_msg("The numComp is more than 3\n");
++		jpg->ecsPtr = 0;
++		jpg->header_status = 1;
++		return 1;
++	}
++
+ 	if (get_bits_left(&jpg->gbc) < (numComp * (8 + 4 + 4) + 24))
+ 		return 0;
+ 
+@@ -2134,8 +2166,10 @@ int decode_sos_header(JpgDecInfo *jpg)
+ 	al = get_bits(&jpg->gbc, 4);
+ 
+ 	if ((ss != 0) || (se != 0x3F) || (ah != 0) || (al != 0)) {
++		jpg->ecsPtr = 0;
+ 		info_msg("The Jpeg Image must be another profile\n");
+-		return 0;
++		jpg->header_status = 1;
++		return 1;
+ 	}
+ 
+ 	return 1;
+@@ -2189,6 +2223,7 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 	/* Init some variable in jpgInfo */
+ 	jpg->rstIntval = 0;
+ 	jpg->userHuffTab = 0;
++	jpg->header_status = 0; /* 0 - valid; 1 - find wrong header info already */
+ 
+ 	if (jpg->lineBufferMode) {
+ 		b = jpg->pVirtJpgChunkBase;
+@@ -2278,6 +2313,18 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 		}
+ 
+ 		code = get_bits(&jpg->gbc, 16);
++		/*
++		 * Skip to analyze coming marker till EOI if found wrong info
++		 * in the header already for streaming mode.
++		 */
++		if (jpg->header_status) {
++			if (jpg->lineBufferMode) {
++				ret = -1;
++				goto DONE_DEC_HEADER;
++			} else if (code != EOI_Marker)
++				continue;
++		}
++
+ 		switch (code) {
+ 		case SOI_Marker:
+ 			break;
+@@ -2322,6 +2369,12 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 				ret = -1;
+ 				dprintf(4, "error in SOS_Marker\n");
+ 			}
++			if (jpg->header_status) {
++				if (jpg->lineBufferMode)
++					ret = -1;
++				else
++					break;
++			}
+ 			goto DONE_DEC_HEADER;
+ 			break;
+ 		case EOI_Marker:
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index fc00eae..193ead2 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -385,6 +385,7 @@ typedef struct {
+ 	int quitCodec;
+ 	int rollBack;
+ 	int wrappedHeader;
++	int header_status;
+ } JpgDecInfo;
+ 
+ typedef struct {
+-- 
+1.8.0
+

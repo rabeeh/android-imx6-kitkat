@@ -1,0 +1,121 @@
+From 919dfd8fd4b2f4c4761b9815b08fe2d8b4507ce2 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Thu, 21 Nov 2013 13:58:00 +0800
+Subject: [PATCH 48/50] ENGR00281841-2 refine MetaData code to fix libc crash.
+
+add mutex to MetaData class.
+when access the member mItems in multi thread,
+it needs mutex to protect that.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ include/media/stagefright/MetaData.h |  4 +++-
+ media/libstagefright/MetaData.cpp    | 13 +++++++++++--
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/include/media/stagefright/MetaData.h b/include/media/stagefright/MetaData.h
+index de3fc36..d12f5e0 100644
+--- a/include/media/stagefright/MetaData.h
++++ b/include/media/stagefright/MetaData.h
+@@ -25,6 +25,7 @@
+ #include <utils/RefBase.h>
+ #include <utils/KeyedVector.h>
+ #include <utils/String8.h>
++#include <utils/Mutex.h>
+ 
+ namespace android {
+ 
+@@ -238,7 +239,7 @@ private:
+ 
+         union {
+             void *ext_data;
+-            float reservoir;
++            int64_t reservoir;
+         } u;
+ 
+         bool usesReservoir() const {
+@@ -261,6 +262,7 @@ private:
+         int32_t mLeft, mTop, mRight, mBottom;
+     };
+ 
++    Mutex mMutex;
+     KeyedVector<uint32_t, typed_data> mItems;
+ 
+     // MetaData &operator=(const MetaData &);
+diff --git a/media/libstagefright/MetaData.cpp b/media/libstagefright/MetaData.cpp
+index 7b60afc..369e574 100644
+--- a/media/libstagefright/MetaData.cpp
++++ b/media/libstagefright/MetaData.cpp
+@@ -28,7 +28,9 @@
+ 
+ namespace android {
+ 
+-MetaData::MetaData() {
++MetaData::MetaData()
++    : RefBase() {
++    clear();
+ }
+ 
+ MetaData::MetaData(const MetaData &from)
+@@ -41,10 +43,12 @@ MetaData::~MetaData() {
+ }
+ 
+ void MetaData::clear() {
++    Mutex::Autolock _l(mMutex);
+     mItems.clear();
+ }
+ 
+ bool MetaData::remove(uint32_t key) {
++    Mutex::Autolock _l(mMutex);
+     ssize_t i = mItems.indexOfKey(key);
+ 
+     if (i < 0) {
+@@ -191,6 +195,7 @@ bool MetaData::setData(
+         uint32_t key, uint32_t type, const void *data, size_t size) {
+     bool overwrote_existing = true;
+ 
++    Mutex::Autolock _l(mMutex);
+     ssize_t i = mItems.indexOfKey(key);
+     if (i < 0) {
+         typed_data item;
+@@ -208,6 +213,7 @@ bool MetaData::setData(
+ 
+ bool MetaData::findData(uint32_t key, uint32_t *type,
+                         const void **data, size_t *size) const {
++    Mutex::Autolock _l(const_cast<Mutex&>(mMutex));
+     ssize_t i = mItems.indexOfKey(key);
+ 
+     if (i < 0) {
+@@ -224,6 +230,7 @@ bool MetaData::findData(uint32_t key, uint32_t *type,
+ MetaData::typed_data::typed_data()
+     : mType(0),
+       mSize(0) {
++    u.ext_data = NULL;
+ }
+ 
+ MetaData::typed_data::~typed_data() {
+@@ -233,6 +240,7 @@ MetaData::typed_data::~typed_data() {
+ MetaData::typed_data::typed_data(const typed_data &from)
+     : mType(from.mType),
+       mSize(0) {
++    u.ext_data = NULL;
+     allocateStorage(from.mSize);
+     memcpy(storage(), from.storage(), mSize);
+ }
+@@ -279,11 +287,12 @@ void MetaData::typed_data::allocateStorage(size_t size) {
+     }
+ 
+     u.ext_data = malloc(mSize);
++    CHECK(u.ext_data != NULL);
+ }
+ 
+ void MetaData::typed_data::freeStorage() {
+     if (!usesReservoir()) {
+-        if (u.ext_data) {
++        if (u.ext_data != NULL) {
+             free(u.ext_data);
+             u.ext_data = NULL;
+         }
+-- 
+1.8.0
+

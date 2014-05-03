@@ -1,0 +1,142 @@
+From 1fcf02965d641b54445a282d5376e77c1090f03a Mon Sep 17 00:00:00 2001
+From: Jason Liu <r64343@freescale.com>
+Date: Fri, 6 Sep 2013 13:18:44 +0800
+Subject: [PATCH 421/435] ENGR00278625-2 fix the memtool issue due to the
+ cpuinfo changed
+
+Now, we need get the soc information from the new interface:
+"/sys/devices/soc0/soc_id"
+
+This patch also do the kernel version change to keep the compatible
+with the old kernel by using the /proc/cpuinfo interface
+
+Signed-off-by: Jason Liu <r64343@freescale.com>
+---
+ test/memtool/memtool.c | 91 ++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 66 insertions(+), 25 deletions(-)
+
+diff --git a/test/memtool/memtool.c b/test/memtool/memtool.c
+index 875a71b..264ae19 100644
+--- a/test/memtool/memtool.c
++++ b/test/memtool/memtool.c
+@@ -21,6 +21,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <sys/utsname.h>
+ #include "memtools_register_info.h"
+ 
+ int g_size = 4;
+@@ -38,6 +39,7 @@ int g_map_vaddr = 0;
+ int g_map_paddr = 0;
+ 
+ #define MAP_SIZE 0x1000
++#define KERN_VER(a, b, c) (((a) << 16) + ((b) << 8) + (c))
+ 
+ extern const module_t mx6q[];
+ extern const module_t mx6dl[];
+@@ -234,37 +236,76 @@ void parse_module(char *module, char *reg, char *field, int iswrite)
+ 	int n;
+ 	char *rev;
+ 
+-	fd = open("/proc/cpuinfo", O_RDONLY);
+-	if (fd < 0)
+-		die("can't open file /proc/cpuinfo\n");
++	int kv, kv_major, kv_minor, kv_rel;
++	int rev_major, rev_minor;
++	struct utsname sys_name;
++
++	if (uname(&sys_name) < 0)
++		die("uname error");
++
++	if (sscanf(sys_name.release, "%d.%d.%d", &kv_major, &kv_minor, &kv_rel) != 3)
++		die("fail to get release version");
++
++	kv = ((kv_major << 16) + (kv_minor << 8) + kv_rel);
++	if (kv < KERN_VER(3, 10, 0)) {
++		fd = open("/proc/cpuinfo", O_RDONLY);
++		if (fd < 0)
++			die("can't open file /proc/cpuinfo\n");
++
++		n = read(fd, g_buffer, 4095);
++		if ((rev = strstr(g_buffer, "Revision"))) {
++			int r;
++			rev = strstr(rev, ":");
++			if (!rev)
++				die("Unkown CPUInfo format\n");
++
++			r = strtoul(rev + 2, NULL, 16);
++
++			switch (r >> 12) {
++			case 0x63:
++				mx = mx6q;
++				printf("SOC is mx6q\n\n");
++				break;
++			case 0x61:
++				mx = mx6dl;
++				printf("SOC is mx6dl\n\n");
++				break;
++			case 0x60:
++				mx = mx6sl;
++				printf("SOC is mx6sl\n\n");
++				break;
++			default:
++				die("Unknown SOC\n\n");
++			}
++		} else
++			die("Unknown SOC\n");
++	} else {
++		FILE *fp;
++		char soc_name[255];
++
++		fp = fopen("/sys/devices/soc0/soc_id", "r");
++		if (fp == NULL) {
++			perror("/sys/devices/soc0/soc_id");
++			die("fail to get soc_id");
++		}
+ 
+-	n = read(fd, g_buffer, 4095);
+-	if ((rev = strstr(g_buffer, "Revision"))) {
+-		int r;
+-		rev = strstr(rev, ":");
+-		if (!rev)
+-			die("Unkown CPUInfo format\n");
++		if (fscanf(fp, "%s", soc_name) != 1) {
++			fclose(fp);
++			die("fail to get soc_name");
++		}
++		fclose(fp);
+ 
+-		r = strtoul(rev + 2, NULL, 16);
++		printf("SOC: %s\n", soc_name);
+ 
+-		switch (r >> 12) {
+-		case 0x63:
++		if (!strcmp(soc_name, "i.MX6Q"))
+ 			mx = mx6q;
+-			printf("SOC is mx6q\n\n");
+-			break;
+-		case 0x61:
++		else if (!strcmp(soc_name, "i.MX6DL"))
+ 			mx = mx6dl;
+-			printf("SOC is mx6dl\n\n");
+-			break;
+-		case 0x60:
++		else if (!strcmp(soc_name, "i.MX6SL"))
+ 			mx = mx6sl;
+-			printf("SOC is mx6sl\n\n");
+-			break;
+-		default:
+-			die("Unknown SOC\n\n");
+-		}
+-	} else
+-		die("Unknown SOC\n");
++		else
++			die("Unknown SOC\n");	
++	}
+ 
+ 	if (iswrite) {
+ 		while (mx) {
+-- 
+1.8.0
+

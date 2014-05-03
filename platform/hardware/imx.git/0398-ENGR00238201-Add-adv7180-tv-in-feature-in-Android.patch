@@ -1,0 +1,847 @@
+From 7e334c64db26da35949198e75bf7b1bffc30b08b Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Fri, 21 Dec 2012 12:34:52 +0800
+Subject: [PATCH 398/486] ENGR00238201 Add adv7180 tv-in feature in Android
+
+Create TVINDevice to handle adv7180
+Make setDeviceConfig/getCaptureMode to be virtual function
+Default preview/capture size setting based on each camera device
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera/Android.mk        |   1 +
+ mx6/libcamera/CameraUtil.h      |   4 +
+ mx6/libcamera/DeviceAdapter.cpp |  40 +---
+ mx6/libcamera/DeviceAdapter.h   |   4 +-
+ mx6/libcamera/Ov5640.cpp        |   7 +
+ mx6/libcamera/Ov5642.cpp        |   7 +
+ mx6/libcamera/OvDevice.cpp      |  46 ++++
+ mx6/libcamera/OvDevice.h        |  10 +-
+ mx6/libcamera/TVINDevice.cpp    | 497 ++++++++++++++++++++++++++++++++++++++++
+ mx6/libcamera/TVINDevice.h      |  55 +++++
+ 10 files changed, 628 insertions(+), 43 deletions(-)
+ create mode 100644 mx6/libcamera/TVINDevice.cpp
+ create mode 100644 mx6/libcamera/TVINDevice.h
+
+diff --git a/mx6/libcamera/Android.mk b/mx6/libcamera/Android.mk
+index 0bcdd89..e6715d0 100755
+--- a/mx6/libcamera/Android.mk
++++ b/mx6/libcamera/Android.mk
+@@ -32,6 +32,7 @@ LOCAL_SRC_FILES:=    \
+     OvDevice.cpp \
+     Ov5640.cpp \
+     Ov5642.cpp \
++    TVINDevice.cpp \
+     PhysMemAdapter.cpp \
+     YuvToJpegEncoder.cpp \
+     NV12_resize.c
+diff --git a/mx6/libcamera/CameraUtil.h b/mx6/libcamera/CameraUtil.h
+index 914544b..bf5a7e2 100644
+--- a/mx6/libcamera/CameraUtil.h
++++ b/mx6/libcamera/CameraUtil.h
+@@ -69,6 +69,7 @@ using namespace android;
+ #define UVC_SENSOR_NAME "uvc"
+ #define OV5640_SENSOR_NAME "ov5640"
+ #define OV5642_SENSOR_NAME "ov5642"
++#define ADV7180_TVIN_NAME "adv7180_decoder"
+ #define V4LSTREAM_WAKE_LOCK "V4LCapture"
+ 
+ #define MAX_PREVIEW_BUFFER      6
+@@ -81,6 +82,9 @@ using namespace android;
+ #define PARAMS_DELIMITER ","
+ #define THREAD_WAIT_TIMEOUT 500 * 1000 * 1000
+ 
++#define MAX_SENSOR_FORMAT 20
++#define FORMAT_STRING_LEN 64
++
+ #define CAMERA_GRALLOC_USAGE GRALLOC_USAGE_HW_TEXTURE | \
+     GRALLOC_USAGE_HW_RENDER |                           \
+     GRALLOC_USAGE_SW_READ_RARELY |                      \
+diff --git a/mx6/libcamera/DeviceAdapter.cpp b/mx6/libcamera/DeviceAdapter.cpp
+index dbda8b4..23058d9 100644
+--- a/mx6/libcamera/DeviceAdapter.cpp
++++ b/mx6/libcamera/DeviceAdapter.cpp
+@@ -19,6 +19,7 @@
+ #include "UvcDevice.h"
+ #include "Ov5640.h"
+ #include "Ov5642.h"
++#include "TVINDevice.h"
+ 
+ sp<DeviceAdapter>DeviceAdapter::Create(const CameraInfo& info)
+ {
+@@ -34,6 +35,9 @@ sp<DeviceAdapter>DeviceAdapter::Create(const CameraInfo& info)
+     else if (strstr(info.name, OV5642_SENSOR_NAME)) {
+         FLOGI("DeviceAdapter: Create ov5642 device");
+         devAdapter = new Ov5642();
++    }else if (strstr(info.name, ADV7180_TVIN_NAME)) {
++        FLOGI("DeviceAdapter: Create adv7180 device");
++        devAdapter = new TVINDevice();
+     }
+     else {
+         devAdapter = new OvDevice();
+@@ -105,42 +109,10 @@ status_t DeviceAdapter::initialize(const CameraInfo& info)
+     return NO_ERROR;
+ }
+ 
+-static int getCaptureMode(int width,
++int DeviceAdapter::getCaptureMode(int width,
+                           int height)
+ {
+-    int capturemode = 0;
+-
+-    if ((width == 640) && (height == 480)) {
+-        capturemode = 0;
+-    }
+-    else if ((width == 320) && (height == 240)) {
+-        capturemode = 1;
+-    }
+-    else if ((width == 720) && (height == 480)) {
+-        capturemode = 2;
+-    }
+-    else if ((width == 720) && (height == 576)) {
+-        capturemode = 3;
+-    }
+-    else if ((width == 1280) && (height == 720)) {
+-        capturemode = 4;
+-    }
+-    else if ((width == 1920) && (height == 1080)) {
+-        capturemode = 5;
+-    }
+-    else if ((width == 2592) && (height == 1944)) {
+-        capturemode = 6;
+-    }
+-    else if ((width == 176) && (height == 144)) {
+-        capturemode = 7;
+-    }
+-    else if ((width == 1024) && (height == 768)) {
+-        capturemode = 8;
+-    }
+-    else {
+-        FLOGE("width:%d height:%d is not supported.", width, height);
+-    }
+-    return capturemode;
++    return 0;
+ }
+ 
+ status_t DeviceAdapter::setDeviceConfig(int         width,
+diff --git a/mx6/libcamera/DeviceAdapter.h b/mx6/libcamera/DeviceAdapter.h
+index cb4a295..dff69f5 100644
+--- a/mx6/libcamera/DeviceAdapter.h
++++ b/mx6/libcamera/DeviceAdapter.h
+@@ -38,7 +38,7 @@ public:
+     void             setErrorListener(CameraErrorListener *listener);
+     void             setCameraBufferProvide(CameraBufferProvider *bufferProvider);
+     virtual status_t initialize(const CameraInfo& info);
+-    status_t         setDeviceConfig(int         width,
++    virtual status_t setDeviceConfig(int         width,
+                                      int         height,
+                                      PixelFormat format,
+                                      int         fps);
+@@ -56,6 +56,8 @@ public:
+                                     int               rfmtLen,
+                                     int              *supportPictureFormat,
+                                     int               pfmtLen) = 0;
++    virtual int getCaptureMode(int width,
++                          int height);
+ 
+     // API to send a command to the camera
+     // virtual status_t sendCommand(CameraCommands operation, int value1 = 0,
+diff --git a/mx6/libcamera/Ov5640.cpp b/mx6/libcamera/Ov5640.cpp
+index 2568b1a..a5c9c23 100644
+--- a/mx6/libcamera/Ov5640.cpp
++++ b/mx6/libcamera/Ov5640.cpp
+@@ -17,6 +17,13 @@
+ 
+ #include "Ov5640.h"
+ 
++#define DEFAULT_PREVIEW_FPS (15)
++#define DEFAULT_PREVIEW_W   (640)
++#define DEFAULT_PREVIEW_H   (480)
++#define DEFAULT_PICTURE_W   (640)
++#define DEFAULT_PICTURE_H   (480)
++
++
+ status_t Ov5640::initParameters(CameraParameters& params,
+                                   int              *supportRecordingFormat,
+                                   int               rfmtLen,
+diff --git a/mx6/libcamera/Ov5642.cpp b/mx6/libcamera/Ov5642.cpp
+index 5033f53..12795e2 100644
+--- a/mx6/libcamera/Ov5642.cpp
++++ b/mx6/libcamera/Ov5642.cpp
+@@ -17,6 +17,13 @@
+ 
+ #include "Ov5642.h"
+ 
++#define DEFAULT_PREVIEW_FPS (15)
++#define DEFAULT_PREVIEW_W   (640)
++#define DEFAULT_PREVIEW_H   (480)
++#define DEFAULT_PICTURE_W   (640)
++#define DEFAULT_PICTURE_H   (480)
++
++
+ status_t Ov5642::initParameters(CameraParameters& params,
+                                   int              *supportRecordingFormat,
+                                   int               rfmtLen,
+diff --git a/mx6/libcamera/OvDevice.cpp b/mx6/libcamera/OvDevice.cpp
+index 656051d..cf62695 100644
+--- a/mx6/libcamera/OvDevice.cpp
++++ b/mx6/libcamera/OvDevice.cpp
+@@ -18,6 +18,12 @@
+ #include "CameraUtil.h"
+ #include "OvDevice.h"
+ 
++#define DEFAULT_PREVIEW_FPS (15)
++#define DEFAULT_PREVIEW_W   (640)
++#define DEFAULT_PREVIEW_H   (480)
++#define DEFAULT_PICTURE_W   (640)
++#define DEFAULT_PICTURE_H   (480)
++
+ PixelFormat OvDevice::getMatchFormat(int *sfmt,
+                                      int  slen,
+                                      int *dfmt,
+@@ -249,6 +255,9 @@ status_t OvDevice::initParameters(CameraParameters& params,
+                     previewCnt++;
+                 }
+             }
++        } // end if (ret == 0)
++        else {
++            FLOGI("enum frame size error %d", ret);
+         }
+     } // end while
+ 
+@@ -358,3 +367,40 @@ status_t OvDevice::setParameters(CameraParameters& params)
+     return NO_ERROR;
+ }
+ 
++int OvDevice::getCaptureMode(int width,
++                          int height)
++{
++    int capturemode = 0;
++
++    if ((width == 640) && (height == 480)) {
++        capturemode = 0;
++    }
++    else if ((width == 320) && (height == 240)) {
++        capturemode = 1;
++    }
++    else if ((width == 720) && (height == 480)) {
++        capturemode = 2;
++    }
++    else if ((width == 720) && (height == 576)) {
++        capturemode = 3;
++    }
++    else if ((width == 1280) && (height == 720)) {
++        capturemode = 4;
++    }
++    else if ((width == 1920) && (height == 1080)) {
++        capturemode = 5;
++    }
++    else if ((width == 2592) && (height == 1944)) {
++        capturemode = 6;
++    }
++    else if ((width == 176) && (height == 144)) {
++        capturemode = 7;
++    }
++    else if ((width == 1024) && (height == 768)) {
++        capturemode = 8;
++    }
++    else {
++        FLOGE("width:%d height:%d is not supported.", width, height);
++    }
++    return capturemode;
++}
+diff --git a/mx6/libcamera/OvDevice.h b/mx6/libcamera/OvDevice.h
+index 6dcb681..10056e6 100644
+--- a/mx6/libcamera/OvDevice.h
++++ b/mx6/libcamera/OvDevice.h
+@@ -21,14 +21,6 @@
+ #include "CameraUtil.h"
+ #include "DeviceAdapter.h"
+ 
+-#define DEFAULT_PREVIEW_FPS (15)
+-#define DEFAULT_PREVIEW_W   (640)
+-#define DEFAULT_PREVIEW_H   (480)
+-#define DEFAULT_PICTURE_W   (640)
+-#define DEFAULT_PICTURE_H   (480)
+-#define MAX_SENSOR_FORMAT 20
+-#define FORMAT_STRING_LEN 64
+-
+ class OvDevice : public DeviceAdapter {
+ public:
+     virtual status_t initParameters(CameraParameters& params,
+@@ -37,6 +29,8 @@ public:
+                                     int              *supportPictureFormat,
+                                     int               pfmtLen);
+     virtual status_t setParameters(CameraParameters& params);
++    virtual int getCaptureMode(int width,
++                          int height);
+ 
+ protected:
+     PixelFormat      getMatchFormat(int *sfmt,
+diff --git a/mx6/libcamera/TVINDevice.cpp b/mx6/libcamera/TVINDevice.cpp
+new file mode 100644
+index 0000000..5fcc44b
+--- /dev/null
++++ b/mx6/libcamera/TVINDevice.cpp
+@@ -0,0 +1,497 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "CameraUtil.h"
++#include "TVINDevice.h"
++
++#define DEFAULT_PREVIEW_FPS (15)
++
++PixelFormat TVINDevice::getMatchFormat(int *sfmt,
++                                     int  slen,
++                                     int *dfmt,
++                                     int  dlen)
++{
++    if ((sfmt == NULL) || (slen == 0) || (dfmt == NULL) || (dlen == 0)) {
++        FLOGE("setSupportedPreviewFormats invalid parameters");
++        return 0;
++    }
++
++    PixelFormat matchFormat = 0;
++    bool live               = true;
++    for (int i = 0; i < slen && live; i++) {
++        for (int j = 0; j < dlen; j++) {
++            FLOG_RUNTIME("sfmt[%d]=%c%c%c%c, dfmt[%d]=%c%c%c%c",
++                         i,
++                         sfmt[i] & 0xFF,
++                         (sfmt[i] >> 8) & 0xFF,
++                         (sfmt[i] >> 16) & 0xFF,
++                         (sfmt[i] >> 24) & 0xFF,
++                         j,
++                         dfmt[j] & 0xFF,
++                         (dfmt[j] >> 8) & 0xFF,
++                         (dfmt[j] >> 16) & 0xFF,
++                         (dfmt[j] >> 24) & 0xFF);
++            if (sfmt[i] == dfmt[j]) {
++                matchFormat = convertV4L2FormatToPixelFormat(dfmt[j]);
++                live        = false;
++                break;
++            }
++        }
++    }
++
++    return matchFormat;
++}
++
++status_t TVINDevice::setSupportedPreviewFormats(int *sfmt,
++                                              int  slen,
++                                              int *dfmt,
++                                              int  dlen)
++{
++    if ((sfmt == NULL) || (slen == 0) || (dfmt == NULL) || (dlen == 0)) {
++        FLOGE("setSupportedPreviewFormats invalid parameters");
++        return BAD_VALUE;
++    }
++
++    char fmtStr[FORMAT_STRING_LEN];
++    memset(fmtStr, 0, FORMAT_STRING_LEN);
++    for (int i = 0; i < slen; i++) {
++        for (int j = 0; j < dlen; j++) {
++            // should report VPU support format.
++            if (sfmt[i] == dfmt[j]) {
++                if (sfmt[i] == v4l2_fourcc('Y', 'U', '1', '2')) {
++                    strcat(fmtStr, "yuv420p");
++                    strcat(fmtStr, ",");
++                }
++                else if (sfmt[i] == v4l2_fourcc('N', 'V', '1', '2')) {
++                    strcat(fmtStr, "yuv420sp");
++                    strcat(fmtStr, ",");
++                }
++                else if (sfmt[i] == v4l2_fourcc('Y', 'U', 'Y', 'V')) {
++                    strcat(fmtStr, "yuv422i-yuyv");
++                    strcat(fmtStr, ",");
++                }
++            }
++        }
++    }
++    mParams.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FORMATS, fmtStr);
++
++    return NO_ERROR;
++}
++
++status_t TVINDevice::setPreviewStringFormat(PixelFormat format)
++{
++    const char *pformat = NULL;
++
++    if (format == HAL_PIXEL_FORMAT_YCbCr_420_P) {
++        pformat = "yuv420p";
++    }
++    else if (format == HAL_PIXEL_FORMAT_YCbCr_420_SP) {
++        pformat = "yuv420sp";
++    }
++    else if (format == HAL_PIXEL_FORMAT_YCbCr_422_I) {
++        pformat = "yuv422i-yuyv";
++    }
++    else {
++        FLOGE("format %d is not supported", format);
++        return BAD_VALUE;
++    }
++    ALOGI("setPreviewFormat: %s", pformat);
++    mParams.setPreviewFormat(pformat);
++    mParams.set(CameraParameters::KEY_VIDEO_FRAME_FORMAT, pformat);
++    return NO_ERROR;
++}
++
++status_t TVINDevice::setDeviceConfig(int         width,
++                                        int         height,
++                                        PixelFormat format,
++                                        int         fps)
++{
++    if (mCameraHandle <= 0) {
++        FLOGE("setDeviceConfig: DeviceAdapter uninitialized");
++        return BAD_VALUE;
++    }
++    if ((width == 0) || (height == 0)) {
++        FLOGE("setDeviceConfig: invalid parameters");
++        return BAD_VALUE;
++    }
++
++    status_t ret = NO_ERROR;
++    int input    = 1;
++    ret = ioctl(mCameraHandle, VIDIOC_S_INPUT, &input);
++    if (ret < 0) {
++        FLOGE("Open: VIDIOC_S_INPUT Failed: %s", strerror(errno));
++        return ret;
++    }
++
++    int vformat;
++    vformat = convertPixelFormatToV4L2Format(format);
++
++    FLOGI("Width * Height %d x %d format %d, fps: %d",
++          width,
++          height,
++          vformat,
++          fps);
++
++    mVideoInfo->width       = width;
++    mVideoInfo->height      = height;
++    mVideoInfo->framesizeIn = (width * height << 1);
++    mVideoInfo->formatIn    = vformat;
++
++    mVideoInfo->param.type =
++        V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    mVideoInfo->param.parm.capture.timeperframe.numerator   = 1;
++    mVideoInfo->param.parm.capture.timeperframe.denominator = 0;
++    mVideoInfo->param.parm.capture.capturemode = 0;
++    ret = ioctl(mCameraHandle, VIDIOC_S_PARM, &mVideoInfo->param);
++    if (ret < 0) {
++        FLOGE("Open: VIDIOC_S_PARM Failed: %s", strerror(errno));
++        return ret;
++    }
++
++    mVideoInfo->format.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    mVideoInfo->format.fmt.pix.width        = width & 0xFFFFFFF8;
++    mVideoInfo->format.fmt.pix.height       = height & 0xFFFFFFF8;
++    mVideoInfo->format.fmt.pix.pixelformat  = vformat;
++    mVideoInfo->format.fmt.pix.field        = V4L2_FIELD_INTERLACED;
++    mVideoInfo->format.fmt.pix.priv         = 0;
++    mVideoInfo->format.fmt.pix.sizeimage    = 0;
++    mVideoInfo->format.fmt.pix.bytesperline = 0;
++
++    // Special stride alignment for YU12
++    if (vformat == v4l2_fourcc('Y', 'U', '1', '2')){
++        // Goolge define the the stride and c_stride for YUV420 format
++        // y_size = stride * height
++        // c_stride = ALIGN(stride/2, 16)
++        // c_size = c_stride * height/2
++        // size = y_size + c_size * 2
++        // cr_offset = y_size
++        // cb_offset = y_size + c_size
++        // int stride = (width+15)/16*16;
++        // int c_stride = (stride/2+16)/16*16;
++        // y_size = stride * height
++        // c_stride = ALIGN(stride/2, 16)
++        // c_size = c_stride * height/2
++        // size = y_size + c_size * 2
++        // cr_offset = y_size
++        // cb_offset = y_size + c_size
++
++        // GPU and IPU take below stride calculation
++        // GPU has the Y stride to be 32 alignment, and UV stride to be
++        // 16 alignment.
++        // IPU have the Y stride to be 2x of the UV stride alignment
++        int stride = (width+31)/32*32;
++        int c_stride = (stride/2+15)/16*16;
++        mVideoInfo->format.fmt.pix.bytesperline = stride;
++        mVideoInfo->format.fmt.pix.sizeimage    = stride*height+c_stride * height;
++        FLOGI("Special handling for YV12 on Stride %d, size %d",
++            mVideoInfo->format.fmt.pix.bytesperline,
++            mVideoInfo->format.fmt.pix.sizeimage);
++    }
++
++    ret = ioctl(mCameraHandle, VIDIOC_S_FMT, &mVideoInfo->format);
++    if (ret < 0) {
++        FLOGE("Open: VIDIOC_S_FMT Failed: %s", strerror(errno));
++        return ret;
++    }
++
++    return ret;
++}
++
++status_t TVINDevice::initParameters(CameraParameters& params,
++                                  int              *supportRecordingFormat,
++                                  int               rfmtLen,
++                                  int              *supportPictureFormat,
++                                  int               pfmtLen)
++{
++    int ret = 0, index = 0;
++    int maxWait = 6;
++    int sensorFormat[MAX_SENSOR_FORMAT];
++
++    if (mCameraHandle < 0) {
++        FLOGE("TVINDevice: initParameters sensor has not been opened");
++        return BAD_VALUE;
++    }
++    if ((supportRecordingFormat == NULL) || (rfmtLen == 0) ||
++        (supportPictureFormat == NULL) || (pfmtLen == 0)) {
++        FLOGE("TVINDevice: initParameters invalid parameters");
++        return BAD_VALUE;
++    }
++
++    // Get the PAL/NTSC STD
++    do {
++        ret = ioctl(mCameraHandle, VIDIOC_G_STD, &mSTD);
++        if (ret < 0)
++        {
++            FLOGE("VIDIOC_G_STD failed with more try %d\n",
++                  maxWait - 1);
++            sleep(1);
++        }
++        maxWait --;
++    }while ((ret != 0) || (maxWait <= 0));
++
++    if (mSTD == V4L2_STD_PAL)
++        FLOGI("Get current mode: PAL");
++    else if (mSTD == V4L2_STD_NTSC)
++        FLOGI("Get current mode: NTSC");
++    else {
++        FLOGI("Error!Get invalid mode: %llu", mSTD);
++		return BAD_VALUE;
++    }
++
++	if (ioctl(mCameraHandle, VIDIOC_S_STD, &mSTD) < 0)
++	{
++		FLOGE("VIDIOC_S_STD failed\n");
++		return BAD_VALUE;
++	}
++
++    // first read sensor format.
++#if 0
++    struct v4l2_fmtdesc vid_fmtdesc;
++    while (ret == 0) {
++        vid_fmtdesc.index = index;
++        vid_fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        ret               = ioctl(mCameraHandle, VIDIOC_ENUM_FMT, &vid_fmtdesc);
++        FLOG_RUNTIME("index:%d,ret:%d, format:%c%c%c%c", index, ret,
++                     vid_fmtdesc.pixelformat & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 8) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 16) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 24) & 0xFF);
++        if (ret == 0) {
++            sensorFormat[index++] = vid_fmtdesc.pixelformat;
++        }
++    }
++#endif // if 0
++
++    // v4l2 does not support enum format, now hard code here.
++    sensorFormat[0] = v4l2_fourcc('N', 'V', '1', '2');
++    sensorFormat[1] = v4l2_fourcc('Y', 'U', '1', '2');
++    sensorFormat[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
++    index           = 3;
++
++    // second check match sensor format with vpu support format and picture
++    // format.
++    mPreviewPixelFormat = getMatchFormat(supportRecordingFormat,
++                                         rfmtLen,
++                                         sensorFormat,
++                                         index);
++    mPicturePixelFormat = getMatchFormat(supportPictureFormat,
++                                         pfmtLen,
++                                         sensorFormat,
++                                         index);
++    setPreviewStringFormat(mPreviewPixelFormat);
++    ret = setSupportedPreviewFormats(supportRecordingFormat,
++                                     rfmtLen,
++                                     sensorFormat,
++                                     index);
++    if (ret) {
++        FLOGE("setSupportedPreviewFormats failed");
++        return ret;
++    }
++
++    index = 0;
++    char TmpStr[20];
++    int  previewCnt = 0, pictureCnt = 0;
++    struct v4l2_frmsizeenum vid_frmsize;
++    struct v4l2_frmivalenum vid_frmval;
++    while (ret == 0) {
++        memset(TmpStr, 0, 20);
++        memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
++        vid_frmsize.index        = index++;
++        vid_frmsize.pixel_format = v4l2_fourcc('N', 'V', '1', '2');
++        ret                      = ioctl(mCameraHandle,
++                                         VIDIOC_ENUM_FRAMESIZES,
++                                         &vid_frmsize);
++        if (ret == 0) {
++            FLOG_RUNTIME("enum frame size w:%d, h:%d",
++                         vid_frmsize.discrete.width, vid_frmsize.discrete.height);
++            memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
++            vid_frmval.index        = 0;
++            vid_frmval.pixel_format = vid_frmsize.pixel_format;
++            vid_frmval.width        = vid_frmsize.discrete.width;
++            vid_frmval.height       = vid_frmsize.discrete.height;
++
++            // ret = ioctl(mCameraHandle, VIDIOC_ENUM_FRAMEINTERVALS,
++            // &vid_frmval);
++            // v4l2 does not support, now hard code here.
++            if (ret == 0) {
++                FLOG_RUNTIME("vid_frmval denominator:%d, numeraton:%d",
++                             vid_frmval.discrete.denominator,
++                             vid_frmval.discrete.numerator);
++                if ((vid_frmsize.discrete.width > 1280) ||
++                    (vid_frmsize.discrete.height > 720)) {
++                    vid_frmval.discrete.denominator = 15;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++                else {
++                    vid_frmval.discrete.denominator = 30;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++
++                sprintf(TmpStr,
++                        "%dx%d",
++                        vid_frmsize.discrete.width,
++                        vid_frmsize.discrete.height);
++
++                // Set default to be first enum w/h, since tvin may only
++                // have one set
++                if (pictureCnt == 0){
++                    mParams.setPreviewSize(vid_frmsize.discrete.width,
++                            vid_frmsize.discrete.height);
++                    mParams.setPictureSize(vid_frmsize.discrete.width,
++                            vid_frmsize.discrete.height);
++                }
++
++                if (pictureCnt == 0)
++                    strncpy((char *)mSupportedPictureSizes,
++                            TmpStr,
++                            CAMER_PARAM_BUFFER_SIZE);
++                else {
++                    strncat(mSupportedPictureSizes,
++                            PARAMS_DELIMITER,
++                            CAMER_PARAM_BUFFER_SIZE);
++                    strncat(mSupportedPictureSizes,
++                            TmpStr,
++                            CAMER_PARAM_BUFFER_SIZE);
++                }
++                pictureCnt++;
++
++                if (vid_frmval.discrete.denominator /
++                    vid_frmval.discrete.numerator >= 15) {
++                    if (previewCnt == 0)
++                        strncpy((char *)mSupportedPreviewSizes,
++                                TmpStr,
++                                CAMER_PARAM_BUFFER_SIZE);
++                    else {
++                        strncat(mSupportedPreviewSizes,
++                                PARAMS_DELIMITER,
++                                CAMER_PARAM_BUFFER_SIZE);
++                        strncat(mSupportedPreviewSizes,
++                                TmpStr,
++                                CAMER_PARAM_BUFFER_SIZE);
++                    }
++                    previewCnt++;
++                }
++            }
++        } // end if (ret == 0)
++        else {
++            FLOGI("enum frame size error %d", ret);
++        }
++    } // end while
++
++    strcpy(mSupportedFPS, "15,30");
++    FLOGI("SupportedPictureSizes is %s", mSupportedPictureSizes);
++    FLOGI("SupportedPreviewSizes is %s", mSupportedPreviewSizes);
++    FLOGI("SupportedFPS is %s", mSupportedFPS);
++
++    mParams.set(CameraParameters::KEY_SUPPORTED_PICTURE_SIZES,
++                mSupportedPictureSizes);
++    mParams.set(CameraParameters::KEY_SUPPORTED_PREVIEW_SIZES,
++                mSupportedPreviewSizes);
++    mParams.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES,
++                mSupportedFPS);
++    mParams.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE,
++                "(12000,17000),(25000,33000)");
++    // Align the default FPS RANGE to the DEFAULT_PREVIEW_FPS
++    mParams.set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "12000,17000");
++    mParams.setPreviewFrameRate(DEFAULT_PREVIEW_FPS);
++
++    params = mParams;
++    return NO_ERROR;
++}
++
++status_t TVINDevice::setParameters(CameraParameters& params)
++{
++    int  w, h;
++    int  framerate, local_framerate;
++    int  max_zoom, zoom, max_fps, min_fps;
++    char tmp[128];
++
++    Mutex::Autolock lock(mLock);
++
++    max_zoom = params.getInt(CameraParameters::KEY_MAX_ZOOM);
++    zoom     = params.getInt(CameraParameters::KEY_ZOOM);
++    if (zoom > max_zoom) {
++        FLOGE("Invalid zoom setting, zoom %d, max zoom %d", zoom, max_zoom);
++        return BAD_VALUE;
++    }
++    if (!((strcmp(params.getPreviewFormat(), "yuv420sp") == 0) ||
++          (strcmp(params.getPreviewFormat(), "yuv420p") == 0) ||
++          (strcmp(params.getPreviewFormat(), "yuv422i-yuyv") == 0))) {
++        FLOGE("Only yuv420sp or yuv420pis supported, but input format is %s",
++              params.getPreviewFormat());
++        return BAD_VALUE;
++    }
++
++    if (strcmp(params.getPictureFormat(), "jpeg") != 0) {
++        FLOGE("Only jpeg still pictures are supported");
++        return BAD_VALUE;
++    }
++
++    params.getPreviewSize(&w, &h);
++    sprintf(tmp, "%dx%d", w, h);
++    FLOGI("Set preview size: %s", tmp);
++    if (strstr(mSupportedPreviewSizes, tmp) == NULL) {
++        FLOGE("The preview size w %d, h %d is not corrected", w, h);
++        return BAD_VALUE;
++    }
++
++    params.getPictureSize(&w, &h);
++    sprintf(tmp, "%dx%d", w, h);
++    FLOGI("Set picture size: %s", tmp);
++    if (strstr(mSupportedPictureSizes, tmp) == NULL) {
++        FLOGE("The picture size w %d, h %d is not corrected", w, h);
++        return BAD_VALUE;
++    }
++
++    local_framerate = mParams.getPreviewFrameRate();
++    FLOGI("get local frame rate:%d FPS", local_framerate);
++    if ((local_framerate > 30) || (local_framerate < 0)) {
++        FLOGE("The framerate is not corrected");
++        local_framerate = 15;
++    }
++
++    framerate = params.getPreviewFrameRate();
++    FLOGI("Set frame rate:%d FPS", framerate);
++    if ((framerate > 30) || (framerate < 0)) {
++        FLOGE("The framerate is not corrected");
++        return BAD_VALUE;
++    }
++    else if (local_framerate != framerate) {
++        if (framerate == 15) {
++            params.set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "12000,17000");
++        }
++        else if (framerate == 30) {
++            params.set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "25000,33000");
++        }
++    }
++
++    int actual_fps = 15;
++    params.getPreviewFpsRange(&min_fps, &max_fps);
++    FLOGI("FPS range: %d - %d", min_fps, max_fps);
++    if ((max_fps < 1000) || (min_fps < 1000) || (max_fps > 33000) ||
++        (min_fps > 33000)) {
++        FLOGE("The fps range from %d to %d is error", min_fps, max_fps);
++        return BAD_VALUE;
++    }
++    actual_fps = min_fps > 15000 ? 30 : 15;
++    FLOGI("setParameters: actual_fps=%d", actual_fps);
++    params.setPreviewFrameRate(actual_fps);
++
++    mParams = params;
++    return NO_ERROR;
++}
++
+diff --git a/mx6/libcamera/TVINDevice.h b/mx6/libcamera/TVINDevice.h
+new file mode 100644
+index 0000000..695f783
+--- /dev/null
++++ b/mx6/libcamera/TVINDevice.h
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _TVIN_DEVICE_H_
++#define _TVIN_DEVICE_H_
++
++#include "CameraUtil.h"
++#include "DeviceAdapter.h"
++
++class TVINDevice : public DeviceAdapter {
++public:
++    virtual status_t         setDeviceConfig(int         width,
++                                     int         height,
++                                     PixelFormat format,
++                                     int         fps);
++    virtual status_t initParameters(CameraParameters& params,
++                                    int              *supportRecordingFormat,
++                                    int               rfmtLen,
++                                    int              *supportPictureFormat,
++                                    int               pfmtLen);
++    virtual status_t setParameters(CameraParameters& params);
++
++protected:
++    PixelFormat      getMatchFormat(int *sfmt,
++                                    int  slen,
++                                    int *dfmt,
++                                    int  dlen);
++    status_t setSupportedPreviewFormats(int *sfmt,
++                                        int  slen,
++                                        int *dfmt,
++                                        int  dlen);
++    status_t setPreviewStringFormat(PixelFormat format);
++
++protected:
++    char mSupportedFPS[MAX_SENSOR_FORMAT];
++    char mSupportedPictureSizes[CAMER_PARAM_BUFFER_SIZE];
++    char mSupportedPreviewSizes[CAMER_PARAM_BUFFER_SIZE];
++    v4l2_std_id mSTD;
++};
++
++#endif // ifndef _TVIN_DEVICE_H_
+-- 
+1.8.0
+

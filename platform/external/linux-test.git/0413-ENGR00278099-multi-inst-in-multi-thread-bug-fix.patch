@@ -1,0 +1,315 @@
+From b5af1ccf8eedbd05e04a71b64cf9eb2d57222b1b Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 4 Sep 2013 14:24:09 +0800
+Subject: [PATCH 413/435] ENGR00278099 multi-inst in multi-thread bug fix
+
+- multi-inst in multi-thread bug fix
+Bug:
+Some instances aborted before processing 1st frame.
+
+Root cause:
+fbpool[] is a global variable, framebuf_alloc returned
+NULL when multiple threads visited it simultaneously
+
+Solution:
+put fbpool[] in decode/encode handle
+
+- correct style of some code (indent, comment, ...)
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 52 ++++++++++++++++++++++----------------------
+ test/mxc_vpu_test/enc.c      |  8 +++----
+ test/mxc_vpu_test/fb.c       | 52 +++++---------------------------------------
+ test/mxc_vpu_test/main.c     |  4 +---
+ test/mxc_vpu_test/vpu_test.h |  9 +++++---
+ 5 files changed, 42 insertions(+), 83 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index ee4e1d5..01e0a41 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1751,7 +1751,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 		if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
+ 			/* All buffers are linear */
+ 			for (i = 0; i < totalfb; i++) {
+-				pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++				pfbpool[i] = framebuf_alloc(&dec->fbpool[i], dec->cmdl->format, dec->mjpg_fmt,
+ 						    dec->stride, dec->picheight, mvCol);
+ 				if (pfbpool[i] == NULL)
+ 					goto err;
+@@ -1759,7 +1759,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+                 } else {
+ 			/* decoded buffers are tiled */
+ 			for (i = 0; i < regfbcount; i++) {
+-				pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++				pfbpool[i] = tiled_framebuf_alloc(&dec->fbpool[i], dec->cmdl->format, dec->mjpg_fmt,
+ 						dec->stride, dec->picheight, mvCol, dec->cmdl->mapType);
+ 				if (pfbpool[i] == NULL)
+ 					goto err;
+@@ -1769,10 +1769,10 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 				/* if tiled2LinearEnable == 1, post processing buffer is linear,
+ 				 * otherwise, the buffer is tiled */
+ 				if (dec->tiled2LinearEnable)
+-					pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++					pfbpool[i] = framebuf_alloc(&dec->fbpool[i], dec->cmdl->format, dec->mjpg_fmt,
+ 							dec->stride, dec->picheight, mvCol);
+ 				else
+-					pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++					pfbpool[i] = tiled_framebuf_alloc(&dec->fbpool[i], dec->cmdl->format, dec->mjpg_fmt,
+ 						    dec->stride, dec->picheight, mvCol, dec->cmdl->mapType);
+ 				if (pfbpool[i] == NULL)
+ 					goto err1;
+@@ -1828,28 +1828,28 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			for (i = 0; i < totalfb; i++) {
+ 				fb[i].myIndex = i;
+ 
+-                if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
+-                    if (dst_scheme == PATH_V4L2)
+-                        fb[i].bufY = disp->buffers[i]->offset;
+-                    else
+-                        fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
+-                    fb[i].bufCb = fb[i].bufY + img_size;
+-                    fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
+-                }
+-                else if ((dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP)
+-                        ||(dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP)){
+-                    if (dst_scheme == PATH_V4L2)
+-                        tiled_framebuf_base(&fb[i], disp->buffers[i]->offset,
+-                                dec->stride, dec->picheight, dec->cmdl->mapType);
+-                    else {
+-                        fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
+-                        fb[i].bufCb = fb[i].bufY + img_size;
+-                        fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
+-                    }
+-                } else {
+-                    err_msg("undefined mapType = %d\n", dec->cmdl->mapType);
+-                    goto err1;
+-                }
++				if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
++					if (dst_scheme == PATH_V4L2)
++						fb[i].bufY = disp->buffers[i]->offset;
++					else
++						fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
++					fb[i].bufCb = fb[i].bufY + img_size;
++					fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
++				}
++				else if ((dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP)
++						||(dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP)){
++					if (dst_scheme == PATH_V4L2)
++						tiled_framebuf_base(&fb[i], disp->buffers[i]->offset,
++							dec->stride, dec->picheight, dec->cmdl->mapType);
++					else {
++						fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
++						fb[i].bufCb = fb[i].bufY + img_size;
++						fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
++					}
++				} else {
++					err_msg("undefined mapType = %d\n", dec->cmdl->mapType);
++					goto err1;
++				}
+ 
+ 				/* allocate MvCol buffer here */
+ 				if (!cpu_is_mx27()) {
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 6a1c146..968761b 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -407,7 +407,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	if (enc->cmdl->mapType == LINEAR_FRAME_MAP) {
+ 		/* All buffers are linear */
+ 		for (i = 0; i < minfbcount + extrafbcount; i++) {
+-			pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++			pfbpool[i] = framebuf_alloc(&enc->fbpool[i], enc->cmdl->format, enc->mjpg_fmt,
+ 						    enc_fbwidth, enc_fbheight, 0);
+ 			if (pfbpool[i] == NULL) {
+ 				goto err1;
+@@ -416,14 +416,14 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	 } else {
+ 		/* Encoded buffers are tiled */
+ 		for (i = 0; i < minfbcount; i++) {
+-			pfbpool[i] = tiled_framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++			pfbpool[i] = tiled_framebuf_alloc(&enc->fbpool[i], enc->cmdl->format, enc->mjpg_fmt,
+ 					    enc_fbwidth, enc_fbheight, 0, enc->cmdl->mapType);
+ 			if (pfbpool[i] == NULL)
+ 				goto err1;
+ 		}
+ 		/* sub frames are linear */
+ 		for (i = minfbcount; i < minfbcount + extrafbcount; i++) {
+-			pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++			pfbpool[i] = framebuf_alloc(&enc->fbpool[i], enc->cmdl->format, enc->mjpg_fmt,
+ 						    enc_fbwidth, enc_fbheight, 0);
+ 			if (pfbpool[i] == NULL)
+ 				goto err1;
+@@ -470,7 +470,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		}
+ 	} else {
+ 		/* Allocate a single frame buffer for source frame */
+-		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++		pfbpool[src_fbid] = framebuf_alloc(&enc->fbpool[src_fbid], enc->cmdl->format, enc->mjpg_fmt,
+ 						   src_fbwidth, src_fbheight, 0);
+ 		if (pfbpool[src_fbid] == NULL) {
+ 			err_msg("failed to allocate single framebuf\n");
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index bf74c94..66e2468 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright 2004-2013 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -26,50 +26,11 @@
+ #include <stdio.h>
+ #include "vpu_test.h"
+ 
+-#define NUM_FRAME_BUFS	32
+-#define FB_INDEX_MASK	(NUM_FRAME_BUFS - 1)
+-
+-static int fb_index;
+-static struct frame_buf *fbarray[NUM_FRAME_BUFS];
+-static struct frame_buf fbpool[NUM_FRAME_BUFS];
+-
+-void framebuf_init(void)
+-{
+-	int i;
+-
+-	for (i = 0; i < NUM_FRAME_BUFS; i++) {
+-		fbarray[i] = &fbpool[i];
+-	}
+-}
+-
+-struct frame_buf *get_framebuf(void)
++struct frame_buf *framebuf_alloc(struct frame_buf *fb, int stdMode, int format, int strideY, int height, int mvCol)
+ {
+-	struct frame_buf *fb;
+-
+-	fb = fbarray[fb_index];
+-	fbarray[fb_index] = 0;
+-
+-	++fb_index;
+-	fb_index &= FB_INDEX_MASK;
+-
+-	return fb;
+-}
+-
+-void put_framebuf(struct frame_buf *fb)
+-{
+-	--fb_index;
+-	fb_index &= FB_INDEX_MASK;
+-
+-	fbarray[fb_index] = fb;
+-}
+-
+-struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height, int mvCol)
+-{
+-	struct frame_buf *fb;
+ 	int err;
+ 	int divX, divY;
+ 
+-	fb = get_framebuf();
+ 	if (fb == NULL)
+ 		return NULL;
+ 
+@@ -163,19 +124,17 @@ int tiled_framebuf_base(FrameBuffer *fb, Uint32 frame_base, int strideY, int hei
+ 	fb->bufCb = (chr_top_20bits << 24) + (lum_bot_20bits << 4) + (chr_bot_20bits >> 16);
+ 	fb->bufCr = chr_bot_20bits << 16;
+ 
+-    return 0;
++	return 0;
+ }
+ 
+-struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int mvCol, int mapType)
++struct frame_buf *tiled_framebuf_alloc(struct frame_buf *fb, int stdMode, int format, int strideY, int height, int mvCol, int mapType)
+ {
+-	struct frame_buf *fb;
+ 	int err, align;
+ 	int divX, divY;
+ 	Uint32 lum_top_base, lum_bot_base, chr_top_base, chr_bot_base;
+ 	Uint32 lum_top_20bits, lum_bot_20bits, chr_top_20bits, chr_bot_20bits;
+ 	int luma_top_size, luma_bot_size, chroma_top_size, chroma_bot_size;
+ 
+-	fb = get_framebuf();
+ 	if (fb == NULL)
+ 		return NULL;
+ 
+@@ -260,7 +219,7 @@ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int
+ 		}
+ 	}
+ 
+-    return fb;
++	return fb;
+ }
+ 
+ void framebuf_free(struct frame_buf *fb)
+@@ -277,6 +236,5 @@ void framebuf_free(struct frame_buf *fb)
+ 	}
+ 
+ 	memset(&(fb->desc), 0, sizeof(vpu_mem_desc));
+-	put_framebuf(fb);
+ }
+ 
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 1c15279..c3017ef 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -486,7 +486,7 @@ main(int argc, char *argv[])
+ 	int ret_thr;
+ 
+ #ifndef COMMON_INIT
+-	srand((unsigned)time(0));     // init seed of rand()
++	srand((unsigned)time(0)); /* init seed of rand() */
+ #endif
+ 
+ 	dbg_env=getenv("VPU_TEST_DBG");
+@@ -512,8 +512,6 @@ main(int argc, char *argv[])
+ 	pthread_create(&sigtid, NULL, (void *)&signal_thread, NULL);
+ #endif
+ 
+-	framebuf_init();
+-
+ #ifdef COMMON_INIT
+ 	err = vpu_Init(NULL);
+ 	if (err) {
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 9730ce9..a05d97b 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -245,6 +245,8 @@ struct decode {
+ 	int mjpg_sc_state; /* start code FSM state */
+ 	int mjpg_eof;
+ 	u8 *mjpg_cached_bsbuf;
++
++	struct frame_buf fbpool[MAX_BUF_NUM];
+ };
+ 
+ struct encode {
+@@ -275,9 +277,10 @@ struct encode {
+ 	struct cmd_line *cmdl; /* command line */
+ 	u8 * huffTable;
+ 	u8 * qMatTable;
++
++	struct frame_buf fbpool[MAX_BUF_NUM];
+ };
+ 
+-void framebuf_init(void);
+ int fwriten(int fd, void *vptr, size_t n);
+ int freadn(int fd, void *vptr, size_t n);
+ int vpu_read(struct cmd_line *cmd, char *buf, int n);
+@@ -293,9 +296,9 @@ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ 					struct rot rotation, Rect rotCrop);
+ int v4l_put_data(struct decode *dec, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+-struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol);
++struct frame_buf *framebuf_alloc(struct frame_buf *fb, int stdMode, int format, int strideY, int height, int mvCol);
+ int tiled_framebuf_base(FrameBuffer *fb, Uint32 frame_base, int strideY, int height, int mapType);
+-struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol, int mapType);
++struct frame_buf *tiled_framebuf_alloc(struct frame_buf *fb, int stdMode, int format, int strideY, int height, int mvCol, int mapType);
+ void framebuf_free(struct frame_buf *fb);
+ 
+ struct vpu_display *
+-- 
+1.8.0
+

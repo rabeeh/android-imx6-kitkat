@@ -1,0 +1,220 @@
+From 9d240d0ffe813b33f12f7d318a30001077d16115 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Thu, 19 Jun 2008 15:37:13 +0800
+Subject: [PATCH 024/435] ENGR00080977 Display is not correct in VPU test when
+ rotation is enabled
+
+Display is not correct in VPU test when rotation is enabled.
+IPU/VPU rotation can be switched by (un)define USE_IPU_ROTATION
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 39 +++++++++++++++++++++++++++++++++------
+ test/mxc_vpu_test/display.c  | 32 ++++++++++++++++++++++----------
+ test/mxc_vpu_test/vpu_test.h |  2 ++
+ 3 files changed, 57 insertions(+), 16 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index ec81005..3c84ef5 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -179,6 +179,7 @@ decoder_start(struct decode *dec)
+ 	DecOutputInfo outinfo = {0};
+ 	DecParam decparam = {0};
+ 	int rot_en = dec->cmdl->rot_en, rot_stride, fwidth, fheight;
++	int rot_angle = dec->cmdl->rot_angle;
+ 	int mp4dblk_en = dec->cmdl->mp4dblk_en;
+ 	int dering_en = dec->cmdl->dering_en;
+ 	FrameBuffer *rot_fb = NULL;
+@@ -197,6 +198,12 @@ decoder_start(struct decode *dec)
+ 	int count = dec->cmdl->count;
+ 	int totalNumofErrMbs = 0;
+ 
++#ifdef USE_IPU_ROTATION
++	if (cpu_is_mx37() && rot_en) {
++		rot_en = 0;
++	}
++#endif
++
+ 	if (rot_en || dering_en) {
+ 		rotid = dec->fbcount;
+ 		if (mp4dblk_en) {
+@@ -215,16 +222,22 @@ decoder_start(struct decode *dec)
+ 		rot_fb = &fb[rotid];
+ 
+ 		lock(dec->cmdl);
++		/*
++		 * VPU is setting the rotation angle by counter-clockwise.
++		 * We convert it to clockwise, which is consistent with V4L2
++		 * rotation angle strategy.
++		 */
++		if (rot_angle == 90 || rot_angle == 270)
++			rot_angle = 360 - rot_angle;
+ 		vpu_DecGiveCommand(handle, SET_ROTATION_ANGLE,
+-					&dec->cmdl->rot_angle);
++					&rot_angle);
+ 
+ 		mirror = dec->cmdl->mirror;
+ 		vpu_DecGiveCommand(handle, SET_MIRROR_DIRECTION,
+ 					&mirror);
+ 
+-		rot_stride = (dec->cmdl->rot_angle == 90 ||
+-				dec->cmdl->rot_angle == 270) ? fheight :
+-				fwidth;
++		rot_stride = (rot_angle == 90 || rot_angle == 270) ?
++					fheight : fwidth;
+ 
+ 		vpu_DecGiveCommand(handle, SET_ROTATOR_STRIDE, &rot_stride);
+ 		unlock(dec->cmdl);
+@@ -465,6 +478,12 @@ decoder_free_framebuffer(struct decode *dec)
+ 	int mp4dblk_en = dec->cmdl->mp4dblk_en;
+ 	int dering_en = dec->cmdl->dering_en;
+ 
++#ifdef USE_IPU_ROTATION
++	if (cpu_is_mx37() && rot_en) {
++		rot_en = 0;
++	}
++#endif
++
+ 	if (dec->cmdl->dst_scheme == PATH_V4L2) {
+ 		v4l_display_close(dec->disp);
+ 
+@@ -480,8 +499,8 @@ decoder_free_framebuffer(struct decode *dec)
+ 
+ 	if ((dec->cmdl->dst_scheme != PATH_V4L2) ||
+ 			((dec->cmdl->dst_scheme == PATH_V4L2) &&
+-			 (dec->cmdl->rot_en || dec->cmdl->mp4dblk_en ||
+-			 (cpu_is_mx37() && dec->cmdl->dering_en)))) {
++			 (rot_en || mp4dblk_en ||
++			 (cpu_is_mx37() && dering_en)))) {
+ 		totalfb = dec->fbcount + dec->extrafb;
+ 		for (i = 0; i < totalfb; i++) {
+ 			framebuf_free(dec->pfbpool[i]);
+@@ -510,6 +529,12 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	int stride;
+ 	vpu_mem_desc *mvcol_md = NULL;
+ 
++#ifdef USE_IPU_ROTATION
++	if (cpu_is_mx37() && rot_en) {
++		rot_en = 0;
++	}
++#endif
++
+ 	/* 1 extra fb for rotation(or dering) */
+ 	if (rot_en || dering_en) {
+ 		extrafb++;
+@@ -561,11 +586,13 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	if (dst_scheme == PATH_V4L2) {
+ 		rotation.rot_en = dec->cmdl->rot_en;
+ 		rotation.rot_angle = dec->cmdl->rot_angle;
++#ifdef USE_IPU_ROTATION
+ 		/* use the ipu h/w rotation instead of vpu rotaton */
+ 		if (cpu_is_mx37() && rotation.rot_en) {
+ 			rotation.rot_en = 0;
+ 			rotation.ipu_rot_en = 1;
+ 		}
++#endif
+ 
+ 		disp = v4l_display_open(dec->picwidth, dec->picheight,
+ 					fbcount, rotation, dec->stride);
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 8c766c6..40f353f 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -27,6 +27,15 @@
+ #include <stdio.h>
+ #include "vpu_test.h"
+ 
++#define V4L2_MXC_ROTATE_NONE                    0
++#define V4L2_MXC_ROTATE_VERT_FLIP               1
++#define V4L2_MXC_ROTATE_HORIZ_FLIP              2
++#define V4L2_MXC_ROTATE_180                     3
++#define V4L2_MXC_ROTATE_90_RIGHT                4
++#define V4L2_MXC_ROTATE_90_RIGHT_VFLIP          5
++#define V4L2_MXC_ROTATE_90_RIGHT_HFLIP          6
++#define V4L2_MXC_ROTATE_90_LEFT                 7
++
+ void v4l_free_bufs(int n, struct vpu_display *disp)
+ {
+ 	int i;
+@@ -91,7 +100,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 	}
+ 	dprintf(3, "rot_en:%d; rot_angle:%d; ipu_rot_en:%d\n", rotation.rot_en,
+ 			rotation.rot_angle, rotation.ipu_rot_en);
+-	
++
+ #ifdef	TVOUT_ENABLE
+ 	err = system("/bin/echo U:720x480i-60 > /sys/class/graphics/fb1/mode");
+ 	if (err == -1) {
+@@ -100,11 +109,13 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 
+ 	out = 5;
+ #endif
+-		
++
+ 	if (rotation.rot_en) {
+-		i = width;
+-		width = height;
+-		height = i;
++		if (rotation.rot_angle == 90 || rotation.rot_angle == 270) {
++			i = width;
++			width = height;
++			height = i;
++		}
+ 	}
+ 
+ 	disp = (struct vpu_display *)calloc(1, sizeof(struct vpu_display));
+@@ -146,12 +157,12 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 	crop.c.left = 0;
+ 	crop.c.width = width / ratio;
+ 	crop.c.height = height / ratio;
+-	dprintf(1, "crop.c.width/height: %d/%d\n", width/ratio, height/ratio);
+ 	
+ 	if (cpu_is_mx37()) {
+ 		crop.c.width = cropcap.bounds.width;
+ 		crop.c.height = cropcap.bounds.height;
+ 	}
++	dprintf(1, "crop.c.width/height: %d/%d\n", crop.c.width, crop.c.height);
+ 
+ 	err = ioctl(fd, VIDIOC_S_CROP, &crop);
+ 	if (err < 0) {
+@@ -164,9 +175,11 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 		struct v4l2_control ctrl;
+ 		ctrl.id = V4L2_CID_PRIVATE_BASE;
+ 		if (rotation.rot_angle == 90)
+-			ctrl.value = 4;
++			ctrl.value = V4L2_MXC_ROTATE_90_RIGHT;
++		else if (rotation.rot_angle == 180)
++			ctrl.value = V4L2_MXC_ROTATE_180;
+ 		else if (rotation.rot_angle == 270)
+-			ctrl.value = 7;
++			ctrl.value = V4L2_MXC_ROTATE_90_LEFT;
+ 		err = ioctl(fd, VIDIOC_S_CTRL, &ctrl);
+ 		if (err < 0) {
+ 			printf("VIDIOC_S_CTRL failed\n");
+@@ -198,8 +211,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 	fmt.fmt.pix.width = width;
+ 	fmt.fmt.pix.height = height;
+ 	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+-	dprintf(1, "stride %d , width %d\n", stride , width);
+-	/*fmt.fmt.pix.bytesperline = stride;*/
++	dprintf(1, "stride %d , width %d, height %d\n", stride, width, height);
+ 	if (rotation.ipu_rot_en) {
+ 		fmt.fmt.pix.bytesperline = height;
+ 	} else {
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 2f1613d..d3a1419 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -27,6 +27,8 @@
+         printf("<VPU-test> " fmt , ## arg)
+ 
+ /*#define TVOUT_ENABLE*/
++/* Available on MX37. If not defined, then use VPU rotation.  */
++#define USE_IPU_ROTATION
+ 
+ typedef unsigned long u32;
+ typedef unsigned short u16;
+-- 
+1.8.0
+

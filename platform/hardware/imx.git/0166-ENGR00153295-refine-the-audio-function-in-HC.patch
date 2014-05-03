@@ -1,0 +1,178 @@
+From 360c6ffe61430c6a329f38afaa30623642bb91ce Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Tue, 19 Jul 2011 16:15:31 +0800
+Subject: [PATCH 166/486] ENGR00153295 refine the audio function in HC
+
+refine the audio function in HC
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ modules/alsa/alsa_imx5x.cpp | 74 +++++++++++++++++++++++++++------------------
+ 1 file changed, 45 insertions(+), 29 deletions(-)
+
+diff --git a/modules/alsa/alsa_imx5x.cpp b/modules/alsa/alsa_imx5x.cpp
+index 5878c68..5f4e8b3 100755
+--- a/modules/alsa/alsa_imx5x.cpp
++++ b/modules/alsa/alsa_imx5x.cpp
+@@ -29,6 +29,10 @@
+ #define ALSA_DEFAULT_SAMPLE_RATE 44100 // in Hz
+ #endif
+ 
++#define DEVICE_DEFAULT    0
++#define DEVICE_SPDIF      1
++#define DEVICE_SGTL5000   2
++
+ #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
+ 
+ namespace android
+@@ -43,7 +47,7 @@ static status_t s_route(alsa_handle_t *, uint32_t, int);
+ 
+ char spdifcardname[32];
+ char sgtlcardname[32];
+-    
++int  selecteddevice ;    
+     
+ static hw_module_methods_t s_module_methods = {
+     open            : s_device_open
+@@ -101,7 +105,7 @@ static void setDefaultControls(uint32_t devices, int mode, const char *cardname)
+ 
+ typedef void (*AlsaControlSet)(uint32_t devices, int mode, const char *cardname);
+ 
+-#define IMX51_OUT_DEFAULT   (\
++#define IMX51_OUT_CODEC_DEFAULT   (\
+         AudioSystem::DEVICE_OUT_EARPIECE | \
+         AudioSystem::DEVICE_OUT_SPEAKER | \
+         AudioSystem::DEVICE_OUT_WIRED_HEADSET | \
+@@ -111,8 +115,10 @@ typedef void (*AlsaControlSet)(uint32_t devices, int mode, const char *cardname)
+         AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER | \
+         AudioSystem::DEVICE_OUT_DEFAULT \
+ 	)
+-
+-#define IMX51_IN_DEFAULT    (\
++#define IMX51_OUT_SPDIF_DEFAULT   (\
++        AudioSystem::DEVICE_OUT_AUX_DIGITAL \
++        )
++#define IMX51_IN_CODEC_DEFAULT    (\
+         AudioSystem::DEVICE_IN_ALL &\
+ 	~AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET \
+ 	)
+@@ -120,7 +126,20 @@ typedef void (*AlsaControlSet)(uint32_t devices, int mode, const char *cardname)
+ static alsa_handle_t _defaults[] = {
+     {
+         module      : 0,
+-        devices     : IMX51_OUT_DEFAULT,
++        devices     : IMX51_OUT_CODEC_DEFAULT,
++        curDev      : 0,
++        curMode     : 0,
++        handle      : 0,
++        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
++        channels    : 2,
++        sampleRate  : DEFAULT_SAMPLE_RATE,
++        latency     : 200000, // Desired Delay in usec
++        bufferSize  : 6144, // Desired Number of samples
++        modPrivate  : (void *)&setDefaultControls,
++    },
++    {
++        module      : 0,
++        devices     : IMX51_OUT_SPDIF_DEFAULT,
+         curDev      : 0,
+         curMode     : 0,
+         handle      : 0,
+@@ -133,7 +152,7 @@ static alsa_handle_t _defaults[] = {
+     },
+     {
+         module      : 0,
+-        devices     : IMX51_IN_DEFAULT,
++        devices     : IMX51_IN_CODEC_DEFAULT,
+         curDev      : 0,
+         curMode     : 0,
+         handle      : 0,
+@@ -233,18 +252,18 @@ const char *deviceName(alsa_handle_t *alsa_handle, uint32_t device, int mode, in
+ 		}
+ 	}
+         
+-/*
+     property_get("ro.HDMI_AUDIO_OUTPUT", value, "");
+-    if((device & AudioSystem::DEVICE_OUT_WIRED_HDMI) && havespdifdevice && (strcmp(value, "1") == 0))
++    if((device & AudioSystem::DEVICE_OUT_AUX_DIGITAL) && havespdifdevice && (strcmp(value, "1") == 0))
+     {
++        selecteddevice = DEVICE_SPDIF;
+         return spdifcardname;
+ 
+     }else if(havesgtldevice)
+-*/
+     {
++        selecteddevice = DEVICE_SGTL5000;
+         return sgtlcardname;
+     }
+-    
++    selecteddevice = DEVICE_DEFAULT; 
+     return "default";
+ }
+ 
+@@ -505,17 +524,16 @@ status_t setSoftwareParams(alsa_handle_t *handle)
+ 
+ void setDefaultControls(uint32_t devices, int mode, const char *cardname)
+ {
+-	ALSAControl *ctl = new ALSAControl("hw:00");
+-	if (cardname && !!strcmp(cardname,"hw:00")){
+-		delete ctl;
+-		ALSAControl *ctl = new ALSAControl(cardname);
+-		LOGD (" setDefaultControls set card :%s",cardname);
+-	}
+-    if (devices & AudioSystem::DEVICE_OUT_SPEAKER ||
+-        devices & AudioSystem::DEVICE_OUT_EARPIECE) {
+-        ctl->set("Speaker Function", "on"); // on
+-    } else {
+-        ctl->set("Speaker Function", "off"); // off
++    ALSAControl *ctl = new ALSAControl(cardname);
++    LOGD (" setDefaultControls set card :%s",cardname);
++    if(devices & IMX51_OUT_CODEC_DEFAULT)
++    {
++	if (devices & AudioSystem::DEVICE_OUT_SPEAKER ||
++		devices & AudioSystem::DEVICE_OUT_EARPIECE) {
++        	ctl->set("Speaker Function", "on"); // on
++    	} else {
++        	ctl->set("Speaker Function", "off"); // off
++    	}
+     }
+ 
+ #if 0
+@@ -580,7 +598,7 @@ static status_t s_open(alsa_handle_t *handle, uint32_t devices, int mode)
+ 
+     if (err == NO_ERROR) err = setSoftwareParams(handle);
+ 
+-
++    setAlsaControls(handle, devices, mode);
+     LOGI("Initialized ALSA %s device %s", stream, devName);
+ 
+     handle->curDev = devices;
+@@ -611,20 +629,18 @@ static status_t s_route(alsa_handle_t *handle, uint32_t devices, int mode)
+ 
+     LOGD("route called for devices %08x in mode %d...", devices, mode);
+     // below Always noting to do, so we open device every time.
+-#if 0
+     if (handle->handle && handle->curDev == devices && handle->curMode == mode)
+         ; // Nothing to do
+     else if (handle->handle && (handle->devices & devices))
++    {
+         setAlsaControls(handle, devices, mode);
++        handle->curDev  = devices;
++        handle->curMode = mode;
++    }
+     else {
+-        LOGE("Why are we routing to a device that isn't supported by this object?!?!?!?!");
++        //LOGE("Why are we routing to a device that isn't supported by this object?!?!?!?!");
+         status = s_open(handle, devices, mode);
+     }
+-#else
+-    /* fix me if I was wrong here to judge the current sound card. In facat, in s_open, it will reconfig the controls */
+-	setAlsaControls(handle, devices, mode);
+-	status = s_open(handle, devices, mode);
+-#endif
+     return status;
+ }
+ 
+-- 
+1.8.0
+

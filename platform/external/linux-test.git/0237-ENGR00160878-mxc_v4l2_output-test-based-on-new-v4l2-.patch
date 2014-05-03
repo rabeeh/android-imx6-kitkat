@@ -1,0 +1,735 @@
+From 25af8ac786314d28c03cea45cffba4c4de61b65e Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Fri, 4 Nov 2011 17:11:08 +0800
+Subject: [PATCH 237/435] ENGR00160878  mxc_v4l2_output: test based on new
+ v4l2 output driver.
+
+use cmdline like:
+    "mxc_v4l2_output.out -d <output display dev /dev/video17 as default>"
+    "-iw <input width> -ih <input height>"
+    "[-u if defined, means use userp, otherwise mmap]"
+    "[-cr <input crop w, h, x, y>] [-f <WBMP|fourcc code>]"
+    "[-ow <display width> -oh <display height>]"
+    "[-ot <display top> -ol <display left>]"
+    "[-r <rotate mode 0, 90, 180, 270>] [-vf <vflip 0,1>] [-hf <hflip 0,1>]"
+    "[-v <deinterlacing motion level 0 - low, 1 - medium, 2 - high>]"
+    "[-fr <frame rate (fps)>] [-l <loop count>]"
+    "<input YUV file>"
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ test/mxc_v4l2_test/mxc_v4l2_output.c | 464 ++++++++++++++++++-----------------
+ 1 file changed, 240 insertions(+), 224 deletions(-)
+
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_output.c b/test/mxc_v4l2_test/mxc_v4l2_output.c
+index f8ecd76..19f9291 100644
+--- a/test/mxc_v4l2_test/mxc_v4l2_output.c
++++ b/test/mxc_v4l2_test/mxc_v4l2_output.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc. All rights reserved.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc. All rights reserved.
+  */
+ 
+ /*
+@@ -43,23 +43,20 @@ extern "C"{
+ #include <sys/time.h>
+ 
+ #include <linux/mxcfb.h>
+-//#include <linux/mxc_v4l2.h>
+-
+-struct v4l2_mxc_offset {
+-	uint32_t u_offset;
+-	uint32_t v_offset;
+-};
++#include <linux/mxc_v4l2.h>
++#include <linux/ipu.h>
+ 
+ #define TFAIL -1
+ #define TPASS 0
+ 
+-char v4l_device[100] = "/dev/video16";
+ int fd_v4l = 0;
++int fd_ipu = 0;
+ int g_frame_size;
+ int g_num_buffers;
+ 
+-int g_output = 3;
++char * g_dev = "/dev/video17";
+ int g_overlay = 0;
++int g_mem_type = V4L2_MEMORY_MMAP;
+ int g_in_width = 0;
+ int g_in_height = 0;
+ int g_display_width = 0;
+@@ -67,14 +64,21 @@ int g_display_height = 0;
+ int g_display_top = 0;
+ int g_display_left = 0;
+ int g_rotate = 0;
+-int g_extra_pixel = 0;
++int g_vflip = 0;
++int g_hflip = 0;
++int g_vdi_enable = 0;
++int g_vdi_motion = 0;
++int g_icrop_w = 0;
++int g_icrop_h = 0;
++int g_icrop_top = 0;
++int g_icrop_left = 0;
+ uint32_t g_in_fmt = V4L2_PIX_FMT_YUV420;
+ 
+ int g_bmp_header = 0;
+ int g_loop_count = 1;
+ int g_frame_period = 33333;
+ 
+-#define MAX_BUFFER_NUM 5
++#define MAX_BUFFER_NUM 16
+ 
+ struct testbuffer
+ {
+@@ -83,7 +87,23 @@ struct testbuffer
+         unsigned int length;
+ };
+ 
+-struct testbuffer buffers[5];
++struct testbuffer buffers[MAX_BUFFER_NUM];
++
++void fb_setup(void)
++{
++        struct mxcfb_gbl_alpha alpha;
++	int fd;
++
++	fd = open("/dev/fb0",O_RDWR);
++
++        alpha.alpha = 0;
++        alpha.enable = 1;
++        if (ioctl(fd, MXCFB_SET_GBL_ALPHA, &alpha) < 0) {
++		printf("set alpha %d failed for fb0\n",  alpha.alpha);
++        }
++
++	close(fd);
++}
+ 
+ /*
+        Y = R *  .299 + G *  .587 + B *  .114;
+@@ -97,7 +117,7 @@ struct testbuffer buffers[5];
+ #define u(rgb) ((((blue(rgb)*500L) - (red(rgb)*169L) - (green(rgb)*332L)) / 1000))
+ #define v(rgb) (((red(rgb)*500L - green(rgb)*419L - blue(rgb)*81L) / 1000))
+ 
+-void gen_fill_pattern(char * buf, int frame_num)
++void gen_fill_pattern(unsigned char * buf, int frame_num)
+ {
+ 	int y_size = g_in_width * g_in_height;
+ 	int h_step = g_in_height / 16;
+@@ -129,7 +149,6 @@ void gen_fill_pattern(char * buf, int frame_num)
+ 				rgb_temp++;
+ 				if (rgb_temp > 255)
+ 					rgb_temp = 0;
+-//				printf("y = %8d, u = %08x, v = %08x\n", y_color, u_color, v_color);
+ 			}
+ 			buf[(h*g_in_width) + w] = y_color;
+ 			if (!(h & 0x1) && !(w & 0x1)) {
+@@ -165,44 +184,50 @@ mxc_v4l_output_test(FILE *in)
+         int retval = 0;
+         int type;
+         struct v4l2_buffer buf;
+-        int y_size = (g_frame_size * 2) / 3;
+         __u32 total_time;
+ 	int count = 100;
++	int streamon_cnt = 0;
+         struct timeval tv_start, tv_current;
+ 
++	if (g_vdi_enable)
++		streamon_cnt = 1;
++
+         memset(&buf, 0, sizeof(buf));
+ 
+-        for (i = 0; i < g_num_buffers; i++)
+-        {
+-                memset(&buf, 0, sizeof (buf));
+-                buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-                buf.memory = V4L2_MEMORY_MMAP;
+-                buf.index = i;
+-                if (ioctl(fd_v4l, VIDIOC_QUERYBUF, &buf) < 0)
+-                {
+-                        printf("VIDIOC_QUERYBUF error\n");
+-			retval = -1;
+-                        goto cleanup;
+-                }
++	if (g_mem_type == V4L2_MEMORY_MMAP) {
++		for (i = 0; i < g_num_buffers; i++) {
++			memset(&buf, 0, sizeof (buf));
++			buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++			buf.memory = g_mem_type;
++			buf.index = i;
++			if (ioctl(fd_v4l, VIDIOC_QUERYBUF, &buf) < 0)
++			{
++				printf("VIDIOC_QUERYBUF error\n");
++				retval = -1;
++				goto cleanup;
++			}
+ 
+-                buffers[i].length = buf.length;
+-                buffers[i].offset = (size_t) buf.m.offset;
+-                printf("VIDIOC_QUERYBUF: length = %d, offset = %d\n",  buffers[i].length, buffers[i].offset);
+-                buffers[i].start = mmap (NULL, buffers[i].length,
+-                                         PROT_READ | PROT_WRITE, MAP_SHARED,
+-                                         fd_v4l, buffers[i].offset);
+-                if (buffers[i].start == NULL) {
+-                        printf("v4l2_out test: mmap failed\n");
+-			retval = -1;
+-                }
+-        }
++			buffers[i].length = buf.length;
++			buffers[i].offset = (size_t) buf.m.offset;
++			printf("VIDIOC_QUERYBUF: length = %d, offset = %d\n",
++				buffers[i].length, buffers[i].offset);
++			buffers[i].start = mmap (NULL, buffers[i].length,
++					PROT_READ | PROT_WRITE, MAP_SHARED,
++					fd_v4l, buffers[i].offset);
++			if (buffers[i].start == NULL) {
++				printf("v4l2_out test: mmap failed\n");
++				retval = -1;
++				goto cleanup;
++			}
++		}
++	}
+ 
+         gettimeofday(&tv_start, 0);
+         printf("start time = %d s, %d us\n", tv_start.tv_sec, tv_start.tv_usec);
+ 
+         for (i = 0; ; i++) {
+                 buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-                buf.memory = V4L2_MEMORY_MMAP;
++                buf.memory = g_mem_type;
+                 if (i < g_num_buffers) {
+                         buf.index = i;
+                         if (ioctl(fd_v4l, VIDIOC_QUERYBUF, &buf) < 0)
+@@ -211,10 +236,14 @@ mxc_v4l_output_test(FILE *in)
+ 				retval = -1;
+                                 break;
+                         }
++			if (g_mem_type == V4L2_MEMORY_USERPTR) {
++				buf.m.userptr = (unsigned long) buffers[i].offset;
++				buf.length = buffers[i].length;
++			}
+                 }
+                 else {
+                         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-                        buf.memory = V4L2_MEMORY_MMAP;
++                        buf.memory = g_mem_type;
+                         if (ioctl(fd_v4l, VIDIOC_DQBUF, &buf) < 0)
+                         {
+                                 printf("VIDIOC_DQBUF failed\n");
+@@ -233,8 +262,8 @@ mxc_v4l_output_test(FILE *in)
+                                 g_loop_count--;
+                                 if (g_loop_count == 0) {
+                                         printf("v4l2_output: end of input file, g_frame_size=%d, err = %d\n", g_frame_size, err);
+-					if (i <= 1)
+-                                        	printf("v4l2_output: no display because v4l need at least 2 frames\n");
++					if (i <= streamon_cnt)
++						printf("v4l2_output: no display because v4l need at least %d frames\n", streamon_cnt + 1);
+ 					else {
+ 						int deq_cnt, j;
+ 
+@@ -244,7 +273,7 @@ mxc_v4l_output_test(FILE *in)
+ 							deq_cnt = g_num_buffers - 1;
+ 						for (j=0;j<(deq_cnt - 1);j++) {
+ 							buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-							buf.memory = V4L2_MEMORY_MMAP;
++							buf.memory = g_mem_type;
+ 							if (ioctl(fd_v4l, VIDIOC_DQBUF, &buf) < 0)
+ 							{
+ 								printf("VIDIOC_DQBUF failed\n");
+@@ -265,8 +294,8 @@ mxc_v4l_output_test(FILE *in)
+                 else {
+ 			if (count-- == 0) {
+ 				if (g_loop_count-- == 0) {
+-					if (i <= 1)
+-                                        	printf("v4l2_output: no display because v4l need at least 2 frames\n");
++					if (i <= streamon_cnt)
++						printf("v4l2_output: no display because v4l need at least %d frames\n", streamon_cnt + 1);
+ 					else {
+ 						int deq_cnt, j;
+ 
+@@ -276,7 +305,7 @@ mxc_v4l_output_test(FILE *in)
+ 							deq_cnt = g_num_buffers - 1;
+ 						for (j=0;j<(deq_cnt - 1);j++) {
+ 							buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-							buf.memory = V4L2_MEMORY_MMAP;
++							buf.memory = g_mem_type;
+ 							if (ioctl(fd_v4l, VIDIOC_DQBUF, &buf) < 0)
+ 							{
+ 								printf("VIDIOC_DQBUF failed\n");
+@@ -291,29 +320,26 @@ mxc_v4l_output_test(FILE *in)
+ 			}
+                         gen_fill_pattern(buffers[buf.index].start, i);
+                 }
+-                //sleep(1);
+ 
+                 buf.timestamp.tv_sec = tv_start.tv_sec;
+                 buf.timestamp.tv_usec = tv_start.tv_usec + (g_frame_period * i);
+-                //printf("buffer timestamp = %d s, %d us\n", buf.timestamp.tv_sec, buf.timestamp.tv_usec);
+-                if (g_extra_pixel) {
+-                	buf.m.offset = buffers[buf.index].offset + g_extra_pixel *
+-                		(g_in_width + 2 * g_extra_pixel) + g_extra_pixel;
+-				}
+-                if (ioctl(fd_v4l, VIDIOC_QBUF, &buf) < 0)
++
++                if ((retval = ioctl(fd_v4l, VIDIOC_QBUF, &buf)) < 0)
+                 {
+-                        printf("VIDIOC_QBUF failed\n");
++                        printf("VIDIOC_QBUF failed %d\n", retval);
+ 			retval = -1;
+                         break;
+                 }
+ 
+-                if ( i == 1 ) { // Start playback after buffers queued
++                if ( i == streamon_cnt ) { // Start playback after buffers queued
+                         type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+                         if (ioctl (fd_v4l, VIDIOC_STREAMON, &type) < 0) {
+                                 printf("Could not start stream\n");
+ 				retval = -1;
+                                 break;
+                         }
++			/*simply set fb0 alpha to 0*/
++			fb_setup();
+                 }
+         }
+ 
+@@ -326,10 +352,11 @@ mxc_v4l_output_test(FILE *in)
+         ioctl (fd_v4l, VIDIOC_STREAMOFF, &type);
+ 
+ cleanup:
+-        for (i = 0; i < g_num_buffers; i++)
+-        {
+-                munmap (buffers[i].start, buffers[i].length);
+-        }
++	if (g_mem_type == V4L2_MEMORY_MMAP) {
++		for (i = 0; i < g_num_buffers; i++) {
++			munmap (buffers[i].start, buffers[i].length);
++		}
++	}
+ 	return retval;
+ }
+ 
+@@ -353,7 +380,7 @@ mxc_v4l_output_setup(struct v4l2_format *fmt)
+         memset(&buf_req, 0, sizeof(buf_req));
+         buf_req.count = 4;
+         buf_req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-        buf_req.memory = V4L2_MEMORY_MMAP;
++        buf_req.memory = g_mem_type;
+         if (ioctl(fd_v4l, VIDIOC_REQBUFS, &buf_req) < 0)
+         {
+                 printf("request buffers failed\n");
+@@ -365,124 +392,6 @@ mxc_v4l_output_setup(struct v4l2_format *fmt)
+         return TPASS;
+ }
+ 
+-
+-int fb_setup(void)
+-{
+-        int i;
+-        char fbdev[] = "/dev/fb0";
+-        struct fb_var_screeninfo fb_var;
+-        struct fb_fix_screeninfo fb_fix;
+-        struct mxcfb_color_key color_key;
+-        struct mxcfb_gbl_alpha alpha;
+-        int retval = -1;
+-        int fd_fb;
+-        unsigned short * fb0;
+-        unsigned char * cur_fb8;
+-        unsigned short * cur_fb16;
+-        unsigned int * cur_fb32;
+-        __u32 screen_size;
+-        int h, w;
+-
+-        for (i=0; i < 5; i++) {
+-                fbdev[7] = '0' + i;
+-                if ((fd_fb = open(fbdev, O_RDWR, 0)) < 0)
+-                {
+-                        printf("Unable to open %s\n", fbdev);
+-                        retval = TFAIL;
+-                        goto err0;
+-                }
+-                if ( ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix) < 0) {
+-                        goto err1;
+-                }
+-		if ((g_output == 5) && (strcmp(fb_fix.id, "DISP3 BG - DI1") == 0)) {
+-			break;
+-		} else if ((g_output == 4) && (strcmp(fb_fix.id, "DISP3 BG") == 0)) {
+-			break;
+-		} else if ((g_output == 3) && (strcmp(fb_fix.id, "DISP3 FG") == 0)) {
+-			break;
+-		} else if (fb_fix.id[4] == ('0' + g_output)) {
+-                        break;
+-		}
+-                close(fd_fb);
+-        }
+-
+-        if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
+-                goto err1;
+-        }
+-        if (g_display_height == 0)
+-                g_display_height = fb_var.yres;
+-
+-        if (g_display_width == 0)
+-                g_display_width = fb_var.xres;
+-
+-        if ((g_display_top + g_display_height) > fb_var.yres)
+-                g_display_height = fb_var.yres - g_display_top;
+-        if ((g_display_left + g_display_width) > fb_var.xres)
+-                g_display_width = fb_var.xres - g_display_left;
+-
+-        alpha.alpha = 255;
+-        alpha.enable = 1;
+-        if ( ioctl(fd_fb, MXCFB_SET_GBL_ALPHA, &alpha) < 0) {
+-                retval = 0; // No error, fails for ADC panels
+-                goto err1;
+-        }
+-
+-        color_key.color_key = 0x00080808;
+-        color_key.enable = 1;
+-        if ( ioctl(fd_fb, MXCFB_SET_CLR_KEY, &color_key) < 0) {
+-                retval = 0; // No error, fails for ADC panels
+-                goto err1;
+-        }
+-
+-        screen_size = fb_var.yres * fb_fix.line_length;
+-
+-        /* Map the device to memory*/
+-        fb0 = (unsigned short *)mmap(0, screen_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_fb, 0);
+-        if ((int)fb0 == -1)
+-        {
+-                printf("\nError: failed to map framebuffer device 0 to memory.\n");
+-                retval = -1;
+-                goto err1;
+-        }
+-
+-
+-        if (fb_var.bits_per_pixel == 16) {
+-                for (h = g_display_top; h < (g_display_height + g_display_top); h++) {
+-                        cur_fb16 = (unsigned short *)((__u32)fb0 + h*fb_fix.line_length);
+-                        for (w = g_display_left; w < g_display_width + g_display_left; w++) {
+-                                cur_fb16[w] = 0x0841;
+-                        }
+-                }
+-        }
+-        else if (fb_var.bits_per_pixel == 24) {
+-                for (h = g_display_top; h < (g_display_height + g_display_top); h++) {
+-                        cur_fb8 = (unsigned char *)((__u32)fb0 + h*fb_fix.line_length);
+-                        for (w = g_display_left; w < g_display_width + g_display_left; w++) {
+-                                *cur_fb8++ = 8;
+-                                *cur_fb8++ = 8;
+-                                *cur_fb8++ = 8;
+-                        }
+-                }
+-        }
+-        else if (fb_var.bits_per_pixel == 32) {
+-                for (h = g_display_top; h < (g_display_height + g_display_top); h++) {
+-                        cur_fb32 = (unsigned int *)((__u32)fb0 + h*fb_fix.line_length);
+-                        for (w = g_display_left; w < g_display_width + g_display_left; w++) {
+-                                cur_fb32[w] = 0x00080808;
+-                        }
+-                }
+-        }
+-
+-        retval = 0;
+-//        munmap(fb0, screen_size);
+-err1:
+-        close(fd_fb);
+-err0:
+-        return retval;
+-}
+-
+-
+-
+ int process_cmdline(int argc, char **argv)
+ {
+         int i;
+@@ -494,6 +403,9 @@ int process_cmdline(int argc, char **argv)
+                 else if (strcmp(argv[i], "-ih") == 0) {
+                         g_in_height = atoi(argv[++i]);
+                 }
++                else if (strcmp(argv[i], "-u") == 0) {
++			g_mem_type = V4L2_MEMORY_USERPTR;
++                }
+                 else if (strcmp(argv[i], "-ow") == 0) {
+                         g_display_width = atoi(argv[++i]);
+                 }
+@@ -507,7 +419,7 @@ int process_cmdline(int argc, char **argv)
+                         g_display_left = atoi(argv[++i]);
+                 }
+                 else if (strcmp(argv[i], "-d") == 0) {
+-                        g_output = atoi(argv[++i]);
++                        g_dev = argv[++i];
+                 }
+                 else if (strcmp(argv[i], "-fg") == 0) {
+                         g_overlay = 1;
+@@ -515,6 +427,16 @@ int process_cmdline(int argc, char **argv)
+                 else if (strcmp(argv[i], "-r") == 0) {
+                         g_rotate = atoi(argv[++i]);
+                 }
++                else if (strcmp(argv[i], "-vf") == 0) {
++                        g_vflip = atoi(argv[++i]);
++                }
++                else if (strcmp(argv[i], "-hf") == 0) {
++                        g_hflip = atoi(argv[++i]);
++                }
++                else if (strcmp(argv[i], "-v") == 0) {
++			g_vdi_enable = 1;
++                        g_vdi_motion = atoi(argv[++i]);
++                }
+                 else if (strcmp(argv[i], "-fr") == 0) {
+                         g_frame_period = atoi(argv[++i]);
+                         g_frame_period = 1000000L / g_frame_period;
+@@ -522,8 +444,11 @@ int process_cmdline(int argc, char **argv)
+                 else if (strcmp(argv[i], "-l") == 0) {
+                         g_loop_count = atoi(argv[++i]);
+                 }
+-                else if (strcmp(argv[i], "-e") == 0) {
+-                        g_extra_pixel = atoi(argv[++i]);
++                else if (strcmp(argv[i], "-cr") == 0) {
++                        g_icrop_w = atoi(argv[++i]);
++                        g_icrop_h = atoi(argv[++i]);
++                        g_icrop_left = atoi(argv[++i]);
++                        g_icrop_top = atoi(argv[++i]);
+                 }
+                 else if (strcmp(argv[i], "-f") == 0) {
+                         i++;
+@@ -557,6 +482,60 @@ int process_cmdline(int argc, char **argv)
+         return 0;
+ }
+ 
++void memfree(int buf_size, int buf_cnt)
++{
++	int i;
++        unsigned int page_size;
++
++	page_size = getpagesize();
++	buf_size = (buf_size + page_size - 1) & ~(page_size - 1);
++
++	for (i = 0; i < buf_cnt; i++) {
++		if (buffers[i].start)
++			munmap(buffers[i].start, buf_size);
++		if (buffers[i].offset)
++			ioctl(fd_ipu, IPU_FREE, &buffers[i].offset);
++	}
++	close(fd_ipu);
++}
++
++int memalloc(int buf_size, int buf_cnt)
++{
++	int i, ret = TPASS;
++        unsigned int page_size;
++
++	fd_ipu = open("/dev/mxc_ipu", O_RDWR, 0);
++	if (fd_ipu < 0) {
++		printf("open ipu dev fail\n");
++		return TFAIL;
++	}
++
++	for (i = 0; i < buf_cnt; i++) {
++		page_size = getpagesize();
++		buf_size = (buf_size + page_size - 1) & ~(page_size - 1);
++		buffers[i].length = buffers[i].offset = buf_size;
++		ret = ioctl(fd_ipu, IPU_ALLOC, &buffers[i].offset);
++		if (ret < 0) {
++			printf("ioctl IPU_ALLOC fail\n");
++			ret = TFAIL;
++			goto err;
++		}
++		buffers[i].start = mmap(0, buf_size, PROT_READ | PROT_WRITE,
++				MAP_SHARED, fd_ipu, buffers[i].offset);
++		if (!buffers[i].start) {
++			printf("mmap fail\n");
++			ret = TFAIL;
++			goto err;
++		}
++		printf("USRP: alloc bufs offset 0x%x size %d\n", buffers[i].offset, buf_size);
++	}
++
++	return ret;
++err:
++	memfree(buf_size, buf_cnt);
++	return ret;
++}
++
+ int
+ main(int argc, char **argv)
+ {
+@@ -564,40 +543,53 @@ main(int argc, char **argv)
+         struct v4l2_format fmt;
+         struct v4l2_framebuffer fb;
+         struct v4l2_cropcap cropcap;
++	struct v4l2_capability cap;
++	struct v4l2_fmtdesc fmtdesc;
+         struct v4l2_crop crop;
++	struct v4l2_rect icrop;
+         FILE * fd_in;
+         int retval = TPASS;
+-		struct v4l2_mxc_offset off;
+ 
+         if (process_cmdline(argc, argv) < 0) {
+                 printf("MXC Video4Linux Output Device Test\n\n" \
+-                       "Syntax: mxc_v4l2_output.out\n -d <output display #>\n" \
+-                       "-iw <input width> -ih <input height>\n [-f <WBMP|fourcc code>]" \
+-                       "[-ow <display width>\n -oh <display height>]\n" \
+-                       " -e <input cropping: extra pixels> \n" \
+-                       "[-fr <frame rate (fps)>] [-r <rotate mode 0-7>] [-l <loop count>]\n" \
++                       "Syntax: mxc_v4l2_output.out\n -d <output display dev>\n" \
++                       "-iw <input width> -ih <input height>\n" \
++                       "[-u if defined, means use userp, otherwise mmap]\n" \
++                       "[-cr <input crop w, h, x, y>]\n [-f <WBMP|fourcc code>]" \
++                       "[-ow <display width> -oh <display height>]\n" \
++                       "[-ot <display top> -ol <display left>]\n" \
++                       "[-r <rotate mode 0, 90, 180, 270>]\n [-vf <vflip 0,1>] [-hf <hflip 0,1>]\n" \
++                       "[-v <deinterlacing motion level 0 - low, 1 - medium, 2 - high>]\n" \
++                       "[-fr <frame rate (fps)>] [-l <loop count>]\n" \
+                        "<input YUV file>\n\n");
+                 retval = TFAIL;
+                 goto err0;
+         }
+ 
+-        if (fb_setup() < 0) {
+-                retval = TFAIL;
+-                goto err1;
+-        }
+-
+-        if ((fd_v4l = open(v4l_device, O_RDWR, 0)) < 0)
++        if ((fd_v4l = open(g_dev, O_RDWR, 0)) < 0)
+         {
+-                printf("Unable to open %s\n", v4l_device);
++                printf("Unable to open %s\n", g_dev);
+                 retval = TFAIL;
+                 goto err0;
+         }
+ 
+-        if (ioctl(fd_v4l, VIDIOC_S_OUTPUT, &g_output) < 0)
+-        {
+-                printf("set output failed\n");
+-                return TFAIL;
+-        }
++	if (!ioctl(fd_v4l, VIDIOC_QUERYCAP, &cap)) {
++		printf("driver=%s, card=%s, bus=%s, "
++				"version=0x%08x, "
++				"capabilities=0x%08x\n",
++				cap.driver, cap.card, cap.bus_info,
++				cap.version,
++				cap.capabilities);
++	}
++
++	fmtdesc.index = 0;
++	fmtdesc.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++	while (!ioctl(fd_v4l, VIDIOC_ENUM_FMT, &fmtdesc)) {
++		printf("fmt %s: fourcc = 0x%08x\n",
++				fmtdesc.description,
++				fmtdesc.pixelformat);
++		fmtdesc.index++;
++	}
+ 
+         memset(&cropcap, 0, sizeof(cropcap));
+         cropcap.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+@@ -625,14 +617,40 @@ main(int argc, char **argv)
+         }
+ 
+         // Set rotation
+-        ctrl.id = V4L2_CID_PRIVATE_BASE;
++        ctrl.id = V4L2_CID_ROTATE;
+         ctrl.value = g_rotate;
+         if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctrl) < 0)
+         {
+-                printf("set ctrl failed\n");
++                printf("set ctrl rotate failed\n");
++                retval = TFAIL;
++                goto err1;
++        }
++        ctrl.id = V4L2_CID_VFLIP;
++        ctrl.value = g_vflip;
++        if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctrl) < 0)
++        {
++                printf("set ctrl vflip failed\n");
++                retval = TFAIL;
++                goto err1;
++        }
++        ctrl.id = V4L2_CID_HFLIP;
++        ctrl.value = g_hflip;
++        if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctrl) < 0)
++        {
++                printf("set ctrl hflip failed\n");
+                 retval = TFAIL;
+                 goto err1;
+         }
++	if (g_vdi_enable) {
++		ctrl.id = V4L2_CID_MXC_MOTION;
++		ctrl.value = g_vdi_motion;
++		if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctrl) < 0)
++		{
++			printf("set ctrl motion failed\n");
++			retval = TFAIL;
++			goto err1;
++		}
++	}
+ 
+         // Set framebuffer parameter for MX27
+         fb.capability = V4L2_FBUF_CAP_EXTERNOVERLAY;
+@@ -647,37 +665,35 @@ main(int argc, char **argv)
+         fmt.fmt.pix.width=g_in_width;
+         fmt.fmt.pix.height=g_in_height;
+         fmt.fmt.pix.pixelformat = g_in_fmt;
+-		if (g_extra_pixel) {
+-			off.u_offset = (2 * g_extra_pixel + g_in_width) * (g_in_height + g_extra_pixel)
+-				 - g_extra_pixel + (g_extra_pixel / 2) * ((g_in_width / 2)
+-				 + g_extra_pixel) + g_extra_pixel / 2;
+-			off.v_offset = off.u_offset + (g_extra_pixel + g_in_width / 2) *
+-				((g_in_height / 2) + g_extra_pixel);
+-        	fmt.fmt.pix.bytesperline = g_in_width + g_extra_pixel * 2;
+-			fmt.fmt.pix.priv = (uint32_t) &off;
+-        	fmt.fmt.pix.sizeimage = (g_in_width + g_extra_pixel * 2 )
+-        		* (g_in_height + g_extra_pixel * 2) * 3 / 2;
+-        } else {
+-        	fmt.fmt.pix.bytesperline = g_in_width;
+-			fmt.fmt.pix.priv = 0;
+-        	fmt.fmt.pix.sizeimage = 0;
+-		}
+-        mxc_v4l_output_setup(&fmt);
++	if (g_vdi_enable)
++		fmt.fmt.pix.field = V4L2_FIELD_INTERLACED_TB;
++	if (g_icrop_w && g_icrop_h) {
++		icrop.left = g_icrop_left;
++		icrop.top = g_icrop_top;
++		icrop.width = g_icrop_w;
++		icrop.height = g_icrop_h;
++		fmt.fmt.pix.priv = (unsigned int)&icrop;
++        } else
++		fmt.fmt.pix.priv = 0;
++        retval = mxc_v4l_output_setup(&fmt);
++	if (retval < 0)
++		goto err1;
++
+         g_frame_size = fmt.fmt.pix.sizeimage;
+ 
++	if (g_mem_type == V4L2_MEMORY_USERPTR)
++		if (memalloc(g_frame_size, g_num_buffers) < 0)
++			goto err1;
++
+         fd_in = fopen(argv[argc-1], "rb");
+-/*
+-        if (fd_in == NULL) {
+-                printf("Unable to open file: %s\n", argv[argc-1]);
+-                retval = TFAIL;
+-                goto err1;
+-        }
+-        */
+         if (fd_in)
+                 fseek(fd_in, 0, SEEK_SET);
+ 
+         retval = mxc_v4l_output_test(fd_in);
+ 
++	if (g_mem_type == V4L2_MEMORY_USERPTR)
++		memfree(g_frame_size, g_num_buffers);
++
+         if (fd_in)
+                 fclose(fd_in);
+ err1:
+-- 
+1.8.0
+

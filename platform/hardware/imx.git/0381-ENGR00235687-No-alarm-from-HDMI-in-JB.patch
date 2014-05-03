@@ -1,0 +1,138 @@
+From 9fd49e7a2947bbece25b78a5c85f250717bc5e68 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Wed, 5 Dec 2012 15:14:29 +0800
+Subject: [PATCH 381/486] ENGR00235687 No alarm from HDMI in JB
+
+JB will output alarm to HDMI and speaker in the same time.
+This is caused by HDMI's period_size is fixed in the driver, the period_size
+set int HAL will be changed in pcm_open. Then the pre-set threshold
+is not suitable for HDMI, which will cause the HDMI output mute. remove the
+threshold, then tinyalsa will set it according the actual period_size.
+
+Change-Id: I33ce392f4113f7e59ae7fbdab1faec4db1683d85
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/tinyalsa_hal.c | 44 ++++++++++++++++++++++++--------------------
+ 1 file changed, 24 insertions(+), 20 deletions(-)
+
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index b616183..a0728c3 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -80,6 +80,7 @@
+ #define MM_LOW_POWER_SAMPLING_RATE  44100
+ /* sampling rate when using MM full power port */
+ #define MM_FULL_POWER_SAMPLING_RATE 44100
++
+ #define MM_USB_AUDIO_IN_RATE   16000
+ 
+ /* product-specific defines */
+@@ -104,6 +105,8 @@ struct pcm_config pcm_config_mm_out = {
+     .period_size = LONG_PERIOD_SIZE,
+     .period_count = PLAYBACK_LONG_PERIOD_COUNT,
+     .format = PCM_FORMAT_S16_LE,
++    .start_threshold = 0,
++    .avail_min = 0,
+ };
+ 
+ struct pcm_config pcm_config_hdmi_multi = {
+@@ -434,13 +437,11 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+         out->write_flags[PCM_NORMAL]            = PCM_OUT | PCM_MMAP;
+         out->write_threshold[PCM_NORMAL]        = PLAYBACK_LONG_PERIOD_COUNT * LONG_PERIOD_SIZE;
+         out->config[PCM_NORMAL] = pcm_config_mm_out;
+-        out->config[PCM_NORMAL].start_threshold = PLAYBACK_LONG_PERIOD_COUNT * LONG_PERIOD_SIZE;
+-        out->config[PCM_NORMAL].avail_min       = LONG_PERIOD_SIZE;
+ 
+         card = get_card_for_device(adev, pcm_device);
+         out->pcm[PCM_NORMAL] = pcm_open(card, port,out->write_flags[PCM_NORMAL], &out->config[PCM_NORMAL]);
+-        ALOGW("card %d, port %d device %x", card, port, out->device);
+-        ALOGW("rate %d, channel %d period_size %x", out->config[PCM_NORMAL].rate, out->config[PCM_NORMAL].channels, out->config[PCM_NORMAL].period_size);
++        ALOGW("card %d, port %d device 0x%x", card, port, out->device);
++        ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_NORMAL].rate, out->config[PCM_NORMAL].channels, out->config[PCM_NORMAL].period_size);
+     }
+ 
+     pcm_device = out->device & AUDIO_DEVICE_OUT_AUX_DIGITAL;
+@@ -448,12 +449,10 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+         out->write_flags[PCM_HDMI]            = PCM_OUT;
+         out->write_threshold[PCM_HDMI]        = HDMI_PERIOD_SIZE * PLAYBACK_HDMI_PERIOD_COUNT;
+         out->config[PCM_HDMI] = pcm_config_mm_out;
+-        out->config[PCM_HDMI].start_threshold = HDMI_PERIOD_SIZE * PLAYBACK_HDMI_PERIOD_COUNT;
+-        out->config[PCM_HDMI].avail_min       = HDMI_PERIOD_SIZE;
+         card = get_card_for_device(adev, pcm_device);
+         out->pcm[PCM_HDMI] = pcm_open(card, port,out->write_flags[PCM_HDMI], &out->config[PCM_HDMI]);
+-        ALOGW("card %d, port %d device %x", card, port, out->device);
+-        ALOGW("rate %d, channel %d period_size %x", out->config[PCM_HDMI].rate, out->config[PCM_HDMI].channels, out->config[PCM_HDMI].period_size);
++        ALOGW("card %d, port %d device 0x%x", card, port, out->device);
++        ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_HDMI].rate, out->config[PCM_HDMI].channels, out->config[PCM_HDMI].period_size);
+     }
+     /* default to low power: will be corrected in out_write if necessary before first write to
+      * tinyalsa.
+@@ -502,8 +501,8 @@ static int start_output_stream_hdmi(struct imx_stream_out *out)
+     }
+ 
+     card = get_card_for_device(adev, out->device & AUDIO_DEVICE_OUT_AUX_DIGITAL);
+-    ALOGW("card %d, port %d device %x", card, port, out->device);
+-    ALOGW("rate %d, channel %d period_size %x", out->config[PCM_HDMI].rate, out->config[PCM_HDMI].channels, out->config[PCM_HDMI].period_size);
++    ALOGW("card %d, port %d device 0x%x", card, port, out->device);
++    ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_HDMI].rate, out->config[PCM_HDMI].channels, out->config[PCM_HDMI].period_size);
+ 
+     out->pcm[PCM_HDMI] = pcm_open(card, port, PCM_OUT, &out->config[PCM_HDMI]);
+ 
+@@ -784,9 +783,7 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+         pthread_mutex_lock(&adev->lock);
+         pthread_mutex_lock(&out->lock);
+         if (((adev->devices & AUDIO_DEVICE_OUT_ALL) != val) && (val != 0)) {
+-            for(i = 0; i < OUTPUT_TOTAL; i++)
+-                if(out == adev->active_output[i]) out_is_active = true;
+-            if (out_is_active) {
++            if (out == adev->active_output[OUTPUT_PRIMARY] && !out->standby) {
+                 /* a change in output device may change the microphone selection */
+                 if (adev->active_input &&
+                         adev->active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION) {
+@@ -796,13 +793,20 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+                 if (((val & AUDIO_DEVICE_OUT_AUX_DIGITAL) ^
+                         (adev->devices & AUDIO_DEVICE_OUT_AUX_DIGITAL)) ||
+                         ((val & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET) ^
+-                        (adev->devices & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET)))
++                        (adev->devices & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET)) ||
++                        (adev->devices & (AUDIO_DEVICE_OUT_AUX_DIGITAL |
++                                         AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET)) ||
++                        ((val & AUDIO_DEVICE_OUT_SPEAKER) ^
++                        (adev->devices & AUDIO_DEVICE_OUT_SPEAKER)) ||
++                        (adev->mode == AUDIO_MODE_IN_CALL))
+                     do_output_standby(out);
+             }
+-            adev->devices &= ~AUDIO_DEVICE_OUT_ALL;
+-            adev->devices |= val;
+-            out->device    = val;
+-            select_output_device(adev);
++            if (out != adev->active_output[OUTPUT_HDMI]) {
++                adev->devices &= ~AUDIO_DEVICE_OUT_ALL;
++                adev->devices |= val;
++                out->device    = val;
++                select_output_device(adev);
++            }
+         }
+         pthread_mutex_unlock(&out->lock);
+         if (force_input_standby) {
+@@ -1112,7 +1116,7 @@ static int start_input_stream(struct imx_stream_in *in)
+             return -EINVAL;
+         }
+     }
+-    ALOGW("card %d, port %d device %x", card, port, in->device);
++    ALOGW("card %d, port %d device 0x%x", card, port, in->device);
+ 
+     in->config.stop_threshold = in->config.period_size * in->config.period_count;
+ 
+@@ -2149,7 +2153,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
+ 
+     in->requested_rate = config->sample_rate;
+ 
+-    ALOGW("In channels %d, rate %d, devices %x", channel_count, config->sample_rate, devices);
++    ALOGW("In channels %d, rate %d, devices 0x%x", channel_count, config->sample_rate, devices);
+     memcpy(&in->config, &pcm_config_mm_in, sizeof(pcm_config_mm_in));
+     //in->config.channels = channel_count;
+     //in->config.rate     = *sample_rate;
+-- 
+1.8.0
+

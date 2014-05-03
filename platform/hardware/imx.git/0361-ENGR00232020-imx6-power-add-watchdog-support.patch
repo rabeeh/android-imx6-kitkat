@@ -1,0 +1,420 @@
+From 833b802c58a830756f3ba323567a617567e895d5 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Thu, 1 Nov 2012 16:24:49 +0800
+Subject: [PATCH 361/486] ENGR00232020 imx6 power: add watchdog support
+
+Add hardware watchdog support to make sure
+system can reboot when it can not recovery
+itself from error (kernel crash or system server
+frequently crash in early time).
+Set the watchdog timeout to 30s to give
+change for system server restart if only
+dalvik or system process be able to recovery
+from crashs.
+
+Change-Id: I35a7926c552f4d545bc0a85b29886e54221a0f45
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ mx6/power/Android.mk   |   4 +-
+ mx6/power/power.c      | 117 ---------------------------------------------
+ mx6/power/power.cpp    | 126 +++++++++++++++++++++++++++++++++++++++++++++++++
+ mx6/power/watchdog.cpp |  63 +++++++++++++++++++++++++
+ mx6/power/watchdog.h   |  44 +++++++++++++++++
+ 5 files changed, 235 insertions(+), 119 deletions(-)
+ delete mode 100644 mx6/power/power.c
+ create mode 100644 mx6/power/power.cpp
+ create mode 100644 mx6/power/watchdog.cpp
+ create mode 100644 mx6/power/watchdog.h
+
+diff --git a/mx6/power/Android.mk b/mx6/power/Android.mk
+index 970c135..22327e5 100644
+--- a/mx6/power/Android.mk
++++ b/mx6/power/Android.mk
+@@ -21,8 +21,8 @@ LOCAL_PATH := $(call my-dir)
+ include $(CLEAR_VARS)
+ 
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libcutils
+-LOCAL_SRC_FILES := power.c
++LOCAL_SHARED_LIBRARIES := liblog libcutils libutils
++LOCAL_SRC_FILES := power.cpp watchdog.cpp
+ LOCAL_MODULE := power.$(TARGET_BOARD_PLATFORM)
+ LOCAL_MODULE_TAGS := optional
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/mx6/power/power.c b/mx6/power/power.c
+deleted file mode 100644
+index 3c3d04e..0000000
+--- a/mx6/power/power.c
++++ /dev/null
+@@ -1,117 +0,0 @@
+-/*
+- * Copyright (C) 2012 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-#include <errno.h>
+-#include <string.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
+-#include <fcntl.h>
+-
+-#define LOG_TAG "i.MXPowerHAL"
+-#include <utils/Log.h>
+-
+-#include <hardware/hardware.h>
+-#include <hardware/power.h>
+-
+-#define BOOST_PATH      "/sys/devices/system/cpu/cpufreq/interactive/boost"
+-#define BOOSTPULSE_PATH "/sys/devices/system/cpu/cpufreq/interactive/boostpulse"
+-static int boost_fd = -1;
+-static int boost_warned;
+-
+-static void sysfs_write(char *path, char *s)
+-{
+-    int len;
+-    int fd = open(path, O_WRONLY);
+-
+-    if (fd < 0) {
+-        ALOGE("Error opening %s: %s\n", path, strerror(errno));
+-        return;
+-    }
+-
+-    len = write(fd, s, strlen(s));
+-    if (len < 0) {
+-        ALOGE("Error writing to %s: %s\n", path, strerror(errno));
+-    }
+-
+-    close(fd);
+-}
+-
+-static void fsl_power_init(struct power_module *module)
+-{
+-    /*
+-     * cpufreq interactive governor: timer 20ms, min sample 60ms,
+-     * hispeed at cpufreq MAX point at load 40%
+-     */
+-
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/timer_rate",
+-                "20000");
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time",
+-                "60000");
+-    /*
+-     * use cpufreq max freq default, the high speed also can be specified by
+-     * wrriten a value to hispeed like below set high speed to 800MHz:
+-     * sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq",
+-                "792000");
+-     */
+-
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load",
+-                "40");
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
+-		"1");
+-}
+-
+-static void fsl_power_set_interactive(struct power_module *module, int on)
+-{
+-	sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
+-			on ? "1" : "0");
+-}
+-
+-static void fsl_power_hint(struct power_module *module, power_hint_t hint,
+-                            void *data)
+-{
+-    char buf[80];
+-    int len;
+-
+-    switch (hint) {
+-    case POWER_HINT_VSYNC:
+-        break;
+-    case POWER_HINT_INTERACTION:
+-	sysfs_write(BOOSTPULSE_PATH, "1");
+-	break;
+-    default:
+-            break;
+-    }
+-}
+-
+-static struct hw_module_methods_t power_module_methods = {
+-    .open = NULL,
+-};
+-
+-struct power_module HAL_MODULE_INFO_SYM = {
+-    .common = {
+-        .tag = HARDWARE_MODULE_TAG,
+-        .module_api_version = POWER_MODULE_API_VERSION_0_2,
+-        .hal_api_version = HARDWARE_HAL_API_VERSION,
+-        .id = POWER_HARDWARE_MODULE_ID,
+-        .name = "FSL i.MX Power HAL",
+-        .author = "Freescale Semiconductor, Inc.",
+-        .methods = &power_module_methods,
+-    },
+-
+-    .init = fsl_power_init,
+-    .setInteractive = fsl_power_set_interactive,
+-    .powerHint = fsl_power_hint,
+-};
+diff --git a/mx6/power/power.cpp b/mx6/power/power.cpp
+new file mode 100644
+index 0000000..348430a
+--- /dev/null
++++ b/mx6/power/power.cpp
+@@ -0,0 +1,126 @@
++/*
++ * Copyright (C) 2012 The Android Open Source Project
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include <errno.h>
++#include <string.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++#define LOG_TAG "i.MXPowerHAL"
++#include <utils/Log.h>
++
++#include <hardware/hardware.h>
++#include <hardware/power.h>
++#include <utils/StrongPointer.h>
++
++#include "watchdog.h"
++
++#define BOOST_PATH      "/sys/devices/system/cpu/cpufreq/interactive/boost"
++#define BOOSTPULSE_PATH "/sys/devices/system/cpu/cpufreq/interactive/boostpulse"
++static int boost_fd = -1;
++static int boost_warned;
++static sp<WatchdogThread> wdThread;
++
++static void sysfs_write(const char *path, const char *s)
++{
++    int len;
++    int fd = open(path, O_WRONLY);
++
++    if (fd < 0) {
++        ALOGE("Error opening %s: %s\n", path, strerror(errno));
++        return;
++    }
++
++    len = write(fd, s, strlen(s));
++    if (len < 0) {
++        ALOGE("Error writing to %s: %s\n", path, strerror(errno));
++    }
++
++    close(fd);
++}
++
++static void fsl_power_init(struct power_module *module)
++{
++    /*
++     * cpufreq interactive governor: timer 20ms, min sample 60ms,
++     * hispeed at cpufreq MAX point at load 40%
++     */
++
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/timer_rate",
++                "20000");
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time",
++                "60000");
++    /*
++     * use cpufreq max freq default, the high speed also can be specified by
++     * wrriten a value to hispeed like below set high speed to 800MHz:
++     * sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq",
++                "792000");
++     */
++
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load",
++                "40");
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
++		"1");
++
++    // create and run the watchdog thread
++    wdThread = new WatchdogThread();
++}
++
++static void fsl_power_set_interactive(struct power_module *module, int on)
++{
++	sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
++			on ? "1" : "0");
++}
++
++static void fsl_power_hint(struct power_module *module, power_hint_t hint,
++                            void *data)
++{
++    char buf[80];
++    int len;
++
++    switch (hint) {
++    case POWER_HINT_VSYNC:
++        break;
++    case POWER_HINT_INTERACTION:
++	sysfs_write(BOOSTPULSE_PATH, "1");
++	break;
++    default:
++            break;
++    }
++}
++
++static struct hw_module_methods_t power_module_methods = {
++    open: NULL,
++};
++
++struct power_module HAL_MODULE_INFO_SYM = {
++    common: {
++        tag: HARDWARE_MODULE_TAG,
++        module_api_version: POWER_MODULE_API_VERSION_0_2,
++        hal_api_version: HARDWARE_HAL_API_VERSION,
++        id: POWER_HARDWARE_MODULE_ID,
++        name: "FSL i.MX Power HAL",
++        author: "Freescale Semiconductor, Inc.",
++        methods: &power_module_methods,
++        dso: NULL,
++        reserved: {0}
++    },
++
++    init: fsl_power_init,
++    setInteractive: fsl_power_set_interactive,
++    powerHint: fsl_power_hint,
++};
+diff --git a/mx6/power/watchdog.cpp b/mx6/power/watchdog.cpp
+new file mode 100644
+index 0000000..aac3b49
+--- /dev/null
++++ b/mx6/power/watchdog.cpp
+@@ -0,0 +1,63 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#define LOG_TAG "WDT"
++#include <cutils/log.h>
++
++#include "watchdog.h"
++
++using namespace android;
++
++WatchdogThread::WatchdogThread()
++    : Thread(false)
++{
++}
++
++void WatchdogThread::onFirstRef()
++{
++    run("watchdogThread", PRIORITY_URGENT_DISPLAY);
++}
++
++status_t WatchdogThread::readyToRun()
++{
++    // open the watchdog device
++    mFd = open(getPath(), O_WRONLY);
++    if (mFd <= 0) {
++        ALOGE("Could not open the watchdog device:%s", getPath());
++	return NO_INIT;
++    }
++
++    int stout = WDT_TIMEOUT, tout = 0;
++    // set the watchdog timeout
++    ioctl(mFd, WDIOC_SETTIMEOUT, &stout);
++    ALOGD("Setup the watchdog timeout:%d", stout);
++    ioctl(mFd, WDIOC_GETTIMEOUT, &tout);
++    if (stout != tout) {
++        ALOGE("Failed to set the watchdog timeout:%d", tout);
++        return BAD_VALUE;
++    }
++    return NO_ERROR;
++}
++
++bool WatchdogThread::threadLoop()
++{
++    // feed the watchdog
++    ioctl(mFd, WDIOC_KEEPALIVE, 0);
++    // Sleep 2 secs shorter than feed time, cause the watchdog
++    // timer accuracy is 0.5s and we cannot schedule here after
++    // 2s, it's gonna be problem to reboot.
++    sleep(WDT_TIMEOUT-2);
++    return true;
++}
+diff --git a/mx6/power/watchdog.h b/mx6/power/watchdog.h
+new file mode 100644
+index 0000000..05521ac
+--- /dev/null
++++ b/mx6/power/watchdog.h
+@@ -0,0 +1,44 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef WATCHDOG_H_
++#define WATCHDOG_H_
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <utils/threads.h>
++#include <linux/watchdog.h>
++
++// set timeout to 30s to make sure system server
++// can restarted within enough time when dalvik crash
++#define WDT_TIMEOUT	30
++
++using namespace android;
++
++class WatchdogThread : public Thread
++{
++public:
++    WatchdogThread();
++
++private:
++    virtual status_t readyToRun();
++    virtual void onFirstRef();
++    virtual bool threadLoop();
++    static char const* getPath() { return "/dev/watchdog"; }
++    int mFd;
++};
++
++#endif
+-- 
+1.8.0
+

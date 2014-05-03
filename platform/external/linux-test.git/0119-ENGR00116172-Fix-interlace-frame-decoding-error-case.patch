@@ -1,0 +1,123 @@
+From b0dfd7c683848a276aad119ad90e48ed45209136 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Mon, 14 Sep 2009 17:21:07 +0800
+Subject: [PATCH 119/435] ENGR00116172 Fix interlace frame decoding error case
+ in vpu unit test
+
+1. [#787]: [Generic] 32 btyes aligned for picture height in some cases;
+2. Allocate 2 more buffers and dequeue buffer after 3 buffers are queued
+   for rinterlaced frame;
+3. Change test app to make sure WaitForInt is called in each frame decoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c     | 27 ++++++++++++++++++++++++---
+ test/mxc_vpu_test/display.c |  7 +++++--
+ 2 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 66cc95f..7d645e7 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -667,6 +667,7 @@ decoder_start(struct decode *dec)
+ 	int count = dec->cmdl->count;
+ 	int totalNumofErrMbs = 0;
+ 	int disp_clr_index = -1, actual_display_index = -1, field = V4L2_FIELD_NONE;
++	int is_waited_int = 0;
+ 
+ 	if ((dec->cmdl->dst_scheme == PATH_V4L2) && (dec->cmdl->ipu_rot_en))
+ 		rot_en = 0;
+@@ -812,6 +813,7 @@ decoder_start(struct decode *dec)
+ 			return -1;
+ 		}
+ 
++		is_waited_int = 0;
+ 		while (vpu_IsBusy()) {
+ 			err = dec_fill_bsbuffer(handle, dec->cmdl,
+ 				      dec->virt_bsbuf_addr,
+@@ -826,9 +828,13 @@ decoder_start(struct decode *dec)
+ 
+ 			if (!err) {
+ 				vpu_WaitForInt(500);
++				is_waited_int = 1;
+ 			}
+ 		}
+ 
++		if (!is_waited_int)
++			vpu_WaitForInt(500);
++
+ 		gettimeofday(&tdec_end, NULL);
+ 		sec = tdec_end.tv_sec - tdec_begin.tv_sec;
+ 		usec = tdec_end.tv_usec - tdec_begin.tv_usec;
+@@ -926,7 +932,7 @@ decoder_start(struct decode *dec)
+ 						  outinfo.topFieldFirst, decIndex);
+ 				}
+ 			} else if ((dec->cmdl->format != STD_MPEG4) && (dec->cmdl->format != STD_RV)){
+-				if (outinfo.interlacedFrame || !outinfo.progressiveFrame) {
++				if (!outinfo.interlacedFrame) {
+ 					if (outinfo.pictureStructure == 1)
+ 						field = V4L2_FIELD_TOP;
+ 					else if (outinfo.pictureStructure == 2)
+@@ -1389,6 +1395,7 @@ decoder_parse(struct decode *dec)
+ {
+ 	DecInitialInfo initinfo = {0};
+ 	DecHandle handle = dec->handle;
++	int align;
+ 	RetCode ret;
+ 
+ 	/*
+@@ -1541,10 +1548,24 @@ decoder_parse(struct decode *dec)
+ 	 *
+ 	 * Performance is better when more buffers are used if IPU performance
+ 	 * is bottleneck.
++	 *
++	 * Two more buffers may be needed for interlace stream from IPU DVI view
+ 	 */
+-	dec->fbcount = initinfo.minFrameBufferCount + 2;
++	if (initinfo.interlace)
++		dec->fbcount = initinfo.minFrameBufferCount + 2 + 2;
++	else
++		dec->fbcount = initinfo.minFrameBufferCount + 2;
++
+ 	dec->picwidth = ((initinfo.picWidth + 15) & ~15);
+-	dec->picheight = ((initinfo.picHeight + 15) & ~15);
++
++	align = 16;
++	if ((dec->cmdl->format == STD_MPEG2 ||
++	    dec->cmdl->format == STD_VC1 ||
++	    dec->cmdl->format == STD_AVC) && initinfo.interlace == 1)
++		align = 32;
++
++	dec->picheight = ((initinfo.picHeight + align - 1) & ~(align - 1));
++
+ 	if ((dec->picwidth == 0) || (dec->picheight == 0))
+ 		return -1;
+ 
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 98fe5bb..c518c76 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -379,7 +379,7 @@ void v4l_display_close(struct vpu_display *disp)
+ int v4l_put_data(struct vpu_display *disp, int index, int field)
+ {
+ 	struct timeval tv;
+-	int err, type;
++	int err, type, threshold;
+ 	struct v4l2_format fmt = {0};
+ 
+ 	if (disp->ncount == 0) {
+@@ -457,7 +457,10 @@ int v4l_put_data(struct vpu_display *disp, int index, int field)
+ 
+ 	disp->ncount++;
+ 
+-	if (disp->queued_count > 1) {
++	threshold = 2;
++	if (disp->buf.field == V4L2_FIELD_ANY || disp->buf.field == V4L2_FIELD_NONE)
++		threshold = 1;
++	if (disp->queued_count > threshold) {
+ 		disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 		disp->buf.memory = V4L2_MEMORY_MMAP;
+ 		err = ioctl(disp->fd, VIDIOC_DQBUF, &disp->buf);
+-- 
+1.8.0
+

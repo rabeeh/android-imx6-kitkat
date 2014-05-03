@@ -1,0 +1,338 @@
+From 9d94ae9ec3bd043ea6d293f5dfa85bb1150ca37c Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Tue, 4 Sep 2012 18:44:57 +0800
+Subject: [PATCH 333/486] ENGR00222903 Camera: Rear camera can't be opened in
+ 1 second
+
+Open each onboard camera will cost around 600ms. Search the right devpath
+by certain camera sensor name may cost 1200ms for the worst case.
+Move the sensor name and dev path match process in CameraService init time
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp              |   4 +-
+ mx6/libcamera/CameraHal.h                |   3 +-
+ mx6/libcamera/CameraModule.cpp           | 101 +++++++++++++++++++++++++------
+ mx6/libcamera/CaptureDeviceInterface.cpp |   6 +-
+ mx6/libcamera/CaptureDeviceInterface.h   |   6 +-
+ mx6/libcamera/V4l2CapDeviceBase.cpp      |   9 +--
+ mx6/libcamera/V4l2CapDeviceBase.h        |   4 +-
+ mx6/libcamera/V4l2UVCDevice.cpp          |   2 +-
+ 8 files changed, 100 insertions(+), 35 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 3064a46..75ac3b3 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -364,8 +364,8 @@ namespace android {
+             //Typically only max to 1080p for mipi, 720p for csi,
+             //and minum 15 fps need for preview.
+             unsigned int max_preview_w, max_preview_h;
+-            char device_name[CAMAERA_SENSOR_LENGTH];
+-            memset(device_name, 0, CAMAERA_SENSOR_LENGTH);
++            char device_name[CAMERA_SENSOR_LENGTH];
++            memset(device_name, 0, CAMERA_SENSOR_LENGTH);
+             mCaptureDevice->GetDevName(device_name);
+             if(strstr(device_name, "mipi")) {
+                 max_preview_w = MAX_MIPI_PREVIEW_W;
+diff --git a/mx6/libcamera/CameraHal.h b/mx6/libcamera/CameraHal.h
+index d0d8972..22f8e23 100755
+--- a/mx6/libcamera/CameraHal.h
++++ b/mx6/libcamera/CameraHal.h
+@@ -52,7 +52,6 @@
+ #define MAX_QUERY_FMT_TIMES 20
+ #define PARAMS_DELIMITER ","
+ #define V4LSTREAM_WAKE_LOCK "V4LCapture"
+-#define MAX_SENSOR_NAME 32
+ 
+ #define PREVIEW_HEAP_BUF_NUM    6
+ #define VIDEO_OUTPUT_BUFFER_NUM 6
+@@ -380,7 +379,7 @@ namespace android {
+         unsigned int        mPreviewHeapBufNum;
+         unsigned int        mTakePicBufQueNum;
+ 
+-        char                mCameraSensorName[MAX_SENSOR_NAME];
++        char                mCameraSensorName[CAMERA_SENSOR_LENGTH];
+         bool mCameraReady;
+         bool mCaptureDeviceOpen;
+         bool mIsCaptureBufsAllocated;
+diff --git a/mx6/libcamera/CameraModule.cpp b/mx6/libcamera/CameraModule.cpp
+index 96e2d1c..479baa3 100755
+--- a/mx6/libcamera/CameraModule.cpp
++++ b/mx6/libcamera/CameraModule.cpp
+@@ -19,7 +19,13 @@
+  */
+ 
+ #define LOG_TAG "CameraHAL"
+-
++#include <linux/videodev2.h>
++#include <linux/mxcfb.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <dirent.h>
+ #include <utils/threads.h>
+ #include <cutils/properties.h>
+ #include "CameraHal.h"
+@@ -473,9 +479,12 @@ done:
+ #define DEFAULT_ERROR_NAME_str "0"
+ #define UVC_NAME "uvc"
+ static struct camera_info sCameraInfo[2];
+-//Camera_name[0]  for back camera name
+-//Camera_name[1]  for front camera name
+-static char Camera_name[2][MAX_SENSOR_NAME];
++//gCameraName[0]  for back camera name
++//gCameraName[1]  for front camera name
++static char gCameraName[2][CAMERA_SENSOR_LENGTH];
++static char gCameraDevPath[2][CAMAERA_FILENAME_LENGTH];
++static int gCameraNum = 0;
++
+ /*******************************************************************
+  * implementation of camera_module functions
+  *******************************************************************/
+@@ -576,9 +585,10 @@ int camera_device_open(const hw_module_t* module, const char* name,
+         *device = &camera_device->base.common;
+ 
+         camera_device->cameraid = cameraid;
+-        SelectedCameraName = Camera_name[sCameraInfo[cameraid].facing];
++        SelectedCameraName = gCameraName[sCameraInfo[cameraid].facing];
+ 
+-        pCaptureDevice = android::createCaptureDevice(SelectedCameraName);
++        pCaptureDevice = android::createCaptureDevice(SelectedCameraName,
++                gCameraDevPath[sCameraInfo[cameraid].facing]);
+         pJpegEncoder = android::createJpegEncoder(android::SOFTWARE_JPEG_ENC);
+ 
+         camera = new android::CameraHal(cameraid);
+@@ -624,6 +634,56 @@ fail:
+     return rv;
+ }
+ 
++static int GetDevPath(const char *pCameraName, char *pCameraDevPath, unsigned int pathLen)
++{
++    int retCode = -1;
++    int fd = 0;
++    char   dev_node[CAMAERA_FILENAME_LENGTH];
++    DIR *v4l_dir = NULL;
++    struct dirent *dir_entry;
++    struct v4l2_capability v4l2_cap;
++    struct v4l2_dbg_chip_ident vid_chip;
++
++    v4l_dir = opendir("/sys/class/video4linux");
++    if (v4l_dir){
++        while((dir_entry = readdir(v4l_dir))) {
++            memset((void *)dev_node, 0, CAMAERA_FILENAME_LENGTH);
++            if(strncmp(dir_entry->d_name, "video", 5))
++                continue;
++            sprintf(dev_node, "/dev/%s", dir_entry->d_name);
++            if ((fd = open(dev_node, O_RDWR, O_NONBLOCK)) < 0)
++                continue;
++            if(ioctl(fd, VIDIOC_QUERYCAP, &v4l2_cap) < 0 ) {
++                close(fd);
++                fd = 0;
++                continue;
++            } else if (v4l2_cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
++                if(ioctl(fd, VIDIOC_DBG_G_CHIP_IDENT, &vid_chip) < 0 ) {
++                    close(fd);
++                    fd = 0;
++                    continue;
++                }
++                if(strstr(vid_chip.match.name, pCameraName)){
++                    //fsl csi/mipi camera name and path match
++                    if(pathLen > strlen(dev_node)) {
++                        strcpy(pCameraDevPath, dev_node);
++                        LOGI("Get sensor %s's dev path %s", pCameraName, pCameraDevPath);
++                        retCode = 0;
++                    }
++                    close(fd);
++                    fd = 0;
++                    break;
++                }
++            }
++            close(fd);
++            fd = 0;
++        }
++        closedir(v4l_dir);
++    }
++
++    return retCode;
++}
++
+ static void GetCameraPropery(char * pFaceBackCameraName, char *pFaceFrontCameraName, int *pFaceBackOrient, int *pFaceFrontOrient)
+ {
+     char orientStr[10];
+@@ -654,19 +714,24 @@ static void GetCameraPropery(char * pFaceBackCameraName, char *pFaceFrontCameraN
+ int camera_get_number_of_cameras()
+ {
+     int back_orient =0,  front_orient = 0;
+-    int camera_num = 0;
+-    GetCameraPropery(Camera_name[0], Camera_name[1], &back_orient, &front_orient);
+-    if (Camera_name[0][0] != DEFAULT_ERROR_NAME){
+-        sCameraInfo[camera_num].facing = CAMERA_FACING_BACK;
+-        sCameraInfo[camera_num].orientation = back_orient;
+-        camera_num++;
+-    }
+-    if (Camera_name[1][0] != DEFAULT_ERROR_NAME){
+-	    sCameraInfo[camera_num].facing = CAMERA_FACING_FRONT;
+-	    sCameraInfo[camera_num].orientation = front_orient;
+-        camera_num ++;
++    if(gCameraNum == 0) {
++        GetCameraPropery(gCameraName[0], gCameraName[1], &back_orient, &front_orient);
++        if (gCameraName[0][0] != DEFAULT_ERROR_NAME){
++            sCameraInfo[gCameraNum].facing = CAMERA_FACING_BACK;
++            sCameraInfo[gCameraNum].orientation = back_orient;
++            memset(gCameraDevPath[gCameraNum], 0, CAMAERA_FILENAME_LENGTH);
++            GetDevPath(gCameraName[gCameraNum], gCameraDevPath[gCameraNum], CAMAERA_FILENAME_LENGTH);
++            gCameraNum++;
++        }
++        if (gCameraName[1][0] != DEFAULT_ERROR_NAME){
++            sCameraInfo[gCameraNum].facing = CAMERA_FACING_FRONT;
++            sCameraInfo[gCameraNum].orientation = front_orient;
++            memset(gCameraDevPath[gCameraNum], 0, CAMAERA_FILENAME_LENGTH);
++            GetDevPath(gCameraName[gCameraNum], gCameraDevPath[gCameraNum], CAMAERA_FILENAME_LENGTH);
++            gCameraNum++;
++        }
+     }
+-    return camera_num;
++    return gCameraNum;
+ 
+ }
+ 
+diff --git a/mx6/libcamera/CaptureDeviceInterface.cpp b/mx6/libcamera/CaptureDeviceInterface.cpp
+index 8fa89e1..6f8c90a 100755
+--- a/mx6/libcamera/CaptureDeviceInterface.cpp
++++ b/mx6/libcamera/CaptureDeviceInterface.cpp
+@@ -20,15 +20,15 @@
+ #include "V4l2UVCDevice.h"
+ #include "V4l2CsiDevice.h"
+ namespace android{
+-    extern "C" sp<CaptureDeviceInterface> createCaptureDevice(char *deviceName)
++    extern "C" sp<CaptureDeviceInterface> createCaptureDevice(const char *deviceName, const char *devPath)
+     {
+         if(strstr(deviceName, UVC_NAME_STRING)){
+             sp<CaptureDeviceInterface>  device(new V4l2UVCDevice());
+-            device->SetDevName(deviceName);
++            device->SetDevName(deviceName, devPath);
+             return device;
+         }else{
+             sp<CaptureDeviceInterface>  device(new V4l2CsiDevice());
+-            device->SetDevName(deviceName);
++            device->SetDevName(deviceName, devPath);
+             return device;
+         }
+     }
+diff --git a/mx6/libcamera/CaptureDeviceInterface.h b/mx6/libcamera/CaptureDeviceInterface.h
+index 38163e1..dddb38f 100755
+--- a/mx6/libcamera/CaptureDeviceInterface.h
++++ b/mx6/libcamera/CaptureDeviceInterface.h
+@@ -27,7 +27,7 @@
+ 
+ #define CAMAERA_FILENAME_LENGTH     256
+ #define MAX_CAPTURE_BUF_QUE_NUM     6
+-#define CAMAERA_SENSOR_LENGTH       32
++#define CAMERA_SENSOR_LENGTH       32
+ #define MAX_DEQUEUE_WAIT_TIME  (5000)  //5000ms for uvc camera
+ 
+ namespace android {
+@@ -91,7 +91,7 @@ namespace android {
+     class CaptureDeviceInterface : public virtual RefBase{
+     public:
+ 
+-        virtual CAPTURE_DEVICE_RET SetDevName(char * deviceName)=0;
++        virtual CAPTURE_DEVICE_RET SetDevName(const char * deviceName, const char * devPath = NULL)=0;
+         virtual CAPTURE_DEVICE_RET GetDevName(char * deviceName)=0;
+         virtual CAPTURE_DEVICE_RET DevOpen(int cameraId)=0;
+         virtual CAPTURE_DEVICE_RET EnumDevParam(DevParamType devParamType, void *retParam)=0;
+@@ -109,7 +109,7 @@ namespace android {
+ 
+         virtual ~ CaptureDeviceInterface(){}
+     };
+-    extern "C" sp<CaptureDeviceInterface> createCaptureDevice(char *deviceName);
++    extern "C" sp<CaptureDeviceInterface> createCaptureDevice(const char *deviceName, const char *devPath);
+ 
+ };
+ #endif
+diff --git a/mx6/libcamera/V4l2CapDeviceBase.cpp b/mx6/libcamera/V4l2CapDeviceBase.cpp
+index f563e62..34d9487 100755
+--- a/mx6/libcamera/V4l2CapDeviceBase.cpp
++++ b/mx6/libcamera/V4l2CapDeviceBase.cpp
+@@ -57,12 +57,14 @@ namespace android{
+     {
+     }
+ 
+-    CAPTURE_DEVICE_RET V4l2CapDeviceBase::SetDevName(char * deviceName){
++    CAPTURE_DEVICE_RET V4l2CapDeviceBase::SetDevName(const char * deviceName, const char * devPath){
+         CAMERA_LOG_FUNC;
+         CAPTURE_DEVICE_RET ret = CAPTURE_DEVICE_ERR_NONE;
+         if(NULL == deviceName)
+             return CAPTURE_DEVICE_ERR_BAD_PARAM;
+         strcpy(mInitalDeviceName, deviceName);
++        if((devPath != NULL) && (strlen(devPath) > 0))
++            strcpy(mCaptureDeviceName, devPath);
+         return ret;
+     }
+ 
+@@ -225,7 +227,6 @@ namespace android{
+         CAMERA_LOG_FUNC;
+         int fd = 0, i, j, is_found = 0;
+         const char *flags[] = {"uncompressed", "compressed"};
+-
+         char   dev_node[CAMAERA_FILENAME_LENGTH];
+         DIR *v4l_dir = NULL;
+         struct dirent *dir_entry;
+@@ -238,7 +239,7 @@ namespace android{
+         if(mCameraDevice > 0)
+             return CAPTURE_DEVICE_ERR_ALRADY_OPENED;
+         else if (mCaptureDeviceName[0] != '#'){
+-            CAMERA_LOG_RUNTIME("already get the device name %s", mCaptureDeviceName);
++            CAMERA_LOG_INFO("already get the device name %s", mCaptureDeviceName);
+             mCameraDevice = open(mCaptureDeviceName, O_RDWR, O_NONBLOCK);
+             if (mCameraDevice < 0)
+                 return CAPTURE_DEVICE_ERR_OPEN;
+@@ -672,7 +673,7 @@ namespace android{
+         }
+         type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+         if (ioctl (mCameraDevice, VIDIOC_STREAMOFF, &type) < 0) {
+-            CAMERA_LOG_ERR("VIDIOC_STREAMON error\n");
++            CAMERA_LOG_ERR("VIDIOC_STREAMOFF error\n");
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+         } else
+             CAMERA_LOG_INFO("VIDIOC_STREAMOFF ok\n");
+diff --git a/mx6/libcamera/V4l2CapDeviceBase.h b/mx6/libcamera/V4l2CapDeviceBase.h
+index 6bc3e0b..f48ac32 100755
+--- a/mx6/libcamera/V4l2CapDeviceBase.h
++++ b/mx6/libcamera/V4l2CapDeviceBase.h
+@@ -28,7 +28,7 @@ namespace android{
+     class V4l2CapDeviceBase : public CaptureDeviceInterface{
+     public:
+ 
+-        virtual CAPTURE_DEVICE_RET SetDevName(char * deviceName);
++        virtual CAPTURE_DEVICE_RET SetDevName(const char * deviceName, const char *devPath = NULL);
+         virtual CAPTURE_DEVICE_RET GetDevName(char * deviceName);
+         virtual CAPTURE_DEVICE_RET GetDevType(CAMERA_TYPE *pType);
+         virtual CAPTURE_DEVICE_RET DevOpen(int cameraId);
+@@ -67,7 +67,7 @@ namespace android{
+         virtual CAPTURE_DEVICE_RET V4l2SetRot(struct capture_config_t *pCapcfg);
+ 
+         char         mCaptureDeviceName[CAMAERA_FILENAME_LENGTH];
+-        char         mInitalDeviceName[CAMAERA_SENSOR_LENGTH];
++        char         mInitalDeviceName[CAMERA_SENSOR_LENGTH];
+         int          mCameraDevice;
+         unsigned int mFmtParamIdx;
+         unsigned int mSizeFPSParamIdx;
+diff --git a/mx6/libcamera/V4l2UVCDevice.cpp b/mx6/libcamera/V4l2UVCDevice.cpp
+index 1c3eb99..5e198de 100755
+--- a/mx6/libcamera/V4l2UVCDevice.cpp
++++ b/mx6/libcamera/V4l2UVCDevice.cpp
+@@ -85,7 +85,7 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2Open(int cameraId)
+         if(mCameraDevice > 0)
+             return CAPTURE_DEVICE_ERR_ALRADY_OPENED;
+         else if (mCaptureDeviceName[0] != '#'){
+-            CAMERA_LOG_RUNTIME("already get the device name %s", mCaptureDeviceName);
++            CAMERA_LOG_INFO("already get the device name %s", mCaptureDeviceName);
+             mCameraDevice = open(mCaptureDeviceName, O_RDWR | O_NONBLOCK, 0);
+             if (mCameraDevice < 0)
+                 return CAPTURE_DEVICE_ERR_OPEN;
+-- 
+1.8.0
+

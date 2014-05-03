@@ -1,0 +1,1554 @@
+From 465eb7e4a4f9839016fc6a587a1a9b7742d4d68f Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 11 May 2010 01:27:53 +0800
+Subject: [PATCH 039/486] Init version of cameraHAL based on overlay
+ interface, V4L capture    interface is used for
+ both preview and record.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ libcamera/CameraHal.cpp | 1063 +++++++++++++++++------------------------------
+ libcamera/CameraHal.h   |   83 ++--
+ 2 files changed, 395 insertions(+), 751 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index 02ce226..e5af7ab 100644
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -32,29 +32,16 @@
+ 
+ namespace android {
+ int CameraHal::camera_device = -1;
+-int CameraHal::g_sensor_width = 640;
+-int CameraHal::g_sensor_height = 480;
+-int CameraHal::g_sensor_top = 0;
+-int CameraHal::g_sensor_left = 0;
+-int CameraHal::g_display_width = DISPLAY_WIDTH;
+-int CameraHal::g_display_height = DISPLAY_HEIGHT;
+-int CameraHal::g_display_top = 0;
+-int CameraHal::g_display_left = 0;
+ int CameraHal::g_rotate=0;
+-int CameraHal::g_display_lcd = 0;
+ int CameraHal::g_capture_mode = 0;	//0:low resolution, 1:high resolution
+-int CameraHal::g_preview_width = PREVIEW_WIDTH;
+-int CameraHal::g_preview_height = PREVIEW_HEIGHT;
+ int CameraHal::g_recording_width = RECORDING_WIDTH_NORMAL;
+ int CameraHal::g_recording_height = RECORDING_HEIGHT_NORMAL;
+-int CameraHal::g_recording_level = 1;	//1: CIF mode; 0: QCIF mode
+-
+ //Camera Take Picture Parameter
+ int CameraHal::g_pic_width = PICTURE_WIDTH;
+ int CameraHal::g_pic_height = PICTURE_HEIGHT;
+ int CameraHal::g_still_bpp = 16;
+ 
+-struct picbuffer CameraHal::buffers[3];
++struct picbuffer CameraHal::buffers[CAPTURE_BUFFER_NUM];
+ 
+ #ifdef USE_FSL_JPEG_ENC 
+ JPEG_ENC_UINT32 CameraHal::g_JpegDataSize = 0;//Total size of g_JpegData
+@@ -77,35 +64,43 @@ const char CameraHal::PARAMS_DELIMITER []= ",";
+ 
+ CameraHal::CameraHal()
+                   : mParameters(),
+-		    mRawHeap(0),
+-                    mHeap(0),
+-                    mPictureHeap(0),
++                    mPreviewHeight(0),
++                    mPreviewWidth(0),
++                    mPictureHeight(0),
++                    mPictureWidth(0),
+                     fcount(6),
+-                    previewStopped(true),
+-                    recordStopped(true),
+-                    doubledPreviewWidth(false),
+-                    doubledPreviewHeight(false),
+-                    mPreviewFrameSize(0),
+-		    mPreviewRunning(0),
+-		    mRecordFrameSize(0),
+-		    mCurrentRecordFrame(0),
+-		    mVideoHeap(0),
++                    mOverlay(NULL),
++                    mPreviewRunning(0),
++                    mPreviewHeap(0),
++                    nOverlayBuffersQueued(0),
++                    mRecordFrameSize(0),
++                    mRecordRunning(0),
++                    mCurrentRecordFrame(0),
++                    mVideoHeap(0),
+                     mNotifyCb(0),
+                     mDataCb(0),
+                     mDataCbTimestamp(0),
+                     mCallbackCookie(0),
+                     mMsgEnabled(0),
+                     mCurrentPreviewFrame(0),
+-		    nCameraBuffersQueued(0),
+-		    mCameraOpened(0),
+-		    mIsTakingPic(0)
++                    nCameraBuffersQueued(0),
++                    mCameraOpened(0),
++                    mIsTakingPic(0)
+ {
+-    for(int i = 0; i < videoBufferCount; i++)
+-    {
++    int i;
++
++    for (i = 0; i < kVideoBufferCount; i++) {
+         mVideoBuffer[i] = 0;
+         mVideoBufferUsing[i] = 0;
+     }
+ 
++    for (i = 0; i < kPreviewBufferCount; i++) {
++        mPreviewBuffer[i] = 0;
++        mPreviewBufferUsing[i] = 0;
++    }
++
++    cameraCreate();
++
+     initDefaultParameters();
+ }
+ 
+@@ -114,9 +109,9 @@ void CameraHal::initDefaultParameters()
+     CameraParameters p;
+     char tmpBuffer[PARAM_BUFFER];
+ 
+-    p.setPreviewSize(PREVIEW_WIDTH, PREVIEW_HEIGHT);
++    p.setPreviewSize(RECORDING_WIDTH_NORMAL, RECORDING_HEIGHT_NORMAL);
+     p.setPreviewFrameRate(PREVIEW_FRAMERATE);
+-    p.setPreviewFormat(PREVIEW_FORMAT);
++    p.setPreviewFormat("yuv420sp");
+ 
+     p.setPictureSize(PICTURE_WIDTH, PICTURE_HEIGHT);
+     p.setPictureFormat("jpeg");
+@@ -126,7 +121,7 @@ void CameraHal::initDefaultParameters()
+     p.set(CameraParameters::KEY_SUPPORTED_PICTURE_SIZES, CameraHal::supportedPictureSizes);
+     p.set(CameraParameters::KEY_SUPPORTED_PICTURE_FORMATS, CameraParameters::PIXEL_FORMAT_JPEG);
+     p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_SIZES, CameraHal::supportedPreviewSizes);
+-    p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FORMATS, CameraParameters::PIXEL_FORMAT_YUV422I);
++    p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FORMATS, CameraParameters::PIXEL_FORMAT_YUV420SP);
+     p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES, CameraHal::supportedFPS);
+     p.set(CameraParameters::KEY_SUPPORTED_THUMBNAIL_SIZES, CameraHal::supprotedThumbnailSizes);
+ 
+@@ -211,353 +206,221 @@ CameraHal::~CameraHal()
+     LOG_FUNCTION_NAME
+     LOGD(">>> Release");
+ 
++    cameraDestroy();
++
+     LOGD("<<< Release");
+ 
+     singleton.clear();
+ }
+ 
+-int CameraHal::CameraOpen()
++int CameraHal::cameraCreate()
+ {
+     int err;
+ 
+     LOG_FUNCTION_NAME
+ 
+     if(mCameraOpened == 0){
+-    	camera_device = open(VIDEO_DEVICE, O_RDWR, 0);
+-    	if (camera_device < 0) {
+-        	LOGE ("Could not open the camera device: %s",  strerror(errno) );
+-        	return -1;
+-    	}
+-    	mCameraOpened = 1;
+-    	LOGD("Camera Created - Success");
+-    }else{
+-	LOGE ("Camera device has been opened!");
+-    }
++        camera_device = open(VIDEO_DEVICE, O_RDWR, 0);
++        if (camera_device < 0) {
++            LOGE ("Could not open the camera device: %s",  strerror(errno) );
++            return -1;
++        }
++        mCameraOpened = 1;
++        LOGD("Camera Created - Success");
++    } else
++        LOGE ("Camera device has been opened!");
+ 
+     return 0;
+ }
+ 
+ 
+-int CameraHal::CameraClose()
++int CameraHal::cameraDestroy()
+ {
+     int err;
+ 
+-    if(mCameraOpened == 1){
+-    	close(camera_device);
+-    	camera_device = -1;
+-    	mCameraOpened = 0;
+-    	LOGD("Camera Destroyed - Success");
+-    }else{
+-	LOGE ("Camera device has been closed!");
++    if(mCameraOpened == 1) {
++        close(camera_device);
++        camera_device = -1;
++        mCameraOpened = 0;
++        LOGD("Camera Destroyed - Success");
++    } else
++        LOGE ("Camera device has been closed!");
++
++    if (mOverlay != NULL) {
++        mOverlay->destroy();
++        mOverlay = NULL;
+     }
+ 
+     return 0;
+ }
+ 
+-int CameraHal::CameraGetFBInfo()
++int CameraHal::cameraTakePicConfig()
+ {
+-        int fd_fb = 0;
+-        struct fb_fix_screeninfo fix;
+-        struct fb_var_screeninfo var;
+-
+-        if ((fd_fb = open(FB_DEVICE, O_RDWR )) < 0)     {
+-                LOGD("Unable to open frame buffer\n");
+-                return -1;
+-        }
++    struct v4l2_streamparm parm;
++    struct v4l2_format fmt;
++    struct v4l2_crop crop;
++    int fd_v4l = camera_device;
+ 
+-        if (ioctl(fd_fb, FBIOGET_VSCREENINFO, &var) < 0) {
+-                close(fd_fb);
+-                return -1;
+-        }
+-        if (ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix) < 0) {
+-                close(fd_fb);
+-                return -1;
+-        }
++    memset(&fmt, 0, sizeof(fmt));
++    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    fmt.fmt.pix.pixelformat = PICTURE_FROMAT;
++    fmt.fmt.pix.width = g_pic_width;
++    fmt.fmt.pix.height = g_pic_height;
++    fmt.fmt.pix.sizeimage = fmt.fmt.pix.width * fmt.fmt.pix.height * g_still_bpp / 8;
++    fmt.fmt.pix.bytesperline = g_pic_width * g_still_bpp / 8;
++
++    if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0) {
++        LOGE("set format failed\n");
++        return -1;
++    }
+ 
+-        g_display_width = var.xres;
+-        g_display_height = var.yres;
+-        LOGD("var.xres = %d", var.xres);
+-        LOGD("var.yres = %d", var.yres);
+-        LOGD("var.bits_per_pixel = %d", var.bits_per_pixel);
+-        close(fd_fb);
++    crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    crop.c.left = 0;
++    crop.c.top = 0;
++    crop.c.width = g_pic_width;
++    crop.c.height = g_pic_height;
++    if (ioctl(fd_v4l, VIDIOC_S_CROP, &crop) < 0) {
++        LOGE("set cropping failed\n");
++        return -1;
++    }
+ 
+-        return 0;
++    return NO_ERROR;
+ }
+ 
+-int CameraHal::CameraPreviewConfig(int fd_v4l)
++int CameraHal::cameraPreviewConfig()
+ {
+-        LOG_FUNCTION_NAME
+-        
+-        struct v4l2_streamparm parm;
+-        v4l2_std_id id;
+-        struct v4l2_control ctl;
+-        struct v4l2_crop crop;
+-	struct v4l2_format fmt;
+-
+-        if (ioctl(fd_v4l, VIDIOC_S_OUTPUT, &g_display_lcd) < 0)
+-        {
+-                LOGE("VIDIOC_S_OUTPUT failed\n");
+-                return -1;
+-        }
+-
+-        ctl.id = V4L2_CID_PRIVATE_BASE;
+-	ctl.value = g_rotate;
+-        if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctl) < 0)
+-        {
+-                LOGE("set control failed\n");
+-                return -1;
+-        }
+-
+-        crop.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
+-        crop.c.left = g_sensor_left;
+-        crop.c.top = g_sensor_top;
+-        crop.c.width = g_sensor_width;
+-        crop.c.height = g_sensor_height;
+-        if (ioctl(fd_v4l, VIDIOC_S_CROP, &crop) < 0)
+-        {
+-                LOGE("set cropping failed\n");
+-                return -1;
+-        }
+-
+-        fmt.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
+-        fmt.fmt.win.w.top=  g_display_top ;
+-        fmt.fmt.win.w.left= g_display_left;
+-        fmt.fmt.win.w.width=g_preview_width;
+-        fmt.fmt.win.w.height=g_preview_height;
+-
+-        if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
+-        {
+-                LOGE("set format failed\n");
+-                return -1;
+-        }
+-
+-	//Camera Preview VIDIOC_S_PARM
+-        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        parm.parm.capture.timeperframe.numerator = 1;
+-        parm.parm.capture.timeperframe.denominator = PREVIEW_FRAMERATE;
+-	parm.parm.capture.capturemode = g_capture_mode;
++    struct v4l2_format fmt;
++    struct v4l2_control ctrl;
++    struct v4l2_streamparm parm;
++    int fd_v4l = camera_device;
+ 
+-        if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0)
+-        {
+-                LOGE("VIDIOC_S_PARM failed\n");
+-                return -1;
+-        }
++    LOG_FUNCTION_NAME
+ 
+-        return 0;
+-}
++    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    fmt.fmt.pix.pixelformat = RECORDING_FORMAT;
++    fmt.fmt.pix.width = mPreviewWidth;
++    fmt.fmt.pix.height = mPreviewHeight;
++    fmt.fmt.pix.bytesperline = mPreviewWidth;
++    fmt.fmt.pix.priv = 0;
++    fmt.fmt.pix.sizeimage = 0;
++
++    if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0) {
++        LOGE("set format failed\n");
++        return -1;
++    }
+ 
+-int CameraHal::CameraTakePicConfig(int fd_v4l)
+-{
+-        struct v4l2_streamparm parm;
+-        struct v4l2_format fmt;
+-        struct v4l2_crop crop;
+-
+-	memset(&fmt, 0, sizeof(fmt));
+-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        fmt.fmt.pix.pixelformat = PICTURE_FROMAT;
+-        fmt.fmt.pix.width = g_pic_width;
+-        fmt.fmt.pix.height = g_pic_height;
+-        fmt.fmt.pix.sizeimage = fmt.fmt.pix.width * fmt.fmt.pix.height * g_still_bpp / 8;
+-        fmt.fmt.pix.bytesperline = g_pic_width * g_still_bpp / 8;
+-
+-        if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
+-        {
+-                LOGE("set format failed\n");
+-                return -1;
+-        }
++    //Camera Recording VIDIOC_S_PARM
++    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    parm.parm.capture.timeperframe.numerator = 1;
++    parm.parm.capture.timeperframe.denominator = PREVIEW_FRAMERATE;
++    parm.parm.capture.capturemode = g_capture_mode;
+ 
+-        crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        crop.c.left = 0;
+-        crop.c.top = 0;
+-        crop.c.width = g_pic_width;
+-        crop.c.height = g_pic_height;
+-        if (ioctl(fd_v4l, VIDIOC_S_CROP, &crop) < 0)
+-        {
+-                LOGE("set cropping failed\n");
+-                return -1;
+-        }
++    if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0) {
++        LOGE("VIDIOC_S_PARM failed\n");
++        return -1;
++    }
+ 
+-	//Camera Picture VIDIOC_S_PARM
+-	//avoid taking time to reconfig the sensor
+-/*
+-        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        parm.parm.capture.timeperframe.numerator = 1;
+-	parm.parm.capture.timeperframe.denominator = PREVIEW_FRAMERATE;
+-	parm.parm.capture.capturemode = g_capture_mode;
++    // Set rotation
++    ctrl.id = V4L2_CID_PRIVATE_BASE + 0;
++    ctrl.value = g_rotate;
++    if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctrl) < 0) {
++        LOGE("set ctrl failed\n");
++        return -1;
++    }
+ 
+-        if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0)
+-        {
+-                LOGE("VIDIOC_S_PARM failed\n");
+-                return -1;
+-        }
+-*/
++    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    if (ioctl(fd_v4l, VIDIOC_G_FMT, &fmt) < 0)
++        return -1;
++    else {
++        LOGD(" Width = %d\n", fmt.fmt.pix.width);
++        LOGD(" Height = %d \n", fmt.fmt.pix.height);
++        LOGD(" Image size = %d\n", fmt.fmt.pix.sizeimage);
++        LOGD(" pixelformat = %d\n", fmt.fmt.pix.pixelformat);
++             mRecordFrameSize = fmt.fmt.pix.sizeimage;
++    }
+ 
+-        return NO_ERROR;
++    return 0;
+ }
+ 
+-int CameraHal::CameraRecordingConfig(int fd_v4l)
++int CameraHal::cameraPreviewStart()
+ {
+-        struct v4l2_format fmt;
+-        struct v4l2_control ctrl;
+-        struct v4l2_streamparm parm;
+-
+-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-	fmt.fmt.pix.pixelformat = RECORDING_FORMAT;
+-        fmt.fmt.pix.width = g_recording_width;
+-        fmt.fmt.pix.height = g_recording_height;
+-
+-	fmt.fmt.pix.bytesperline = g_recording_width;
+-	fmt.fmt.pix.priv = 0;
+-       	fmt.fmt.pix.sizeimage = 0;
+-
+-	if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
+-        {
+-                LOGE("set format failed\n");
+-                return -1;
+-        }
+-
+-	//Camera Recording VIDIOC_S_PARM
+-        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        parm.parm.capture.timeperframe.numerator = 1;
+-        parm.parm.capture.timeperframe.denominator = PREVIEW_FRAMERATE;
+-	parm.parm.capture.capturemode = g_capture_mode;
++    int i;
++    struct v4l2_buffer buf;
++    enum v4l2_buf_type type;
++    int fd_v4l = camera_device;
+ 
+-        if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0)
+-        {
+-                LOGE("VIDIOC_S_PARM failed\n");
+-                return -1;
+-        }
++    LOG_FUNCTION_NAME
+ 
+-        // Set rotation
+-        ctrl.id = V4L2_CID_PRIVATE_BASE + 0;
+-        ctrl.value = g_rotate;
+-        if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctrl) < 0)
+-        {
+-                LOGE("set ctrl failed\n");
+-                return -1;
+-        }
++    struct v4l2_requestbuffers req;
++    memset(&req, 0, sizeof (req));
+ 
+-        struct v4l2_requestbuffers req;
+-        memset(&req, 0, sizeof (req));
+-        req.count = CAPTURE_BUFFER_NUM;
+-        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        req.memory = V4L2_MEMORY_MMAP;
++    req.count = CAPTURE_BUFFER_NUM;
++    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    req.memory = V4L2_MEMORY_MMAP;
++    if (ioctl(fd_v4l, VIDIOC_REQBUFS, &req) < 0) {
++	    LOGE("v4l_capture_setup: VIDIOC_REQBUFS failed\n");
++	    return -1;
++    }
+ 
+-        if (ioctl(fd_v4l, VIDIOC_REQBUFS, &req) < 0)
+-        {
+-                LOGE("v4l_capture_setup: VIDIOC_REQBUFS failed\n");
+-                return -1;
++    for (i = 0; i < CAPTURE_BUFFER_NUM; i++) {
++        memset(&buf, 0, sizeof (buf));
++        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        buf.index = i;
++        if (ioctl(fd_v4l, VIDIOC_QUERYBUF, &buf) < 0) {
++            LOGE("VIDIOC_QUERYBUF error\n");
++            return -1;
++        } else {
++            LOGE("VIDIOC_QUERYBUF ok\n");
+         }
+ 
+-        return 0;
+-}
++        buffers[i].length = buf.length;
++        buffers[i].offset = (size_t) buf.m.offset;
++        buffers[i].start = (unsigned char *)mmap (NULL, buffers[i].length,
++                    PROT_READ | PROT_WRITE, MAP_SHARED, fd_v4l, buffers[i].offset);
++        memset(buffers[i].start, 0xFF, buffers[i].length);
++        LOGE("buffers[%d].length = %d\n", i, buffers[i].length);
++        LOGE("buffers[%d].offset = 0x%x\n", i, buffers[i].offset);
++        LOGE("buffers[%d].start = 0x%x\n", i, buffers[i].start);
++    }
+ 
+-int CameraHal::CameraStartRecording(int fd_v4l)
+-{
+-        unsigned int i;
+-        struct v4l2_buffer buf;
+-        enum v4l2_buf_type type;
++    nCameraBuffersQueued = 0;
++    for (i = 0; i < CAPTURE_BUFFER_NUM; i++) {
++        memset(&buf, 0, sizeof (buf));
++        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        buf.memory = V4L2_MEMORY_MMAP;
++        buf.index = i;
++        buf.m.offset = buffers[i].offset;
+ 
+-        for (i = 0; i < CAPTURE_BUFFER_NUM; i++)
+-        {
+-                memset(&buf, 0, sizeof (buf));
+-                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-                buf.index = i;
+-                if (ioctl(fd_v4l, VIDIOC_QUERYBUF, &buf) < 0)
+-                {
+-                        LOGE("VIDIOC_QUERYBUF error\n");
+-                        return -1;
+-                }else{
+-			LOGE("VIDIOC_QUERYBUF ok\n");
+-		}
+-
+-                buffers[i].length = buf.length;
+-                buffers[i].offset = (size_t) buf.m.offset;
+-                buffers[i].start = (unsigned char *)mmap (NULL, buffers[i].length,
+-                    PROT_READ | PROT_WRITE, MAP_SHARED,
+-                    fd_v4l, buffers[i].offset);
+-				memset(buffers[i].start, 0xFF, buffers[i].length);
+-		LOGE("buffers[%d].length = %d\n", i, buffers[i].length);
+-		LOGE("buffers[%d].offset = 0x%x\n", i, buffers[i].offset);
+-		LOGE("buffers[%d].start = 0x%x\n", i, buffers[i].start);
+-        }
+-
+-        for (i = 0; i < CAPTURE_BUFFER_NUM; i++)
+-        {
+-                memset(&buf, 0, sizeof (buf));
+-                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-                buf.memory = V4L2_MEMORY_MMAP;
+-                buf.index = i;
+-		buf.m.offset = buffers[i].offset;
+-
+-                if (ioctl (fd_v4l, VIDIOC_QBUF, &buf) < 0) {
+-                        LOGE("VIDIOC_QBUF error\n");
+-                        return -1;
+-                }else{
+-			LOGE("VIDIOC_QBUF ok\n");
+-		}
+-		nCameraBuffersQueued++;
++        if (ioctl (fd_v4l, VIDIOC_QBUF, &buf) < 0) {
++            LOGE("VIDIOC_QBUF error\n");
++            return -1;
++        } else {
++            LOGE("VIDIOC_QBUF ok\n");
+         }
+-
+-        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        if (ioctl (fd_v4l, VIDIOC_STREAMON, &type) < 0) {
+-                LOGE("VIDIOC_STREAMON error\n");
+-                return -1;
+-        }else{
+-		LOGE("VIDIOC_STREAMON ok\n");
+-	}
+-        return 0;
+-}
+-
+-bool CameraHal::initHeapLocked()
+-{
+-    LOG_FUNCTION_NAME
+-
+-    int width, height;
+-    int nSizeBytes;
+-    struct v4l2_requestbuffers creqbuf;
+-
+-    mParameters.getPreviewSize(&width, &height);
+-
+-    LOGD("initHeapLocked: preview size=%dx%d", width, height);
+-
+-    // Note that we enforce yuv422 in setParameters().
+-    int how_big = width * height * 2;
+-    nSizeBytes =  how_big;
+-
+-    if (nSizeBytes & 0xfff)
+-    {
+-        how_big = (nSizeBytes & 0xfffff000) + 0x1000;
++        nCameraBuffersQueued++;
+     }
+ 
+-    mPreviewFrameSize = how_big;
+-    LOGD("mPreviewFrameSize = 0x%x = %d", mPreviewFrameSize, mPreviewFrameSize);
+-
+-
+-    int buffer_count = mOverlay->getBufferCount();
+-    LOGD("mOverlay->getBufferCount=%d",buffer_count);
+-
+-    buffer_count = CAPTURE_BUFFER_NUM;
+-    LOGD("number of buffers = %d\n", buffer_count);
+-    // Check that the camera can accept that many buffers */
+-    creqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    creqbuf.memory = V4L2_MEMORY_MMAP;
+-    creqbuf.count  = buffer_count;
+-
+-    return true;
++    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    if (ioctl (fd_v4l, VIDIOC_STREAMON, &type) < 0) {
++        LOGE("VIDIOC_STREAMON error\n");
++        return -1;
++    } else {
++        LOGE("VIDIOC_STREAMON ok\n");
++    }
+ 
++    return 0;
+ }
+ 
+ sp<IMemoryHeap> CameraHal::getPreviewHeap() const
+ {
+     LOG_FUNCTION_NAME
+ 
+-    return mSurfaceFlingerHeap;
++    return mPreviewHeap;
+ }
+ 
+ sp<IMemoryHeap> CameraHal::getRawHeap() const
+ {
+-    return mRawHeap;
++    return NULL;
+ }
+ 
+ void CameraHal::setCallbacks(notify_callback notify_cb,
+@@ -592,114 +455,95 @@ bool CameraHal::msgTypeEnabled(int32_t msgType)
+ 
+ // ---------------------------------------------------------------------------
+ 
+-int CameraHal::previewThread()
++void CameraHal::previewOneFrame()
+ {
+-    int w, h;
+-    unsigned long offset;
+-    void *croppedImage;
+-    overlay_buffer_t overlaybuffer;    
++    overlay_buffer_t overlaybuffer;
+     struct v4l2_buffer cfilledbuffer;
+-    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    cfilledbuffer.memory = V4L2_MEMORY_MMAP; 
+- 
+-    return NO_ERROR;
+-}
++    int ret, index, i;
+ 
+-int CameraHal::recordThread()
+-{
+-    int w, h;
+-    unsigned long offset;
+-    void *croppedImage;
+-    overlay_buffer_t overlaybuffer;    
+-    struct v4l2_buffer cfilledbuffer;
+     memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
+     cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    cfilledbuffer.memory = V4L2_MEMORY_MMAP; 
++    cfilledbuffer.memory = V4L2_MEMORY_MMAP;
+ 
+-    if (!recordStopped){
++    /* De-queue the next avaliable buffer */
++    while (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
++        LOGE("VIDIOC_DQBUF Failed!!!");
++    }
++    nCameraBuffersQueued--;
++    index = cfilledbuffer.index;
++    /* Notify overlay of a new frame. */
++    if (mOverlay != 0) {
++        mOverlay->dequeueBuffer(&overlaybuffer);
++        void* address = mOverlay->getBufferAddress(overlaybuffer);
++        nOverlayBuffersQueued--;
++        memcpy(address, (void*)buffers[cfilledbuffer.index].start,  mRecordFrameSize);
++        if (mOverlay->queueBuffer(overlaybuffer))
++            LOGD("qbuf failed. May be bcos stream was not turned on yet. So try again");
++        else
++            nOverlayBuffersQueued++;
++    }
+ 
+-        /* De-queue the next avaliable buffer */
+-	nCameraBuffersQueued--;    
+-        while (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
+-            LOGE("VIDIOC_DQBUF Failed");
++    if (mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
++        for(i = 0 ; i < kPreviewBufferCount; i ++) {
++            if (mPreviewBufferUsing[i] == 0) {
++                memcpy(mPreviewBuffer[i]->pointer(),
++		       (void*)buffers[cfilledbuffer.index].start, mRecordFrameSize);
++                mDataCb(CAMERA_MSG_PREVIEW_FRAME, mPreviewBuffer[i], mCallbackCookie);
++                mPreviewBufferUsing[i] = 0;
++                break;
++            } else
++                LOGD("no Buffer can be used for preview\n");
+         }
++    }
+ 
+-        mCurrentRecordFrame++;
+-
+-        //LOGD("recordThread: CurrentRecordFrame %d", mCurrentRecordFrame);
+-       
+-	if (mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) {
+-        	int i;
+-		nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+-        	for(i = 0 ; i < videoBufferCount; i ++)
+-        	{
+-            		if(0 == mVideoBufferUsing[i])
+-            		{
+-                		//LOGD("send buffer:%d pointer:0x%x", i,(unsigned int)(mVideoBuffer[i]->pointer()));
+-#ifdef DUMP_CAPTURE_YUV        
+-       		if(record_yuvFile)
+-       		{
+-            		int len = fwrite(buffers[cfilledbuffer.index].start, 1, mRecordFrameSize, record_yuvFile);
+-            		//LOGI("CameraHal:: WRITE FILE len %d",len);            
+-       		}        
+-#endif
+-                		memcpy(mVideoBuffer[i]->pointer(),(void*)buffers[cfilledbuffer.index].start,mRecordFrameSize);
+-                		mVideoBufferUsing[i] = 1;
+-				mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoBuffer[i], mCallbackCookie);
+-                		break;
+-            		}else{
+-                		//LOGD("no Buffer can be used \n");
+-            		}
+-        	}
+-    	}
+-        
+-	nCameraBuffersQueued++;
+-	if (ioctl(camera_device, VIDIOC_QBUF, &cfilledbuffer) < 0) {
+-        	LOGE("nextPreview VIDIOC_QBUF Failed!!!");
+-    	}
++    if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
++        nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
++
++        for(i = 0 ; i < kVideoBufferCount; i ++) {
++            if(mVideoBufferUsing[i] == 0) {
++                 memcpy(mVideoBuffer[i]->pointer(),
++		        (void*)buffers[cfilledbuffer.index].start, mRecordFrameSize);
++                 mVideoBufferUsing[i] = 1;
++                 mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoBuffer[i], mCallbackCookie);
++                 break;
++            } else
++                 LOGD("no Buffer can be used for record\n");
++        }
+     }
+-    return NO_ERROR;
++
++    while (ioctl(camera_device, VIDIOC_QBUF, &cfilledbuffer) < 0) {
++	    LOGE("VIDIOC_QBUF Failed.");
++    }
++    nCameraBuffersQueued++;
++    return;
+ }
+ 
+-status_t CameraHal::setOverlay(const sp<Overlay> &overlay)
++int CameraHal::previewThread()
+ {
+-    Mutex::Autolock lock(mLock);
+-    if (overlay == NULL)
+-        LOGE("Trying to set overlay, but overlay is null!");
+-    mOverlay = overlay;
++    if (mPreviewRunning) {
++	previewOneFrame();
++    }
++
+     return NO_ERROR;
+ }
+ 
+-#ifdef CAPTURE_ONLY_TEST
+-status_t CameraHal::startPreview(preview_callback cb, void* user)
++status_t CameraHal::setOverlay(const sp<Overlay> &overlay)
+ {
+     LOG_FUNCTION_NAME
+ 
+     Mutex::Autolock lock(mLock);
+-    if (mPreviewThread != 0) {
+-        // already running
+-        return INVALID_OPERATION;
+-    }
+-
+-    int width, height;
+-    mParameters.setPreviewSize(PICTURE_WIDTH, PICTURE_HEIGHT);
+-    mParameters.getPreviewSize(&width, &height);
+-    LOGI("w=%d h=%d", width, height);
++    if (overlay == NULL)
++        LOGE("Trying to set overlay, but overlay is null!");
++    mOverlay = overlay;
+ 
+-    previewStopped = false;
+-    mPreviewRunning = true;
+-    mPreviewCallback = cb;
+-    mPreviewCallbackCookie = user;
+-    mPreviewThread = new PreviewThread(this);
+     return NO_ERROR;
+ }
+-#else
++
+ status_t CameraHal::startPreview()
+ {
+     LOG_FUNCTION_NAME
+ 
+-    int width;
+-    int height;
++    int i, width, height;
+ 
+     Mutex::Autolock lock(mLock);
+     if (mPreviewRunning != 0) {
+@@ -707,203 +551,113 @@ status_t CameraHal::startPreview()
+         return INVALID_OPERATION;
+     }
+ 
+-if(mIsTakingPic == 0){
+-#ifdef DUMP_CAPTURE_YUV        
+-       capture_yuvFile = fopen("/sdcard/capture.yuv","wb");
+-       LOGD ("capture.yuv file opened!");
+-#endif
+-
+-    CameraGetFBInfo();
++    cameraPreviewConfig();
+ 
+-    if (CameraOpen() < 0) {
+-        LOGE ("Could not open the camera device: %d, errno: %d", camera_device, errno);
+-        return -1;
+-    }else{
+-        LOGE ("Opened the camera device in preview!");
++    LOGD("Clear the old preview memory and Init new memory");
++    mPreviewHeap.clear();
++    for(i = 0; i < kPreviewBufferCount; i++)
++        mPreviewBuffer[i].clear();
++    mPreviewHeap = new MemoryHeapBase(mRecordFrameSize * kPreviewBufferCount);
++    for(i = 0; i < kPreviewBufferCount; i++) {
++        mPreviewBuffer[i] = new MemoryBase(mPreviewHeap,
++	                       mRecordFrameSize * i, mRecordFrameSize);
+     }
+ 
+-    int width, height;
+-    mParameters.getPreviewSize(&width, &height);
+-    LOGI("Original Preview Width=%d Height=%d", width, height);
+-
+-    g_recording_width = width;
+-    g_recording_height = height;
+-
+-#ifdef IMX51_3STACK
+-    //mParameters.getPreviewSize(&g_preview_height, &g_preview_width);
+-    g_preview_height = PREVIEW_WIDTH;
+-    g_preview_width = PREVIEW_HEIGHT;
+-    g_display_top = 30;
+-    g_display_left = (g_display_width - g_preview_width) / 2;
+-#else
+-    //mParameters.getPreviewSize(&g_preview_width, &g_preview_height);
+-    g_preview_height = PREVIEW_HEIGHT;
+-    g_preview_width = PREVIEW_WIDTH;
+-    g_display_left = 45;
+-    g_display_top = 0;
+-#endif
+-
+-    CameraPreviewConfig(camera_device);
+-}else{
+-    mIsTakingPic = 0;
+-    LOGD("Camera taking picture closed!");
+-}
+-
+-    /* turn on streaming */
+-    int overlay = 1;
++    cameraPreviewStart();
+ 
+-    if (ioctl(camera_device, VIDIOC_OVERLAY, &overlay) < 0)
+-    {
+-          LOGE("VIDIOC_OVERLAY start failed\n");
+-		return -1;
+-    }
+-    else LOGE("VIDIOC_OVERLAY started\n");
+-    LOGD("camera is in viewfinder mode...");
++    mPreviewThread = new PreviewThread(this);
+ 
+-    previewStopped = false;
+     mPreviewRunning = true;
+ 
+     return NO_ERROR;
+ }
+-#endif
+ 
+-#ifdef CAPTURE_ONLY_TEST
+ void CameraHal::stopPreview()
+ {
+     LOG_FUNCTION_NAME
+ 
+-    sp<PreviewThread> previewThread;
+-    struct v4l2_requestbuffers creqbuf;
+-
+-    { // scope for the lock
+-        Mutex::Autolock lock(mLock);
+-        previewStopped = true;
+-        mPreviewRunning = false;
+-    }
+-
+-    { // scope for the lock
+-        Mutex::Autolock lock(mLock);
+-        previewThread = mPreviewThread;
+-    }
+-
+-    // don't hold the lock while waiting for the thread to quit
+-    if (previewThread != 0) {
+-        previewThread->requestExitAndWait();
+-    }
+-
+     Mutex::Autolock lock(mLock);
+-    mPreviewThread.clear();
++    /* Cannot stop preview in recording */
++    if(mMsgEnabled & CAMERA_MSG_VIDEO_FRAME)
++	    return;
++    cameraPreviewStop();
+ }
+-#else
+-void CameraHal::stopPreview()
+-{
+-    LOG_FUNCTION_NAME
+ 
++void CameraHal::cameraPreviewStop()
++{
+     sp<PreviewThread> previewThread;
+     struct v4l2_requestbuffers creqbuf;
+ 
+-    { // scope for the lock
+-        Mutex::Autolock lock(mLock);
+-        previewStopped = true;
+-    }
++    LOG_FUNCTION_NAME
+ 
+     if (mPreviewRunning != 0) {
++        int ret;
++        struct v4l2_requestbuffers creqbuf;
++        struct v4l2_buffer cfilledbuffer;
+ 
+-        /* Turn off streaming */
+-        int overlay = 0;
+-        if (ioctl(camera_device, VIDIOC_OVERLAY, &overlay) < 0)
+-        {
+-                LOGE("VIDIOC_OVERLAY stop failed\n");
+-        }
+-        LOGD("Turned off Viewfinder Mode\n");
++        mPreviewRunning = 0;
+ 
+-        if(mIsTakingPic == 0){
+-                CameraClose();
+-#ifdef DUMP_CAPTURE_YUV        
+-               fclose(capture_yuvFile);
+-               LOGD ("capture.yuv file closed!");
+-#endif
++	{// scope for the lock
++//	Mutex::Autolock lock(mLock);
++        previewThread = mPreviewThread;
++	}
++
++        if (previewThread != 0) {
++            previewThread->requestExitAndWait();
+         }
+ 
+-        mPreviewRunning = 0;
+-    }
++        memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
++        cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        cfilledbuffer.memory = V4L2_MEMORY_MMAP;
+ 
++        while(nCameraBuffersQueued){
++            LOGD("DQUEUING UNDQUEUED BUFFERS enter = %d",nCameraBuffersQueued);
++            if (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
++                LOGE("VIDIOC_DQBUF Failed!!!");
++            }
++            nCameraBuffersQueued--;
++            LOGD("DQUEUING UNDQUEUED BUFFERS exit = %d",nCameraBuffersQueued);
++        }
+ 
++        creqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        if (ioctl(camera_device, VIDIOC_STREAMOFF, &creqbuf.type) == -1) {
++            LOGE("VIDIOC_STREAMOFF Failed");
++        }
++    }
+ 
+-    singleton.clear();
++//    Mutex::Autolock lock(mLock);
++    mPreviewThread.clear();
+ }
+-#endif
+ 
+ bool CameraHal::previewEnabled()
+ {
+-    return (!previewStopped);
++    return mPreviewRunning;
+ }
+ 
+ status_t CameraHal::startRecording()
+ {
+     LOG_FUNCTION_NAME 
++    int w,h;
++    int i = 0, mRecordingFrameSize= 0;
+ 
+-    if (mRecordThread != 0) {
+-	LOGI("mRecordThread already exist!");
++    if (mRecordRunning !=0 ) {
++        LOGI("Recording is already existed\n");
+         return INVALID_OPERATION;
+     }
+ 
+-#ifdef DUMP_CAPTURE_YUV
+-    record_yuvFile = fopen("/sdcard/recording.yuv","wb");
+-#endif
+-
+-#ifdef CAPTURE_ONLY_TEST
+-    if (CameraOpen() < 0) {
+-        LOGE ("Could not open the camera device in recording: %d, errno: %d", camera_device, errno);
+-        return -1;
+-    }else{
+-        LOGE ("Opened the camera device in recording!");
++    LOGD("Clear the old memory ");
++    mVideoHeap.clear();
++    for(i = 0; i < kVideoBufferCount; i++)
++        mVideoBuffer[i].clear();
++    LOGD("Init the video Memory %d", mRecordFrameSize);
++    mVideoHeap = new MemoryHeapBase(mRecordFrameSize * kVideoBufferCount);
++    for(i = 0; i < kVideoBufferCount; i++) {
++        LOGD("Init Video Buffer:%d ",i);
++        mVideoBuffer[i] = new MemoryBase(mVideoHeap,
++	                       mRecordFrameSize * i, mRecordFrameSize);
+     }
+-#endif
++    mRecordRunning = true;
+ 
+-    CameraRecordingConfig(camera_device);
+-
+-    struct v4l2_format fmt; 
+-    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    if (ioctl(camera_device, VIDIOC_G_FMT, &fmt) < 0)
+-    {
+-            LOGD("get format failed\n");
+-            return -1;
+-    }else{
+-            LOGD("\t Width = %d", fmt.fmt.pix.width);
+-            LOGD("\t Height = %d", fmt.fmt.pix.height);
+-            LOGD("\t Image size = %d\n", fmt.fmt.pix.sizeimage);
+-            LOGD("\t pixelformat = %d\n", fmt.fmt.pix.pixelformat);
+-    }
+-
+-    // Just for the same size case
+-    //mRecordFrameSize = mPreviewFrameSize;
+-    mRecordFrameSize = fmt.fmt.pix.sizeimage;
+-    LOGD("mRecordFrameSize = %d\n", mRecordFrameSize);
+-
+-    if (mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) {
+-        int i = 0;
+-        LOGD("Clear the old memory ");
+-        mVideoHeap.clear();
+-        for(i = 0; i < videoBufferCount; i++)
+-        {
+-            mVideoBuffer[i].clear();
+-        }
+-        LOGD("Init the video Memory %d", mRecordFrameSize);
+-        mVideoHeap = new MemoryHeapBase(mRecordFrameSize * videoBufferCount);
+-        for(i = 0; i < videoBufferCount; i++)
+-        {
+-            LOGD("Init Video Buffer:%d ",i);
+-            mVideoBuffer[i] = new MemoryBase(mVideoHeap, mRecordFrameSize*i, mRecordFrameSize);
+-        }
+-    }
+-    
+-    CameraStartRecording(camera_device);
+-
+-    LOGD("Recording:camera is streaming...");
+-
+-    recordStopped = false;
+-    mRecordThread = new RecordThread(this);
+     return NO_ERROR;
+ }
+ 
+@@ -911,93 +665,47 @@ void CameraHal::stopRecording()
+ {
+     LOG_FUNCTION_NAME
+ 
+-    sp<RecordThread> recordThread;
+-    struct v4l2_requestbuffers creqbuf;
+-
+-    {// scope for the lock
+-        Mutex::Autolock lock(mLock);
+-        recordStopped = true;
++    mRecordRunning = false;
++    if(mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
++        LOGD("Preview is still in progress\n");
+     }
+-
+-    if (mRecordThread != 0) {
+-
+-        struct v4l2_buffer cfilledbuffer;
+-        cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        cfilledbuffer.memory = V4L2_MEMORY_MMAP;
+-        
+-   	while(nCameraBuffersQueued){
+-		LOGD("DQUEUING UNDQUEUED BUFFERS = %d",nCameraBuffersQueued);
+-        	nCameraBuffersQueued--;
+-        	if (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
+-        		LOGE("VIDIOC_DQBUF Failed!!!");
+-        	}
+-    	}
+-
+-       	/* Turn off streaming */
+-        creqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        if (ioctl(camera_device, VIDIOC_STREAMOFF, &creqbuf.type) == -1) {
+-            LOGE("VIDIOC_STREAMOFF Failed");
+-        }
+-        LOGD("Recording:Turned off streaming\n");
+-    }
+-
+-#ifdef DUMP_CAPTURE_YUV
+-    fclose(record_yuvFile);
+-    LOGD("Closed recorded_yuvfile captured\n");
+-#endif
+-
+-    {// scope for the lock
+-        Mutex::Autolock lock(mLock);
+-        recordThread = mRecordThread;
+-    }
+-
+-    // don't hold the lock while waiting for the thread to quit
+-    if (recordThread != 0) {
+-        recordThread->requestExitAndWait();
+-    }
+-
+-#ifdef CAPTURE_ONLY_TEST
+-    CameraClose();
+-#endif
+-
+-    Mutex::Autolock lock(mLock);
+-    mRecordThread.clear();
++    cameraPreviewStop();
+ }
+ 
+ bool CameraHal::recordingEnabled()
+ {
+     LOG_FUNCTION_NAME
+-    return (!recordStopped);
++    return (mPreviewRunning && mRecordRunning);
+ }
+ 
+ static void debugShowFPS()
+ {
+-     static int mFrameCount = 0;
+-     static int mLastFrameCount = 0;
+-     static nsecs_t mLastFpsTime = 0;
+-     static float mFps = 0;
+-     mFrameCount++;
+-     if (!(mFrameCount & 0x1F)) {
+-         nsecs_t now = systemTime();
+-         nsecs_t diff = now - mLastFpsTime;
+-         mFps =  ((mFrameCount - mLastFrameCount) * float(s2ns(1))) / diff;
+-         mLastFpsTime = now;
+-         mLastFrameCount = mFrameCount;
+-         LOGD("####### [%d] Frames, %f FPS", mFrameCount, mFps);
+-     }
++    static int mFrameCount = 0;
++    static int mLastFrameCount = 0;
++    static nsecs_t mLastFpsTime = 0;
++    static float mFps = 0;
++    mFrameCount++;
++    if (!(mFrameCount & 0x1F)) {
++        nsecs_t now = systemTime();
++        nsecs_t diff = now - mLastFpsTime;
++        mFps =  ((mFrameCount - mLastFrameCount) * float(s2ns(1))) / diff;
++        mLastFpsTime = now;
++        mLastFrameCount = mFrameCount;
++        LOGD("####### [%d] Frames, %f FPS", mFrameCount, mFps);
++    }
+ }
+ 
+ void CameraHal::releaseRecordingFrame(const sp<IMemory>& mem)
+ {
+-    //LOG_FUNCTION_NAME
+     ssize_t offset;
+     size_t  size;
+     int index;
++
+     debugShowFPS();
+     offset = mem->offset();
+     size   = mem->size();
+     index = offset / size;
+-    //LOGD("Index[%d] Buffer has been released,pointer = %p",index,mem->pointer());
++
+     mVideoBufferUsing[index] = 0;
+ }
+ 
+@@ -1039,15 +747,7 @@ status_t CameraHal::cancelAutoFocus()
+     return NO_ERROR;
+ }
+ 
+-/*static*/ int CameraHal::beginPictureThread(void *cookie)
+-{
+-    LOG_FUNCTION_NAME
+-
+-    CameraHal *c = (CameraHal *)cookie;
+-    return c->pictureThread();
+-}
+-
+-int CameraHal::pictureThread()
++int CameraHal::cameraTakePicture()
+ {
+ 
+     int w, h;
+@@ -1062,7 +762,7 @@ int CameraHal::pictureThread()
+     LOG_FUNCTION_NAME
+ 
+     if (mMsgEnabled & CAMERA_MSG_SHUTTER) {
+-	LOGI("CAMERA_MSG_SHUTTER");
++        LOGI("CAMERA_MSG_SHUTTER");
+         mNotifyCb(CAMERA_MSG_SHUTTER, 0, 0, mCallbackCookie);
+     }
+ 
+@@ -1070,55 +770,54 @@ int CameraHal::pictureThread()
+     mParameters.getPictureSize(&w, &h);
+     LOGD("Picture Size: Width = %d \tHeight = %d", w, h);
+ 
+-    if(CameraTakePicConfig(camera_device) < 0){
+-	    return -1;
++    if(cameraTakePicConfig() < 0){
++        return -1;
+     }
+ 
+     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+     if (ioctl(camera_device, VIDIOC_G_FMT, &fmt) < 0) {
+-            LOGE("get format failed\n");
+-            return -1;
++        LOGE("get format failed\n");
++        return -1;
+     }
+ 
+     buf1 = (char *)malloc(fmt.fmt.pix.sizeimage);
+     if (!buf1){
+-            LOGE("buffer malloc error!\n");
+-            free(buf1);
+-	    return -1;
++        LOGE("buffer malloc error!\n");
++        free(buf1);
++        return -1;
+     }
+ 
+     memset(buf1, 0, fmt.fmt.pix.sizeimage);
+ 
+     if (read(camera_device, buf1, fmt.fmt.pix.sizeimage) != fmt.fmt.pix.sizeimage) {
+-            LOGE("v4l2 read error.\n");
+-   	    free(buf1);
+-	    return -1;
++        LOGE("v4l2 read error.\n");
++        free(buf1);
++        return -1;
+     }
+ 
+     LOGD("pictureThread: generated a picture");
+ 
+ #ifdef DUMP_CAPTURE_YUV        
+-       if(capture_yuvFile)
+-       {
+-            int len = fwrite((void*)buf1, 1, fmt.fmt.pix.sizeimage, capture_yuvFile);
+-            LOGI("CameraHal:: WRITE FILE len %d",len);            
+-       }
++    if(capture_yuvFile) {
++        int len = fwrite((void*)buf1, 1, fmt.fmt.pix.sizeimage, capture_yuvFile);
++        LOGI("CameraHal:: WRITE FILE len %d",len);
++    }
+ #endif
+ 
+ #ifdef USE_FSL_JPEG_ENC
+-        sp<MemoryBase> jpegMemBase = encodeImage((void*)buf1, fmt.fmt.pix.sizeimage);
+-        if (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
+-		LOGI("==========CAMERA_MSG_COMPRESSED_IMAGE");
+-		mDataCb(CAMERA_MSG_COMPRESSED_IMAGE, jpegMemBase, mCallbackCookie);
+-	}
++    sp<MemoryBase> jpegMemBase = encodeImage((void*)buf1, fmt.fmt.pix.sizeimage);
++    if (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
++        LOGI("==========CAMERA_MSG_COMPRESSED_IMAGE");
++        mDataCb(CAMERA_MSG_COMPRESSED_IMAGE, jpegMemBase, mCallbackCookie);
++    }
+ 
+ #else
+-        LOGI("CameraHal::pictureThread get default image");     
+-        sp<MemoryHeapBase> heap = new MemoryHeapBase(kCannedJpegSize);
+-        sp<MemoryBase> mem = new MemoryBase(heap, 0, kCannedJpegSize);
+-        memcpy(heap->base(), kCannedJpeg, kCannedJpegSize);
+-        if (mJpegPictureCallback)
+-            mJpegPictureCallback(mem, mPictureCallbackCookie);
++    LOGI("CameraHal::pictureThread get default image");
++    sp<MemoryHeapBase> heap = new MemoryHeapBase(kCannedJpegSize);
++    sp<MemoryBase> mem = new MemoryBase(heap, 0, kCannedJpegSize);
++    memcpy(heap->base(), kCannedJpeg, kCannedJpegSize);
++    if (mJpegPictureCallback)
++        mJpegPictureCallback(mem, mPictureCallbackCookie);
+ #endif
+ 
+ exit0:
+@@ -1135,12 +834,13 @@ status_t CameraHal::takePicture()
+     mIsTakingPic = 1;
+     LOGD("Camera taking picture opened!");
+ 
+-    stopPreview();
++    /* Stop preview, start picture capture, and then restart preview again */
++    cameraPreviewStop();
+ 
+-    LOGD("Creating Picture Thread");
+-    //##############################TODO use  thread
+-    if (createThread(beginPictureThread, this) == false)
+-        return -1;
++    cameraTakePicture();
++
++    cameraPreviewConfig();
++    cameraPreviewStart();
+ 
+     return NO_ERROR;
+ }
+@@ -1178,8 +878,9 @@ status_t CameraHal::setParameters(const CameraParameters& params)
+ 
+     Mutex::Autolock lock(mLock);
+ 
+-    if (strcmp(params.getPreviewFormat(), PREVIEW_FORMAT) != 0) {
+-        LOGE("Only yuv422i preview is supported");
++    if (!(strcmp(params.getPreviewFormat(), "yuv420sp") == 0) ||
++	(strcmp(params.getPreviewFormat(), "yuv420i") == 0)) {
++        LOGE("Only yuv420 or yuv420i is supported");
+         return -1;
+     }
+ 
+@@ -1204,21 +905,13 @@ status_t CameraHal::setParameters(const CameraParameters& params)
+ 
+     mParameters = params;
+ 
+-    mParameters.getPreviewSize(&w, &h);
+-    doubledPreviewWidth = false;
+-    doubledPreviewHeight = false;
+-    if (w < MIN_WIDTH){
+-        LOGE("Preview Width < MIN");
+-        return -1;
+-    }
+-    if (h < MIN_HEIGHT){
+-        LOGE("Preview Height < MIN");
+-        return -1;
++    mParameters.getPreviewSize(&mPreviewWidth, &mPreviewHeight);
++    mParameters.getPictureSize(&mPictureWidth, &mPictureHeight);
++    if (!mPictureWidth || !mPictureHeight) {
++	/* This is a hack. MMS APP is not setting the resolution correctly. So hardcoding it. */
++        mParameters.setPictureSize(PICTURE_WIDTH, PICTURE_HEIGHT);
++        mParameters.getPictureSize(&mPictureWidth, &mPictureHeight);
+     }
+-    mParameters.setPreviewSize(w, h);
+-
+-    /* This is a hack. MMS APP is not setting the resolution correctly. So hardcoding it. */
+-    mParameters.setPictureSize(PICTURE_WIDTH, PICTURE_HEIGHT);
+ 
+     return NO_ERROR;
+ }
+@@ -1226,23 +919,9 @@ status_t CameraHal::setParameters(const CameraParameters& params)
+ CameraParameters CameraHal::getParameters() const
+ {
+     LOG_FUNCTION_NAME
+-    CameraParameters params;
+ 
+-    {
+-        Mutex::Autolock lock(mLock);
+-        params = mParameters;
+-    }
+-
+-    int w, h;
+-    params.getPreviewSize(&w, &h);
+-    if (doubledPreviewWidth){
+-        w = w >> 1;
+-    }
+-    if (doubledPreviewHeight){
+-        h= h >> 1;
+-    }
+-    params.setPreviewSize(w, h);
+-    return params;
++    Mutex::Autolock lock(mLock);
++    return mParameters;
+ }
+ 
+ status_t CameraHal::sendCommand(int32_t command, int32_t arg1,
+@@ -1329,7 +1008,7 @@ sp<MemoryBase> CameraHal::encodeImage(void *buffer, uint32_t bufflen)
+     g_JpegDataSize = 0;//Total size of g_JpegData
+     g_JpegDataLen = 0;//Valid data len of g_JpegData
+     g_JpegData = NULL;//Buffer to hold jpeg data
+-    size = width*height*3/2;
++    size = width * height * 3 / 2;
+     LOGI("CameraHal::encodeImage:buffer 0x%x, bufflen %d,width %d,height %d",buffer,bufflen,width,height);
+     sp<MemoryHeapBase> mJpegImageHeap = new MemoryHeapBase(size);
+ 
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index 3df58ca..f6bf781 100644
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -50,26 +50,17 @@
+ #define VIDEO_DEVICE            "/dev/video0"
+ #define MIN_WIDTH               176
+ #define MIN_HEIGHT              144
+-#define DISPLAY_WIDTH           480     //lcd width
+-#define DISPLAY_HEIGHT          640     //lcd height
+ 
+-#ifdef IMX51_3STACK
+-#define PREVIEW_WIDTH           535     //default preview width
+-#define PREVIEW_HEIGHT          400     //default preview height
+-#else
+-#define PREVIEW_WIDTH           635     //default preview width
+-#define PREVIEW_HEIGHT          480     //default preview height
+-#endif
+-
+-#define PREVIEW_FORMAT          "yuv422i"
+ #define PREVIEW_FRAMERATE       30
+ #define PICTURE_WIDTH           640     //default picture width
+ #define PICTURE_HEIGHT          480     //default picture height
+ #define PICTURE_FROMAT          V4L2_PIX_FMT_YUV420     //default picture format
+-#define RECORDING_WIDTH_NORMAL  352     //default recording width
++#define RECORDING_WIDTH_NORMAL  352    //default recording width
+ #define RECORDING_HEIGHT_NORMAL 288     //default recording height
+ #define RECORDING_WIDTH_LOW     176     //default recording width
+ #define RECORDING_HEIGHT_LOW    144     //default recording height
++
++#undef RECORDING_FORMAT_NV12
+ #ifdef  RECORDING_FORMAT_NV12
+ #define RECORDING_FORMAT        V4L2_PIX_FMT_NV12    //recording format
+ #else
+@@ -161,33 +152,14 @@ private:
+         }
+     };
+ 
+-    class RecordThread : public Thread {
+-        CameraHal* mHardware;
+-    public:
+-        RecordThread(CameraHal* hw)
+-            : Thread(false), mHardware(hw) { }
+-        virtual void onFirstRef() {
+-            run("CameraRecordThread", PRIORITY_URGENT_DISPLAY);
+-        }
+-        virtual bool threadLoop() {
+-            mHardware->recordThread();
+-            // loop until we need to quit
+-            return true;
+-        }
+-    };
+-
+     void initDefaultParameters();
+     bool initHeapLocked();
+ 
+     int previewThread();
+-    int recordThread();
+ 
+     static int beginAutoFocusThread(void *cookie);
+     int autoFocusThread();
+ 
+-    static int beginPictureThread(void *cookie);
+-    int pictureThread();
+-
+     int validateSize(int w, int h);
+     void* cropImage(unsigned long buffer);
+     void convertYUYVtoYUV422SP(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height);
+@@ -198,27 +170,28 @@ private:
+     sp<MemoryBase> encodeImage(void *buffer, uint32_t bufflen);
+ #endif
+ 
+-    int CameraOpen();
+-    int CameraClose();
+-    int CameraPreviewConfig(int fd_v4l);
+-    int CameraRecordingConfig(int fd_v4l);
+-    int CameraStartRecording(int fd_v4l);
+-    int CameraTakePicConfig(int fd_v4l);
+-    int CameraGetFBInfo(void);
++    int cameraCreate();
++    int cameraDestroy();
++    int cameraPreviewConfig();
++    int cameraPreviewStart();
++    void cameraPreviewStop();
++    int cameraTakePicConfig();
++    int cameraTakePicture();
++    void previewOneFrame();
+ 
+     int fcount;
+     mutable Mutex       mLock;
+ 
+     CameraParameters    mParameters;
+ 
+-    sp<MemoryHeapBase>  mHeap;
+-    sp<MemoryHeapBase>  mSurfaceFlingerHeap;
+-    sp<MemoryHeapBase>  mPictureHeap;
+-    sp<MemoryHeapBase>  mRawHeap;
+-    sp<MemoryBase>      mSurfaceFlingerBuffer;
+-
++    static const int    kPreviewBufferCount = 1;
++    sp<MemoryHeapBase>  mPreviewHeap;
++    sp<MemoryBase>      mPreviewBuffer[kPreviewBufferCount];
++    int                 mPreviewBufferUsing[kPreviewBufferCount];
+     bool                mPreviewRunning;
+     int                 mPreviewFrameSize;
++    int			mPreviewHeight;
++    int			mPreviewWidth;
+ 
+     // protected by mLock
+     sp<Overlay>         mOverlay;
+@@ -234,19 +207,22 @@ private:
+     bool                mCameraOpened;
+     bool                mIsTakingPic;;
+ 
+-    sp<RecordThread>    mRecordThread;
++    int			mPictureHeight;
++    int			mPictureWidth;
++
+     int 		mRecordFrameSize;
+     bool                mRecordRunning;
+     int                 mCurrentRecordFrame;
+     int 		nCameraBuffersQueued;
+    
+-    static const int    videoBufferCount = 3;
++    static const int    kVideoBufferCount = 3;
+     sp<MemoryHeapBase>  mVideoHeap;
+-    sp<MemoryBase>      mVideoBuffer[videoBufferCount];
+-    int   		mVideoBufferUsing[videoBufferCount];
++    sp<MemoryBase>      mVideoBuffer[kVideoBufferCount];
++    int   		mVideoBufferUsing[kVideoBufferCount];
+ 
+     // only used from PreviewThread
+     int                 mCurrentPreviewFrame;
++    int 		nOverlayBuffersQueued;
+ 
+     bool previewStopped;
+     bool recordStopped;
+@@ -257,18 +233,7 @@ private:
+     static int g_camera_framerate;
+ 
+     //used for priview
+-    static int g_sensor_width;
+-    static int g_sensor_height;
+-    static int g_sensor_top;
+-    static int g_sensor_left;
+-    static int g_display_width;
+-    static int g_display_height;
+-    static int g_display_top;
+-    static int g_display_left;
+     static int g_rotate;
+-    static int g_display_lcd;
+-    static int g_preview_width;
+-    static int g_preview_height;
+     static int g_recording_width;
+     static int g_recording_height;
+     static int g_recording_level;
+-- 
+1.8.0
+

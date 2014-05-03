@@ -1,0 +1,3445 @@
+From 2203d209fb36f63cd19ee5c5f6d0757c11edc010 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Wed, 19 Oct 2011 11:03:00 +0800
+Subject: [PATCH 192/486] ENGR00160300 modify mx6 hardware composer according
+ to new ipu driver.
+
+Old hardware composer uses ipu lib to implement the resize and CSC.
+New kernel for imx6 has refactor the ipu driver and replace ipu lib.
+So, hardware composer must directly access ipu driver accordingly.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ Android.mk                       |   2 +-
+ mx6/hwcomposer/Android.mk        |   2 +-
+ mx6/hwcomposer/BG_device.cpp     | 348 ++++++++++-----------
+ mx6/hwcomposer/FG_device.cpp     | 646 +++++++++++++++++++--------------------
+ mx6/hwcomposer/blit_gpu.cpp      | 115 ++++---
+ mx6/hwcomposer/blit_gpu.h        | 117 ++++---
+ mx6/hwcomposer/blit_ipu.cpp      | 389 +++++++++++------------
+ mx6/hwcomposer/blit_ipu.h        | 140 ++++-----
+ mx6/hwcomposer/hwc_common.cpp    | 464 ++++++++++++++--------------
+ mx6/hwcomposer/hwc_common.h      | 468 ++++++++++++++--------------
+ mx6/hwcomposer/hwcomposer.cpp    | 126 +++++---
+ mx6/hwcomposer/output_device.cpp | 343 +++++++++++----------
+ 12 files changed, 1634 insertions(+), 1526 deletions(-)
+
+diff --git a/Android.mk b/Android.mk
+index 4f175b6..cfb525b 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -1,6 +1,6 @@
+ common_imx_dirs := libsensors alsa
+ mx5x_dirs := $(common_imx_dirs) libgps mx5x/libcopybit mx5x/libgralloc  mx5x/hwcomposer mx5x/libcamera
+-mx6_dirs := $(common_imx_dirs) mx6/libgralloc
++mx6_dirs := $(common_imx_dirs) mx6/libgralloc mx6/hwcomposer
+ 
+ ifeq ($(TARGET_BOARD_PLATFORM),imx6)
+   include $(call all-named-subdir-makefiles,$(mx6_dirs))
+diff --git a/mx6/hwcomposer/Android.mk b/mx6/hwcomposer/Android.mk
+index f85449b..70f0e25 100755
+--- a/mx6/hwcomposer/Android.mk
++++ b/mx6/hwcomposer/Android.mk
+@@ -20,7 +20,7 @@ LOCAL_PATH := $(call my-dir)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libEGL libipu libcutils libutils
++LOCAL_SHARED_LIBRARIES := liblog libEGL libipu libcutils libutils libui
+ LOCAL_SRC_FILES := hwcomposer.cpp BG_device.cpp FG_device.cpp hwc_common.cpp blit_gpu.cpp blit_ipu.cpp output_device.cpp
+ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+ LOCAL_C_INCLUDES += hardware/imx/mx6/libgralloc
+diff --git a/mx6/hwcomposer/BG_device.cpp b/mx6/hwcomposer/BG_device.cpp
+index 4a5de6c..7826449 100755
+--- a/mx6/hwcomposer/BG_device.cpp
++++ b/mx6/hwcomposer/BG_device.cpp
+@@ -1,174 +1,174 @@
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-#include <sys/mman.h>
+-#include <sys/ioctl.h>
+-#include <hardware/hardware.h>
+-//#include <hardware/overlay.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-/*****************************************************************************/
+-using namespace android;
+-
+-//note: the fb1 in mx5x is hdmi port and should use 1080p=1920_1080. 
+-BG_device::BG_device(const char *dev_name, int usage) 
+-			: output_device(dev_name, usage)
+-{
+-		init();
+-}
+-
+-BG_device::~BG_device()
+-{
+-		uninit();
+-}
+-
+-int BG_device::init()
+-{
+-	  int status = -EINVAL;
+-	  int fbSize = 0;
+-	  void *vaddr = NULL;
+-
+-    if(m_dev <= 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_init invalid parameter!");
+-    	  return -1;       	
+-    }
+-    
+-    struct fb_var_screeninfo info;
+-    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init VSCREENINFO getting failed!");
+-    	  return -1;    	  
+-    }
+-    
+-    struct fb_fix_screeninfo finfo;
+-    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init FSCREENINFO getting failed!");
+-    	  return -1;       	
+-    }
+-    
+-   // m_left = 0;
+-   // m_top = 0;
+-    m_width = 1920;//info.xres;
+-    m_height = 1080;//info.yres;
+-    m_format = fourcc('R', 'G', 'B', 'P');//('U', 'Y', 'V', 'Y');
+-  	
+-  	info.reserved[0] = 0;
+-  	info.reserved[1] = 0;
+-  	info.reserved[2] = 0;  
+-  	info.xoffset = 0;
+-  	info.yoffset = 0;
+-  	info.activate = FB_ACTIVATE_NOW;
+-  	
+-  	info.bits_per_pixel = fmt_to_bpp(m_format);
+-  	info.nonstd = m_format;
+-  	info.red.offset = 0;
+-  	info.red.length = 0;
+-  	info.green.offset = 0;
+-  	info.green.length = 0;
+-  	info.blue.offset = 0;
+-  	info.blue.length = 0;
+-  	info.transp.offset = 0;
+-  	info.transp.length = 0;	 
+-  	
+-  	info.xres = m_width;
+-  	info.yres = m_height;
+-  	info.yres_virtual = ALIGN_PIXEL_128(info.yres) * DEFAULT_BUFFERS;
+-  	info.xres_virtual = ALIGN_PIXEL(info.xres);
+-  	
+-    if(ioctl(m_dev, FBIOPUT_VSCREENINFO, &info) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init-2 VSCREENINFO setting failed!");
+-    	  return -1;    	  
+-    }
+-
+-    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init-2 VSCREENINFO getting failed!");
+-    	  return -1;    	  
+-    }
+-
+-    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init-2 FSCREENINFO getting failed!");
+-    	  return -1;       	
+-    }
+-  	
+-  	if(finfo.smem_len <= 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init finfo.smem_len < 0!");
+-    	  return -1;      		
+-  	}
+-  	
+-  	fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
+-  	vaddr = mmap(0, fbSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_dev, 0);
+-  	if(vaddr == MAP_FAILED) {
+-    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init mapping the framebuffer error(%s)!", strerror(errno));
+-    	  return -1;    		
+-  	}
+-
+-        hwc_fill_frame_back((char *)vaddr, fbSize, m_width, m_height, m_format); 
+-        int blank = FB_BLANK_UNBLANK;
+-	if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
+-		HWCOMPOSER_LOG_ERR("Error!BG_device::init UNBLANK FB1 failed!\n");
+-        return -1;
+-	} 	
+-//  	key.enable = 1;
+-//  	key.color_key = 0x00000000; //black
+-//  	if(ioctl(m_dev, MXCFB_SET_CLR_KEY, &key) < 0) {
+-//    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
+-//    	  return -1;    		
+-//  	}
+-//  	
+-//  	gbl_alpha.alpha = 255;
+-//  	gbl_alpha.enable = 1;
+-//  	if(ioctl(m_dev, MXCFB_SET_GBL_ALPHA, &key) < 0) {
+-//    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
+-//    	  return -1;    		
+-//  	}  	
+-  	
+-  	mbuffer_count = DEFAULT_BUFFERS;
+-  	mbuffer_cur = 0;
+-  	for(int i = 0; i < DEFAULT_BUFFERS; i++){
+-  			(mbuffers[i]).size = fbSize/DEFAULT_BUFFERS;
+-  			(mbuffers[i]).virt_addr = (void *)((unsigned long)vaddr + i * (mbuffers[i]).size);
+-  			(mbuffers[i]).phy_addr = finfo.smem_start + i * (mbuffers[i]).size;
+-  			(mbuffers[i]).format = m_format;
+-  	}
+-	
+-    status = 0;
+-    return status;
+-}
+-
+-int BG_device::uninit()
+-{
+-	  //int status = -EINVAL;    
+-    int blank = 1;
+-    HWCOMPOSER_LOG_RUNTIME("---------------BG_device::uninit()------------");
+-
+-    if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
+-	    HWCOMPOSER_LOG_ERR("Error!BG_device::uninit BLANK FB2 failed!\n");
+-        //return -1;
+-    }	  
+-    munmap((mbuffers[0]).virt_addr, (mbuffers[0]).size * DEFAULT_BUFFERS);
+-    close(m_dev);
+-
+-    return 0;
+-}
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++#include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <hardware/hardware.h>
++//#include <hardware/overlay.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++/*****************************************************************************/
++using namespace android;
++
++//note: the fb1 in mx5x is hdmi port and should use 1080p=1920_1080. 
++BG_device::BG_device(const char *dev_name, int usage) 
++			: output_device(dev_name, usage)
++{
++		init();
++}
++
++BG_device::~BG_device()
++{
++		uninit();
++}
++
++int BG_device::init()
++{
++	  int status = -EINVAL;
++	  int fbSize = 0;
++	  void *vaddr = NULL;
++
++    if(m_dev <= 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_init invalid parameter!");
++    	  return -1;       	
++    }
++    
++    struct fb_var_screeninfo info;
++    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init VSCREENINFO getting failed!");
++    	  return -1;    	  
++    }
++    
++    struct fb_fix_screeninfo finfo;
++    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init FSCREENINFO getting failed!");
++    	  return -1;       	
++    }
++    
++   // m_left = 0;
++   // m_top = 0;
++    m_width = 1920;//info.xres;
++    m_height = 1080;//info.yres;
++    m_format = fourcc('R', 'G', 'B', 'P');//('U', 'Y', 'V', 'Y');
++  	
++  	info.reserved[0] = 0;
++  	info.reserved[1] = 0;
++  	info.reserved[2] = 0;  
++  	info.xoffset = 0;
++  	info.yoffset = 0;
++  	info.activate = FB_ACTIVATE_NOW;
++  	
++  	info.bits_per_pixel = fmt_to_bpp(m_format);
++  	info.nonstd = m_format;
++  	info.red.offset = 0;
++  	info.red.length = 0;
++  	info.green.offset = 0;
++  	info.green.length = 0;
++  	info.blue.offset = 0;
++  	info.blue.length = 0;
++  	info.transp.offset = 0;
++  	info.transp.length = 0;	 
++  	
++  	info.xres = m_width;
++  	info.yres = m_height;
++  	info.yres_virtual = ALIGN_PIXEL_128(info.yres) * DEFAULT_BUFFERS;
++  	info.xres_virtual = ALIGN_PIXEL(info.xres);
++  	
++    if(ioctl(m_dev, FBIOPUT_VSCREENINFO, &info) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init-2 VSCREENINFO setting failed!");
++    	  return -1;    	  
++    }
++
++    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init-2 VSCREENINFO getting failed!");
++    	  return -1;    	  
++    }
++
++    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init-2 FSCREENINFO getting failed!");
++    	  return -1;       	
++    }
++  	
++  	if(finfo.smem_len <= 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init finfo.smem_len < 0!");
++    	  return -1;      		
++  	}
++  	
++  	fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
++  	vaddr = mmap(0, fbSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_dev, 0);
++  	if(vaddr == MAP_FAILED) {
++    	  HWCOMPOSER_LOG_ERR("Error! BG_device::init mapping the framebuffer error(%s)!", strerror(errno));
++    	  return -1;    		
++  	}
++
++        hwc_fill_frame_back((char *)vaddr, fbSize, m_width, m_height, m_format); 
++        int blank = FB_BLANK_UNBLANK;
++	if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
++		HWCOMPOSER_LOG_ERR("Error!BG_device::init UNBLANK FB1 failed!\n");
++        return -1;
++	} 	
++//  	key.enable = 1;
++//  	key.color_key = 0x00000000; //black
++//  	if(ioctl(m_dev, MXCFB_SET_CLR_KEY, &key) < 0) {
++//    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
++//    	  return -1;    		
++//  	}
++//  	
++//  	gbl_alpha.alpha = 255;
++//  	gbl_alpha.enable = 1;
++//  	if(ioctl(m_dev, MXCFB_SET_GBL_ALPHA, &key) < 0) {
++//    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
++//    	  return -1;    		
++//  	}  	
++  	
++  	mbuffer_count = DEFAULT_BUFFERS;
++  	mbuffer_cur = 0;
++  	for(int i = 0; i < DEFAULT_BUFFERS; i++){
++  			(mbuffers[i]).size = fbSize/DEFAULT_BUFFERS;
++  			(mbuffers[i]).virt_addr = (void *)((unsigned long)vaddr + i * (mbuffers[i]).size);
++  			(mbuffers[i]).phy_addr = finfo.smem_start + i * (mbuffers[i]).size;
++  			(mbuffers[i]).format = m_format;
++  	}
++	
++    status = 0;
++    return status;
++}
++
++int BG_device::uninit()
++{
++	  //int status = -EINVAL;    
++    int blank = 1;
++    HWCOMPOSER_LOG_RUNTIME("---------------BG_device::uninit()------------");
++
++    if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
++	    HWCOMPOSER_LOG_ERR("Error!BG_device::uninit BLANK FB2 failed!\n");
++        //return -1;
++    }	  
++    munmap((mbuffers[0]).virt_addr, (mbuffers[0]).size * DEFAULT_BUFFERS);
++    close(m_dev);
++
++    return 0;
++}
+diff --git a/mx6/hwcomposer/FG_device.cpp b/mx6/hwcomposer/FG_device.cpp
+index 824d368..8274b06 100755
+--- a/mx6/hwcomposer/FG_device.cpp
++++ b/mx6/hwcomposer/FG_device.cpp
+@@ -1,323 +1,323 @@
+-
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <linux/fb.h>
+-#include <linux/mxcfb.h>
+-#include <sys/mman.h>
+-#include <sys/ioctl.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-/*****************************************************************************/
+-using namespace android;
+-
+-FG_device::FG_device(const char *dev_name, int usage)
+-			: output_device(dev_name, usage)
+-{
+-		init();
+-}
+-
+-FG_device::~FG_device()
+-{
+-		uninit();
+-}
+-
+-static int switch_set(int fd0, int fd1, int flag)
+-{
+-    struct mxcfb_gbl_alpha gbl_alpha;
+-    struct mxcfb_color_key key;
+-  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP0) {
+-		  	key.enable = 1;
+-		  	key.color_key = 0x00000000; //black
+-		  	if(ioctl(fd0, MXCFB_SET_CLR_KEY, &key) < 0) {
+-		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
+-		    	  return -1;
+-		  	}
+-
+-		  	gbl_alpha.alpha = 128;
+-		  	gbl_alpha.enable = 1;
+-		  	if(ioctl(fd0, MXCFB_SET_GBL_ALPHA, &key) < 0) {
+-		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
+-		    	  return -1;
+-		  	}
+-  	}
+-
+-  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP1) {
+-		  	key.enable = 1;
+-		  	key.color_key = 0x00000000; //black
+-		  	if(ioctl(fd1, MXCFB_SET_CLR_KEY, &key) < 0) {
+-		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
+-		    	  return -1;
+-		  	}
+-
+-		  	gbl_alpha.alpha = 255;
+-		  	gbl_alpha.enable = 1;
+-		  	if(ioctl(fd1, MXCFB_SET_GBL_ALPHA, &key) < 0) {
+-		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
+-		    	  return -1;
+-		  	}
+-  	}
+-
+-		return 0;
+-}
+-
+-static int overlay_switch(int fd0, int fd1, int fd2, int flag)
+-{
+-		int blank = 1;
+-  	int fp_property;
+-  	char overlayStr[32];
+-  	// it may be modified in mx6x.
+-
+-		if(ioctl(fd2, FBIOBLANK, blank) < 0) {
+-				HWCOMPOSER_LOG_ERR("Error!BLANK FB0 failed!\n");
+-        return -1;
+-		}
+-
+-		if(ioctl(fd1, FBIOBLANK, blank) < 0) {
+-				HWCOMPOSER_LOG_ERR("Error!BLANK FB1 failed!\n");
+-	      return -1;
+-		}
+-
+-	  if(ioctl(fd0, FBIOBLANK, blank) < 0) {
+-				HWCOMPOSER_LOG_ERR("Error!BLANK FB0 failed!\n");
+-	      return -1;
+-		}
+-
+-  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP1) {
+-  			//fp_property;
+-
+-		    HWCOMPOSER_LOG_ERR("Open fb0/fsl_disp_property");
+-		    fp_property = open("/sys/class/graphics/fb0/fsl_disp_property",O_RDWR, 0);
+-		    if(fp_property < 0) {
+-		         HWCOMPOSER_LOG_ERR("Error!Cannot switch the overlay to second disp");
+-		         return -1;
+-		    }
+-
+-		    memset(overlayStr, 0 ,32);
+-		    strcpy(overlayStr, "1-layer-fb\n");
+-		    HWCOMPOSER_LOG_ERR("WRITE 1-layer-fb to fb0/fsl_disp_property");
+-		    write(fp_property, overlayStr, strlen(overlayStr)+1);
+-		    close(fp_property);
+-
+-  	}
+-  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP0) {
+-		    HWCOMPOSER_LOG_ERR("Open fb1/fsl_disp_property");
+-		    fp_property = open("/sys/class/graphics/fb1/fsl_disp_property",O_RDWR, 0);
+-		    if(fp_property < 0) {
+-		         HWCOMPOSER_LOG_ERR("Error!Cannot switch the overlay to second disp");
+-		         return -1;
+-		    }
+-
+-		    memset(overlayStr, 0 ,32);
+-		    strcpy(overlayStr, "1-layer-fb\n");
+-		    HWCOMPOSER_LOG_ERR("WRITE 1-layer-fb to fb1/fsl_disp_property");
+-		    write(fp_property, overlayStr, strlen(overlayStr)+1);
+-		    close(fp_property);
+-  	}
+-
+-    blank = FB_BLANK_UNBLANK;
+-		if(ioctl(fd1, FBIOBLANK, blank) < 0) {
+-				HWCOMPOSER_LOG_ERR("Error!UNBLANK FB1 failed!\n");
+-	      return -1;
+-		}
+-
+-		if(ioctl(fd0, FBIOBLANK, blank) < 0) {
+-				HWCOMPOSER_LOG_ERR("Error!UNBLANK FB0 failed!\n");
+-	      return -1;
+-		}
+-
+-		return 0;
+-}
+-
+-int FG_device::init()
+-{
+-    int status = -EINVAL;
+-    int fbSize = 0;
+-    void *vaddr = NULL;
+-HWCOMPOSER_LOG_RUNTIME("---------------FG_device::init()------------");
+-    if(m_dev <= 0) {
+-        HWCOMPOSER_LOG_ERR("Error! FG_device::FG_init() invalid parameter!");
+-        return -1;
+-    }
+-#if 1
+-    //fist open fb0 device that it is binded to.
+-    //it may be modified in mx6x
+-    int fd_def = -1;
+-    int fd_fb1 = -1;
+-    if(m_usage & GRALLOC_USAGE_HWC_OVERLAY_DISP0) {
+-HWCOMPOSER_LOG_RUNTIME("-------------FG_device::init()---open fb0-------------");
+-	    fd_def = open(DEFAULT_FB_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
+-	    if(fd_def < 0) {
+-	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", DEFAULT_FB_DEV_NAME);
+-	    	  return -1;
+-	    }
+-			fd_fb1 = open(FB2_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
+-	    if(fd_fb1 < 0) {
+-	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", FB1_DEV_NAME);
+-	    	  return -1;
+-	    }
+-
+-  	}
+-    else if(m_usage & GRALLOC_USAGE_HWC_OVERLAY_DISP1) {
+-	    fd_def = open(FB2_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
+-	    if(fd_def < 0) {
+-	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", FB1_DEV_NAME);
+-	    	  return -1;
+-	    }
+-			fd_fb1 = open(DEFAULT_FB_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
+-	    if(fd_fb1 < 0) {
+-	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", DEFAULT_FB_DEV_NAME);
+-	    	  return -1;
+-	    }
+-  	}
+-  	//it may be modified in mx6x
+-
+-//    status = overlay_switch(fd_def, fd_fb1, m_dev, m_usage);
+-
+-    struct fb_var_screeninfo def_info;
+-    if(ioctl(fd_def, FBIOGET_VSCREENINFO, &def_info) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init VSCREENINFO def getting failed!");
+-    	  return -1;
+-    }
+-
+-    struct fb_fix_screeninfo def_finfo;
+-    if(ioctl(fd_def, FBIOGET_FSCREENINFO, &def_finfo) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init FSCREENINFO def getting failed!");
+-    	  return -1;
+-    }
+-
+-    struct fb_var_screeninfo info;
+-    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init VSCREENINFO getting failed!");
+-    	  return -1;
+-    }
+-
+-    struct fb_fix_screeninfo finfo;
+-    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init FSCREENINFO getting failed!");
+-    	  return -1;
+-    }
+-
+-   // m_left = 0;
+-   // m_top = 0;
+-    m_width = def_info.xres;//info.xres;
+-    m_height = def_info.yres;//info.yres;
+-    m_format = fourcc('R', 'G', 'B', 'P');//('U', 'Y', 'V', 'Y');
+-
+-  	info.reserved[0] = def_info.reserved[0];
+-  	info.reserved[1] = def_info.reserved[0];
+-  	info.reserved[2] = def_info.reserved[0];
+-  	info.xoffset = 0;
+-  	info.yoffset = 0;
+-  	info.activate = FB_ACTIVATE_NOW;
+-
+-  	info.bits_per_pixel = fmt_to_bpp(m_format);//def_info.bits_per_pixel;
+-  	info.nonstd = m_format;
+-  	info.red.offset = 0;//def_info.red.offset;
+-  	info.red.length = 0;//def_info.red.length;
+-  	info.green.offset = 0;//def_info.green.offset;
+-  	info.green.length = 0;//def_info.green.length;
+-  	info.blue.offset = 0;//def_info.blue.offset;
+-  	info.blue.length = 0;//def_info.blue.length;
+-  	info.transp.offset = 0;//def_info.transp.offset;
+-  	info.transp.length = 0;//def_info.transp.length;
+-
+-  	info.xres = m_width;
+-  	info.yres = m_height;
+-  	info.yres_virtual = ALIGN_PIXEL_128(info.yres) * DEFAULT_BUFFERS;
+-  	info.xres_virtual = ALIGN_PIXEL(info.xres);
+-
+-    if(ioctl(m_dev, FBIOPUT_VSCREENINFO, &info) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init-2 VSCREENINFO setting failed!");
+-    	  return -1;
+-    }
+-
+-    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init-2 VSCREENINFO getting failed!");
+-    	  return -1;
+-    }
+-
+-    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init-2 FSCREENINFO getting failed!");
+-    	  return -1;
+-    }
+-
+-  	if(finfo.smem_len <= 0) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init finfo.smem_len < 0!");
+-    	  return -1;
+-  	}
+-
+-  	fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
+-  	vaddr = mmap(0, fbSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_dev, 0);
+-  	if(vaddr == MAP_FAILED) {
+-    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init mapping the framebuffer error(%s)!", strerror(errno));
+-    	  return -1;
+-  	}
+-    //memset(vaddr, 0, fbSize);
+-    hwc_fill_frame_back((char *)vaddr, fbSize, m_width, m_height, m_format);
+-    int blank = FB_BLANK_UNBLANK;
+-	if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
+-		HWCOMPOSER_LOG_ERR("Error!FG_device::init UNBLANK FB1 failed!\n");
+-        return -1;
+-	}
+-  	//do it after switch fb2 to fb1 or fb0
+-  	//status = switch_set(fd_def, fd_fb1, m_usage);
+-  	close(fd_def);
+-  	close(fd_fb1);
+-
+-  	mbuffer_count = DEFAULT_BUFFERS;
+-  	mbuffer_cur = 0;
+-  	for(int i = 0; i < DEFAULT_BUFFERS; i++){
+-		(mbuffers[i]).size = fbSize/DEFAULT_BUFFERS;
+-		(mbuffers[i]).virt_addr = (void *)((unsigned long)vaddr + i * (mbuffers[i]).size);
+-		(mbuffers[i]).phy_addr = finfo.smem_start + i * (mbuffers[i]).size;
+-		(mbuffers[i]).format = m_format;
+-  	}
+-
+-  	//pthread_mutex_init(&dev->buf_mutex, NULL);
+-#endif
+-    status = 0;
+-    return status;
+-}
+-
+-int FG_device::uninit()
+-{
+-	  //int status = -EINVAL;
+-    int blank = 1;
+-    HWCOMPOSER_LOG_RUNTIME("---------------FG_device::uninit()------------");
+-
+-    if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
+-		HWCOMPOSER_LOG_ERR("Error!FG_device::uninit BLANK FB2 failed!\n");
+-        //return -1;
+-	}
+-	munmap((mbuffers[0]).virt_addr, (mbuffers[0]).size * DEFAULT_BUFFERS);
+-    close(m_dev);
+-    return 0;
+-}
+-
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <linux/fb.h>
++#include <linux/mxcfb.h>
++#include <sys/mman.h>
++#include <sys/ioctl.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++/*****************************************************************************/
++using namespace android;
++
++FG_device::FG_device(const char *dev_name, int usage)
++			: output_device(dev_name, usage)
++{
++		init();
++}
++
++FG_device::~FG_device()
++{
++		uninit();
++}
++
++static int switch_set(int fd0, int fd1, int flag)
++{
++    struct mxcfb_gbl_alpha gbl_alpha;
++    struct mxcfb_color_key key;
++  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP0) {
++		  	key.enable = 1;
++		  	key.color_key = 0x00000000; //black
++		  	if(ioctl(fd0, MXCFB_SET_CLR_KEY, &key) < 0) {
++		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
++		    	  return -1;
++		  	}
++
++		  	gbl_alpha.alpha = 128;
++		  	gbl_alpha.enable = 1;
++		  	if(ioctl(fd0, MXCFB_SET_GBL_ALPHA, &key) < 0) {
++		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
++		    	  return -1;
++		  	}
++  	}
++
++  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP1) {
++		  	key.enable = 1;
++		  	key.color_key = 0x00000000; //black
++		  	if(ioctl(fd1, MXCFB_SET_CLR_KEY, &key) < 0) {
++		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
++		    	  return -1;
++		  	}
++
++		  	gbl_alpha.alpha = 255;
++		  	gbl_alpha.enable = 1;
++		  	if(ioctl(fd1, MXCFB_SET_GBL_ALPHA, &key) < 0) {
++		    	  HWCOMPOSER_LOG_ERR("Error! MXCFB_SET_CLR_KEY failed!");
++		    	  return -1;
++		  	}
++  	}
++
++		return 0;
++}
++
++static int overlay_switch(int fd0, int fd1, int fd2, int flag)
++{
++		int blank = 1;
++  	int fp_property;
++  	char overlayStr[32];
++  	// it may be modified in mx6x.
++
++		if(ioctl(fd2, FBIOBLANK, blank) < 0) {
++				HWCOMPOSER_LOG_ERR("Error!BLANK FB0 failed!\n");
++        return -1;
++		}
++
++		if(ioctl(fd1, FBIOBLANK, blank) < 0) {
++				HWCOMPOSER_LOG_ERR("Error!BLANK FB1 failed!\n");
++	      return -1;
++		}
++
++	  if(ioctl(fd0, FBIOBLANK, blank) < 0) {
++				HWCOMPOSER_LOG_ERR("Error!BLANK FB0 failed!\n");
++	      return -1;
++		}
++
++  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP1) {
++  			//fp_property;
++
++		    HWCOMPOSER_LOG_ERR("Open fb0/fsl_disp_property");
++		    fp_property = open("/sys/class/graphics/fb0/fsl_disp_property",O_RDWR, 0);
++		    if(fp_property < 0) {
++		         HWCOMPOSER_LOG_ERR("Error!Cannot switch the overlay to second disp");
++		         return -1;
++		    }
++
++		    memset(overlayStr, 0 ,32);
++		    strcpy(overlayStr, "1-layer-fb\n");
++		    HWCOMPOSER_LOG_ERR("WRITE 1-layer-fb to fb0/fsl_disp_property");
++		    write(fp_property, overlayStr, strlen(overlayStr)+1);
++		    close(fp_property);
++
++  	}
++  	if(flag & GRALLOC_USAGE_HWC_OVERLAY_DISP0) {
++		    HWCOMPOSER_LOG_ERR("Open fb1/fsl_disp_property");
++		    fp_property = open("/sys/class/graphics/fb1/fsl_disp_property",O_RDWR, 0);
++		    if(fp_property < 0) {
++		         HWCOMPOSER_LOG_ERR("Error!Cannot switch the overlay to second disp");
++		         return -1;
++		    }
++
++		    memset(overlayStr, 0 ,32);
++		    strcpy(overlayStr, "1-layer-fb\n");
++		    HWCOMPOSER_LOG_ERR("WRITE 1-layer-fb to fb1/fsl_disp_property");
++		    write(fp_property, overlayStr, strlen(overlayStr)+1);
++		    close(fp_property);
++  	}
++
++    blank = FB_BLANK_UNBLANK;
++		if(ioctl(fd1, FBIOBLANK, blank) < 0) {
++				HWCOMPOSER_LOG_ERR("Error!UNBLANK FB1 failed!\n");
++	      return -1;
++		}
++
++		if(ioctl(fd0, FBIOBLANK, blank) < 0) {
++				HWCOMPOSER_LOG_ERR("Error!UNBLANK FB0 failed!\n");
++	      return -1;
++		}
++
++		return 0;
++}
++
++int FG_device::init()
++{
++    int status = -EINVAL;
++    int fbSize = 0;
++    void *vaddr = NULL;
++HWCOMPOSER_LOG_RUNTIME("---------------FG_device::init()------------");
++    if(m_dev <= 0) {
++        HWCOMPOSER_LOG_ERR("Error! FG_device::FG_init() invalid parameter!");
++        return -1;
++    }
++#if 1
++    //fist open fb0 device that it is binded to.
++    //it may be modified in mx6x
++    int fd_def = -1;
++    int fd_fb1 = -1;
++    if(m_usage & GRALLOC_USAGE_HWC_OVERLAY_DISP0) {
++HWCOMPOSER_LOG_RUNTIME("-------------FG_device::init()---open fb0-------------");
++	    fd_def = open(DEFAULT_FB_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
++	    if(fd_def < 0) {
++	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", DEFAULT_FB_DEV_NAME);
++	    	  return -1;
++	    }
++			fd_fb1 = open(FB2_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
++	    if(fd_fb1 < 0) {
++	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", FB1_DEV_NAME);
++	    	  return -1;
++	    }
++
++  	}
++    else if(m_usage & GRALLOC_USAGE_HWC_OVERLAY_DISP1) {
++	    fd_def = open(FB2_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
++	    if(fd_def < 0) {
++	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", FB1_DEV_NAME);
++	    	  return -1;
++	    }
++			fd_fb1 = open(DEFAULT_FB_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
++	    if(fd_fb1 < 0) {
++	    	  HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", DEFAULT_FB_DEV_NAME);
++	    	  return -1;
++	    }
++  	}
++  	//it may be modified in mx6x
++
++//    status = overlay_switch(fd_def, fd_fb1, m_dev, m_usage);
++
++    struct fb_var_screeninfo def_info;
++    if(ioctl(fd_def, FBIOGET_VSCREENINFO, &def_info) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init VSCREENINFO def getting failed!");
++    	  return -1;
++    }
++
++    struct fb_fix_screeninfo def_finfo;
++    if(ioctl(fd_def, FBIOGET_FSCREENINFO, &def_finfo) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init FSCREENINFO def getting failed!");
++    	  return -1;
++    }
++
++    struct fb_var_screeninfo info;
++    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init VSCREENINFO getting failed!");
++    	  return -1;
++    }
++
++    struct fb_fix_screeninfo finfo;
++    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init FSCREENINFO getting failed!");
++    	  return -1;
++    }
++
++   // m_left = 0;
++   // m_top = 0;
++    m_width = def_info.xres;//info.xres;
++    m_height = def_info.yres;//info.yres;
++    m_format = fourcc('R', 'G', 'B', 'P');//('U', 'Y', 'V', 'Y');
++
++  	info.reserved[0] = def_info.reserved[0];
++  	info.reserved[1] = def_info.reserved[0];
++  	info.reserved[2] = def_info.reserved[0];
++  	info.xoffset = 0;
++  	info.yoffset = 0;
++  	info.activate = FB_ACTIVATE_NOW;
++
++  	info.bits_per_pixel = fmt_to_bpp(m_format);//def_info.bits_per_pixel;
++  	info.nonstd = m_format;
++  	info.red.offset = 0;//def_info.red.offset;
++  	info.red.length = 0;//def_info.red.length;
++  	info.green.offset = 0;//def_info.green.offset;
++  	info.green.length = 0;//def_info.green.length;
++  	info.blue.offset = 0;//def_info.blue.offset;
++  	info.blue.length = 0;//def_info.blue.length;
++  	info.transp.offset = 0;//def_info.transp.offset;
++  	info.transp.length = 0;//def_info.transp.length;
++
++  	info.xres = m_width;
++  	info.yres = m_height;
++  	info.yres_virtual = ALIGN_PIXEL_128(info.yres) * DEFAULT_BUFFERS;
++  	info.xres_virtual = ALIGN_PIXEL(info.xres);
++
++    if(ioctl(m_dev, FBIOPUT_VSCREENINFO, &info) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init-2 VSCREENINFO setting failed!");
++    	  return -1;
++    }
++
++    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init-2 VSCREENINFO getting failed!");
++    	  return -1;
++    }
++
++    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init-2 FSCREENINFO getting failed!");
++    	  return -1;
++    }
++
++  	if(finfo.smem_len <= 0) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init finfo.smem_len < 0!");
++    	  return -1;
++  	}
++
++  	fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
++  	vaddr = mmap(0, fbSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_dev, 0);
++  	if(vaddr == MAP_FAILED) {
++    	  HWCOMPOSER_LOG_ERR("Error! FG_device::init mapping the framebuffer error(%s)!", strerror(errno));
++    	  return -1;
++  	}
++    //memset(vaddr, 0, fbSize);
++    hwc_fill_frame_back((char *)vaddr, fbSize, m_width, m_height, m_format);
++    int blank = FB_BLANK_UNBLANK;
++	if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
++		HWCOMPOSER_LOG_ERR("Error!FG_device::init UNBLANK FB1 failed!\n");
++        return -1;
++	}
++  	//do it after switch fb2 to fb1 or fb0
++  	//status = switch_set(fd_def, fd_fb1, m_usage);
++  	close(fd_def);
++  	close(fd_fb1);
++
++  	mbuffer_count = DEFAULT_BUFFERS;
++  	mbuffer_cur = 0;
++  	for(int i = 0; i < DEFAULT_BUFFERS; i++){
++		(mbuffers[i]).size = fbSize/DEFAULT_BUFFERS;
++		(mbuffers[i]).virt_addr = (void *)((unsigned long)vaddr + i * (mbuffers[i]).size);
++		(mbuffers[i]).phy_addr = finfo.smem_start + i * (mbuffers[i]).size;
++		(mbuffers[i]).width = m_width;
++        (mbuffers[i]).height = m_height;
++        (mbuffers[i]).format = m_format;
++  	}
++
++  	//pthread_mutex_init(&dev->buf_mutex, NULL);
++#endif
++    status = 0;
++    return status;
++}
++
++int FG_device::uninit()
++{
++	  //int status = -EINVAL;
++    int blank = 1;
++    HWCOMPOSER_LOG_RUNTIME("---------------FG_device::uninit()------------");
++
++    if(ioctl(m_dev, FBIOBLANK, blank) < 0) {
++		HWCOMPOSER_LOG_ERR("Error!FG_device::uninit BLANK FB2 failed!\n");
++        //return -1;
++	}
++	munmap((mbuffers[0]).virt_addr, (mbuffers[0]).size * DEFAULT_BUFFERS);
++    close(m_dev);
++    return 0;
++}
++
+diff --git a/mx6/hwcomposer/blit_gpu.cpp b/mx6/hwcomposer/blit_gpu.cpp
+index e348c9d..37e4a78 100755
+--- a/mx6/hwcomposer/blit_gpu.cpp
++++ b/mx6/hwcomposer/blit_gpu.cpp
+@@ -1,58 +1,57 @@
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-#include "blit_gpu.h"
+-/*****************************************************************************/
+-using namespace android;
+-
+-blit_gpu::blit_gpu()
+-{
+-		init();
+-}
+-
+-blit_gpu::~blit_gpu()
+-{
+-		uninit();
+-}
+-
+-int blit_gpu::init()
+-{
+-		return 0;
+-}
+-
+-int blit_gpu::uninit()
+-{
+-		return 0;
+-}
+-
+-int blit_gpu::blit(hwc_layer_t *layer, hwc_buffer *out_buf)
+-{
+-		return 0;
+-}
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++#include "blit_gpu.h"
++/*****************************************************************************/
++using namespace android;
++
++blit_gpu::blit_gpu()
++{
++		init();
++}
++
++blit_gpu::~blit_gpu()
++{
++		uninit();
++}
++
++int blit_gpu::init()
++{
++		return 0;
++}
++
++int blit_gpu::uninit()
++{
++		return 0;
++}
++
++int blit_gpu::blit(hwc_layer_t *layer, hwc_buffer *out_buf)
++{
++		return 0;
++}
+diff --git a/mx6/hwcomposer/blit_gpu.h b/mx6/hwcomposer/blit_gpu.h
+index 15c1860..f191e68 100755
+--- a/mx6/hwcomposer/blit_gpu.h
++++ b/mx6/hwcomposer/blit_gpu.h
+@@ -1,59 +1,58 @@
+-
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-#ifndef _BLIT_GPU_H_
+-#define _BLIT_GPU_H_
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-/*****************************************************************************/
+-
+-class blit_gpu : public blit_device{
+-public:  
+-    virtual int blit(hwc_layer_t *layer, hwc_buffer *out_buf);
+-
+-		blit_gpu();
+-		virtual ~blit_gpu();
+-    
+-private:
+-		int init();
+-    int uninit();
+-	
+-		blit_gpu& operator = (blit_gpu& out);
+-		blit_gpu(const blit_gpu& out);  
+-    //add private members.		    
+-};
+-
+-
+-//int gpu_init(struct blit_device *dev);
+-//
+-//int gpu_uninit(struct blit_device*dev);
+-//
+-//int gpu_blit(struct blit_device *dev, hwc_layer_t *layer, hwc_buffer *out_buf);
+-
+-#endif
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++#ifndef _BLIT_GPU_H_
++#define _BLIT_GPU_H_
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++/*****************************************************************************/
++
++class blit_gpu : public blit_device{
++public:  
++    virtual int blit(hwc_layer_t *layer, hwc_buffer *out_buf);
++
++		blit_gpu();
++		virtual ~blit_gpu();
++    
++private:
++		int init();
++    int uninit();
++	
++		blit_gpu& operator = (blit_gpu& out);
++		blit_gpu(const blit_gpu& out);  
++    //add private members.		    
++};
++
++
++//int gpu_init(struct blit_device *dev);
++//
++//int gpu_uninit(struct blit_device*dev);
++//
++//int gpu_blit(struct blit_device *dev, hwc_layer_t *layer, hwc_buffer *out_buf);
++
++#endif
+diff --git a/mx6/hwcomposer/blit_ipu.cpp b/mx6/hwcomposer/blit_ipu.cpp
+index 72625ce..98c107f 100755
+--- a/mx6/hwcomposer/blit_ipu.cpp
++++ b/mx6/hwcomposer/blit_ipu.cpp
+@@ -1,187 +1,202 @@
+-
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-#include "blit_ipu.h"
+-extern "C" {
+-#include "mxc_ipu_hl_lib.h"
+-}
+-/*****************************************************************************/
+-using namespace android;
+-
+-int blit_device::isIPUDevice(const char *dev_name)
+-{
+-		return !strcmp(dev_name, BLIT_IPU);
+-}
+-
+-int blit_device::isGPUDevice(const char *dev_name)
+-{
+-		return !strcmp(dev_name, BLIT_GPU);
+-}
+-
+-blit_ipu::blit_ipu()
+-{
+-		init();
+-}
+-
+-blit_ipu::~blit_ipu()
+-{
+-		uninit();
+-}
+-
+-int blit_ipu::init()//, hwc_layer_t *layer, struct output_device *output
+-{
+-		//int status = -EINVAL;
+-
+-    return 0;
+-}
+-
+-int blit_ipu::uninit()
+-{
+-	  //int status = -EINVAL;
+-
+-	  return 0;
+-}
+-
+-static void fill_buffer(char *pbuf, int len)
+-{
+-    static int k = 0;
+-    short * pframe = (short *)pbuf;
+-    if(k == 0) {
+-        for(int i=0; i<len; i+=2) {
+-            *pframe = 0xf800;
+-        }
+-    }
+-
+-    if(k == 1){
+-        for(int i=0; i<len; i+=2) {
+-            *pframe = 0x001f;
+-        }
+-    }
+-
+-    if(k == 2){
+-        for(int i=0; i<len; i+=2) {
+-            *pframe = 0x07E0;
+-        }
+-    }
+-
+-    k = (k+1)%3;
+-}
+-
+-int blit_ipu::blit(hwc_layer_t *layer, hwc_buffer *out_buf)
+-{
+-	  int status = -EINVAL;
+-	  if(layer == NULL || out_buf == NULL){
+-	  	  HWCOMPOSER_LOG_ERR("Error!invalid parameters!");
+-	  	  return status;
+-	  }
+-	  //struct blit_ipu *ipu = (struct blit_ipu *)dev;
+-
+-HWCOMPOSER_LOG_RUNTIME("^^^^^^^^^^^^^^^blit_ipu::blit()^^^^^^^^^^^^^^^^^^^^^^");
+-	  hwc_rect_t *src_crop = &(layer->sourceCrop);
+-	  hwc_rect_t *disp_frame = &(layer->displayFrame);
+-	  private_handle_t *handle = (private_handle_t *)(layer->handle);
+-
+-    //fill_buffer((char *)(handle->base), handle->size);
+-
+-	  mIPUInputParam.width = src_crop->right - src_crop->left;
+-	  mIPUInputParam.height = src_crop->bottom - src_crop->top;
+-	  mIPUInputParam.input_crop_win.pos.x = src_crop->left;
+-    mIPUInputParam.input_crop_win.pos.y = src_crop->top;
+-    mIPUInputParam.input_crop_win.win_w = src_crop->right - src_crop->left;
+-    mIPUInputParam.input_crop_win.win_h = src_crop->bottom - src_crop->top;
+-
+-    if(handle->format == HAL_PIXEL_FORMAT_YCbCr_420_SP) {
+-HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= NV12");
+-        mIPUInputParam.fmt = v4l2_fourcc('N', 'V', '1', '2');
+-    }
+-    else if(handle->format == HAL_PIXEL_FORMAT_YCbCr_420_I) {
+-HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= I420");
+-        mIPUInputParam.fmt = v4l2_fourcc('I', '4', '2', '0');
+-    }
+-    else if((handle->format == HAL_PIXEL_FORMAT_RGB_565) || (handle->format == BLIT_PIXEL_FORMAT_RGB_565)) {
+-HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= RGBP");
+-       // mIPUInputParam.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
+-        mIPUInputParam.fmt = v4l2_fourcc('N', 'V', '1', '2');
+-    }else{
+-        HWCOMPOSER_LOG_ERR("Error!Not supported input format %d",handle->format);
+-        return status;
+-    }
+-#if 0
+-    if(handle->base != 0) {
+-       int *pVal = (int *)handle->base;
+-       HWCOMPOSER_LOG_RUNTIME("=========buff[%d]=%x, buff[%d]=%x, phy=%x", 0, pVal[0], 1, pVal[1], handle->phys);
+-    }
+-#endif
+-    mIPUInputParam.user_def_paddr[0] = handle->phys;
+-    //out_buf should has width and height to be checked with the display_frame.
+-    mIPUOutputParam.fmt = out_buf->format;//v4l2_fourcc('U', 'Y', 'V', 'Y');
+-    mIPUOutputParam.show_to_fb = 0;
+-//HWCOMPOSER_LOG_RUNTIME("^^^^^^^^out_buf->format= %x, out->phy_addr=%x, in->phys=%x", out_buf->format, out_buf->phy_addr, handle->phys);
+-    if(out_buf->usage & GRALLOC_USAGE_DISPLAY_MASK) {
+-	    mIPUOutputParam.width = out_buf->width;
+-	    mIPUOutputParam.height = out_buf->height;
+-		mIPUOutputParam.output_win.pos.x = 0;
+-		mIPUOutputParam.output_win.pos.y = 0;
+-		mIPUOutputParam.output_win.win_w = out_buf->width;
+-		mIPUOutputParam.output_win.win_h = out_buf->height;
+-    }
+-    else {
+-	    mIPUOutputParam.width = out_buf->width;//disp_frame->right - disp_frame->left;
+-	    mIPUOutputParam.height = out_buf->height;//disp_frame->bottom - disp_frame->top;
+-	    mIPUOutputParam.output_win.pos.x = (disp_frame->left >> 3) << 3;
+-	    mIPUOutputParam.output_win.pos.y = (disp_frame->top >> 3) << 3;
+-	    mIPUOutputParam.output_win.win_w = ((disp_frame->right - disp_frame->left) >> 3) << 3;
+-	    mIPUOutputParam.output_win.win_h = ((disp_frame->bottom - disp_frame->top) >> 3) << 3;
+-  	}
+-//HWCOMPOSER_LOG_RUNTIME("^^^^^^^^^^^^^^^^right=%d, left=%d, bottom=%d, top=%d", disp_frame->right, disp_frame->left, disp_frame->bottom, disp_frame->top);
+-    mIPUOutputParam.rot = layer->transform;
+-    mIPUOutputParam.user_def_paddr[0] = out_buf->phy_addr;
+-HWCOMPOSER_LOG_RUNTIME("------mxc_ipu_lib_task_init-----in blit_ipu::blit()------\n");
+-    if(out_buf->usage & GRALLOC_USAGE_DISPLAY_MASK)
+-        status = mxc_ipu_lib_task_init(&mIPUInputParam,NULL,&mIPUOutputParam,OP_NORMAL_MODE|TASK_PP_MODE,&mIPUHandle);
+-    else
+-        status = mxc_ipu_lib_task_init(&mIPUInputParam,NULL,&mIPUOutputParam,OP_NORMAL_MODE|TASK_ENC_MODE,&mIPUHandle);
+-	  if(status < 0) {
+-	  		HWCOMPOSER_LOG_ERR("Error!mxc_ipu_lib_task_init failed %d",status);
+-	  		return status;
+-	  }
+-HWCOMPOSER_LOG_RUNTIME("------mxc_ipu_lib_task_buf_update-----in blit_ipu::blit()------\n");
+-	  status = mxc_ipu_lib_task_buf_update(&mIPUHandle, handle->phys, out_buf->phy_addr, NULL,NULL,NULL);
+-	  if(status < 0) {
+-	  		HWCOMPOSER_LOG_ERR("Error!mxc_ipu_lib_task_buf_update failed %d",status);
+-	  		return status;
+-	  }
+-HWCOMPOSER_LOG_RUNTIME("------mxc_ipu_lib_task_uninit-----in blit_ipu::blit()------\n");
+-		mxc_ipu_lib_task_uninit(&mIPUHandle);
+-		status = 0;
+-        HWCOMPOSER_LOG_RUNTIME("^^^^^^^^^^^^^^^blit_ipu::blit()^^end^^^^^^^^^^^^^^^^^^^^");
+-	  return status;
+-}
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++#include "blit_ipu.h"
++
++/*****************************************************************************/
++using namespace android;
++
++int blit_device::isIPUDevice(const char *dev_name)
++{
++		return !strcmp(dev_name, BLIT_IPU);
++}
++
++int blit_device::isGPUDevice(const char *dev_name)
++{
++		return !strcmp(dev_name, BLIT_GPU);
++}
++
++blit_ipu::blit_ipu()
++{
++    memset(&mTask, 0, sizeof(mTask));
++	init();
++}
++
++blit_ipu::~blit_ipu()
++{
++	uninit();
++}
++
++int blit_ipu::init()//, hwc_layer_t *layer, struct output_device *output
++{
++	int status = -EINVAL;
++    mIpuFd = open("/dev/mxc_ipu", O_RDWR, 0);
++    if(mIpuFd < 0) {
++        HWCOMPOSER_LOG_ERR("%s:%d,open ipu dev failed", __FUNCTION__, __LINE__);
++        return status;
++    }
++
++    return 0;
++}
++
++int blit_ipu::uninit()
++{
++	//int status = -EINVAL;
++    if(mIpuFd)
++        close(mIpuFd);
++
++	return 0;
++}
++
++static void fill_buffer(char *pbuf, int len)
++{
++    static int k = 0;
++    short * pframe = (short *)pbuf;
++    if(k == 0) {
++        for(int i=0; i<len; i+=2) {
++            *pframe = 0xf800;
++        }
++    }
++
++    if(k == 1){
++        for(int i=0; i<len; i+=2) {
++            *pframe = 0x001f;
++        }
++    }
++
++    if(k == 2){
++        for(int i=0; i<len; i+=2) {
++            *pframe = 0x07E0;
++        }
++    }
++
++    k = (k+1)%3;
++}
++
++int blit_ipu::blit(hwc_layer_t *layer, hwc_buffer *out_buf)
++{
++	  int status = -EINVAL;
++	  if(mIpuFd < 0 || layer == NULL || out_buf == NULL){
++	  	  HWCOMPOSER_LOG_ERR("Error!invalid parameters!");
++	  	  return status;
++	  }
++	  //struct blit_ipu *ipu = (struct blit_ipu *)dev;
++
++      HWCOMPOSER_LOG_RUNTIME("^^^^^^^^^^^^^^^blit_ipu::blit()^^^^^^^^^^^^^^^^^^^^^^");
++	  hwc_rect_t *src_crop = &(layer->sourceCrop);
++	  hwc_rect_t *disp_frame = &(layer->displayFrame);
++	  private_handle_t *handle = (private_handle_t *)(layer->handle);
++
++    //fill_buffer((char *)(handle->base), handle->size);
++
++    mTask.input.width = handle->width;//src_crop->right - src_crop->left;
++    mTask.input.height = handle->height;//src_crop->bottom - src_crop->top;
++    mTask.input.crop.pos.x = src_crop->left;
++    mTask.input.crop.pos.y = src_crop->top;
++    mTask.input.crop.w = src_crop->right - src_crop->left;
++    mTask.input.crop.h = src_crop->bottom - src_crop->top;
++
++    if(handle->format == HAL_PIXEL_FORMAT_YCbCr_420_SP || handle->format == BLIT_PIXEL_FORMAT_RGB_565) {
++        HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= NV12");
++        mTask.input.format = v4l2_fourcc('N', 'V', '1', '2');
++    }
++    else if(handle->format == HAL_PIXEL_FORMAT_YCbCr_420_I) {
++        HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= I420");
++        mTask.input.format = v4l2_fourcc('I', '4', '2', '0');
++    }
++    else if((handle->format == HAL_PIXEL_FORMAT_RGB_565) || (handle->format == BLIT_PIXEL_FORMAT_RGB_565)) {
++        HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= RGBP");
++        mTask.input.format = v4l2_fourcc('R', 'G', 'B', 'P');
++        //mTask.input.fmt = v4l2_fourcc('N', 'V', '1', '2');
++    }else{
++        HWCOMPOSER_LOG_ERR("Error!Not supported input format %d",handle->format);
++        return status;
++    }
++
++    mTask.input.paddr = handle->phys;
++    //out_buf should has width and height to be checked with the display_frame.
++    mTask.output.format = out_buf->format;//v4l2_fourcc('U', 'Y', 'V', 'Y');
++    if(out_buf->usage & GRALLOC_USAGE_DISPLAY_MASK) {
++	    mTask.output.width = out_buf->width;
++	    mTask.output.height = out_buf->height;
++		mTask.output.crop.pos.x = 0;
++		mTask.output.crop.pos.y = 0;
++		mTask.output.crop.w = out_buf->width;
++		mTask.output.crop.h = out_buf->height;
++    }
++    else {
++	    mTask.output.width = out_buf->width;//disp_frame->right - disp_frame->left;
++	    mTask.output.height = out_buf->height;//disp_frame->bottom - disp_frame->top;
++	    mTask.output.crop.pos.x = (disp_frame->left >> 3) << 3;
++	    mTask.output.crop.pos.y = (disp_frame->top >> 3) << 3;
++	    mTask.output.crop.w = ((disp_frame->right - disp_frame->left) >> 3) << 3;
++	    mTask.output.crop.h = ((disp_frame->bottom - disp_frame->top) >> 3) << 3;
++  	}
++    mTask.output.rotate = layer->transform;
++    mTask.output.paddr = out_buf->phy_addr;
++    int ret = IPU_CHECK_ERR_INPUT_CROP; 
++    
++    while(ret != IPU_CHECK_OK && ret > IPU_CHECK_ERR_MIN) {
++        ret = ioctl(mIpuFd, IPU_CHECK_TASK, &mTask);
++        HWCOMPOSER_LOG_RUNTIME("%s:%d, IPU_CHECK_TASK ret=%d", __FUNCTION__, __LINE__, ret);
++        switch(ret) {
++            case IPU_CHECK_OK:
++                break;
++            case IPU_CHECK_ERR_SPLIT_INPUTW_OVER:
++                mTask.input.crop.w -= 8;
++                break;
++            case IPU_CHECK_ERR_SPLIT_INPUTH_OVER:
++                mTask.input.crop.h -= 8;
++                break;
++            case IPU_CHECK_ERR_SPLIT_OUTPUTW_OVER:
++                mTask.output.crop.w -= 8;
++                break;
++            case IPU_CHECK_ERR_SPLIT_OUTPUTH_OVER:
++                mTask.output.crop.h -= 8;;
++                break;
++            default:
++                HWCOMPOSER_LOG_ERR("%s:%d, IPU_CHECK_TASK ret=%d", __FUNCTION__, __LINE__, ret);
++                return status;
++        }
++    }
++
++    //if(out_buf->usage & GRALLOC_USAGE_DISPLAY_MASK)
++        //status = mxc_ipu_lib_task_init(&mTask.input,NULL,&mTask.output,OP_NORMAL_MODE|TASK_PP_MODE,&mIPUHandle);
++    //else
++        //status = mxc_ipu_lib_task_init(&mTask.input,NULL,&mTask.output,OP_NORMAL_MODE|TASK_ENC_MODE,&mIPUHandle);
++      status = ioctl(mIpuFd, IPU_QUEUE_TASK, &mTask);
++	  if(status < 0) {
++	  		HWCOMPOSER_LOG_ERR("%s:%d, IPU_QUEUE_TASK failed %d", __FUNCTION__, __LINE__ ,status);
++	  		return status;
++	  }
++	  status = 0;
++      HWCOMPOSER_LOG_RUNTIME("^^^^^^^^^^^^^^^blit_ipu::blit()^^end^^^^^^^^^^^^^^^^^^^^");
++	  return status;
++}
+diff --git a/mx6/hwcomposer/blit_ipu.h b/mx6/hwcomposer/blit_ipu.h
+index 03ae5a8..570b5eb 100755
+--- a/mx6/hwcomposer/blit_ipu.h
++++ b/mx6/hwcomposer/blit_ipu.h
+@@ -1,69 +1,71 @@
+-
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-#ifndef _BLIT_IPU_H_
+-#define _BLIT_IPU_H_
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-extern "C" {
+-#include "mxc_ipu_hl_lib.h"
+-}
+-/*****************************************************************************/
+-
+-#define BLIT_PIXEL_FORMAT_RGB_565  209
+-
+-class blit_ipu : public blit_device
+-{
+-public:
+-    virtual int blit(hwc_layer_t *layer, hwc_buffer *out_buf);
+-
+-		blit_ipu();
+-		virtual ~blit_ipu();
+-
+-private:
+-		ipu_lib_input_param_t  mIPUInputParam;
+-    ipu_lib_output_param_t mIPUOutputParam;
+-    ipu_lib_handle_t       mIPUHandle;
+-//    int                    mIPURet;
+-private:
+-		int init();
+-    int uninit();
+-
+-		blit_ipu& operator = (blit_ipu& out);
+-		blit_ipu(const blit_ipu& out);
+-};
+-
+-
+-//int ipu_init(struct blit_device *dev);
+-//
+-//int ipu_uninit(struct blit_device*dev);
+-//
+-//int ipu_blit(struct blit_device *dev, hwc_layer_t *layer, hwc_buffer *out_buf);
+-
+-#endif // _BLIT_IPU_H_
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++#ifndef _BLIT_IPU_H_
++#define _BLIT_IPU_H_
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++#include <linux/ipu.h>
++//extern "C" {
++//#include "mxc_ipu_hl_lib.h"
++//}
++/*****************************************************************************/
++
++#define BLIT_PIXEL_FORMAT_RGB_565  209
++
++class blit_ipu : public blit_device
++{
++public:
++    virtual int blit(hwc_layer_t *layer, hwc_buffer *out_buf);
++
++	blit_ipu();
++	virtual ~blit_ipu();
++
++private:
++    struct ipu_task mTask;
++    int mIpuFd;
++	//ipu_lib_input_param_t  mIPUInputParam;
++    //ipu_lib_output_param_t mIPUOutputParam;
++    //ipu_lib_handle_t       mIPUHandle;
++//    int                    mIPURet;
++private:
++	int init();
++    int uninit();
++
++	blit_ipu& operator = (blit_ipu& out);
++	blit_ipu(const blit_ipu& out);
++};
++
++
++//int ipu_init(struct blit_device *dev);
++//
++//int ipu_uninit(struct blit_device*dev);
++//
++//int ipu_blit(struct blit_device *dev, hwc_layer_t *layer, hwc_buffer *out_buf);
++
++#endif // _BLIT_IPU_H_
+diff --git a/mx6/hwcomposer/hwc_common.cpp b/mx6/hwcomposer/hwc_common.cpp
+index f5a4e2c..e34a24e 100755
+--- a/mx6/hwcomposer/hwc_common.cpp
++++ b/mx6/hwcomposer/hwc_common.cpp
+@@ -1,232 +1,232 @@
+-
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-#include "blit_gpu.h"
+-#include "blit_ipu.h"
+-extern "C" {
+-#include "mxc_ipu_hl_lib.h" 
+-}
+-/*****************************************************************************/
+-using namespace android;
+-//int hwc_check_property(hwc_context_t *dev)
+-//{
+-//    bool bValue = false;
+-//    char value[10];
+-//    property_get("rw.VIDEO_TVOUT_DISPLAY", value, "");
+-//    if (strcmp(value, "1") == 0)
+-//        bValue = true;
+-//
+-//    if((dev->display_mode == DISPLAY_MODE_TV)  !=  bValue){
+-//        dev->display_mode = bValue ? DISPLAY_MODE_TV : DISPLAY_MODE_NORMAL;
+-//        switchTvOut(dev);
+-//        *mode_changed = true;
+-//        return 0;
+-//    }
+-//
+-//    bValue = false;
+-//    property_get("sys.SECOND_DISPLAY_ENABLED", value, "");
+-//    if (strcmp(value, "1") == 0)
+-//        bValue = true;
+-//
+-//    if((dev->display_mode == DISPLAY_MODE_DUAL_DISP)  !=  bValue){
+-//        dev->display_mode = bValue ? DISPLAY_MODE_DUAL_DISP : DISPLAY_MODE_NORMAL;
+-//        switchDualDisp(dev);
+-//        *mode_changed = true;
+-//    }    	
+-//		return 0;
+-//}
+-
+-
+-unsigned long fmt_to_bpp(unsigned long pixelformat)
+-{
+-	unsigned long bpp;
+-
+-	switch (pixelformat)
+-	{
+-		case OUT_PIX_FMT_RGB565:
+-		/*interleaved 422*/
+-		case OUT_PIX_FMT_YUYV:
+-		case OUT_PIX_FMT_UYVY:
+-		/*non-interleaved 422*/
+-		case OUT_PIX_FMT_YUV422P:
+-		case OUT_PIX_FMT_YVU422P:
+-			bpp = 16;
+-			break;
+-		case OUT_PIX_FMT_BGR24:
+-		case OUT_PIX_FMT_RGB24:
+-		case OUT_PIX_FMT_YUV444:
+-			bpp = 24;
+-			break;
+-		case OUT_PIX_FMT_BGR32:
+-		case OUT_PIX_FMT_BGRA32:
+-		case OUT_PIX_FMT_RGB32:
+-		case OUT_PIX_FMT_RGBA32:
+-		case OUT_PIX_FMT_ABGR32:
+-			bpp = 32;
+-			break;
+-		/*non-interleaved 420*/
+-		case OUT_PIX_FMT_YUV420P:
+-		case OUT_PIX_FMT_YVU420P:
+-		case OUT_PIX_FMT_YUV420P2:
+-		case OUT_PIX_FMT_NV12:
+-			bpp = 12;
+-			break;
+-		default:
+-			bpp = 8;
+-			break;
+-	}
+-	return bpp;
+-}
+-
+-int hwc_fill_frame_back(char * frame,int frame_size, int xres,
+-                           int yres, unsigned int pixelformat)
+-{
+-    int ret = 0;
+-    char * base;
+-    int j, screen_size;
+-    short * tmp;
+-    short color;
+-    if((xres<=0)||(yres<=0)||(!frame)) {
+-        HWCOMPOSER_LOG_ERR("Error!Not valid parameters in fill_frame_back");
+-        return -1;
+-    }
+-    switch(pixelformat) {
+-        case OUT_PIX_FMT_RGB565:
+-            memset(frame, 0, frame_size);
+-            break;
+-        case OUT_PIX_FMT_YUYV:
+-        case OUT_PIX_FMT_UYVY:
+-            tmp = (short *) frame;
+-            if(pixelformat == OUT_PIX_FMT_YUYV)
+-               color = 0x8000;
+-            else
+-               color = 0x80;
+-            for(int i = 0; i < frame_size/2;i++, tmp++)
+-                *tmp = color;
+-            break;
+-        case OUT_PIX_FMT_YUV422P:
+-            base = (char *)frame;
+-            screen_size = xres * yres;
+-            memset(base, 0, frame_size);
+-            base += screen_size;
+-            for (int i = 0; i < screen_size; i++, base++)
+-                *base = 0x80;
+-            break;
+-        case OUT_PIX_FMT_YUV420:
+-        case OUT_PIX_FMT_YVU420:
+-        case OUT_PIX_FMT_NV12:
+-            base = (char *)frame;
+-            screen_size = xres * yres;
+-            memset(base, 0, frame_size);
+-            base += screen_size;
+-            for (int i = 0; i < screen_size/2; i++, base++)
+-                 *base = 0x80;
+-            break;
+-        defaule:
+-            HWCOMPOSER_LOG_ERR("Error!Not supported pixel format");
+-            ret = -1;
+-            break;
+-    }
+-    return ret;
+-}
+-
+-int blit_dev_open(const char *dev_name, blit_device **device)
+-{
+-	  int status = -EINVAL;
+-	  
+-	  int isIPU = blit_device::isIPUDevice(dev_name);	  
+-	  if(isIPU) {
+-	  	  blit_ipu *dev;
+-	  	  dev = new blit_ipu();
+-	  	  if(dev == NULL)
+-	  	      return status;
+-	  	  
+-	  	  *device = (blit_device *)dev;
+-	  	  return 0;
+-	  }
+-	  
+-	  int isGPU = blit_device::isGPUDevice(dev_name);
+-	  if(isGPU) {
+-	  	  blit_gpu *dev;
+-	  	  dev = new blit_gpu();
+-	  	  if(dev == NULL)
+-	  	      return status;
+-	  	      	  	  
+-	  	  *device = (blit_device *)dev;
+-	  	  return 0;	  	  	  
+-	  }	  
+-	  
+-	  return status;
+-}
+-
+-int blit_dev_close(blit_device *dev)
+-{
+-		delete(dev);
+-		return 0;
+-}
+-
+-int output_dev_open(const char *dev_name, output_device **device, int flag)
+-{
+-   	int is_overlay = output_device::isFGDevice(dev_name);
+-HWCOMPOSER_LOG_INFO("!!!!!!!!!!!!!!!!!!!!!!!!!output_dev_open: %s", dev_name);   	
+-   	if(is_overlay < 0) {
+-   			return HWC_EGL_ERROR;
+-   	}
+-   	
+-    if(is_overlay == 1) {
+-HWCOMPOSER_LOG_RUNTIME("******output_dev_open() is_overlay =1");    	
+-			  FG_device *dev;
+-			  dev = new FG_device(dev_name, flag);
+-			  	  if(dev == NULL)
+-			  	      return HWC_EGL_ERROR;
+-			
+-			  //dev->setUsage(flag);					   	
+-    		*device = (output_device *)dev;
+-    }
+-		else {
+-			  BG_device *dev;
+-			  dev = new BG_device(dev_name, flag);
+-			  	  if(dev == NULL)
+-			  	      return HWC_EGL_ERROR;
+-			
+-			  //dev->setUsage(flag);	  	
+-    		*device = (output_device *)dev;
+-		}
+-       
+-    return 0;
+-}
+-
+-int output_dev_close(output_device *dev)
+-{
+-  	delete(dev); 
+-  	
+-  	return 0;
+-}
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++#include "blit_gpu.h"
++#include "blit_ipu.h"
++#include <linux/ipu.h>
++//extern "C" {
++//#include "mxc_ipu_hl_lib.h" 
++//}
++/*****************************************************************************/
++using namespace android;
++//int hwc_check_property(hwc_context_t *dev)
++//{
++//    bool bValue = false;
++//    char value[10];
++//    property_get("rw.VIDEO_TVOUT_DISPLAY", value, "");
++//    if (strcmp(value, "1") == 0)
++//        bValue = true;
++//
++//    if((dev->display_mode == DISPLAY_MODE_TV)  !=  bValue){
++//        dev->display_mode = bValue ? DISPLAY_MODE_TV : DISPLAY_MODE_NORMAL;
++//        switchTvOut(dev);
++//        *mode_changed = true;
++//        return 0;
++//    }
++//
++//    bValue = false;
++//    property_get("sys.SECOND_DISPLAY_ENABLED", value, "");
++//    if (strcmp(value, "1") == 0)
++//        bValue = true;
++//
++//    if((dev->display_mode == DISPLAY_MODE_DUAL_DISP)  !=  bValue){
++//        dev->display_mode = bValue ? DISPLAY_MODE_DUAL_DISP : DISPLAY_MODE_NORMAL;
++//        switchDualDisp(dev);
++//        *mode_changed = true;
++//    }    	
++//		return 0;
++//}
++
++
++unsigned long fmt_to_bpp(unsigned long pixelformat)
++{
++	unsigned long bpp;
++
++	switch (pixelformat)
++	{
++		case OUT_PIX_FMT_RGB565:
++		/*interleaved 422*/
++		case OUT_PIX_FMT_YUYV:
++		case OUT_PIX_FMT_UYVY:
++		/*non-interleaved 422*/
++		case OUT_PIX_FMT_YUV422P:
++		case OUT_PIX_FMT_YVU422P:
++			bpp = 16;
++			break;
++		case OUT_PIX_FMT_BGR24:
++		case OUT_PIX_FMT_RGB24:
++		case OUT_PIX_FMT_YUV444:
++			bpp = 24;
++			break;
++		case OUT_PIX_FMT_BGR32:
++		case OUT_PIX_FMT_BGRA32:
++		case OUT_PIX_FMT_RGB32:
++		case OUT_PIX_FMT_RGBA32:
++		case OUT_PIX_FMT_ABGR32:
++			bpp = 32;
++			break;
++		/*non-interleaved 420*/
++		case OUT_PIX_FMT_YUV420P:
++		case OUT_PIX_FMT_YVU420P:
++		case OUT_PIX_FMT_YUV420P2:
++		case OUT_PIX_FMT_NV12:
++			bpp = 12;
++			break;
++		default:
++			bpp = 8;
++			break;
++	}
++	return bpp;
++}
++
++int hwc_fill_frame_back(char * frame,int frame_size, int xres,
++                           int yres, unsigned int pixelformat)
++{
++    int ret = 0;
++    char * base;
++    int j, screen_size;
++    short * tmp;
++    short color;
++    if((xres<=0)||(yres<=0)||(!frame)) {
++        HWCOMPOSER_LOG_ERR("Error!Not valid parameters in fill_frame_back");
++        return -1;
++    }
++    switch(pixelformat) {
++        case OUT_PIX_FMT_RGB565:
++            memset(frame, 0, frame_size);
++            break;
++        case OUT_PIX_FMT_YUYV:
++        case OUT_PIX_FMT_UYVY:
++            tmp = (short *) frame;
++            if(pixelformat == OUT_PIX_FMT_YUYV)
++               color = 0x8000;
++            else
++               color = 0x80;
++            for(int i = 0; i < frame_size/2;i++, tmp++)
++                *tmp = color;
++            break;
++        case OUT_PIX_FMT_YUV422P:
++            base = (char *)frame;
++            screen_size = xres * yres;
++            memset(base, 0, frame_size);
++            base += screen_size;
++            for (int i = 0; i < screen_size; i++, base++)
++                *base = 0x80;
++            break;
++        case OUT_PIX_FMT_YUV420:
++        case OUT_PIX_FMT_YVU420:
++        case OUT_PIX_FMT_NV12:
++            base = (char *)frame;
++            screen_size = xres * yres;
++            memset(base, 0, frame_size);
++            base += screen_size;
++            for (int i = 0; i < screen_size/2; i++, base++)
++                 *base = 0x80;
++            break;
++        defaule:
++            HWCOMPOSER_LOG_ERR("Error!Not supported pixel format");
++            ret = -1;
++            break;
++    }
++    return ret;
++}
++
++int blit_dev_open(const char *dev_name, blit_device **device)
++{
++	  int status = -EINVAL;
++	  
++	  int isIPU = blit_device::isIPUDevice(dev_name);	  
++	  if(isIPU) {
++	  	  blit_ipu *dev;
++	  	  dev = new blit_ipu();
++	  	  if(dev == NULL)
++	  	      return status;
++	  	  
++	  	  *device = (blit_device *)dev;
++	  	  return 0;
++	  }
++	  
++	  int isGPU = blit_device::isGPUDevice(dev_name);
++	  if(isGPU) {
++	  	  blit_gpu *dev;
++	  	  dev = new blit_gpu();
++	  	  if(dev == NULL)
++	  	      return status;
++	  	      	  	  
++	  	  *device = (blit_device *)dev;
++	  	  return 0;	  	  	  
++	  }	  
++	  
++	  return status;
++}
++
++int blit_dev_close(blit_device *dev)
++{
++		delete(dev);
++		return 0;
++}
++
++int output_dev_open(const char *dev_name, output_device **device, int flag)
++{
++   	int is_overlay = output_device::isFGDevice(dev_name);
++HWCOMPOSER_LOG_INFO("!!!!!!!!!!!!!!!!!!!!!!!!!output_dev_open: %s", dev_name);   	
++   	if(is_overlay < 0) {
++   			return HWC_EGL_ERROR;
++   	}
++   	
++    if(is_overlay == 1) {
++HWCOMPOSER_LOG_RUNTIME("******output_dev_open() is_overlay =1");    	
++			  FG_device *dev;
++			  dev = new FG_device(dev_name, flag);
++			  	  if(dev == NULL)
++			  	      return HWC_EGL_ERROR;
++			
++			  //dev->setUsage(flag);					   	
++    		*device = (output_device *)dev;
++    }
++		else {
++			  BG_device *dev;
++			  dev = new BG_device(dev_name, flag);
++			  	  if(dev == NULL)
++			  	      return HWC_EGL_ERROR;
++			
++			  //dev->setUsage(flag);	  	
++    		*device = (output_device *)dev;
++		}
++       
++    return 0;
++}
++
++int output_dev_close(output_device *dev)
++{
++  	delete(dev); 
++  	
++  	return 0;
++}
+diff --git a/mx6/hwcomposer/hwc_common.h b/mx6/hwcomposer/hwc_common.h
+index 4b5ea9b..7895e6e 100755
+--- a/mx6/hwcomposer/hwc_common.h
++++ b/mx6/hwcomposer/hwc_common.h
+@@ -1,230 +1,238 @@
+-
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-#ifndef _HWC_FSL_H_
+-#define _HWC_FSL_H_
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <utils/threads.h>
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include <asm/page.h>
+-
+-#undef LOG_TAG
+-#define LOG_TAG "FslHwcomposer"
+-#include <utils/Log.h>
+-
+-//#define HWCOMPOSER__DEBUG_LOG
+-
+-#ifdef HWCOMPOSER_DEBUG_LOG
+-#define HWCOMPOSER_LOG_RUNTIME(format, ...) LOGI((format), ## __VA_ARGS__)
+-#define HWCOMPOSER_LOG_FUNC LOGI("%s is excuting...",  __FUNCTION__)
+-#else
+-#define HWCOMPOSER_LOG_RUNTIME(format, ...)
+-#define HWCOMPOSER_LOG_FUNC
+-#endif
+-
+-#define HWCOMPOSER_LOG_TRACE   LOGI("%s : %d", __FUNCTION__,__LINE__)
+-#define HWCOMPOSER_LOG_INFO(format, ...) LOGI((format), ## __VA_ARGS__)
+-
+-#define HWCOMPOSER_LOG_ERR(format, ...) LOGE((format), ##__VA_ARGS__)
+-/*****************************************************************************/
+-#define DEFAULT_FB_DEV_NAME "/dev/graphics/fb0"
+-#define FB1_DEV_NAME "/dev/graphics/fb1"
+-#define FB2_DEV_NAME "/dev/graphics/fb2"
+-#define V4L_DEV_NAME "/dev/video16"
+-#define MAX_OUTPUT_DISPLAY  10
+-
+-#define BLIT_IPU "blt_ipu"
+-#define BLIT_GPU "blt_gpu"
+-
+-#define DEFAULT_BUFFERS  3 
+-
+-using namespace android;
+-
+-//typedef unsigned long __u32;
+-#define fourcc(a, b, c, d)\
+-	 (((__u32)(a)<<0)|((__u32)(b)<<8)|((__u32)(c)<<16)|((__u32)(d)<<24))
+-
+-#define OUT_PIX_FMT_RGB565  fourcc('R', 'G', 'B', 'P')	/*!< 1 6  RGB-5-6-5   */
+-#define OUT_PIX_FMT_BGR24   fourcc('B', 'G', 'R', '3')	/*!< 24  BGR-8-8-8    */
+-#define OUT_PIX_FMT_RGB24   fourcc('R', 'G', 'B', '3')	/*!< 24  RGB-8-8-8    */
+-#define OUT_PIX_FMT_BGR32   fourcc('B', 'G', 'R', '4')	/*!< 32  BGR-8-8-8-8  */
+-#define OUT_PIX_FMT_BGRA32  fourcc('B', 'G', 'R', 'A')	/*!< 32  BGR-8-8-8-8  */
+-#define OUT_PIX_FMT_RGB32   fourcc('R', 'G', 'B', '4')	/*!< 32  RGB-8-8-8-8  */
+-#define OUT_PIX_FMT_RGBA32  fourcc('R', 'G', 'B', 'A')	/*!< 32  RGB-8-8-8-8  */
+-#define OUT_PIX_FMT_ABGR32  fourcc('A', 'B', 'G', 'R')	/*!< 32  ABGR-8-8-8-8 */
+-
+-#define OUT_PIX_FMT_YUYV    fourcc('Y', 'U', 'Y', 'V')	/*!< 16 YUV 4:2:2 */
+-#define OUT_PIX_FMT_UYVY    fourcc('U', 'Y', 'V', 'Y')	/*!< 16 YUV 4:2:2 */
+-#define OUT_PIX_FMT_YUV422P fourcc('4', '2', '2', 'P')	/*!< 16 YUV 4:2:2 */
+-#define OUT_PIX_FMT_YVU422P fourcc('Y', 'V', '1', '6')	/*!< 16 YVU 4:2:2 */
+-#define OUT_PIX_FMT_YUV444  fourcc('Y', '4', '4', '4')	/*!< 24 YUV 4:4:4 */
+-#define OUT_PIX_FMT_YUV420P fourcc('I', '4', '2', '0')	/*!< 12 YUV 4:2:0 */
+-#define OUT_PIX_FMT_YVU420P fourcc('Y', 'V', '1', '2')	/*!< 12 YVU 4:2:0 */
+-#define OUT_PIX_FMT_YUV420P2 fourcc('Y', 'U', '1', '2')	/*!< 12 YUV 4:2:0 */
+-#define OUT_PIX_FMT_NV12    fourcc('N', 'V', '1', '2') /* 12  Y/CbCr 4:2:0  */
+-#define OUT_PIX_FMT_YUV420  fourcc('Y', 'U', '1', '2') /* 12  YUV 4:2:0     */
+-#define OUT_PIX_FMT_YVU420  fourcc('Y', 'V', '1', '2') /* 12  YVU 4:2:0     */
+-
+-inline size_t roundUpToPageSize(size_t x) {
+-    return (x + (PAGE_SIZE-1)) & ~(PAGE_SIZE-1);
+-}
+-
+-typedef enum {
+-    DISPLAY_MODE_OVERLAY_DISP0 = 0x00000001,
+-    DISPLAY_MODE_OVERLAY_DISP1 = 0x00000002,
+-    DISPLAY_MODE_OVERLAY_DISP2 = 0x00000004,
+-    DISPLAY_MODE_OVERLAY_DISP3 = 0x00000008,
+-    DISPLAY_MODE_DISP1 = 0x00000010,
+-    DISPLAY_MODE_DISP2 = 0x00000020,
+-    DISPLAY_MODE_DISP3 = 0x00000040,
+-}DISPLAY_MODE;
+-
+-//seperate into three groups. one group member can be or with other group member.
+-//but the group member can not be or with that in the same group except display group.
+-#define GRALLOC_USAGE_OVERLAY0_MASK   0x00300000
+-#define GRALLOC_USAGE_OVERLAY1_MASK   0x00C00000
+-#define GRALLOC_USAGE_DISPLAY_MASK    0x07000000
+-#define GRALLOC_USAGE_OVERLAY_DISPLAY_MASK 0x07F00000
+-
+-typedef struct{
+-    void *virt_addr;
+-    unsigned long phy_addr;
+-    unsigned long size;
+-    int format;
+-    int width;
+-    int height;
+-    int usage;
+-}hwc_buffer;
+-
+-class output_device
+-{
+-public:
+-		virtual int post(hwc_buffer *);
+-		virtual int fetch(hwc_buffer *);
+-
+-		void setUsage(int usage);
+-		int getUsage();
+-		int getWidth();
+-		int getHeight();
+-
+-		output_device(const char *dev_name, int usage);
+-		virtual ~output_device();
+-
+-		static int isFGDevice(const char *dev_name);
+-
+-private:
+-		output_device& operator = (output_device& out);
+-		output_device(const output_device& out);
+-
+-protected:
+-		int m_dev;
+-		//int m_left;
+-		//int m_top;
+-		int m_usage;
+-		int m_width;
+-		int m_height;
+-		int m_format;
+-//		int is_overlay;
+-
+-		mutable Mutex mLock;
+-		hwc_buffer mbuffers[DEFAULT_BUFFERS];
+-		unsigned long mbuffer_count;
+-		unsigned long mbuffer_cur;
+-
+-};
+-
+-//the normal display device
+-class BG_device : public output_device
+-{
+-public:
+-//		virtual int post(hwc_buffer *);
+-//		virtual int fetch(hwc_buffer *);
+-
+-		BG_device(const char *dev_name, int usage);
+-		virtual ~BG_device();
+-
+-private:
+-		BG_device& operator = (BG_device& out);
+-		BG_device(const BG_device& out);
+-
+-		int init();
+-		int uninit();
+-
+-public:
+-		//add private data
+-};
+-
+-//the overlay display device
+-class FG_device : public output_device
+-{
+-public:
+-//		virtual int post(hwc_buffer *);
+-//		virtual int fetch(hwc_buffer *);
+-
+-		FG_device(const char *dev_name, int usage);
+-		virtual ~FG_device();
+-
+-private:
+-		FG_device& operator = (FG_device& out);
+-		FG_device(const FG_device& out);
+-
+-		int init();
+-		int uninit();
+-
+-private:
+-		//add private data
+-		//int m_flag; //for display number flag.
+-};
+-
+-class blit_device{
+-public:
+-		static int isIPUDevice(const char *dev_name);
+-		static int isGPUDevice(const char *dev_name);
+-    virtual int blit(hwc_layer_t *layer, hwc_buffer *out_buf) = 0;
+-		virtual ~blit_device(){}
+-};
+-
+-//int FG_init(struct output_device *dev);
+-//int FG_uninit(struct output_device *dev);
+-//int FG_fetch(struct output_device *dev, hwc_buffer *buf);
+-//int FG_post(struct output_device *dev);
+-//
+-//int BG_init(struct output_device *dev);
+-//int BG_uninit(struct output_device *dev);
+-//int BG_fetch(struct output_device *dev, hwc_buffer *buf);
+-//int BG_post(struct output_device *dev);
+-unsigned long fmt_to_bpp(unsigned long pixelformat);
+-int hwc_fill_frame_back(char * frame,int frame_size, int xres,
+-                           int yres, unsigned int pixelformat);
+-int blit_dev_open(const char *dev_name, blit_device **);
+-int blit_dev_close(blit_device *);
+-
+-int output_dev_open(const char *dev_name, output_device **, int);
+-int output_dev_close(output_device *);
+-
+-#endif
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++#ifndef _HWC_FSL_H_
++#define _HWC_FSL_H_
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <utils/threads.h>
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include <asm/page.h>
++#include <ui/Rect.h>
++#include <ui/Region.h>
++
++#undef LOG_TAG
++#define LOG_TAG "FslHwcomposer"
++#include <utils/Log.h>
++
++//#define HWCOMPOSER_DEBUG_LOG
++
++#ifdef HWCOMPOSER_DEBUG_LOG
++#define HWCOMPOSER_LOG_RUNTIME(format, ...) LOGI((format), ## __VA_ARGS__)
++#define HWCOMPOSER_LOG_FUNC LOGI("%s is excuting...",  __FUNCTION__)
++#else
++#define HWCOMPOSER_LOG_RUNTIME(format, ...)
++#define HWCOMPOSER_LOG_FUNC
++#endif
++
++#define HWCOMPOSER_LOG_TRACE   LOGI("%s : %d", __FUNCTION__,__LINE__)
++#define HWCOMPOSER_LOG_INFO(format, ...) LOGI((format), ## __VA_ARGS__)
++
++#define HWCOMPOSER_LOG_ERR(format, ...) LOGE((format), ##__VA_ARGS__)
++/*****************************************************************************/
++#define DEFAULT_FB_DEV_NAME "/dev/graphics/fb0"
++#define FB1_DEV_NAME "/dev/graphics/fb1"
++#define FB2_DEV_NAME "/dev/graphics/fb2"
++#define V4L_DEV_NAME "/dev/video16"
++#define MAX_OUTPUT_DISPLAY  10
++
++#define BLIT_IPU "blt_ipu"
++#define BLIT_GPU "blt_gpu"
++
++#define DEFAULT_BUFFERS  3 
++
++using namespace android;
++
++//typedef unsigned long __u32;
++#define fourcc(a, b, c, d)\
++	 (((__u32)(a)<<0)|((__u32)(b)<<8)|((__u32)(c)<<16)|((__u32)(d)<<24))
++
++#define OUT_PIX_FMT_RGB565  fourcc('R', 'G', 'B', 'P')	/*!< 1 6  RGB-5-6-5   */
++#define OUT_PIX_FMT_BGR24   fourcc('B', 'G', 'R', '3')	/*!< 24  BGR-8-8-8    */
++#define OUT_PIX_FMT_RGB24   fourcc('R', 'G', 'B', '3')	/*!< 24  RGB-8-8-8    */
++#define OUT_PIX_FMT_BGR32   fourcc('B', 'G', 'R', '4')	/*!< 32  BGR-8-8-8-8  */
++#define OUT_PIX_FMT_BGRA32  fourcc('B', 'G', 'R', 'A')	/*!< 32  BGR-8-8-8-8  */
++#define OUT_PIX_FMT_RGB32   fourcc('R', 'G', 'B', '4')	/*!< 32  RGB-8-8-8-8  */
++#define OUT_PIX_FMT_RGBA32  fourcc('R', 'G', 'B', 'A')	/*!< 32  RGB-8-8-8-8  */
++#define OUT_PIX_FMT_ABGR32  fourcc('A', 'B', 'G', 'R')	/*!< 32  ABGR-8-8-8-8 */
++
++#define OUT_PIX_FMT_YUYV    fourcc('Y', 'U', 'Y', 'V')	/*!< 16 YUV 4:2:2 */
++#define OUT_PIX_FMT_UYVY    fourcc('U', 'Y', 'V', 'Y')	/*!< 16 YUV 4:2:2 */
++#define OUT_PIX_FMT_YUV422P fourcc('4', '2', '2', 'P')	/*!< 16 YUV 4:2:2 */
++#define OUT_PIX_FMT_YVU422P fourcc('Y', 'V', '1', '6')	/*!< 16 YVU 4:2:2 */
++#define OUT_PIX_FMT_YUV444  fourcc('Y', '4', '4', '4')	/*!< 24 YUV 4:4:4 */
++#define OUT_PIX_FMT_YUV420P fourcc('I', '4', '2', '0')	/*!< 12 YUV 4:2:0 */
++#define OUT_PIX_FMT_YVU420P fourcc('Y', 'V', '1', '2')	/*!< 12 YVU 4:2:0 */
++#define OUT_PIX_FMT_YUV420P2 fourcc('Y', 'U', '1', '2')	/*!< 12 YUV 4:2:0 */
++#define OUT_PIX_FMT_NV12    fourcc('N', 'V', '1', '2') /* 12  Y/CbCr 4:2:0  */
++#define OUT_PIX_FMT_YUV420  fourcc('Y', 'U', '1', '2') /* 12  YUV 4:2:0     */
++#define OUT_PIX_FMT_YVU420  fourcc('Y', 'V', '1', '2') /* 12  YVU 4:2:0     */
++
++inline size_t roundUpToPageSize(size_t x) {
++    return (x + (PAGE_SIZE-1)) & ~(PAGE_SIZE-1);
++}
++
++typedef enum {
++    DISPLAY_MODE_OVERLAY_DISP0 = 0x00000001,
++    DISPLAY_MODE_OVERLAY_DISP1 = 0x00000002,
++    DISPLAY_MODE_OVERLAY_DISP2 = 0x00000004,
++    DISPLAY_MODE_OVERLAY_DISP3 = 0x00000008,
++    DISPLAY_MODE_DISP1 = 0x00000010,
++    DISPLAY_MODE_DISP2 = 0x00000020,
++    DISPLAY_MODE_DISP3 = 0x00000040,
++}DISPLAY_MODE;
++
++//seperate into three groups. one group member can be or with other group member.
++//but the group member can not be or with that in the same group except display group.
++#define GRALLOC_USAGE_OVERLAY0_MASK   0x00300000
++#define GRALLOC_USAGE_OVERLAY1_MASK   0x00C00000
++#define GRALLOC_USAGE_DISPLAY_MASK    0x07000000
++#define GRALLOC_USAGE_OVERLAY_DISPLAY_MASK 0x07F00000
++
++typedef struct{
++    void *virt_addr;
++    unsigned long phy_addr;
++    unsigned long size;
++    int format;
++    int width;
++    int height;
++    int usage;
++    Region disp_region;
++}hwc_buffer;
++
++class output_device
++{
++public:
++		virtual int post(hwc_buffer *);
++		virtual int fetch(hwc_buffer *);
++
++		void setUsage(int usage);
++		int getUsage();
++		int getWidth();
++		int getHeight();
++        void setDisplayFrame(hwc_rect_t *disFrame);
++        int needFillBlack(hwc_buffer *buf);
++        void fillBlack(hwc_buffer *buf);
++
++		output_device(const char *dev_name, int usage);
++		virtual ~output_device();
++
++		static int isFGDevice(const char *dev_name);
++
++private:
++		output_device& operator = (output_device& out);
++		output_device(const output_device& out);
++
++protected:
++		int m_dev;
++		//int m_left;
++		//int m_top;
++		int m_usage;
++		int m_width;
++		int m_height;
++		int m_format;
++//		int is_overlay;
++
++        //Region orignRegion;
++        Region currenRegion;
++
++		mutable Mutex mLock;
++		hwc_buffer mbuffers[DEFAULT_BUFFERS];
++		unsigned long mbuffer_count;
++		unsigned long mbuffer_cur;
++
++};
++
++//the normal display device
++class BG_device : public output_device
++{
++public:
++//		virtual int post(hwc_buffer *);
++//		virtual int fetch(hwc_buffer *);
++
++		BG_device(const char *dev_name, int usage);
++		virtual ~BG_device();
++
++private:
++		BG_device& operator = (BG_device& out);
++		BG_device(const BG_device& out);
++
++		int init();
++		int uninit();
++
++public:
++		//add private data
++};
++
++//the overlay display device
++class FG_device : public output_device
++{
++public:
++//		virtual int post(hwc_buffer *);
++//		virtual int fetch(hwc_buffer *);
++
++		FG_device(const char *dev_name, int usage);
++		virtual ~FG_device();
++
++private:
++		FG_device& operator = (FG_device& out);
++		FG_device(const FG_device& out);
++
++		int init();
++		int uninit();
++
++private:
++		//add private data
++		//int m_flag; //for display number flag.
++};
++
++class blit_device{
++public:
++		static int isIPUDevice(const char *dev_name);
++		static int isGPUDevice(const char *dev_name);
++    virtual int blit(hwc_layer_t *layer, hwc_buffer *out_buf) = 0;
++		virtual ~blit_device(){}
++};
++
++//int FG_init(struct output_device *dev);
++//int FG_uninit(struct output_device *dev);
++//int FG_fetch(struct output_device *dev, hwc_buffer *buf);
++//int FG_post(struct output_device *dev);
++//
++//int BG_init(struct output_device *dev);
++//int BG_uninit(struct output_device *dev);
++//int BG_fetch(struct output_device *dev, hwc_buffer *buf);
++//int BG_post(struct output_device *dev);
++unsigned long fmt_to_bpp(unsigned long pixelformat);
++int hwc_fill_frame_back(char * frame,int frame_size, int xres,
++                           int yres, unsigned int pixelformat);
++int blit_dev_open(const char *dev_name, blit_device **);
++int blit_dev_close(blit_device *);
++
++int output_dev_open(const char *dev_name, output_device **, int);
++int output_dev_close(output_device *);
++
++#endif
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index e2c049f..6a46ee0 100755
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -12,7 +12,7 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++/*Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+ 
+ #include <hardware/hardware.h>
+ #include <hardware/overlay.h>
+@@ -43,7 +43,8 @@ struct hwc_context_t {
+ 
+     //the system property for dual display and overlay switch.
+     int display_mode;
+-    int display_mode_changed; //the initial value is 0
++    char ui_refresh;
++    char vd_refresh;
+ };
+ 
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+@@ -84,7 +85,6 @@ static int hwc_check_property(hwc_context_t *dev)
+ {
+     //bool bValue = false;
+     char value[10];
+-    int orignMode = dev->display_mode;
+ 
+     property_get("rw.VIDEO_TVOUT_DISPLAY", value, "");
+     if (strcmp(value, "1") == 0) {
+@@ -101,10 +101,10 @@ static int hwc_check_property(hwc_context_t *dev)
+        property_set("sys.VIDEO_OVERLAY_DISPLAY", "2");
+        property_set("sys.VIDEO_DISPLAY", "0");
+     } else
+-	{
++    {
+        property_set("sys.VIDEO_OVERLAY_DISPLAY", "1");
+        property_set("sys.VIDEO_DISPLAY", "0");
+-	}
++    }
+ 
+     /*note:sys.VIDEO_OVERLAY_DISPLAY means the overlay will be combined to which display.
+      *the default value is 0 and it indicates nothing.
+@@ -140,22 +140,25 @@ static int hwc_check_property(hwc_context_t *dev)
+     if (strcmp(value, "2") == 0){
+         dev->display_mode |= DISPLAY_MODE_DISP2;
+     }
+-
+-		if(dev->display_mode ^ orignMode) {
+-				dev->display_mode_changed = 1;
+-		}
+-//HWCOMPOSER_LOG_RUNTIME("*********display_mode=%x, display_mode_changed=%d\n", dev->display_mode, dev->display_mode_changed);
+-		return 0;
++	return 0;
+ }
+ 
+ static int hwc_modify_property(hwc_context_t *dev, private_handle_t *handle)
+ {
+ 	handle->usage &= ~GRALLOC_USAGE_OVERLAY_DISPLAY_MASK;
+ 
++    if(dev->display_mode & DISPLAY_MODE_DISP1){
++            handle->usage |= GRALLOC_USAGE_HWC_DISP1;
++            //dev->display_mode &= ~DISPLAY_MODE_DISP1;
++			return 0;
++    }
++
++    if(dev->display_mode & DISPLAY_MODE_DISP2)
++            handle->usage |= GRALLOC_USAGE_HWC_DISP2;
++
+ 	if(dev->display_mode & DISPLAY_MODE_OVERLAY_DISP0){
+ 			handle->usage |= GRALLOC_USAGE_HWC_OVERLAY_DISP0;
+ 			dev->display_mode &= ~DISPLAY_MODE_OVERLAY_DISP0;
+-			return 0;
+ 	}
+ 	else if(dev->display_mode & DISPLAY_MODE_OVERLAY_DISP1)
+ 			handle->usage |= GRALLOC_USAGE_HWC_OVERLAY_DISP1;
+@@ -165,13 +168,7 @@ static int hwc_modify_property(hwc_context_t *dev, private_handle_t *handle)
+ 	else if(dev->display_mode & DISPLAY_MODE_OVERLAY_DISP3)
+ 			handle->usage |= GRALLOC_USAGE_HWC_OVERLAY_DISP3;
+ 
+-	if(dev->display_mode & DISPLAY_MODE_DISP1){
+-			handle->usage |= GRALLOC_USAGE_HWC_DISP1;
+-			dev->display_mode &= ~DISPLAY_MODE_DISP1;
+-	}
+-	if(dev->display_mode & DISPLAY_MODE_DISP2)
+-			handle->usage |= GRALLOC_USAGE_HWC_DISP2;
+-//HWCOMPOSER_LOG_RUNTIME("************handle->usage=%x", handle->usage);
++//HWCOMPOSER_LOG_ERR("************handle->usage=%x", handle->usage);
+ 	return 0;
+ }
+ 
+@@ -209,6 +206,7 @@ static int findOutputDevice(struct hwc_context_t *ctx, int *index, int usage, in
+ 	output_device *out;
+ 	int uFlag = 0;
+ 	int usg = 0;
++    *index = -1;
+ 
+ 	for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ 		if(ctx->m_using[i]) {
+@@ -297,11 +295,46 @@ static int validate_displayFrame(hwc_layer_t *layer)
+     return isValid;
+ }
+ 
++static void checkDisplayFrame(struct hwc_context_t *ctx, hwc_layer_t *layer, int usage)
++{
++    output_device *out;
++    int usg;
++    hwc_rect_t *disFrame = &(layer->displayFrame);
++
++    for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
++        if(ctx->m_using[i] && ctx->m_out[i] && (usage & (GRALLOC_USAGE_OVERLAY0_MASK | GRALLOC_USAGE_OVERLAY1_MASK))) {
++            out = ctx->m_out[i];
++            usg = out->getUsage();
++            if(usg & usage) {
++                out->setDisplayFrame(disFrame);
++            }
++        }
++    }//end for
++
++}
++
++static int open_outputDevice(struct hwc_context_t *ctx, const char *dev_name, output_device **device, int flag) 
++{
++    int usage;
++    output_device *out;
++    for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
++        if(ctx->m_using[i] && ctx->m_out[i]) {
++            out = ctx->m_out[i];
++            usage = out->getUsage();
++            if(((usage | flag) == GRALLOC_USAGE_OVERLAY0_MASK) || ((usage | flag) == GRALLOC_USAGE_OVERLAY1_MASK)) {
++                output_dev_close(ctx->m_out[i]);
++                ctx->m_using[i] = 0;
++                ctx->m_out[i] = NULL;
++            }
++        }
++    }
++    return output_dev_open(dev_name, device, flag);
++}
++
+ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ //#if 1
+ 		//HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---1>>>>>>>>>>>>>>>>>\n");
+ 		char out_using[MAX_OUTPUT_DISPLAY] = {0};
+-
+ //		for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ //				out_using[i] = m_using[i];
+ //		}
+@@ -312,7 +345,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 			hwc_check_property(ctx);
+ 		}
+ #endif
+-    if (list && dev && ((list->flags & HWC_GEOMETRY_CHANGED) || ctx->display_mode_changed)) {
++    if (list && dev) {
+         for (size_t i=0 ; i<list->numHwLayers ; i++) {
+             //dump_layer(&list->hwLayers[i]);
+             //list->hwLayers[i].compositionType = HWC_FRAMEBUFFER;
+@@ -327,7 +360,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 		    //HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---2>>>>>>>>>>>>>>>>>\n");
+             private_handle_t *handle = (private_handle_t *)(layer->handle);
+             if(!(handle->usage & GRALLOC_USAGE_HWC_OVERLAY)) {
+-            	//HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---usage=%x>>phy=%x>>>>>>>>>>>>>>>\n", handle->usage, handle->phys);
++                //HWCOMPOSER_LOG_ERR("<<<<<<<<<<<<<<<hwc_prepare---usage=%x>>phy=%x>>>>>>>>>>>>>>>\n", handle->usage, handle->phys);
+             	continue;
+             }
+             HWCOMPOSER_LOG_RUNTIME("<<<<<<<<<<<<<<<hwc_prepare---3>usage=%x, phy=%x>>>>>>>>>>>>>>>>\n", handle->usage, handle->phys);
+@@ -349,7 +382,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+             int retv = 0;
+             int m_usage = 0;
+             int i_usage = handle->usage & GRALLOC_USAGE_OVERLAY_DISPLAY_MASK;
+-            //HWCOMPOSER_LOG_ERR("<<<<<<<<<<<<<<<hwc_prepare---3-3>>>>>>>>>>>>>>>>\n");
++            //HWCOMPOSER_LOG_ERR("<<<<<<<<<<<<<<<hwc_prepare---3-3>>>>>usage=%x>>>i_usage=%x>>>>>>>>\n", handle->usage, i_usage);
+             retv = checkOutputDevice(ctx, out_using, i_usage, &m_usage);
+             while(retv && m_usage) {
+ 		        int ruse = 0;
+@@ -372,7 +405,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 	            if(ctx->m_out[index])
+ 	            		deleteEmtpyIndex(ctx);
+ 
+-		        status = output_dev_open(dev_name, &(ctx->m_out[index]), ruse);
++		        status = open_outputDevice(ctx, dev_name, &(ctx->m_out[index]), ruse);//output_dev_open(dev_name, &(ctx->m_out[index]), ruse);
+ 		        if(status < 0){
+ 		        	  HWCOMPOSER_LOG_ERR("Error! open output device failed!");
+ 		        	  continue;
+@@ -381,10 +414,10 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 		        ctx->m_using[index] = 1;
+ 		        //setLayerFrame(layer, ctx->m_out[index], ruse);
+             }//end while
++            checkDisplayFrame(ctx, layer, i_usage);
+ #endif
+         }//end for
+ #if 1
+-        ctx->display_mode_changed = 0;
+ 	    for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ 			if(!out_using[i] && ctx->m_using[i]) {
+ 				ctx->m_using[i] = 0;
+@@ -394,7 +427,6 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 		}
+ #endif
+     }//end if
+-
+ //#endif
+     return 0;
+ }
+@@ -423,6 +455,16 @@ static int getActiveOuputDevice(struct hwc_context_t *ctx)
+ 		return num;
+ }
+ 
++static int hwc_setUpdateMode(hwc_composer_device_t *dev, char refresh, char vRefresh)
++{
++    struct hwc_context_t *ctx = (struct hwc_context_t *)dev;
++    if(ctx == NULL) return 0;
++
++    ctx->ui_refresh = refresh;
++    ctx->vd_refresh = vRefresh;
++    return 0;
++}
++
+ static int hwc_set(hwc_composer_device_t *dev,
+         hwc_display_t dpy,
+         hwc_surface_t sur,
+@@ -439,34 +481,38 @@ static int hwc_set(hwc_composer_device_t *dev,
+     if(ctx && (dpy == NULL) && (sur == NULL) && (list == NULL)) {
+ 		//close the output device.
+ 		releaseAllOutput(ctx);
+-		ctx->display_mode_changed = 1;
++		//ctx->display_mode_changed = 1;
+ 
+ 		return 0;
+     }
+ #endif
+ 		//HWCOMPOSER_LOG_RUNTIME("==============hwc_set=2==============\n");
+ #if 1 
+-    EGLBoolean sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
+-    if (!sucess) {
+-        return HWC_EGL_ERROR;
++    if((ctx == NULL) || (ctx && ctx->ui_refresh)) {
++        EGLBoolean sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
++        if (!sucess) {
++            return HWC_EGL_ERROR;
++        }
+     }
+ #endif
+-    if(list == NULL || dev == NULL) {
++    if(list == NULL || dev == NULL || !ctx->vd_refresh) {
+     	return 0;
+     }
+-#if 1
+  		//HWCOMPOSER_LOG_RUNTIME("==============hwc_set=3==============\n");
+     if(getActiveOuputDevice(ctx) == 0) {return 0;}//eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur); return 0;}
+ 
+     int status = -EINVAL;
+ 	HWCOMPOSER_LOG_RUNTIME("==============hwc_set=4==============\n");
+ 	hwc_buffer out_buffer[MAX_OUTPUT_DISPLAY];
++    char bufs_state[MAX_OUTPUT_DISPLAY];
++    memset(bufs_state, 0, sizeof(bufs_state));
+ 	memset(out_buffer, 0, sizeof(out_buffer));
++#if 0    
+ 	for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ 		if(ctx->m_using[i] && ctx->m_out[i])
+ 			status = ctx->m_out[i]->fetch(&out_buffer[i]);
+-	}
+-
++    }
++#endif
+     blit_device *bltdev = ctx->blit;
+     for (size_t i=0 ; i<list->numHwLayers ; i++){
+ 		hwc_layer_t *layer = &list->hwLayers[i];
+@@ -485,14 +531,22 @@ static int hwc_set(hwc_composer_device_t *dev,
+             int m_usage = 0;
+             int i_usage = handle->usage & GRALLOC_USAGE_OVERLAY_DISPLAY_MASK;
+     	    HWCOMPOSER_LOG_RUNTIME("==============hwc_set=5==============\n");
++            if(!i_usage) continue;
+             do {
+     			output_device *outdev = NULL;
+     			int index = 0;
+         		retv = findOutputDevice(ctx, &index, i_usage, &m_usage);
+                 if((index >= 0) && (index < MAX_OUTPUT_DISPLAY)) {
+                 	outdev = ctx->m_out[index];
++                }else {
++                    break;
+                 }
++                
+     			if(outdev != NULL) {
++                    if(!bufs_state[index] && ctx->m_using[i]) {
++                        outdev->fetch(&out_buffer[index]);
++                        bufs_state[index] = 1;
++                    }
+     				status = bltdev->blit(layer, &(out_buffer[index]));
+     				if(status < 0){
+     					HWCOMPOSER_LOG_ERR("Error! bltdev->blit() failed!");
+@@ -505,7 +559,7 @@ static int hwc_set(hwc_composer_device_t *dev,
+     }//end for
+ 
+     for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+-				if(ctx->m_using[i]) {
++				if(ctx->m_using[i] && bufs_state[i]) {
+ 						status = ctx->m_out[i]->post(&out_buffer[i]);
+ 						if(status < 0){
+ 								HWCOMPOSER_LOG_ERR("Error! output device post buffer failed!");
+@@ -513,7 +567,6 @@ static int hwc_set(hwc_composer_device_t *dev,
+ 						}
+ 				}
+ 		}
+-#endif
+     return 0;
+ }
+ 
+@@ -550,6 +603,7 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+ 
+         dev->device.prepare = hwc_prepare;
+         dev->device.set = hwc_set;
++        dev->device.setUpdateMode = hwc_setUpdateMode;
+ 
+         *device = &dev->device.common;
+ 
+diff --git a/mx6/hwcomposer/output_device.cpp b/mx6/hwcomposer/output_device.cpp
+index ffcaa02..cdbbdff 100755
+--- a/mx6/hwcomposer/output_device.cpp
++++ b/mx6/hwcomposer/output_device.cpp
+@@ -1,156 +1,187 @@
+-
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+-#include <hardware/hardware.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-
+-#include <hardware/hwcomposer.h>
+-
+-#include <EGL/egl.h>
+-#include "gralloc_priv.h"
+-#include "hwc_common.h"
+-
+-void output_device::setUsage(int usage)
+-{
+-    m_usage = usage;
+-}
+-
+-int output_device::getUsage()
+-{
+-    return m_usage;
+-}
+-
+-int output_device::getWidth()
+-{
+-    return m_width;
+-}
+-
+-int output_device::getHeight()
+-{
+-    return m_height;
+-}
+-
+-output_device::output_device(const char *dev_name, int usage)
+-{
+-    m_dev = open(dev_name, O_RDWR | O_NONBLOCK, 0);
+-    if(m_dev < 0) {
+-        HWCOMPOSER_LOG_ERR("Error! output_device Open fb device %s failed!", dev_name);
+-    }
+-    m_usage = usage;
+-}
+-
+-output_device::~output_device()
+-{
+-	if(m_dev > 0) {
+-        close(m_dev);
+-	}
+-}
+-
+-int output_device::isFGDevice(const char *dev_name)
+-{
+-    int status = -EINVAL;
+-    int fd = -1;
+-    char fb_usage[32];
+-    char fb_name[32];
+-    int fd_n = 0;
+-    int size = 0;
+-    int is_overlay = 0;
+-    char *psname;
+-
+-    memset(fb_name, 0, sizeof(fb_name));
+-    psname = (char *)dev_name;
+-    psname += (strlen(dev_name) - 1);
+-    strcpy(fb_name, "/sys/class/graphics/fb");
+-    strcat(fb_name, psname);
+-    strcat(fb_name, "/name");
+-    fd_n = open(fb_name, O_RDONLY, 0);
+-    //fd_n = open("/sys/class/graphics/fb0/name", O_RDONLY, 0);
+-    if(fd_n < 0) {
+-		HWCOMPOSER_LOG_ERR("Error! output_device::isFGDevice  open %s failed!", fb_name);
+-		return -1;
+-    }
+-    memset(fb_usage, 0, sizeof(fb_usage));
+-    size = read(fd_n, fb_usage, sizeof(fb_usage));
+-    if(size < 0) {
+-		HWCOMPOSER_LOG_ERR("Error! output_device::isFGDevice read /sys/class/graphics/fb0/name failed!");
+-		return -1;
+-    }
+-    close(fd_n);
+-HWCOMPOSER_LOG_INFO("output_device::isFGDevice===%s, %s, %s", dev_name, fb_name, fb_usage);
+-    if(strstr(fb_usage, "FG"))
+-    	return 1;
+- 	return 0;
+-}
+-
+-int output_device::fetch(hwc_buffer *buf)
+-{
+-	  //int status = -EINVAL;
+-    if(m_dev <= 0) {
+-        HWCOMPOSER_LOG_ERR("Error! output_device::fetch invalid parameter! usage=%x", m_usage);
+-        return -1;
+-    }
+-
+-	  Mutex::Autolock _l(mLock);
+-	  buf->size = (mbuffers[mbuffer_cur]).size;
+-	  buf->virt_addr = (mbuffers[mbuffer_cur]).virt_addr;
+-	  buf->phy_addr = (mbuffers[mbuffer_cur]).phy_addr;
+-	  buf->width = m_width;
+-	  buf->height = m_height;
+-	  buf->usage = m_usage;
+-	  buf->format = m_format;
+-	  //dev->buffer_cur = (dev->buffer_cur + 1) % DEFAULT_BUFFERS;
+-
+-	  return 0;
+-}
+-
+-int output_device::post(hwc_buffer *buf)
+-{
+-	  //int status = -EINVAL;
+-    if(m_dev <= 0) {
+-        HWCOMPOSER_LOG_ERR("Error! FG_device::FG_post() invalid parameter! usage=%x", m_usage);
+-        return -1;
+-    }
+-HWCOMPOSER_LOG_RUNTIME("#######output_device::post()############");
+-
+-	Mutex::Autolock _l(mLock);
+-    struct fb_var_screeninfo info;
+-    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
+-        HWCOMPOSER_LOG_ERR("Error! output_device::post VSCREENINFO getting failed! usage=%x", m_usage);
+-        return -1;
+-    }
+-
+-    struct fb_fix_screeninfo finfo;
+-    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
+-        HWCOMPOSER_LOG_ERR("Error! output_device::post FSCREENINFO getting failed! usage=%x", m_usage);
+-        return -1;
+-    }
+-
+-    info.yoffset = ((unsigned long)buf->virt_addr - (unsigned long)(mbuffers[0]).virt_addr) / finfo.line_length;
+-    //info.yoffset = ((info.yres_virtual * finfo.line_length)/ DEFAULT_BUFFERS) * mbuffer_cur;
+-    mbuffer_cur = (mbuffer_cur + 1) % DEFAULT_BUFFERS;
+-    info.activate = FB_ACTIVATE_VBL;
+-//HWCOMPOSER_LOG_RUNTIME("#######yoffset=%d, mbuffer_cur=%d######", info.yoffset, mbuffer_cur);
+-    ioctl(m_dev, FBIOPAN_DISPLAY, &info);
+-
+-HWCOMPOSER_LOG_RUNTIME("#######output_device::post()##end##########");
+-    return 0;
+-}
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* Copyright 2009-2011 Freescale Semiconductor, Inc. All Rights Reserved.*/
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hwcomposer.h>
++
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_common.h"
++
++void output_device::setUsage(int usage)
++{
++    m_usage = usage;
++}
++
++int output_device::getUsage()
++{
++    return m_usage;
++}
++
++int output_device::getWidth()
++{
++    return m_width;
++}
++
++int output_device::getHeight()
++{
++    return m_height;
++}
++
++output_device::output_device(const char *dev_name, int usage)
++{
++    m_dev = open(dev_name, O_RDWR | O_NONBLOCK, 0);
++    if(m_dev < 0) {
++        HWCOMPOSER_LOG_ERR("Error! output_device Open fb device %s failed!", dev_name);
++    }
++    m_usage = usage;
++}
++
++output_device::~output_device()
++{
++	if(m_dev > 0) {
++        close(m_dev);
++	}
++}
++
++int output_device::isFGDevice(const char *dev_name)
++{
++    int status = -EINVAL;
++    int fd = -1;
++    char fb_usage[32];
++    char fb_name[32];
++    int fd_n = 0;
++    int size = 0;
++    int is_overlay = 0;
++    char *psname;
++
++    memset(fb_name, 0, sizeof(fb_name));
++    psname = (char *)dev_name;
++    psname += (strlen(dev_name) - 1);
++    strcpy(fb_name, "/sys/class/graphics/fb");
++    strcat(fb_name, psname);
++    strcat(fb_name, "/name");
++    fd_n = open(fb_name, O_RDONLY, 0);
++    //fd_n = open("/sys/class/graphics/fb0/name", O_RDONLY, 0);
++    if(fd_n < 0) {
++		HWCOMPOSER_LOG_ERR("Error! output_device::isFGDevice  open %s failed!", fb_name);
++		return -1;
++    }
++    memset(fb_usage, 0, sizeof(fb_usage));
++    size = read(fd_n, fb_usage, sizeof(fb_usage));
++    if(size < 0) {
++		HWCOMPOSER_LOG_ERR("Error! output_device::isFGDevice read /sys/class/graphics/fb0/name failed!");
++		return -1;
++    }
++    close(fd_n);
++HWCOMPOSER_LOG_INFO("output_device::isFGDevice===%s, %s, %s", dev_name, fb_name, fb_usage);
++    if(strstr(fb_usage, "FG"))
++    	return 1;
++ 	return 0;
++}
++
++void output_device::setDisplayFrame(hwc_rect_t *disFrame)
++{
++    if(disFrame == NULL) {
++        HWCOMPOSER_LOG_ERR("Error! output_device::setDisplayFrame invalid parameter!");
++    }
++    Rect disRect(disFrame->left, disFrame->top, disFrame->right, disFrame->bottom);
++    currenRegion.orSelf(disRect);
++}
++
++int output_device::needFillBlack(hwc_buffer *buf)
++{
++    Rect orignBound(buf->disp_region.getBounds());
++    Rect currentBound(currenRegion.getBounds());
++    return currentBound != orignBound;
++}
++
++void output_device::fillBlack(hwc_buffer *buf)
++{
++    if(buf == NULL) {
++        HWCOMPOSER_LOG_ERR("Error! output_device::fillBlack invalid parameter!");
++        return;
++    }
++
++    hwc_fill_frame_back((char *)buf->virt_addr, buf->size, buf->width, buf->height, buf->format);
++}
++
++int output_device::fetch(hwc_buffer *buf)
++{
++	  //int status = -EINVAL;
++    if(m_dev <= 0 || buf == NULL) {
++        HWCOMPOSER_LOG_ERR("Error! output_device::fetch invalid parameter! usage=%x", m_usage);
++        return -1;
++    }
++
++	  Mutex::Autolock _l(mLock);
++	  buf->size = (mbuffers[mbuffer_cur]).size;
++	  buf->virt_addr = (mbuffers[mbuffer_cur]).virt_addr;
++	  buf->phy_addr = (mbuffers[mbuffer_cur]).phy_addr;
++	  buf->width = m_width;
++	  buf->height = m_height;
++	  buf->usage = m_usage;
++	  buf->format = m_format;
++	  //dev->buffer_cur = (dev->buffer_cur + 1) % DEFAULT_BUFFERS;
++      if((m_usage & (GRALLOC_USAGE_OVERLAY0_MASK | GRALLOC_USAGE_OVERLAY1_MASK)) && needFillBlack(&mbuffers[mbuffer_cur])) {
++          fillBlack(&mbuffers[mbuffer_cur]);
++          mbuffers[mbuffer_cur].disp_region = currenRegion;
++      }
++      //orignRegion = currenRegion;
++      currenRegion.clear();
++
++	  return 0;
++}
++
++int output_device::post(hwc_buffer *buf)
++{
++	  //int status = -EINVAL;
++    if(m_dev <= 0) {
++        HWCOMPOSER_LOG_ERR("Error! FG_device::FG_post() invalid parameter! usage=%x", m_usage);
++        return -1;
++    }
++HWCOMPOSER_LOG_RUNTIME("#######output_device::post()############");
++
++	Mutex::Autolock _l(mLock);
++    struct fb_var_screeninfo info;
++    if(ioctl(m_dev, FBIOGET_VSCREENINFO, &info) < 0) {
++        HWCOMPOSER_LOG_ERR("Error! output_device::post VSCREENINFO getting failed! usage=%x", m_usage);
++        return -1;
++    }
++
++    struct fb_fix_screeninfo finfo;
++    if(ioctl(m_dev, FBIOGET_FSCREENINFO, &finfo) < 0) {
++        HWCOMPOSER_LOG_ERR("Error! output_device::post FSCREENINFO getting failed! usage=%x", m_usage);
++        return -1;
++    }
++
++    info.yoffset = ((unsigned long)buf->virt_addr - (unsigned long)(mbuffers[0]).virt_addr) / finfo.line_length;
++    //info.yoffset = ((info.yres_virtual * finfo.line_length)/ DEFAULT_BUFFERS) * mbuffer_cur;
++    mbuffer_cur = (mbuffer_cur + 1) % DEFAULT_BUFFERS;
++    info.activate = FB_ACTIVATE_VBL;
++//HWCOMPOSER_LOG_RUNTIME("#######yoffset=%d, mbuffer_cur=%d######", info.yoffset, mbuffer_cur);
++    ioctl(m_dev, FBIOPAN_DISPLAY, &info);
++
++HWCOMPOSER_LOG_RUNTIME("#######output_device::post()##end##########");
++    return 0;
++}
+-- 
+1.8.0
+

@@ -1,0 +1,105 @@
+From d5e098d22af3469a07da7fa7ec841adcad88abd9 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 16 Oct 2013 13:16:33 +0800
+Subject: [PATCH 419/435] ENGR00283719-2 Fix encoder bugs in ring buffer mode
+
+- Single instance bug:
+  Random system crash in MJPEG encoder age test
+  Root cause: interrupt handler may access register after VPU clock
+  is gated off in vpu_EncGetOutputInfo
+  Solution: successfully call vpu_WaitForInt before vpu_EncGetOutputInfo
+  to ensure interrupt is handled before this function
+
+- Multiple instances bug:
+  Encoders other than MJPEG: one instance can abort due to mutex
+  timeout
+  Root cause: one instance was not scheduled in time to lock mutex
+  Solution: insert usleep after vpu_EncGetOutputInfo to yield
+  schedule
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/dec.c |  4 ++--
+ test/mxc_vpu_test/enc.c | 24 ++++++++++++++++++++----
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 01e0a41..17b7140 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1193,8 +1193,8 @@ decoder_start(struct decode *dec)
+ 				return -1;
+ 			}
+ 
+-			vpu_WaitForInt(100);
+-			is_waited_int = 1;
++			if (vpu_WaitForInt(100) == 0)
++				is_waited_int = 1;
+ 			loop_id ++;
+ 		}
+ 
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 968761b..a8d4f9a 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -560,6 +560,7 @@ encoder_start(struct encode *enc)
+ 	PhysicalAddress phy_bsbuf_start = enc->phy_bsbuf_addr;
+ 	u32 virt_bsbuf_start = enc->virt_bsbuf_addr;
+ 	u32 virt_bsbuf_end = virt_bsbuf_start + STREAM_BUF_SIZE;
++	int is_waited_int = 0;
+ 
+ 	/* Must put encode header here before encoding for all codec, except MX6 MJPG */
+ 	if (!(cpu_is_mx6x() && (enc->cmdl->format == STD_MJPG))) {
+@@ -669,13 +670,18 @@ encoder_start(struct encode *enc)
+ 			goto err2;
+ 		}
+ 
++		is_waited_int = 0;
+ 		loop_id = 0;
+ 		while (vpu_IsBusy()) {
+-			vpu_WaitForInt(200);
+ 			if (enc->ringBufferEnable == 1) {
+-				ret = enc_readbs_ring_buffer(handle, enc->cmdl,
+-					virt_bsbuf_start, virt_bsbuf_end,
+-					phy_bsbuf_start, STREAM_READ_SIZE);
++				if (cpu_is_mx6x() && enc->cmdl->format == STD_MJPG)
++					ret = enc_readbs_ring_buffer(handle, enc->cmdl,
++							virt_bsbuf_start, virt_bsbuf_end,
++							phy_bsbuf_start, 0);
++				else
++					ret = enc_readbs_ring_buffer(handle, enc->cmdl,
++							virt_bsbuf_start, virt_bsbuf_end,
++							phy_bsbuf_start, STREAM_READ_SIZE);
+ 				if (ret < 0) {
+ 					goto err2;
+ 				}
+@@ -684,9 +690,14 @@ encoder_start(struct encode *enc)
+ 				ret = vpu_SWReset(handle, 0);
+ 				return -1;
+ 			}
++			if (vpu_WaitForInt(200) == 0)
++				is_waited_int = 1;
+ 			loop_id ++;
+ 		}
+ 
++		if (!is_waited_int)
++			vpu_WaitForInt(200);
++
+ 		gettimeofday(&tenc_end, NULL);
+ 		sec = tenc_end.tv_sec - tenc_begin.tv_sec;
+ 		usec = tenc_end.tv_usec - tenc_begin.tv_usec;
+@@ -699,6 +710,11 @@ encoder_start(struct encode *enc)
+ 		tenc_time += (sec * 1000000) + usec;
+ 
+ 		ret = vpu_EncGetOutputInfo(handle, &outinfo);
++
++		usleep(0);
++
++		dprintf(3, "frame_id %d\n", (int)frame_id);
++
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("vpu_EncGetOutputInfo failed Err code: %d\n",
+ 									ret);
+-- 
+1.8.0
+

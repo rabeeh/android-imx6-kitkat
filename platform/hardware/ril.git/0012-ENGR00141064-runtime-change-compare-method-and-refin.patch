@@ -1,0 +1,161 @@
+From ef34f8b50996ed2c9af4c7075d5e1b0f73973734 Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Wed, 23 Mar 2011 22:25:00 +0800
+Subject: [PATCH 12/38] ENGR00141064 runtime: change compare method and refine
+ restart rild.
+
+- some modem (Amazon1) will report his vendor & product id
+  in a short number in Uevent:
+  like :PRODUCT=1519/20/35 but in table is was 1519/0020
+  make the compare function to convert to number to check it.
+
+- Since USB modem always have much of USB port,
+  will report many uevent,
+  so add a alarm to make sure it will "late action"
+  this to make sure one
+  Modem will only make rild restart one time.
+
+- Remove delay for AMAZON modem.
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ reference-ril/reference-ril.c |  7 ++++--
+ reference-ril/runtime_port.c  | 55 +++++++++++++++++++++++++++++++++++--------
+ 2 files changed, 50 insertions(+), 12 deletions(-)
+
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 3f5682a..b83b96f 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -3506,9 +3506,12 @@ mainLoop(void *param)
+ 	    LOGW ("Should not delay RIL init too long (%d seconds). Please set %s properly", delay, RIL_DELAY_TIME);
+             delay = 0;
+         }
+-        TIMEVAL_DELAYINIT.tv_sec = delay;
++	if (current_modem_type == HUAWEI_MODEM) {
++		TIMEVAL_DELAYINIT.tv_sec = delay;
++		LOGD ("Will delay RIL initialization for %d seconds", TIMEVAL_DELAYINIT.tv_sec); 
++	} else			/* Found other modem don't need delay */
++		TIMEVAL_DELAYINIT.tv_sec = 0;
+ 
+-        LOGD ("Will delay RIL initialization for %d seconds", TIMEVAL_DELAYINIT.tv_sec); 
+ 
+         RIL_requestTimedCallback(initializeCallback, NULL, &TIMEVAL_DELAYINIT);
+ 
+diff --git a/reference-ril/runtime_port.c b/reference-ril/runtime_port.c
+index bfd2ed2..c071ecb 100644
+--- a/reference-ril/runtime_port.c
++++ b/reference-ril/runtime_port.c
+@@ -29,6 +29,8 @@
+ #include <sys/poll.h>
+ #include <linux/netlink.h>
+ 
++#include <signal.h>
++#include <unistd.h>
+ #include "runtime.h"
+ 
+ int current_modem_type = UNKNOWN_MODEM;
+@@ -125,22 +127,40 @@ int readfile(char *path, char *content, size_t size)
+ 	return ret;
+ }
+ 
+-struct modem_3g_device*
++int is_device_equal(struct modem_3g_device *device,
++		     const char *idv, const char *idp)
++{
++	long pvid = 0xffff, ppid = 0xffff;
++	long t_vid, t_pid;
++	if (device == NULL)
++		return 0;
++	t_vid = strtol(device->idVendor, NULL, 16);
++	t_pid = strtol(device->idProduct, NULL, 16);
++	pvid = strtol(idv, NULL, 16);
++	ppid = strtol(idp, NULL, 16);
++
++	return (t_vid == pvid && t_pid == ppid);
++}
++
++struct modem_3g_device *
+ find_devices_in_table(const char *idvendor, const char *idproduct)
+ {
+-	struct modem_3g_device *device;
+ 	int i;
+ 	int size = ARRAY_SIZE(modem_3g_device_table);
++	struct modem_3g_device *device;
++
+ 	for (i = 0; i < size; i++) {
+ 		device = &modem_3g_device_table[i];
+-		if ((strcmp(device->idVendor, idvendor) == 0)
+-		    && (strcmp(device->idProduct, idproduct) == 0)) {
+-			LOGI("Runtime 3G port found matched device with Name:%s idVendor:%s idProduct:%s",
++
++		if (is_device_equal(device, idvendor, idproduct)) {
++			LOGI("Runtime 3G port found matched device with "
++			     "Name:%s idVendor:%s idProduct:%s",
+ 			     device->name, device->idVendor, device->idProduct);
+-			return device;
+ 
++			return device;
+ 		}
+ 	}
++
+ 	return NULL;
+ }
+ 
+@@ -256,10 +276,11 @@ static int dispatch_uevent(struct uevent *event)
+ 				     "PRODUCT=%4s/%4s/", vbuf, pbuf);
+ 			if (ret < 0)
+ 				return -1;
+-			if (find_devices_in_table(vbuf, pbuf) != NULL) {
+-				LOGI("3G Modem changed,RILD will restart... ");
+-				exit(-1);
+-			}
++			if (find_devices_in_table(vbuf, pbuf))
++				alarm(1);
++			/* Restart in 1 second, since USB usually have
++			 * many devices, this avoid rild restart too
++			 * many times. */
+ 		}
+ 	}
+ 	return 0;
+@@ -311,6 +332,9 @@ int process_uevent_message(int sock)
+ 	}
+ 
+ 	ret = dispatch_uevent(event);
++#if DEBUG_UEVENT
++	dump_uevent(event);
++#endif
+ 	free_uevent(event);
+ 	return ret;
+ }
+@@ -328,6 +352,11 @@ static void dump_uevent(struct uevent *event)
+     }
+ }
+ 
++void restart_rild(int p)
++{
++	LOGI("3G Modem changed,RILD will restart...");
++	exit(-1);
++}
+ 
+ void *usb_tty_monitor_thread(void *arg)
+ {
+@@ -337,9 +366,15 @@ void *usb_tty_monitor_thread(void *arg)
+ 	int ret, max = 0;
+ 	int uevent_sz = 64 * 1024;
+ 	int timeout = -1;
++	struct sigaction timeoutsigact;
+ 
+ 	LOGI("3G modem monitor thread is start");
+ 
++	timeoutsigact.sa_handler = restart_rild;
++	sigemptyset(&timeoutsigact.sa_mask);
++	sigaddset(&timeoutsigact.sa_mask, SIGALRM);
++	sigaction(SIGALRM, &timeoutsigact, 0);
++
+ 	memset(&nladdr, 0, sizeof(nladdr));
+ 	nladdr.nl_family = AF_NETLINK;
+ 	nladdr.nl_pid = getpid();
+-- 
+1.8.0
+

@@ -1,0 +1,351 @@
+From 45ecc1f14b1227014d181cdd02cd7d4849eab193 Mon Sep 17 00:00:00 2001
+From: Nitin Garg <nitin.garg@freescale.com>
+Date: Thu, 18 Oct 2012 18:46:10 -0500
+Subject: [PATCH 356/486] ENGR00229943 PowerHAL: Move the PowerHAL to iMX6
+
+Moving this Power HAL to iMX6 and iMX5 uses dvfs instead
+of cpufreq.
+
+Signed-off-by: Nitin Garg <nitin.garg@freescale.com>
+---
+ Android.mk           |   4 +-
+ mx6/power/Android.mk |  28 ++++++++++++
+ mx6/power/power.c    | 117 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ power/Android.mk     |  28 ------------
+ power/power.c        | 117 ---------------------------------------------------
+ 5 files changed, 147 insertions(+), 147 deletions(-)
+ create mode 100644 mx6/power/Android.mk
+ create mode 100644 mx6/power/power.c
+ delete mode 100644 power/Android.mk
+ delete mode 100644 power/power.c
+
+diff --git a/Android.mk b/Android.mk
+index f561e38..a5311e4 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -1,6 +1,6 @@
+-common_imx_dirs := libsensors libgps lights wlan power
++common_imx_dirs := libsensors libgps lights wlan
+ mx5x_dirs := $(common_imx_dirs) mx5x/audio mx5x/libcopybit mx5x/libgralloc  mx5x/hwcomposer mx5x/libcamera
+-mx6_dirs := $(common_imx_dirs) alsa mx6/libgralloc_wrapper mx6/hwcomposer mx6/libcamera
++mx6_dirs := $(common_imx_dirs) alsa mx6/libgralloc_wrapper mx6/hwcomposer mx6/libcamera mx6/power
+ 
+ ifeq ($(TARGET_BOARD_PLATFORM),imx6)
+   include $(call all-named-subdir-makefiles,$(mx6_dirs))
+diff --git a/mx6/power/Android.mk b/mx6/power/Android.mk
+new file mode 100644
+index 0000000..970c135
+--- /dev/null
++++ b/mx6/power/Android.mk
+@@ -0,0 +1,28 @@
++# Copyright (C) 2012 The Android Open Source Project
++# Copyright (C) 2012 Freescale Semiconductor, Inc.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++LOCAL_PATH := $(call my-dir)
++
++# HAL module implemenation stored in
++# hw/<POWERS_HARDWARE_MODULE_ID>.<ro.hardware>.so
++include $(CLEAR_VARS)
++
++LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
++LOCAL_SHARED_LIBRARIES := liblog libcutils
++LOCAL_SRC_FILES := power.c
++LOCAL_MODULE := power.$(TARGET_BOARD_PLATFORM)
++LOCAL_MODULE_TAGS := optional
++include $(BUILD_SHARED_LIBRARY)
+diff --git a/mx6/power/power.c b/mx6/power/power.c
+new file mode 100644
+index 0000000..4f18cc3
+--- /dev/null
++++ b/mx6/power/power.c
+@@ -0,0 +1,117 @@
++/*
++ * Copyright (C) 2012 The Android Open Source Project
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#include <errno.h>
++#include <string.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++#define LOG_TAG "i.MX PowerHAL"
++#include <utils/Log.h>
++
++#include <hardware/hardware.h>
++#include <hardware/power.h>
++
++#define BOOST_PATH      "/sys/devices/system/cpu/cpufreq/interactive/boost"
++static int boost_fd = -1;
++static int boost_warned;
++
++static void sysfs_write(char *path, char *s)
++{
++    int len;
++    int fd = open(path, O_WRONLY);
++
++    if (fd < 0) {
++        ALOGE("Error opening %s: %s\n", path, strerror(errno));
++        return;
++    }
++
++    len = write(fd, s, strlen(s));
++    if (len < 0) {
++        ALOGE("Error writing to %s: %s\n", path, strerror(errno));
++    }
++
++    close(fd);
++}
++
++static void fsl_power_init(struct power_module *module)
++{
++    /*
++     * cpufreq interactive governor: timer 20ms, min sample 60ms,
++     * hispeed at cpufreq MAX point at load 40%
++     */
++
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/timer_rate",
++                "20000");
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time",
++                "60000");
++    /*
++     * use cpufreq max freq default, the high speed also can be specified by
++     * wrriten a value to hispeed like below set high speed to 800MHz:
++     * sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq",
++                "792000");
++     */
++
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load",
++                "40");
++    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
++		"1");
++}
++
++static void fsl_power_set_interactive(struct power_module *module, int on)
++{
++	sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
++			on ? "1" : "0");
++}
++
++static void fsl_power_hint(struct power_module *module, power_hint_t hint,
++                            void *data)
++{
++    char buf[80];
++    int len;
++
++    switch (hint) {
++    case POWER_HINT_VSYNC:
++        break;
++    case POWER_HINT_INTERACTION:
++	sysfs_write(BOOST_PATH, "1");
++	break;
++
++    default:
++            break;
++    }
++}
++
++static struct hw_module_methods_t power_module_methods = {
++    .open = NULL,
++};
++
++struct power_module HAL_MODULE_INFO_SYM = {
++    .common = {
++        .tag = HARDWARE_MODULE_TAG,
++        .module_api_version = POWER_MODULE_API_VERSION_0_2,
++        .hal_api_version = HARDWARE_HAL_API_VERSION,
++        .id = POWER_HARDWARE_MODULE_ID,
++        .name = "FSL i.MX Power HAL",
++        .author = "Freescale Semiconductor, Inc.",
++        .methods = &power_module_methods,
++    },
++
++    .init = fsl_power_init,
++    .setInteractive = fsl_power_set_interactive,
++    .powerHint = fsl_power_hint,
++};
+diff --git a/power/Android.mk b/power/Android.mk
+deleted file mode 100644
+index 970c135..0000000
+--- a/power/Android.mk
++++ /dev/null
+@@ -1,28 +0,0 @@
+-# Copyright (C) 2012 The Android Open Source Project
+-# Copyright (C) 2012 Freescale Semiconductor, Inc.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#      http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-
+-LOCAL_PATH := $(call my-dir)
+-
+-# HAL module implemenation stored in
+-# hw/<POWERS_HARDWARE_MODULE_ID>.<ro.hardware>.so
+-include $(CLEAR_VARS)
+-
+-LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libcutils
+-LOCAL_SRC_FILES := power.c
+-LOCAL_MODULE := power.$(TARGET_BOARD_PLATFORM)
+-LOCAL_MODULE_TAGS := optional
+-include $(BUILD_SHARED_LIBRARY)
+diff --git a/power/power.c b/power/power.c
+deleted file mode 100644
+index 4f18cc3..0000000
+--- a/power/power.c
++++ /dev/null
+@@ -1,117 +0,0 @@
+-/*
+- * Copyright (C) 2012 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-#include <errno.h>
+-#include <string.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
+-#include <fcntl.h>
+-
+-#define LOG_TAG "i.MX PowerHAL"
+-#include <utils/Log.h>
+-
+-#include <hardware/hardware.h>
+-#include <hardware/power.h>
+-
+-#define BOOST_PATH      "/sys/devices/system/cpu/cpufreq/interactive/boost"
+-static int boost_fd = -1;
+-static int boost_warned;
+-
+-static void sysfs_write(char *path, char *s)
+-{
+-    int len;
+-    int fd = open(path, O_WRONLY);
+-
+-    if (fd < 0) {
+-        ALOGE("Error opening %s: %s\n", path, strerror(errno));
+-        return;
+-    }
+-
+-    len = write(fd, s, strlen(s));
+-    if (len < 0) {
+-        ALOGE("Error writing to %s: %s\n", path, strerror(errno));
+-    }
+-
+-    close(fd);
+-}
+-
+-static void fsl_power_init(struct power_module *module)
+-{
+-    /*
+-     * cpufreq interactive governor: timer 20ms, min sample 60ms,
+-     * hispeed at cpufreq MAX point at load 40%
+-     */
+-
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/timer_rate",
+-                "20000");
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time",
+-                "60000");
+-    /*
+-     * use cpufreq max freq default, the high speed also can be specified by
+-     * wrriten a value to hispeed like below set high speed to 800MHz:
+-     * sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq",
+-                "792000");
+-     */
+-
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load",
+-                "40");
+-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
+-		"1");
+-}
+-
+-static void fsl_power_set_interactive(struct power_module *module, int on)
+-{
+-	sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/input_boost",
+-			on ? "1" : "0");
+-}
+-
+-static void fsl_power_hint(struct power_module *module, power_hint_t hint,
+-                            void *data)
+-{
+-    char buf[80];
+-    int len;
+-
+-    switch (hint) {
+-    case POWER_HINT_VSYNC:
+-        break;
+-    case POWER_HINT_INTERACTION:
+-	sysfs_write(BOOST_PATH, "1");
+-	break;
+-
+-    default:
+-            break;
+-    }
+-}
+-
+-static struct hw_module_methods_t power_module_methods = {
+-    .open = NULL,
+-};
+-
+-struct power_module HAL_MODULE_INFO_SYM = {
+-    .common = {
+-        .tag = HARDWARE_MODULE_TAG,
+-        .module_api_version = POWER_MODULE_API_VERSION_0_2,
+-        .hal_api_version = HARDWARE_HAL_API_VERSION,
+-        .id = POWER_HARDWARE_MODULE_ID,
+-        .name = "FSL i.MX Power HAL",
+-        .author = "Freescale Semiconductor, Inc.",
+-        .methods = &power_module_methods,
+-    },
+-
+-    .init = fsl_power_init,
+-    .setInteractive = fsl_power_set_interactive,
+-    .powerHint = fsl_power_hint,
+-};
+-- 
+1.8.0
+

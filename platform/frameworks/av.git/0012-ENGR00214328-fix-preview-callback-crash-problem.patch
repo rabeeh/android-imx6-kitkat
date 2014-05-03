@@ -1,0 +1,202 @@
+From e0671447c9d7f08e5ee1e796df298fd3581a302d Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Wed, 23 Jan 2013 14:26:06 +0800
+Subject: [PATCH 12/50] ENGR00214328 fix preview callback crash problem.
+
+the class member variable access exception in multi-thread.
+so, pass temporary variable to handle work.
+delete parameter KEY_PREFERRED_PREVIEW_SIZE_FOR_VIDEO set.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ .../api1/client2/CallbackProcessor.cpp             | 47 ++++++++++++++--------
+ .../api1/client2/CallbackProcessor.h               |  3 +-
+ .../libcameraservice/api1/client2/Parameters.cpp   |  3 --
+ 3 files changed, 32 insertions(+), 21 deletions(-)
+
+diff --git a/services/camera/libcameraservice/api1/client2/CallbackProcessor.cpp b/services/camera/libcameraservice/api1/client2/CallbackProcessor.cpp
+index 3359629..19edbaa 100644
+--- a/services/camera/libcameraservice/api1/client2/CallbackProcessor.cpp
++++ b/services/camera/libcameraservice/api1/client2/CallbackProcessor.cpp
+@@ -217,6 +217,8 @@ void CallbackProcessor::dump(int /*fd*/, const Vector<String16>& /*args*/) const
+ 
+ bool CallbackProcessor::threadLoop() {
+     status_t res;
++    sp<Camera2Heap> callbackHeap = NULL;
++    sp<CpuConsumer> callbackConsumer = NULL;
+ 
+     {
+         Mutex::Autolock l(mInputMutex);
+@@ -226,6 +228,8 @@ bool CallbackProcessor::threadLoop() {
+             if (res == TIMED_OUT) return true;
+         }
+         mCallbackAvailable = false;
++        callbackHeap = mCallbackHeap;
++        callbackConsumer = mCallbackConsumer;
+     }
+ 
+     do {
+@@ -233,7 +237,7 @@ bool CallbackProcessor::threadLoop() {
+         if (client == 0) {
+             res = discardNewCallback();
+         } else {
+-            res = processNewCallback(client);
++            res = processNewCallback(client, callbackHeap, callbackConsumer);
+         }
+     } while (res == OK);
+ 
+@@ -261,15 +265,20 @@ status_t CallbackProcessor::discardNewCallback() {
+     return OK;
+ }
+ 
+-status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client) {
++status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client,
++        sp<Camera2Heap> callbackHeap, sp<CpuConsumer> callbackConsumer) {
+     ATRACE_CALL();
+     status_t res;
+ 
+-    sp<Camera2Heap> callbackHeap;
++    //sp<Camera2Heap> callbackHeap;
+     bool useFlexibleYuv = false;
+     int32_t previewFormat = 0;
+     size_t heapIdx;
+ 
++    if (callbackConsumer.get() == NULL) {
++         return BAD_VALUE;
++    }
++
+     {
+         /* acquire SharedParameters before mMutex so we don't dead lock
+             with Camera2Client code calling into StreamingProcessor */
+@@ -283,7 +292,7 @@ status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client) {
+         }
+ 
+         ALOGV("%s: Getting buffer", __FUNCTION__);
+-        res = mCallbackConsumer->lockNextBuffer(&imgBuffer);
++        res = callbackConsumer->lockNextBuffer(&imgBuffer);
+         if (res != OK) {
+             if (res != BAD_VALUE) {
+                 ALOGE("%s: Camera %d: Error receiving next callback buffer: "
+@@ -299,21 +308,21 @@ status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client) {
+                 && l.mParameters.state != Parameters::VIDEO_SNAPSHOT) {
+             ALOGV("%s: Camera %d: No longer streaming",
+                     __FUNCTION__, mId);
+-            mCallbackConsumer->unlockBuffer(imgBuffer);
++            callbackConsumer->unlockBuffer(imgBuffer);
+             return OK;
+         }
+ 
+         if (! (l.mParameters.previewCallbackFlags &
+                 CAMERA_FRAME_CALLBACK_FLAG_ENABLE_MASK) ) {
+             ALOGV("%s: No longer enabled, dropping", __FUNCTION__);
+-            mCallbackConsumer->unlockBuffer(imgBuffer);
++            callbackConsumer->unlockBuffer(imgBuffer);
+             return OK;
+         }
+         if ((l.mParameters.previewCallbackFlags &
+                         CAMERA_FRAME_CALLBACK_FLAG_ONE_SHOT_MASK) &&
+                 !l.mParameters.previewCallbackOneShot) {
+             ALOGV("%s: One shot mode, already sent, dropping", __FUNCTION__);
+-            mCallbackConsumer->unlockBuffer(imgBuffer);
++            callbackConsumer->unlockBuffer(imgBuffer);
+             return OK;
+         }
+ 
+@@ -339,7 +348,7 @@ status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client) {
+             ALOGE("%s: Camera %d: Unexpected format for callback: "
+                     "0x%x, expected 0x%x", __FUNCTION__, mId,
+                     imgBuffer.format, expectedFormat);
+-            mCallbackConsumer->unlockBuffer(imgBuffer);
++            callbackConsumer->unlockBuffer(imgBuffer);
+             return INVALID_OPERATION;
+         }
+ 
+@@ -372,27 +381,28 @@ status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client) {
+         size_t bufferSize = Camera2Client::calculateBufferSize(
+                 imgBuffer.width, imgBuffer.height,
+                 previewFormat, destYStride);
+-        size_t currentBufferSize = (mCallbackHeap == 0) ?
+-                0 : (mCallbackHeap->mHeap->getSize() / kCallbackHeapCount);
++        size_t currentBufferSize = (callbackHeap == 0) ?
++                0 : (callbackHeap->mHeap->getSize() / kCallbackHeapCount);
+         if (bufferSize != currentBufferSize) {
+-            mCallbackHeap.clear();
+-            mCallbackHeap = new Camera2Heap(bufferSize, kCallbackHeapCount,
++            callbackHeap.clear();
++            callbackHeap = new Camera2Heap(bufferSize, kCallbackHeapCount,
+                     "Camera2Client::CallbackHeap");
+-            if (mCallbackHeap->mHeap->getSize() == 0) {
++            if (callbackHeap->mHeap->getSize() == 0) {
+                 ALOGE("%s: Camera %d: Unable to allocate memory for callbacks",
+                         __FUNCTION__, mId);
+-                mCallbackConsumer->unlockBuffer(imgBuffer);
++                callbackConsumer->unlockBuffer(imgBuffer);
+                 return INVALID_OPERATION;
+             }
+ 
+             mCallbackHeapHead = 0;
++            mCallbackHeap = callbackHeap;
+             mCallbackHeapFree = kCallbackHeapCount;
+         }
+ 
+         if (mCallbackHeapFree == 0) {
+             ALOGE("%s: Camera %d: No free callback buffers, dropping frame",
+                     __FUNCTION__, mId);
+-            mCallbackConsumer->unlockBuffer(imgBuffer);
++            callbackConsumer->unlockBuffer(imgBuffer);
+             return OK;
+         }
+ 
+@@ -406,8 +416,11 @@ status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client) {
+ 
+         ssize_t offset;
+         size_t size;
++        if (callbackHeap == NULL || callbackHeap->mBuffers == NULL) {
++            return BAD_VALUE;
++        }
+         sp<IMemoryHeap> heap =
+-                mCallbackHeap->mBuffers[heapIdx]->getMemory(&offset,
++                callbackHeap->mBuffers[heapIdx]->getMemory(&offset,
+                         &size);
+         uint8_t *data = (uint8_t*)heap->getBase() + offset;
+ 
+@@ -420,7 +433,7 @@ status_t CallbackProcessor::processNewCallback(sp<Camera2Client> &client) {
+             if (res != OK) {
+                 ALOGE("%s: Camera %d: Can't convert between 0x%x and 0x%x formats!",
+                         __FUNCTION__, mId, imgBuffer.format, previewFormat);
+-                mCallbackConsumer->unlockBuffer(imgBuffer);
++                callbackConsumer->unlockBuffer(imgBuffer);
+                 return BAD_VALUE;
+             }
+         }
+diff --git a/services/camera/libcameraservice/api1/client2/CallbackProcessor.h b/services/camera/libcameraservice/api1/client2/CallbackProcessor.h
+index 613f5be..6ef0661 100644
+--- a/services/camera/libcameraservice/api1/client2/CallbackProcessor.h
++++ b/services/camera/libcameraservice/api1/client2/CallbackProcessor.h
+@@ -80,7 +80,8 @@ class CallbackProcessor:
+ 
+     virtual bool threadLoop();
+ 
+-    status_t processNewCallback(sp<Camera2Client> &client);
++    status_t processNewCallback(sp<Camera2Client> &client,
++             sp<Camera2Heap> callbackHeap, sp<CpuConsumer> callbackConsumer);
+     // Used when shutting down
+     status_t discardNewCallback();
+ 
+diff --git a/services/camera/libcameraservice/api1/client2/Parameters.cpp b/services/camera/libcameraservice/api1/client2/Parameters.cpp
+index 5a2488a..d37fac2 100644
+--- a/services/camera/libcameraservice/api1/client2/Parameters.cpp
++++ b/services/camera/libcameraservice/api1/client2/Parameters.cpp
+@@ -70,9 +70,6 @@ status_t Parameters::initialize(const CameraMetadata *info) {
+ 
+     params.setPreviewSize(previewWidth, previewHeight);
+     params.setVideoSize(videoWidth, videoHeight);
+-    params.set(CameraParameters::KEY_PREFERRED_PREVIEW_SIZE_FOR_VIDEO,
+-            String8::format("%dx%d",
+-                    previewWidth, previewHeight));
+     {
+         String8 supportedPreviewSizes;
+         for (size_t i = 0; i < availablePreviewSizes.size(); i++) {
+-- 
+1.8.0
+

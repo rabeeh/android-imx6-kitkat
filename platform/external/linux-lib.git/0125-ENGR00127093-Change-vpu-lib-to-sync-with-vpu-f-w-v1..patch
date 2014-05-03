@@ -1,0 +1,191 @@
+From d9313d8c2669f5814bc53cdde0b55a594ed340ce Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 8 Sep 2010 01:07:25 +0800
+Subject: [PATCH 125/249] ENGR00127093 Change vpu lib to sync with vpu f/w
+ v1.4.14
+
+Following issues are fixed.
+[#2195]: [Decode/H.264/H.263] VPU enters dead loop with prescan on
+[#2268]: [Elvis][Encode/MPEG4] slice size report is wrong for data partition clip
+[#2266]: [Elvis][Decode/MPEG2] VPU incorrectly FreeRefFrameBuf after seek
+[#2213]: [Elvis][Decode/Divx] VPU will incorrectly decode PB chunk in fileplay mode
+[#1728]: [Elvis][Decode/Div3] VPU will decode normally without clearing display flag
+[#2238]: [Divx] Output of interlacing Divx has artifact
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c | 37 +++++++++++++++++++++++++++----------
+ vpu/vpu_lib.h | 17 ++++++++++++++---
+ vpu/vpu_reg.h |  2 ++
+ 3 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 771cf93..99ec31f 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -73,6 +73,9 @@ extern vpu_mem_desc bit_work_addr;
+ extern semaphore_t *vpu_semap;
+ 
+ extern void vpu_setting_iram();
++
++static int decoded_pictype[32];
++
+ /*!
+  * @brief
+  * This functure indicate whether processing(encoding/decoding) a frame
+@@ -789,8 +792,8 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+  * @li RETCODE_INSUFFICIENT_FRAME_BUFFERS num is smaller than requested.
+  * @li RETCODE_INVALID_STRIDE stride is smaller than the picture width.
+  */
+-RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+-				   FrameBuffer * bufArray, int num, int stride)
++RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
++				   int num, int frameBufStride, int sourceBufStride)
+ {
+ 	CodecInst *pCodecInst;
+ 	EncInfo *pEncInfo;
+@@ -822,13 +825,13 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+ 		return RETCODE_INSUFFICIENT_FRAME_BUFFERS;
+ 	}
+ 
+-	if (stride % 8 != 0 || stride == 0) {
++	if (frameBufStride % 8 != 0 || frameBufStride == 0) {
+ 		return RETCODE_INVALID_STRIDE;
+ 	}
+ 
+ 	pEncInfo->frameBufPool = bufArray;
+ 	pEncInfo->numFrameBuffers = num;
+-	pEncInfo->stride = stride;
++	pEncInfo->stride = frameBufStride;
+ 
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+@@ -861,7 +864,8 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+ 
+ 	/* Tell the codec how much frame buffers were allocated. */
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_NUM, num);
+-	VpuWriteReg(CMD_SET_FRAME_BUF_STRIDE, stride);
++	VpuWriteReg(CMD_SET_FRAME_BUF_STRIDE, frameBufStride);
++	VpuWriteReg(CMD_SET_FRAME_SOURCE_BUF_STRIDE, sourceBufStride);
+ 
+ 	if (cpu_is_mx5x()) {
+ 		VpuWriteReg(CMD_SET_FRAME_AXI_BIT_ADDR, pEncInfo->secAxiUse.bufBitUse);
+@@ -1092,9 +1096,12 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 			    (pEncInfo->encReportMVInfo.enable << 4) |
+ 			    (pEncInfo->encReportMBInfo.enable << 3) | 1);
+ 	} else {
+-		VpuWriteReg(CMD_ENC_PIC_SRC_ADDR_Y, pSrcFrame->bufY);
+-		VpuWriteReg(CMD_ENC_PIC_SRC_ADDR_CB, pSrcFrame->bufCb);
+-		VpuWriteReg(CMD_ENC_PIC_SRC_ADDR_CR, pSrcFrame->bufCr);
++		VpuWriteReg(CMD_ENC_PIC_SRC_ADDR_Y, pSrcFrame->bufY +
++			    param->encTopOffset * pSrcFrame->strideY + param->encLeftOffset);
++		VpuWriteReg(CMD_ENC_PIC_SRC_ADDR_CB, pSrcFrame->bufCb +
++			    param->encTopOffset/2 * pSrcFrame->strideC + param->encLeftOffset/2);
++		VpuWriteReg(CMD_ENC_PIC_SRC_ADDR_CR, pSrcFrame->bufCr +
++			    param->encTopOffset/2 * pSrcFrame->strideC + param->encLeftOffset/2);
+ 
+ 		VpuWriteReg(CMD_ENC_PIC_OPTION,
+ 			    (pEncInfo->encReportSliceInfo.enable << 5) |
+@@ -2407,6 +2414,11 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 			     1024));
+ 	}
+ 
++	VpuWriteReg(CMD_SET_FRAME_MAX_DEC_SIZE,
++		     (pBufInfo->maxDecFrmInfo.maxMbNum << 16 |
++		      pBufInfo->maxDecFrmInfo.maxMbX << 8 |
++		      pBufInfo->maxDecFrmInfo.maxMbY));
++
+ 	if (cpu_is_mx5x()) {
+ 		if (pDecInfo->openParam.bitstreamFormat == STD_DIV3)
+ 			VpuWriteReg(BIT_RUN_AUX_STD, 1);
+@@ -3125,10 +3137,15 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	info->indexFrameDecoded = VpuReadReg(RET_DEC_PIC_CUR_IDX);
+ 	info->NumDecFrameBuf = VpuReadReg(RET_DEC_PIC_FRAME_NEED);
+ 
++	/* save decoded picType to this array */
++	if (info->indexFrameDecoded >= 0)
++		decoded_pictype[info->indexFrameDecoded] = info->picType;
++
+ 	if (pCodecInst->codecMode == VC1_DEC && info->indexFrameDisplay != -3) {
+ 		if (pDecInfo->vc1BframeDisplayValid == 0) {
+-			if ((info->picType == 3 && pDecInfo->initialInfo.profile != 2) ||
+-			    ((info->picType >> 3) == 3 && pDecInfo->initialInfo.profile == 2)) {
++			/* Check the pictype of displayed frame */
++			if ((decoded_pictype[info->indexFrameDisplay] == 3 && pDecInfo->initialInfo.profile != 2) ||
++			    ((decoded_pictype[info->indexFrameDisplay] >> 3) == 3 && pDecInfo->initialInfo.profile == 2)) {
+ 				/* clear buffer for not displayed B frame */
+ 				val = ~(1 << info->indexFrameDisplay);
+ 				val &= VpuReadReg(pDecInfo->frameDisplayFlagRegAddr);
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 5ac8c0c..ec0cecb 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -122,6 +122,8 @@ typedef enum {
+ } CodecCommand;
+ 
+ typedef struct {
++	Uint32 strideY;
++	Uint32 strideC;
+ 	PhysicalAddress bufY;
+ 	PhysicalAddress bufCb;
+ 	PhysicalAddress bufCr;
+@@ -221,7 +223,14 @@ typedef struct {
+ } DecAvcSliceBufInfo;
+ 
+ typedef struct {
++	int maxMbX;
++	int maxMbY;
++	int maxMbNum;
++} DecMaxFrmInfo;
++
++typedef struct {
+ 	DecAvcSliceBufInfo avcSliceBufInfo;
++	DecMaxFrmInfo	maxDecFrmInfo;
+ } DecBufInfo;
+ 
+ typedef enum {
+@@ -395,6 +404,8 @@ typedef struct {
+ 
+ typedef struct {
+ 	FrameBuffer *sourceFrame;
++	int encTopOffset;
++	int encLeftOffset;
+ 	int forceIPicture;
+ 	int skipPicture;
+ 	int quantParam;
+@@ -500,7 +511,7 @@ typedef struct vpu_versioninfo {
+  * v4.1.2 [2008.08.22] update MX37 VPU firmware to V1.0.5
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 1, 0)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 1, 2)
+ 
+ extern unsigned int system_rev;
+ 
+@@ -538,8 +549,8 @@ RetCode vpu_GetVersionInfo(vpu_versioninfo * verinfo);
+ RetCode vpu_EncOpen(EncHandle *, EncOpenParam *);
+ RetCode vpu_EncClose(EncHandle);
+ RetCode vpu_EncGetInitialInfo(EncHandle, EncInitialInfo *);
+-RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+-				   FrameBuffer * bufArray, int num, int stride);
++RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
++				   int num, int frameBufStride, int sourceBufStride);
+ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle, PhysicalAddress * prdPrt,
+ 				  PhysicalAddress * pwrPtr, Uint32 * size);
+ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size);
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 5a793c0..845a7c1 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -305,6 +305,8 @@
+ #define CMD_SET_FRAME_AXI_DBKC_ADDR     0x19C
+ #define CMD_SET_FRAME_AXI_OVL_ADDR      0x1A0
+ 
++#define CMD_SET_FRAME_MAX_DEC_SIZE      0x1A4
++#define CMD_SET_FRAME_SOURCE_BUF_STRIDE 0x1A8
+ /*---------------------------------------------------------------------------
+  * [ENC HEADER] COMMAND
+  *-------------------------------------------------------------------------*/
+-- 
+1.8.0
+

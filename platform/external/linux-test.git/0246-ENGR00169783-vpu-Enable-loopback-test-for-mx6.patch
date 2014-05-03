@@ -1,0 +1,517 @@
+From 545ceef77692881f68a8c6230c39673a3963cee5 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 9 Dec 2011 18:57:36 +0800
+Subject: [PATCH 246/435] ENGR00169783 vpu: Enable loopback test for mx6
+
+Support loopback test in vpu unit for mx6 platform.
+The example command is:
+./mxc_vpu_test.out -L "-f 2 -w 1280 -h 720 -t 1 -s 1"
+./mxc_vpu_test.out -L "-f 2 -w 1920 -h 1080 -t 1 -s 1"
+
+Note: 1) Camera must be buildin before the test;
+      2) "-s 1" must be enabled;
+      3) "-t 1" had better be enabled for better performance.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/capture.c  |  63 ++++++++++++++++----------
+ test/mxc_vpu_test/dec.c      |  15 ++++++-
+ test/mxc_vpu_test/enc.c      |  36 +++++++++++----
+ test/mxc_vpu_test/loopback.c | 103 ++++++++++++++++++++++++++++++++++++-------
+ test/mxc_vpu_test/utils.c    |  12 ++---
+ 5 files changed, 172 insertions(+), 57 deletions(-)
+
+diff --git a/test/mxc_vpu_test/capture.c b/test/mxc_vpu_test/capture.c
+index 64d0383..713b46d 100644
+--- a/test/mxc_vpu_test/capture.c
++++ b/test/mxc_vpu_test/capture.c
+@@ -25,33 +25,23 @@
+ #include "vpu_test.h"
+ 
+ #define TEST_BUFFER_NUM 3
+-
+-#define OV5642_VGA	    0
+-#define OV5642_QVGA	    1
+-#define OV5642_NTSC	    2
+-#define OV5642_PAL	    3
+-#define OV5642_720P	    4
+-#define OV5642_1080P	    5
++#define MAX_CAPTURE_MODES   10
+ 
+ static int cap_fd = -1;
+ struct capture_testbuffer cap_buffers[TEST_BUFFER_NUM];
++static int sizes_buf[MAX_CAPTURE_MODES][2];
+ 
+ static int getCaptureMode(int width, int height)
+ {
+-	int mode = 0;
+-
+-	if (width == 640 && height == 480)
+-		mode = OV5642_VGA;
+-	else if (width == 320 && height == 240)
+-		mode = OV5642_QVGA;
+-	else if (width == 720 && height == 480)
+-		mode = OV5642_NTSC;
+-	else if (width == 720 && height == 576)
+-		mode = OV5642_PAL;
+-	else if (width == 1280 && height == 720)
+-		mode = OV5642_720P;
+-	else if (width == 1920 && height == 1080)
+-		mode = OV5642_1080P;
++	int i, mode = -1;
++
++	for (i = 0; i < MAX_CAPTURE_MODES; i++) {
++		if (width == sizes_buf[i][0] &&
++		    height == sizes_buf[i][1]) {
++			mode = i;
++			break;
++		}
++	}
+ 
+ 	return mode;
+ }
+@@ -116,7 +106,9 @@ v4l_capture_setup(struct encode *enc, int width, int height, int fps)
+ 	struct v4l2_requestbuffers req = {0};
+ 	struct v4l2_control ctl;
+ 	struct v4l2_crop crop;
+-	int g_input = 1;
++	struct v4l2_dbg_chip_ident chip;
++	struct v4l2_frmsizeenum fsize;
++	int i, g_input = 1, mode = 0;
+ 
+ 	if (cap_fd > 0) {
+ 		warn_msg("capture device already opened\n");
+@@ -128,6 +120,23 @@ v4l_capture_setup(struct encode *enc, int width, int height, int fps)
+ 		return -1;
+ 	}
+ 
++	if (ioctl(cap_fd, VIDIOC_DBG_G_CHIP_IDENT, &chip)) {
++		printf("VIDIOC_DBG_G_CHIP_IDENT failed.\n");
++		return -1;
++	}
++	info_msg("sensor chip is %s\n", chip.match.name);
++
++	memset(sizes_buf, 0, sizeof(sizes_buf));
++	for (i = 0; i < MAX_CAPTURE_MODES; i++) {
++		fsize.index = i;
++		if (ioctl(cap_fd, VIDIOC_ENUM_FRAMESIZES, &fsize))
++			break;
++		else {
++			sizes_buf[i][0] = fsize.discrete.width;
++			sizes_buf[i][1] = fsize.discrete.height;
++		}
++	}
++
+ 	ctl.id = V4L2_CID_PRIVATE_BASE;
+ 	ctl.value = 0;
+ 	if (ioctl(cap_fd, VIDIOC_S_CTRL, &ctl) < 0)
+@@ -136,10 +145,18 @@ v4l_capture_setup(struct encode *enc, int width, int height, int fps)
+ 		return -1;
+ 	}
+ 
++	mode = getCaptureMode(width, height);
++	if (mode == -1) {
++		printf("Not support the resolution in camera\n");
++		return -1;
++	}
++	info_msg("sensor frame size is %dx%d\n", sizes_buf[mode][0],
++					       sizes_buf[mode][1]);
++
+ 	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	parm.parm.capture.timeperframe.numerator = 1;
+ 	parm.parm.capture.timeperframe.denominator = fps;
+-	parm.parm.capture.capturemode = getCaptureMode(width, height);
++	parm.parm.capture.capturemode = mode;
+ 	if (ioctl(cap_fd, VIDIOC_S_PARM, &parm) < 0) {
+ 		err_msg("set frame rate failed\n");
+ 		close(cap_fd);
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 5257413..83894ed 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -781,8 +781,10 @@ decoder_start(struct decode *dec)
+ 
+ 	decparam.dispReorderBuf = 0;
+ 
+-	decparam.prescanEnable = dec->cmdl->prescan;
+-	decparam.prescanMode = 0;
++	if (!cpu_is_mx6q()) {
++		decparam.prescanEnable = dec->cmdl->prescan;
++		decparam.prescanMode = 0;
++	}
+ 
+ 	decparam.skipframeMode = 0;
+ 	decparam.skipframeNum = 0;
+@@ -1010,6 +1012,15 @@ decoder_start(struct decode *dec)
+ 		if (cpu_is_mx6q() && (outinfo.decodingSuccess & 0x10)) {
+ 			warn_msg("vpu needs more bitstream in rollback mode\n"
+ 				"\tframe_id = %d\n", (int)frame_id);
++
++			err = dec_fill_bsbuffer(handle,  dec->cmdl, dec->virt_bsbuf_addr,
++					(dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
++					dec->phy_bsbuf_addr, 0, &eos, &fill_end_bs);
++			if (err < 0) {
++				err_msg("dec_fill_bsbuffer failed\n");
++				return -1;
++			}
++
+ 			if (quitflag)
+ 				break;
+ 			else
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 134e41a..69d6c78 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -299,9 +299,9 @@ put_mp4header:
+ 			if (enchdr_param.pParaSet) {
+ 				vpu_EncGiveCommand(handle,ENC_GET_JPEG_HEADER, &enchdr_param);
+ 				vpu_write(enc->cmdl, (void *)enchdr_param.pParaSet, enchdr_param.size);
++				free(enchdr_param.pParaSet);
+ 				if (ret < 0)
+ 					return -1;
+-				free(enchdr_param.pParaSet);
+ 			} else {
+ 				err_msg("memory allocate failure\n");
+ 				return -1;
+@@ -420,8 +420,9 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		}
+ 	} else {
+ 		/* Allocate a single frame buffer for source frame */
+-		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt, enc->src_picwidth,
+-						   enc->src_picheight);
++		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++						   (enc->enc_picwidth + 15) & ~15,
++						   (enc->enc_picheight + 15 ) & ~15);
+ 		if (pfbpool[src_fbid] == NULL) {
+ 			err_msg("failed to allocate single framebuf\n");
+ 			goto err1;
+@@ -466,17 +467,19 @@ encoder_start(struct encode *enc)
+ 	int src_scheme = enc->cmdl->src_scheme;
+ 	int count = enc->cmdl->count;
+ 	struct timeval tenc_begin,tenc_end, total_start, total_end;
+-	int sec, usec;
++	int sec, usec, loop_id;
+ 	float tenc_time = 0, total_time=0;
+ 	PhysicalAddress phy_bsbuf_start = enc->phy_bsbuf_addr;
+ 	u32 virt_bsbuf_start = enc->virt_bsbuf_addr;
+ 	u32 virt_bsbuf_end = virt_bsbuf_start + STREAM_BUF_SIZE;
+ 
+-	/* Must put encode header before encoding */
+-	ret = encoder_fill_headers(enc);
+-	if (ret) {
+-		err_msg("Encode fill headers failed\n");
+-		return -1;
++	/* Must put encode header here before encoding for all codec, except MX6 MJPG */
++	if (!(cpu_is_mx6q() && (enc->cmdl->format == STD_MJPG))) {
++		ret = encoder_fill_headers(enc);
++		if (ret) {
++			err_msg("Encode fill headers failed\n");
++			return -1;
++		}
+ 	}
+ 
+ 	enc_param.sourceFrame = &enc->fb[src_fbid];
+@@ -564,6 +567,15 @@ encoder_start(struct encode *enc)
+ 				break;
+ 		}
+ 
++		/* Must put encode header before each frame encoding for mx6 MJPG */
++		if (cpu_is_mx6q() && (enc->cmdl->format == STD_MJPG)) {
++			ret = encoder_fill_headers(enc);
++			if (ret) {
++				err_msg("Encode fill headers failed\n");
++				goto err2;
++			}
++		}
++
+ 		gettimeofday(&tenc_begin, NULL);
+ 		ret = vpu_EncStartOneFrame(handle, &enc_param);
+ 		if (ret != RETCODE_SUCCESS) {
+@@ -572,6 +584,7 @@ encoder_start(struct encode *enc)
+ 			goto err2;
+ 		}
+ 
++		loop_id = 0;
+ 		while (vpu_IsBusy()) {
+ 			vpu_WaitForInt(200);
+ 			if (enc->ringBufferEnable == 1) {
+@@ -582,6 +595,11 @@ encoder_start(struct encode *enc)
+ 					goto err2;
+ 				}
+ 			}
++			if (loop_id == 20) {
++				ret = vpu_SWReset(handle, 0);
++				return -1;
++			}
++			loop_id ++;
+ 		}
+ 
+ 		gettimeofday(&tenc_end, NULL);
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 720b003..b19d43d 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -29,6 +29,7 @@ extern int quitflag;
+ extern struct capture_testbuffer cap_buffers[];
+ static int disp_clr_index = -1;
+ static int frame_id = 0;
++static int rotid;
+ 
+ static int
+ decode(void)
+@@ -38,20 +39,37 @@ decode(void)
+ 	DecOutputInfo outinfo = {0};
+ 	struct vpu_display *disp = dec->disp;
+ 	RetCode ret;
++	int loop_id = 0, rot_stride = 0;
+ 
+ 	/* Suggest to enable prescan in loopback, then decoder performs scanning stream buffers
+ 	 * to check whether data is enough to prevent decoder hang.
+ 	 */
+-	decparam.prescanEnable = dec->cmdl->prescan;
++	if (!cpu_is_mx6q())
++		decparam.prescanEnable = dec->cmdl->prescan;
++
++	if (dec->cmdl->format == STD_MJPG) {
++		rot_stride = (dec->picwidth + 15) & ~15;
++		vpu_DecGiveCommand(handle, SET_ROTATOR_STRIDE, &rot_stride);
++		vpu_DecGiveCommand(handle, SET_ROTATOR_OUTPUT, (void *)&dec->fb[rotid]);
++	}
+ 
+ 	ret = vpu_DecStartOneFrame(handle, &decparam);
+-	if (ret != RETCODE_SUCCESS) {
+-		err_msg("DecStartOneFrame failed\n");
++	if (ret == RETCODE_JPEG_BIT_EMPTY)
++		goto out;
++	else if (ret != RETCODE_SUCCESS) {
++		err_msg("DecStartOneFrame failed, ret=%d\n", ret);
+ 		return -1;
+ 	}
+ 
++	loop_id = 0;
+ 	while (vpu_IsBusy()) {
+ 		vpu_WaitForInt(200);
++		if (loop_id == 10) {
++			ret = vpu_SWReset(handle, 0);
++			warn_msg("vpu_SWReset in dec\n");
++			return -1;
++		}
++		loop_id ++;
+ 	}
+ 
+ 	ret = vpu_DecGetOutputInfo(handle, &outinfo);
+@@ -62,6 +80,10 @@ decode(void)
+ 		return -1;
+ 	}
+ 
++	if (cpu_is_mx6q() && (outinfo.decodingSuccess & 0x10)) {
++		goto out;
++	}
++
+ 	if (outinfo.notSufficientPsBuffer) {
+ 		err_msg("PS Buffer overflow\n");
+ 		return -1;
+@@ -76,7 +98,7 @@ decode(void)
+ 			(outinfo.indexFrameDisplay > dec->fbcount))
+ 		return -1;
+ 
+-	if ((outinfo.prescanresult == 0) && (decparam.dispReorderBuf == 0)) {
++	if (!cpu_is_mx6q() && (outinfo.prescanresult == 0) && (decparam.dispReorderBuf == 0)) {
+ 		warn_msg("Prescan Enable: not enough bs data\n");
+ 		goto out;
+ 	}
+@@ -93,9 +115,14 @@ decode(void)
+ 		goto out;
+ 	}
+ 
++	if ((dec->cmdl->format == STD_MJPG) && (outinfo.indexFrameDisplay == 0))
++		outinfo.indexFrameDisplay = rotid;
++
+ 	ret = v4l_put_data(disp, outinfo.indexFrameDisplay, V4L2_FIELD_ANY, 30);
+-	if (ret)
++	if (ret) {
++		err_msg("V4L put data failed, ret=%d\n", ret);
+ 		return -1;
++	}
+ 
+ 	if (disp_clr_index >= 0) {
+ 		ret = vpu_DecClrDispFlag(handle, disp_clr_index);
+@@ -105,6 +132,11 @@ decode(void)
+ 	}
+ 	disp_clr_index = disp->buf.index;
+ 
++	if (dec->cmdl->format == STD_MJPG) {
++		rotid++;
++		rotid %= dec->fbcount;
++	}
++
+ out:
+ 	return 0;
+ }
+@@ -212,6 +244,21 @@ encoder_fill_headers(void)
+ 			free(enc->huffTable);
+ 		if (enc->qMatTable)
+ 			free(enc->qMatTable);
++		if (cpu_is_mx6q()) {
++			EncParamSet enchdr_param = {0};
++			enchdr_param.size = STREAM_BUF_SIZE;
++			enchdr_param.pParaSet = malloc(STREAM_BUF_SIZE);
++			if (enchdr_param.pParaSet) {
++				vpu_EncGiveCommand(handle,ENC_GET_JPEG_HEADER, &enchdr_param);
++				ret = dec_fill_bsbuffer((void *)enchdr_param.pParaSet, enchdr_param.size);
++				free(enchdr_param.pParaSet);
++				if (ret < 0)
++					return -1;
++			} else {
++				err_msg("memory allocate failure\n");
++				return -1;
++			}
++		}
+ 	}
+ 
+ 	return 0;
+@@ -224,20 +271,31 @@ encode(void)
+ 	EncParam  enc_param = {0};
+ 	EncOutputInfo outinfo = {0};
+ 	RetCode ret;
+-	int src_fbid = enc->src_fbid, img_size;
++	int src_fbid = enc->src_fbid, img_size, loop_id = 0;
+ 	FrameBuffer *fb = enc->fb;
+ 	struct v4l2_buffer v4l2_buf;
+ 	u32 vbuf;
+ 
++	if (cpu_is_mx6q() && (dec->cmdl->format == STD_MJPG)) {
++		ret = encoder_fill_headers();
++		if (ret) {
++			err_msg("fill headers failed\n");
++			return -1;
++		}
++	}
++
+ 	ret = v4l_get_capture_data(&v4l2_buf);
+ 	if (ret < 0) {
+ 		return -1;
+ 	}
+ 
+ 	img_size = enc->src_picwidth * enc->src_picheight;
++	fb[src_fbid].myIndex = enc->src_fbid + v4l2_buf.index;
+ 	fb[src_fbid].bufY = cap_buffers[v4l2_buf.index].offset;
+ 	fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size;
+ 	fb[src_fbid].bufCr = fb[src_fbid].bufCb + (img_size >> 2);
++	fb[src_fbid].strideY = enc->src_picwidth;
++	fb[src_fbid].strideC = enc->src_picwidth / 2;
+ 
+ 	enc_param.sourceFrame = &enc->fb[src_fbid];
+ 	enc_param.quantParam = 30;
+@@ -254,8 +312,15 @@ encode(void)
+ 		return -1;
+ 	}
+ 
++	loop_id = 0;
+ 	while (vpu_IsBusy()) {
+ 		vpu_WaitForInt(200);
++		if (loop_id == 10) {
++			ret = vpu_SWReset(handle, 0);
++			warn_msg("vpu_SWReset in enc\n");
++			return -1;
++		}
++		loop_id ++;
+ 	}
+ 
+ 	ret = vpu_EncGetOutputInfo(handle, &outinfo);
+@@ -275,7 +340,7 @@ encode(void)
+ 	}
+ 
+ 	if (ret != outinfo.bitstreamSize) {
+-		err_msg("Oops...\n");
++		err_msg("Oops..., ret=%d, bsSize=%d\n", ret, outinfo.bitstreamSize);
+ 	}
+ 
+ 	return 0;
+@@ -291,10 +356,6 @@ encdec_test(void *arg)
+ 	vpu_mem_desc	slice_mem_desc = {0};
+ 	int ret, i;
+ 
+-#if STREAM_ENC_PIC_RESET == 0
+-	return 0;
+-#endif
+-
+ 	/* allocate memory for must remember stuff */
+ 	enc = (struct encode *)calloc(1, sizeof(struct encode));
+ 	if (enc == NULL) {
+@@ -383,10 +444,15 @@ encdec_test(void *arg)
+ 	if (ret)
+ 		goto err3;
+ 
+-	ret = encoder_fill_headers();
+-	if (ret) {
+-		err_msg("fill headers failed\n");
+-		goto err4;
++
++	/* For MX6 MJPG, header must be inserted before each frame, only need to
++	 * fill header here once for other codecs */
++	if (!(cpu_is_mx6q() && (enc->cmdl->format == STD_MJPG))) {
++		ret = encoder_fill_headers();
++		if (ret) {
++			err_msg("fill headers failed\n");
++			goto err4;
++		}
+ 	}
+ 
+ 	/* start capture */
+@@ -396,8 +462,8 @@ encdec_test(void *arg)
+ 		goto err4;
+ 	}
+ 
+-	/* encode 10 frames first */
+-	for (i = 0; i < 10; i++) {
++	/* encode 5 frames first */
++	for (i = 0; i < 5; i++) {
+ 		ret = encode();
+ 		if (ret)
+ 			goto err5;
+@@ -427,6 +493,9 @@ encdec_test(void *arg)
+ 	if (ret)
+ 		goto err5;
+ 
++	if (dec->cmdl->format == STD_MJPG)
++		rotid = 0;
++
+ 	/* main encode decode loop */
+ 	while (1) {
+ 		ret = encode();
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index c831822..4bb2935 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -523,11 +523,12 @@ check_params(struct cmd_line *cmd, int op)
+ 					cmd->width);
+ 		}
+ 
+-		if (cmd->height % 16 != 0) {
+-			cmd->height -= cmd->height % 16;
+-			warn_msg("height not divisible by 16, adjusted %d\n",
++		if (cmd->height % 8 != 0) {
++			cmd->height -= cmd->height % 8;
++			warn_msg("height not divisible by 8, adjusted %d\n",
+ 					cmd->height);
+ 		}
++
+ 	}
+ 
+ 	if (cmd->dst_scheme != PATH_FILE && op == ENCODE) {
+@@ -833,9 +834,8 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode)
+ 		if (str != NULL) {
+ 			str++;
+ 			if (*str != '\0') {
+-				cmd->prescan = strtol(str, NULL, 10);
+-				if (cpu_is_mx6q() && cmd->prescan)
+-					warn_msg("Prescan cannot be enabled on mx6 platform.\n");
++					cmd->bs_mode = strtol(str, NULL, 10);
++					cmd->prescan = strtol(str, NULL, 10);
+ 			}
+ 		}
+ 
+-- 
+1.8.0
+

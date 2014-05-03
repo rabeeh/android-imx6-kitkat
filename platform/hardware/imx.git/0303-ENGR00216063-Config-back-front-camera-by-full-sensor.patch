@@ -1,0 +1,249 @@
+From 2e42656082d9d96db383e70c21c5cf14e49b1aaa Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Mon, 9 Jul 2012 10:05:46 +0800
+Subject: [PATCH 303/486] ENGR00216063 Config back/front camera by full sensor
+ name
+
+Follow below way to config the back/front camera in console
+or init.freescale.rc:
+setprop back_camera_name ov5640
+setprop front_camera_name ov5642
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera/CameraModule.cpp      | 29 +++++++++++------------------
+ mx6/libcamera/V4l2CapDeviceBase.cpp | 24 ++++++++++++++++++------
+ mx6/libcamera/V4l2CsiDevice.cpp     | 37 ++++++-------------------------------
+ mx6/libcamera/V4l2CsiDevice.h       |  5 ++++-
+ 4 files changed, 39 insertions(+), 56 deletions(-)
+
+diff --git a/mx6/libcamera/CameraModule.cpp b/mx6/libcamera/CameraModule.cpp
+index 4dabfdc..77adf62 100755
+--- a/mx6/libcamera/CameraModule.cpp
++++ b/mx6/libcamera/CameraModule.cpp
+@@ -476,6 +476,8 @@ done:
+ #define DEFAULT_ERROR_NAME_str "#"
+ #define UVC_NAME "uvc"
+ static struct camera_info sCameraInfo[2];
++//Camera_name[0]  for back camera name
++//Camera_name[1]  for front camera name
+ static char Camera_name[2][MAX_SENSOR_NAME];
+ /*******************************************************************
+  * implementation of camera_module functions
+@@ -504,7 +506,7 @@ int camera_device_open(const hw_module_t* module, const char* name,
+ 
+     android::Mutex::Autolock lock(gCameraHalDeviceLock);
+ 
+-    LOGI("camera_device open");
++    LOGI("camera_device open: %s", name);
+ 
+     if (name != NULL) {
+         cameraid = atoi(name);
+@@ -601,10 +603,6 @@ int camera_device_open(const hw_module_t* module, const char* name,
+         if (camera->Init() < 0)
+             return NULL;
+ 
+-        //now the board has only one csi camera sensor, so just do mirror for it
+-        if(strstr(SelectedCameraName, "ov") != NULL){
+-            camera->setPreviewRotate(android::CAMERA_PREVIEW_HORIZ_FLIP);
+-        }
+ 
+         gCameraHals[cameraid] = camera;
+         gCamerasOpen++;
+@@ -659,24 +657,19 @@ static void GetCameraPropery(char * pFaceBackCameraName, char *pFaceFrontCameraN
+ int camera_get_number_of_cameras()
+ {
+     int back_orient =0,  front_orient = 0;
+-    int back_camera_num = 0, front_camera_num = 0;
++    int camera_num = 0;
+     GetCameraPropery(Camera_name[0], Camera_name[1], &back_orient, &front_orient);
+     if (Camera_name[0][0] != DEFAULT_ERROR_NAME){
+-        sCameraInfo[0].facing = CAMERA_FACING_BACK;
+-        sCameraInfo[0].orientation = back_orient;
+-        back_camera_num++;
++        sCameraInfo[camera_num].facing = CAMERA_FACING_BACK;
++        sCameraInfo[camera_num].orientation = back_orient;
++        camera_num++;
+     }
+     if (Camera_name[1][0] != DEFAULT_ERROR_NAME){
+-        if(back_camera_num > 0){
+-            sCameraInfo[1].facing = CAMERA_FACING_FRONT;
+-            sCameraInfo[1].orientation = front_orient;
+-        }else{
+-	    sCameraInfo[0].facing = CAMERA_FACING_FRONT;
+-	    sCameraInfo[0].orientation = front_orient;
+-        }
+-        front_camera_num ++;
++	    sCameraInfo[camera_num].facing = CAMERA_FACING_FRONT;
++	    sCameraInfo[camera_num].orientation = front_orient;
++        camera_num ++;
+     }
+-    return (back_camera_num + front_camera_num);					
++    return camera_num;
+ 
+ }
+ 
+diff --git a/mx6/libcamera/V4l2CapDeviceBase.cpp b/mx6/libcamera/V4l2CapDeviceBase.cpp
+index 21c10b0..b6cda32 100755
+--- a/mx6/libcamera/V4l2CapDeviceBase.cpp
++++ b/mx6/libcamera/V4l2CapDeviceBase.cpp
+@@ -230,6 +230,7 @@ namespace android{
+         DIR *v4l_dir = NULL;
+         struct dirent *dir_entry;
+         struct v4l2_capability v4l2_cap;
++        struct v4l2_dbg_chip_ident vid_chip;
+         struct v4l2_fmtdesc vid_fmtdesc;
+         struct v4l2_frmsizeenum vid_frmsize;
+         CAPTURE_DEVICE_RET ret = CAPTURE_DEVICE_ERR_NONE;
+@@ -258,12 +259,21 @@ namespace android{
+                         close(fd);
+                         fd = 0;
+                         continue;
+-                    } else if ((strstr((char *)v4l2_cap.driver, mInitalDeviceName) != 0) &&
+-                            (v4l2_cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+-                        is_found = 1;
+-                        strcpy(mCaptureDeviceName, dev_node);
+-                        CAMERA_LOG_RUNTIME("device name is %s", mCaptureDeviceName);
+-                        break;
++                    } else if (v4l2_cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
++                        if(ioctl(fd, VIDIOC_DBG_G_CHIP_IDENT, &vid_chip) < 0 ) {
++                            close(fd);
++                            fd = 0;
++                            CAMERA_LOG_ERR("dev_node %s:cannot get sensor name", dev_node);
++                            continue;
++                        }
++                        CAMERA_LOG_RUNTIME("dev_node: %s, sensor name: %s", 
++                                dev_node, vid_chip.match.name);
++                        if(strstr(vid_chip.match.name, mInitalDeviceName)){
++                            is_found = 1;
++                            strcpy(mInitalDeviceName, vid_chip.match.name);
++                            strcpy(mCaptureDeviceName, dev_node);
++                            break;
++                        }
+                     } else {
+                         close(fd);
+                         fd = 0;
+@@ -279,6 +289,8 @@ namespace android{
+                 return CAPTURE_DEVICE_ERR_OPEN;
+             }
+         }
++        CAMERA_LOG_INFO("device name is %s", mCaptureDeviceName);
++        CAMERA_LOG_INFO("sensor name is %s", mInitalDeviceName);
+         return ret; 
+     }
+ 
+diff --git a/mx6/libcamera/V4l2CsiDevice.cpp b/mx6/libcamera/V4l2CsiDevice.cpp
+index afe100e..563c98a 100755
+--- a/mx6/libcamera/V4l2CsiDevice.cpp
++++ b/mx6/libcamera/V4l2CsiDevice.cpp
+@@ -49,6 +49,7 @@ namespace android{
+     }
+ 
+ 
++#ifdef V4L2_CAMERA_SWITCH
+     CAPTURE_DEVICE_RET V4l2CsiDevice :: V4l2Open(int cameraId){
+         CAMERA_LOG_FUNC;
+         int fd = 0, i, j, is_found = 0;
+@@ -62,10 +63,12 @@ namespace android{
+         struct v4l2_frmsizeenum vid_frmsize;
+         CAPTURE_DEVICE_RET ret = CAPTURE_DEVICE_ERR_NONE;
+ 
++        LOGI("%s: mInitalDeviceName %s, cameraId %d, mCaptureDeviceName %s",
++                __func__, mInitalDeviceName, cameraId, mCaptureDeviceName);
++
+         if(mCameraDevice > 0)
+             return CAPTURE_DEVICE_ERR_ALRADY_OPENED;
+ 
+-#ifdef V4L2_CAMERA_SWITCH
+         if (mCaptureDeviceName[0] != '#'){
+             CAMERA_LOG_RUNTIME("already get the device name %s", mCaptureDeviceName);
+             mCameraDevice = open(mCaptureDeviceName, O_RDWR, O_NONBLOCK);
+@@ -86,15 +89,6 @@ namespace android{
+                         continue;
+                     CAMERA_LOG_RUNTIME("dev_node is %s", dev_node);
+ 
+-                    if (fd > 0){
+-                        mCameraDevice = fd;
+-                        ret = V4l2SetSensor(cameraId);
+-                    }
+-                    else{
+-                        CAMERA_LOG_ERR("The device name is not correct or the device is error");
+-                        return CAPTURE_DEVICE_ERR_OPEN;
+-                    }
+-
+                     if(ioctl(fd, VIDIOC_DBG_G_CHIP_IDENT, &vid_chip) < 0 ) {
+                         close(fd);
+                         fd = 0;
+@@ -113,6 +107,7 @@ namespace android{
+                 }
+                 closedir(v4l_dir);
+             }
++
+             if (fd > 0){
+                 mCameraDevice = fd;
+                 ret = V4l2SetSensor(cameraId);
+@@ -122,25 +117,6 @@ namespace android{
+                 return CAPTURE_DEVICE_ERR_OPEN;
+             }
+         }
+-#else
+-        memset((void *)dev_node, 0, CAMAERA_FILENAME_LENGTH);
+-        sprintf(dev_node, "/dev/video%d", cameraId);
+-        if ((fd = open(dev_node, O_RDWR, O_NONBLOCK)) < 0) {
+-            CAMERA_LOG_ERR("dev_node %s:cannot be opened", dev_node);
+-            return CAPTURE_DEVICE_ERR_OPEN;
+-        }
+-
+-        if(ioctl(fd, VIDIOC_DBG_G_CHIP_IDENT, &vid_chip) < 0 ) {
+-            close(fd);
+-            CAMERA_LOG_ERR("dev_node %s:cannot get sensor name", dev_node);
+-            return CAPTURE_DEVICE_ERR_OPEN;
+-        }
+-        strcpy(mCaptureDeviceName, dev_node);
+-        strcpy(mInitalDeviceName, vid_chip.match.name);
+-        CAMERA_LOG_INFO("device name is %s", mCaptureDeviceName);
+-        CAMERA_LOG_INFO("sensor name is %s", mInitalDeviceName);
+-        mCameraDevice = fd;
+-#endif
+         return ret; 
+     }
+ 
+@@ -149,7 +125,6 @@ namespace android{
+         CAMERA_LOG_FUNC;
+         CAPTURE_DEVICE_RET ret = CAPTURE_DEVICE_ERR_NONE;
+         CAMERA_LOG_INFO("-----set camera sensor %d-----", cameraId);
+-#ifdef V4L2_CAMERA_SWITCH
+         if(cameraId >= 2) {
+             CAMERA_LOG_ERR("Error: camerId %d is too big", cameraId);
+             return CAPTURE_DEVICE_ERR_BAD_PARAM;
+@@ -162,9 +137,9 @@ namespace android{
+             CAMERA_LOG_ERR("set ctrl switch camera failed\n");
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+         }
+-#endif
+         return ret;
+     }
++#endif
+ 
+     CAPTURE_DEVICE_RET V4l2CsiDevice :: V4l2EnumFmt(void *retParam){
+         CAMERA_LOG_FUNC;
+diff --git a/mx6/libcamera/V4l2CsiDevice.h b/mx6/libcamera/V4l2CsiDevice.h
+index ccf88ab..e935b18 100755
+--- a/mx6/libcamera/V4l2CsiDevice.h
++++ b/mx6/libcamera/V4l2CsiDevice.h
+@@ -36,8 +36,11 @@ class V4l2CsiDevice : public V4l2CapDeviceBase{
+         virtual ~V4l2CsiDevice();
+     protected:
+ 		
+-		CAPTURE_DEVICE_RET V4l2Open(int cameraId);
++#ifdef V4L2_CAMERA_SWITCH
++        //Only for switch camera with ioctl
++        CAPTURE_DEVICE_RET V4l2Open(int cameraId);
+         CAPTURE_DEVICE_RET V4l2SetSensor(int cameraId);
++#endif
+ 		CAPTURE_DEVICE_RET V4l2EnumFmt(void *retParam);
+ 		CAPTURE_DEVICE_RET V4l2EnumSizeFps(void *retParam);
+ 		CAPTURE_DEVICE_RET V4l2SetConfig(struct capture_config_t *pCapcfg);
+-- 
+1.8.0
+

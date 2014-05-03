@@ -1,0 +1,173 @@
+From ccf8141711f1dce41461c039959b853addbb836f Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Fri, 4 Jan 2013 17:54:41 +0800
+Subject: [PATCH 03/10] ENGR00238882 build: add support for ubifs image.
+
+add ubifs image generate command for jb.
+
+Change-Id: I8a2dc9d5e81cbb5eb77cf6a5631489169bb3ecd0
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ core/Makefile                     | 33 +++++++++++++++++++++++++++++++--
+ core/config.mk                    |  2 ++
+ core/main.mk                      |  3 ++-
+ tools/releasetools/build_image.py | 10 ++++++++++
+ tools/releasetools/common.py      |  1 +
+ 5 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/core/Makefile b/core/Makefile
+index fbfd6ae..027669f 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -586,6 +586,11 @@ else
+ ifeq ($(TARGET_USERIMAGES_USE_EXT4),true)
+ INTERNAL_USERIMAGES_USE_EXT := true
+ INTERNAL_USERIMAGES_EXT_VARIANT := ext4
++else
++ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
++# FIXME: this borrow ext's var to generate it.
++INTERNAL_USERIMAGES_EXT_VARIANT := ubifs
++endif
+ endif
+ endif
+ endif
+@@ -597,8 +602,12 @@ endif
+ ifeq ($(INTERNAL_USERIMAGES_USE_EXT),true)
+ INTERNAL_USERIMAGES_DEPS := $(MKEXTUSERIMG) $(MAKE_EXT4FS) $(SIMG2IMG) $(E2FSCK)
+ else
++ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
++INTERNAL_USERIMAGES_DEPS := $(MKUBIFS)
++else
+ INTERNAL_USERIMAGES_DEPS := $(MKYAFFS2)
+ endif
++endif
+ INTERNAL_USERIMAGES_BINARY_PATHS := $(sort $(dir $(INTERNAL_USERIMAGES_DEPS)))
+ 
+ SELINUX_FC := $(TARGET_ROOT_OUT)/file_contexts
+@@ -618,6 +627,7 @@ $(if $(INTERNAL_USERIMAGES_SPARSE_EXT_FLAG),$(hide) echo "extfs_sparse_flag=$(IN
+ $(if $(mkyaffs2_extra_flags),$(hide) echo "mkyaffs2_extra_flags=$(mkyaffs2_extra_flags)" >> $(1))
+ $(hide) echo "selinux_fc=$(SELINUX_FC)" >> $(1)
+ $(if $(2),$(hide) $(foreach kv,$(2),echo "$(kv)" >> $(1);))
++$(if $(TARGET_MKUBIFS_ARGS),$(hide) echo "mkfsubifs_flags=$(TARGET_MKUBIFS_ARGS)" >> $(1))
+ endef
+ 
+ # -----------------------------------------------------------------
+@@ -776,6 +786,8 @@ HOST_PROCESSOR := $(shell cat /proc/cpuinfo | grep processor | wc -l)
+ INSTALLED_KERNEL_TARGET := $(PRODUCT_OUT)/kernel
+ TARGET_PREBUILT_KERNEL := $(PRODUCT_OUT)/kernel
+ KERNEL_CONFIGURE := kernel_imx/.config
++KERNEL_ZIMAGE    := kernel_imx/arch/arm/boot/zImage
++KERNEL_UIMAGE    := kernel_imx/arch/arm/boot/uImage
+ KERNEL_OUT := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ
+ KERNEL_HEADERS_INSTALL := $(KERNEL_OUT)/usr
+ 
+@@ -791,13 +803,30 @@ $(KERNEL_HEADERS_INSTALL): $(KERNEL_CONFIGURE)
+ 
+ $(TARGET_PREBUILT_KERNEL): $(KERNEL_CONFIGURE)
+ 	$(MAKE) -C kernel_imx -j$(HOST_PROCESSOR) uImage $(KERNEL_ENV)
+-	install -D kernel_imx/arch/arm/boot/uImage $(PRODUCT_OUT)/uImage
+-	install -D kernel_imx/arch/arm/boot/zImage $(PRODUCT_OUT)/kernel
++	install -D $(KERNEL_UIMAGE)  $(PRODUCT_OUT)/uImage
++	install -D $(KERNEL_ZIMAGE)  $(PRODUCT_OUT)/kernel
+ 
+ else
+ kernelimage:
+ endif
+ 
++# ----------------------------------------------------------------
++# support ubifs rules:
++.PHONY: ubiimagesgenerate
++ifeq ($(TARGET_USERIMAGES_USE_UBIFS),true)
++UBI_RAW_IMAGE := $(PRODUCT_OUT)/android_root.img
++
++.PHONY: $(UBI_RAW_IMAGE)
++
++ubiimagesgenerate: $(UBI_RAW_IMAGE)
++
++$(UBI_RAW_IMAGE) : $(INSTALLED_USERDATAIMAGE_TARGET) systemimage
++	$(call pretty,"Generating UBI raw image:" "$(UBI_RAW_IMAGE)" "$(UBI_RAW_RECO_IMAGE)")
++	$(MKUBIRAW) -o $(UBI_RAW_IMAGE) $(TARGET_UBIRAW_ARGS)
++else
++ubiimagesgenerate:
++endif
++
+ .PHONY: recoveryimage
+ recoveryimage: $(INSTALLED_RECOVERYIMAGE_TARGET) $(RECOVERY_RESOURCE_ZIP)
+ 
+diff --git a/core/config.mk b/core/config.mk
+index 96993c0..de673ed 100644
+--- a/core/config.mk
++++ b/core/config.mk
+@@ -313,6 +313,8 @@ MKBOOTFS := $(HOST_OUT_EXECUTABLES)/mkbootfs$(HOST_EXECUTABLE_SUFFIX)
+ MINIGZIP := $(HOST_OUT_EXECUTABLES)/minigzip$(HOST_EXECUTABLE_SUFFIX)
+ MKBOOTIMG := $(HOST_OUT_EXECUTABLES)/mkbootimg$(HOST_EXECUTABLE_SUFFIX)
+ MKYAFFS2 := $(HOST_OUT_EXECUTABLES)/mkyaffs2image$(HOST_EXECUTABLE_SUFFIX)
++MKUBIFS := $(HOST_OUT_EXECUTABLES)/mkfs.ubifs$(HOST_EXECUTABLE_SUFFIX)
++MKUBIRAW := $(HOST_OUT_EXECUTABLES)/ubinize$(HOST_EXECUTABLE_SUFFIX)
+ APICHECK := $(HOST_OUT_EXECUTABLES)/apicheck$(HOST_EXECUTABLE_SUFFIX)
+ FS_GET_STATS := $(HOST_OUT_EXECUTABLES)/fs_get_stats$(HOST_EXECUTABLE_SUFFIX)
+ MKEXT2IMG := $(HOST_OUT_EXECUTABLES)/genext2fs$(HOST_EXECUTABLE_SUFFIX)
+diff --git a/core/main.mk b/core/main.mk
+index 4c0c917..8c0970f 100644
+--- a/core/main.mk
++++ b/core/main.mk
+@@ -788,7 +788,8 @@ droidcore: kernelimage \
+ 	$(INSTALLED_USERDATAIMAGE_TARGET) \
+ 	$(INSTALLED_CACHEIMAGE_TARGET) \
+ 	$(INSTALLED_VENDORIMAGE_TARGET) \
+-	$(INSTALLED_FILES_FILE)
++	$(INSTALLED_FILES_FILE) \
++	ubiimagesgenerate
+ 
+ # dist_files only for putting your library into the dist directory with a full build.
+ .PHONY: dist_files
+diff --git a/tools/releasetools/build_image.py b/tools/releasetools/build_image.py
+index f8f2ada..a960ea3 100755
+--- a/tools/releasetools/build_image.py
++++ b/tools/releasetools/build_image.py
+@@ -24,6 +24,7 @@ import os
+ import os.path
+ import subprocess
+ import sys
++import time
+ 
+ def RunCommand(cmd):
+   """ Echo and run the given command
+@@ -63,6 +64,14 @@ def BuildImage(in_dir, prop_dict, out_file):
+       build_command.append(prop_dict["partition_size"])
+     if "selinux_fc" in prop_dict:
+       build_command.append(prop_dict["selinux_fc"])
++  if fs_type.startswith("ubifs"):
++    # add ubifs image generate support.
++    build_command = ["mkfs.ubifs", "-d"]
++    build_command.append(in_dir)
++    build_command.append("-o")
++    build_command.append(out_file)
++    if prop_dict.get("mkfsubifs_flags", None):
++      build_command.extend(prop_dict["mkfsubifs_flags"].split())
+   else:
+     build_command = ["mkyaffs2image", "-f"]
+     if prop_dict.get("mkyaffs2_extra_flags", None):
+@@ -114,6 +123,7 @@ def ImagePropFromGlobalDict(glob_dict, mount_point):
+       "mkyaffs2_extra_flags",
+       "selinux_fc",
+       "skip_fsck",
++      "mkfsubifs_flags",
+       )
+   for p in common_props:
+     copy_prop(p, p)
+diff --git a/tools/releasetools/common.py b/tools/releasetools/common.py
+index a3217dd..a03372d 100644
+--- a/tools/releasetools/common.py
++++ b/tools/releasetools/common.py
+@@ -946,6 +946,7 @@ def ComputeDifferences(diffs):
+ 
+ # map recovery.fstab's fs_types to mount/format "partition types"
+ PARTITION_TYPES = { "yaffs2": "MTD", "mtd": "MTD",
++                    "ubifs": "UBI",
+                     "ext4": "EMMC", "emmc": "EMMC" }
+ 
+ def GetTypeAndDevice(mount_point, info):
+-- 
+1.8.0
+

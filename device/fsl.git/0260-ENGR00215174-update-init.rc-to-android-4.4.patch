@@ -1,0 +1,211 @@
+From 46babf3cc8c23588b317cda2ab43b8b5ed986646 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Wed, 20 Nov 2013 17:52:42 +0800
+Subject: [PATCH 260/281] ENGR00215174 update init.rc to android 4.4.
+
+delete environment variables set.
+import init.environ.rc.
+Create cgroup mount point for memory.
+add ril-daemon, healthd-charger and healthd service.
+delete debus and bluetoothd service.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ imx6/etc/init.rc | 83 ++++++++++++++++++++++++++++++++------------------------
+ 1 file changed, 47 insertions(+), 36 deletions(-)
+
+diff --git a/imx6/etc/init.rc b/imx6/etc/init.rc
+index 2ccded6..40b829e 100755
+--- a/imx6/etc/init.rc
++++ b/imx6/etc/init.rc
+@@ -4,6 +4,7 @@
+ # This is a common source of Android security bugs.
+ #
+ 
++import /init.environ.rc
+ import /init.usb.rc
+ import /init.${ro.hardware}.rc
+ import /init.trace.rc
+@@ -28,16 +29,6 @@ sysclktz 0
+ loglevel 3
+ 
+ # setup the global environment
+-    export PATH /sbin:/vendor/bin:/system/sbin:/system/bin:/system/xbin
+-    export LD_LIBRARY_PATH /vendor/lib:/system/lib
+-    export ANDROID_BOOTLOGO 1
+-    export ANDROID_ROOT /system
+-    export ANDROID_ASSETS /system/app
+-    export ANDROID_DATA /data
+-    export ANDROID_STORAGE /storage
+-    export ASEC_MOUNTPOINT /mnt/asec
+-    export LOOP_MOUNTPOINT /mnt/obb
+-    export BOOTCLASSPATH /system/framework/core.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/mms-common.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar
+     export SHM_MOUNTPOINT /mnt/shm
+     export LIGHTSENSOR_PATH /sys/class/i2c-adapter/i2c-1/1-0044
+     export VPU_FW_PATH /system/lib/firmware/vpu
+@@ -64,6 +55,19 @@ loglevel 3
+     mkdir /mnt/udisk 0000 system system
+     symlink /mnt/udisk /udisk
+ 
++# Create cgroup mount point for memory
++    mount tmpfs none /sys/fs/cgroup mode=0750,uid=0,gid=1000
++    mkdir /sys/fs/cgroup/memory 0750 root system
++    mount cgroup none /sys/fs/cgroup/memory memory
++    write /sys/fs/cgroup/memory/memory.move_charge_at_immigrate 1
++    chown root system /sys/fs/cgroup/memory/tasks
++    chmod 0660 /sys/fs/cgroup/memory/tasks
++    mkdir /sys/fs/cgroup/memory/sw 0750 root system
++    write /sys/fs/cgroup/memory/sw/memory.swappiness 100
++    write /sys/fs/cgroup/memory/sw/memory.move_charge_at_immigrate 1
++    chown root system /sys/fs/cgroup/memory/sw/tasks
++    chmod 0660 /sys/fs/cgroup/memory/sw/tasks
++
+     mkdir /system
+     mkdir /data 0771 system system
+     mkdir /cache 0770 system cache
+@@ -72,7 +76,8 @@ loglevel 3
+     mkdir /device 0771 system system
+     # See storage config details at http://source.android.com/tech/storage/
+     mkdir /mnt/shell 0700 shell shell
+-    mkdir /storage 0050 root sdcard_r
++    mkdir /mnt/media_rw 0700 media_rw media_rw
++    mkdir /storage 0751 root sdcard_r
+ 
+     # Directory for putting things only root should see.
+     mkdir /mnt/secure 0700 root root
+@@ -146,7 +151,11 @@ loglevel 3
+ # Allow everybody to read the xt_qtaguid resource tracking misc dev.
+ # This is needed by any process that uses socket tagging.
+     chmod 0644 /dev/xt_qtaguid
+-    
++
++# Create location for fs_mgr to store abbreviated output from filesystem
++# checker programs.
++    mkdir /dev/fscklogs 0770 root system
++
+ on post-fs
+     # once everything is setup, no need to modify /
+     mount rootfs rootfs / ro remount
+@@ -191,6 +200,9 @@ on post-fs-data
+     # We restorecon /data in case the userdata partition has been reset.
+     restorecon /data
+ 
++    # Avoid predictable entropy pool. Carry over entropy from previous boot.
++    copy /data/system/entropy.dat /dev/urandom
++
+     # Create dump dir and collect dumps.
+     # Do this before we mount cache so eventually we can use cache for
+     # storing dumps on platforms which do not have a dedicated dump partition.
+@@ -274,7 +286,7 @@ on post-fs-data
+     symlink /data/data/com.android.shell/files/bugreports /data/bugreports
+ 
+     # Separate location for storing security policy files on data
+-    mkdir /data/security 0700 system system
++    mkdir /data/security 0711 system system
+ 
+     # If there is no fs-post-data action in the init.<device>.rc file, you
+     # must uncomment this line, otherwise encrypted filesystems
+@@ -341,12 +353,6 @@ on boot
+     chown system system /sys/class/leds/red/device/grpfreq
+     chown system system /sys/class/leds/red/device/grppwm
+     chown system system /sys/class/leds/red/device/blink
+-    chown system system /sys/class/leds/red/brightness
+-    chown system system /sys/class/leds/green/brightness
+-    chown system system /sys/class/leds/blue/brightness
+-    chown system system /sys/class/leds/red/device/grpfreq
+-    chown system system /sys/class/leds/red/device/grppwm
+-    chown system system /sys/class/leds/red/device/blink
+     chown system system /sys/class/timed_output/vibrator/enable
+     chown system system /sys/module/sco/parameters/disable_esco
+     chown system system /sys/kernel/ipv4/tcp_wmem_min
+@@ -357,6 +363,10 @@ on boot
+     chown system system /sys/kernel/ipv4/tcp_rmem_max
+     chown root radio /proc/cmdline
+ 
++# Set these so we can remotely update SELinux policy
++    chown system system /sys/fs/selinux/load
++    chown system system /sys/fs/selinux/enforce
++
+ # Define TCP buffer sizes for various networks
+ #   ReadMin, ReadInitial, ReadMax, WriteMin, WriteInitial, WriteMax,
+     setprop net.tcp.buffersize.default 4096,87380,110208,4096,16384,110208
+@@ -390,7 +400,6 @@ on boot
+ # Prepare for wifi
+     setprop wifi.interface wlan0
+     setprop wifi.ap.interface wlan0
+-
+ # Prepare for bluetooth
+     chmod 665 /sys/class/rfkill/rfkill0/state
+     chown bluetooth bluetooth /sys/class/rfkill/rfkill0/state
+@@ -482,6 +491,13 @@ on property:vold.decrypt=trigger_shutdown_framework
+     class_reset late_start
+     class_reset main
+ 
++on property:sys.powerctl=*
++    powerctl ${sys.powerctl}
++
++# system server cannot write to /proc/sys files, so proxy it through init
++on property:sys.sysctl.extra_free_kbytes=*
++    write /proc/sys/vm/extra_free_kbytes ${sys.sysctl.extra_free_kbytes}
++
+ ## Daemon processes to be run by init.
+ ##
+ service ueventd /sbin/ueventd
+@@ -489,6 +505,16 @@ service ueventd /sbin/ueventd
+     critical
+     seclabel u:r:ueventd:s0
+ 
++service healthd /sbin/healthd
++    class core
++    critical
++    seclabel u:r:healthd:s0
++
++service healthd-charger /sbin/healthd -n
++    class charger
++    critical
++    seclabel u:r:healthd:s0
++
+ on property:selinux.reload_policy=1
+     restart ueventd
+     restart installd
+@@ -518,6 +544,7 @@ service servicemanager /system/bin/servicemanager
+     user system
+     group system
+     critical
++    onrestart restart healthd
+     onrestart restart zygote
+     onrestart restart media
+     onrestart restart surfaceflinger
+@@ -569,21 +596,6 @@ service bootanim /system/bin/bootanimation
+     disabled
+     oneshot
+ 
+-service dbus /system/bin/dbus-daemon --system --nofork
+-    class main
+-    socket dbus stream 660 bluetooth bluetooth
+-    user bluetooth
+-    group bluetooth net_bt_admin
+-
+-service bluetoothd /system/bin/bluetoothd -n
+-    class main
+-    socket bluetooth stream 660 bluetooth bluetooth
+-    socket dbus_bluetooth stream 660 bluetooth bluetooth
+-    # init.rc does not yet support applying capabilities, so run as root and
+-    # let bluetoothd drop uid to bluetooth with the right linux capabilities
+-    group bluetooth net_bt_admin misc
+-    disabled
+-
+ service installd /system/bin/installd
+     class main
+     socket installd stream 600 system system
+@@ -612,7 +624,6 @@ service keystore /system/bin/keystore /data/misc/keystore
+     class main
+     user keystore
+     group keystore drmrpc
+-    socket keystore stream 666
+ 
+ service dumpstate /system/bin/dumpstate -s
+     class main
+-- 
+1.8.0
+

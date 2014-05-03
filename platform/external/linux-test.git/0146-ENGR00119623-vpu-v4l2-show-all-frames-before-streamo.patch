@@ -1,0 +1,136 @@
+From e2987534d83f8d891a1c8c8bf186b4e37236d94c Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Wed, 3 Feb 2010 14:14:54 +0800
+Subject: [PATCH 146/435] ENGR00119623 vpu/v4l2: show all frames before
+ streamoff
+
+For a clip with few frames, streamoff too quick in tvout mode will make
+frame lost for showing.
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ test/mxc_ipudev_test/test_pattern.c  |  3 ++-
+ test/mxc_v4l2_test/mxc_v4l2_output.c | 40 ++++++++++++++++++++++++++++++++++++
+ test/mxc_vpu_test/display.c          | 13 +++++++++++-
+ 3 files changed, 54 insertions(+), 2 deletions(-)
+
+diff --git a/test/mxc_ipudev_test/test_pattern.c b/test/mxc_ipudev_test/test_pattern.c
+index 67b6d54..0297aa3 100644
+--- a/test/mxc_ipudev_test/test_pattern.c
++++ b/test/mxc_ipudev_test/test_pattern.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2009-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  */
+ 
+@@ -1976,6 +1976,7 @@ int screenlayer_test_ipc(int process_num, int three_layer, int op_type)
+ 			if(three_layer)
+ 			{
+ 				/* create second layer */
++				sleep(2);
+ 				printf("Add second layer!\n");
+ 				pthread_create(&second_layer_thread, NULL, second_layer_thread_func, &op_type);
+ 				pthread_join(second_layer_thread, NULL);
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_output.c b/test/mxc_v4l2_test/mxc_v4l2_output.c
+index d7e6b26..03e7bff 100644
+--- a/test/mxc_v4l2_test/mxc_v4l2_output.c
++++ b/test/mxc_v4l2_test/mxc_v4l2_output.c
+@@ -233,6 +233,26 @@ mxc_v4l_output_test(FILE *in)
+                                 g_loop_count--;
+                                 if (g_loop_count == 0) {
+                                         printf("v4l2_output: end of input file, g_frame_size=%d, err = %d\n", g_frame_size, err);
++					if (i <= 1)
++                                        	printf("v4l2_output: no display because v4l need at least 2 frames\n");
++					else {
++						int deq_cnt, j;
++
++						if (i < g_num_buffers)
++							deq_cnt = i;
++						else
++							deq_cnt = g_num_buffers;
++						for (j=0;j<(deq_cnt - 1);j++) {
++							buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++							buf.memory = V4L2_MEMORY_MMAP;
++							if (ioctl(fd_v4l, VIDIOC_DQBUF, &buf) < 0)
++							{
++								printf("VIDIOC_DQBUF failed\n");
++								retval = -1;
++								break;
++							}
++						}
++					}
+                                         break;
+                                 }
+                                 fseek(in, 0, SEEK_SET);
+@@ -245,6 +265,26 @@ mxc_v4l_output_test(FILE *in)
+                 else {
+ 			if (count-- == 0) {
+ 				if (g_loop_count-- == 0) {
++					if (i <= 1)
++                                        	printf("v4l2_output: no display because v4l need at least 2 frames\n");
++					else {
++						int deq_cnt, j;
++
++						if (i < g_num_buffers)
++							deq_cnt = i;
++						else
++							deq_cnt = g_num_buffers;
++						for (j=0;j<(deq_cnt - 1);j++) {
++							buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++							buf.memory = V4L2_MEMORY_MMAP;
++							if (ioctl(fd_v4l, VIDIOC_DQBUF, &buf) < 0)
++							{
++								printf("VIDIOC_DQBUF failed\n");
++								retval = -1;
++								break;
++							}
++						}
++					}
+ 					break;
+ 				}
+ 				count = 100;
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 7518551..fcc08a8 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -147,9 +147,12 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 				 "\tDefault display is LCD if not set this environment "
+ 				 "or set wrong string.\n");
+ 		}
++		err = system("/bin/echo 0 > /sys/class/graphics/fb1/blank");
+ 		if (err == -1) {
+ 			warn_msg("set tv mode error\n");
+ 		}
++		/* make sure tvout init done */
++		sleep(2);
+ 	}
+ 
+ 	if (rotation.rot_en) {
+@@ -388,7 +391,15 @@ err:
+ void v4l_display_close(struct vpu_display *disp)
+ {
+ 	int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++
+ 	if (disp) {
++		while (disp->queued_count > 0) {
++			disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++			disp->buf.memory = V4L2_MEMORY_MMAP;
++			if (ioctl(disp->fd, VIDIOC_DQBUF, &disp->buf) < 0)
++				break;
++			disp->queued_count--;
++		}
+ 		ioctl(disp->fd, VIDIOC_STREAMOFF, &type);
+ 		v4l_free_bufs(disp->nframes, disp);
+ 		close(disp->fd);
+-- 
+1.8.0
+

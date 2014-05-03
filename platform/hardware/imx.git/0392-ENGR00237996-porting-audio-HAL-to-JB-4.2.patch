@@ -1,0 +1,350 @@
+From bc5b71aae80fd1d77eb8015dbbf7381b5689cddf Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Fri, 21 Dec 2012 16:43:26 +0800
+Subject: [PATCH 392/486] ENGR00237996 porting audio HAL to JB 4.2
+
+Porting audio HAL to JB 4.2
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/audio_hardware.h  |   3 +-
+ alsa/config_usbaudio.h |   2 +-
+ alsa/tinyalsa_hal.c    | 139 ++++++++++++++-----------------------------------
+ 3 files changed, 43 insertions(+), 101 deletions(-)
+
+diff --git a/alsa/audio_hardware.h b/alsa/audio_hardware.h
+index 5a1ee5a..6689023 100644
+--- a/alsa/audio_hardware.h
++++ b/alsa/audio_hardware.h
+@@ -91,7 +91,8 @@ struct imx_audio_device {
+ 
+     pthread_mutex_t lock;       /* see note below on mutex acquisition order */
+     int mode;
+-    int devices;
++    int in_device;
++    int out_device;
+     struct pcm *pcm_modem_dl;
+     struct pcm *pcm_modem_ul;
+     int in_call;
+diff --git a/alsa/config_usbaudio.h b/alsa/config_usbaudio.h
+index 7f4c5f6..14bb238 100644
+--- a/alsa/config_usbaudio.h
++++ b/alsa/config_usbaudio.h
+@@ -25,7 +25,7 @@
+ static struct audio_card  usbaudio_card = {
+     .name = "USB Device",
+     .driver_name = "USB-Audio",
+-    .supported_devices   = AUDIO_DEVICE_IN_USB_MIC,
++    .supported_devices   = AUDIO_DEVICE_IN_USB_DEVICE,
+     .defaults            = NULL,
+     .bt_output           = NULL,
+     .speaker_output      = NULL,
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index cd86b68..930dfde 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -302,7 +302,7 @@ static void force_all_standby(struct imx_audio_device *adev)
+ static void select_mode(struct imx_audio_device *adev)
+ {
+     if (adev->mode == AUDIO_MODE_IN_CALL) {
+-        ALOGE("Entering IN_CALL state, in_call=%d", adev->in_call);
++        ALOGW("Entering IN_CALL state, in_call=%d", adev->in_call);
+         if (!adev->in_call) {
+             force_all_standby(adev);
+             /* force earpiece route for in call state if speaker is the
+@@ -315,18 +315,18 @@ static void select_mode(struct imx_audio_device *adev)
+             a call. This works because we're sure that the audio policy
+             manager will update the output device after the audio mode
+             change, even if the device selection did not change. */
+-            if ((adev->devices & AUDIO_DEVICE_OUT_ALL) == AUDIO_DEVICE_OUT_SPEAKER)
+-                adev->devices = AUDIO_DEVICE_OUT_EARPIECE |
+-                                AUDIO_DEVICE_IN_BUILTIN_MIC;
+-            else
+-                adev->devices &= ~AUDIO_DEVICE_OUT_SPEAKER;
++            if (adev->out_device == AUDIO_DEVICE_OUT_SPEAKER) {
++                adev->out_device = AUDIO_DEVICE_OUT_EARPIECE;
++                adev->in_device = AUDIO_DEVICE_IN_BUILTIN_MIC & ~AUDIO_DEVICE_BIT_IN;
++            } else
++                adev->out_device &= ~AUDIO_DEVICE_OUT_SPEAKER;
+             select_output_device(adev);
+ 
+             adev_set_voice_volume(&adev->hw_device, adev->voice_volume);
+             adev->in_call = 1;
+         }
+     } else {
+-        ALOGE("Leaving IN_CALL state, in_call=%d, mode=%d",
++        ALOGW("Leaving IN_CALL state, in_call=%d, mode=%d",
+              adev->in_call, adev->mode);
+         if (adev->in_call) {
+             adev->in_call = 0;
+@@ -348,11 +348,11 @@ static void select_output_device(struct imx_audio_device *adev)
+     unsigned int channel;
+     int i;
+ 
+-    headset_on      = adev->devices & AUDIO_DEVICE_OUT_WIRED_HEADSET;
+-    headphone_on    = adev->devices & AUDIO_DEVICE_OUT_WIRED_HEADPHONE;
+-    speaker_on      = adev->devices & AUDIO_DEVICE_OUT_SPEAKER;
+-    earpiece_on     = adev->devices & AUDIO_DEVICE_OUT_EARPIECE;
+-    bt_on           = adev->devices & AUDIO_DEVICE_OUT_ALL_SCO;
++    headset_on      = adev->out_device & AUDIO_DEVICE_OUT_WIRED_HEADSET;
++    headphone_on    = adev->out_device & AUDIO_DEVICE_OUT_WIRED_HEADPHONE;
++    speaker_on      = adev->out_device & AUDIO_DEVICE_OUT_SPEAKER;
++    earpiece_on     = adev->out_device & AUDIO_DEVICE_OUT_EARPIECE;
++    bt_on           = adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO;
+ 
+     /* force rx path according to TTY mode when in call */
+     if (adev->mode == AUDIO_MODE_IN_CALL && !bt_on) {
+@@ -377,7 +377,7 @@ static void select_output_device(struct imx_audio_device *adev)
+             default:
+                 /* force speaker on when in call and HDMI is selected as voice DL audio
+                  * cannot be routed to HDMI by ABE */
+-                if (adev->devices & AUDIO_DEVICE_OUT_AUX_DIGITAL)
++                if (adev->out_device & AUDIO_DEVICE_OUT_AUX_DIGITAL)
+                     speaker_on = 1;
+                 break;
+         }
+@@ -443,18 +443,18 @@ static void select_input_device(struct imx_audio_device *adev)
+     int headset_on = 0;
+     int main_mic_on = 0;
+     int sub_mic_on = 0;
+-    int bt_on = adev->devices & AUDIO_DEVICE_IN_ALL_SCO;
++    int bt_on = adev->in_device & AUDIO_DEVICE_IN_ALL_SCO;
+ 
+     if (!bt_on) {
+         if ((adev->mode != AUDIO_MODE_IN_CALL) && (adev->active_input != 0)) {
+             /* sub mic is used for camcorder or VoIP on speaker phone */
+             sub_mic_on = (adev->active_input->source == AUDIO_SOURCE_CAMCORDER) ||
+-                         ((adev->devices & AUDIO_DEVICE_OUT_SPEAKER) &&
++                         ((adev->out_device & AUDIO_DEVICE_OUT_SPEAKER) &&
+                           (adev->active_input->source == AUDIO_SOURCE_VOICE_COMMUNICATION));
+         }
+ 
+-        headset_on = adev->devices & AUDIO_DEVICE_IN_WIRED_HEADSET;
+-        main_mic_on = adev->devices & AUDIO_DEVICE_IN_BUILTIN_MIC;
++        headset_on = adev->in_device & AUDIO_DEVICE_IN_WIRED_HEADSET;
++        main_mic_on = adev->in_device & AUDIO_DEVICE_IN_BUILTIN_MIC;
+     }
+ 
+    /* TODO: check how capture is possible during voice calls or if
+@@ -781,7 +781,7 @@ static uint32_t out_get_sample_rate_esai(const struct audio_stream *stream)
+ 
+ static int out_set_sample_rate(struct audio_stream *stream, uint32_t rate)
+ {
+-    ALOGE("out_set_sample_rate %d", rate);
++    ALOGW("out_set_sample_rate %d", rate);
+     return 0;
+ }
+ 
+@@ -835,7 +835,7 @@ static audio_format_t out_get_format(const struct audio_stream *stream)
+ 
+ static int out_set_format(struct audio_stream *stream, audio_format_t format)
+ {
+-    ALOGE("out_set_format %d", format);
++    ALOGW("out_set_format %d", format);
+     return 0;
+ }
+ 
+@@ -911,7 +911,7 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+         val = atoi(value);
+         pthread_mutex_lock(&adev->lock);
+         pthread_mutex_lock(&out->lock);
+-        if (((adev->devices & AUDIO_DEVICE_OUT_ALL) != val) && (val != 0)) {
++        if ((adev->out_device != val) && (val != 0)) {
+             if (out == adev->active_output[OUTPUT_PRIMARY] && !out->standby) {
+                 /* a change in output device may change the microphone selection */
+                 if (adev->active_input &&
+@@ -920,19 +920,18 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+                 }
+                 /* force standby if moving to/from HDMI */
+                 if (((val & AUDIO_DEVICE_OUT_AUX_DIGITAL) ^
+-                        (adev->devices & AUDIO_DEVICE_OUT_AUX_DIGITAL)) ||
++                        (adev->out_device & AUDIO_DEVICE_OUT_AUX_DIGITAL)) ||
+                         ((val & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET) ^
+-                        (adev->devices & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET)) ||
+-                        (adev->devices & (AUDIO_DEVICE_OUT_AUX_DIGITAL |
++                        (adev->out_device & AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET)) ||
++                        (adev->out_device & (AUDIO_DEVICE_OUT_AUX_DIGITAL |
+                                          AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET)) ||
+                         ((val & AUDIO_DEVICE_OUT_SPEAKER) ^
+-                        (adev->devices & AUDIO_DEVICE_OUT_SPEAKER)) ||
++                        (adev->out_device & AUDIO_DEVICE_OUT_SPEAKER)) ||
+                         (adev->mode == AUDIO_MODE_IN_CALL))
+                     do_output_standby(out);
+             }
+             if (out != adev->active_output[OUTPUT_HDMI]) {
+-                adev->devices &= ~AUDIO_DEVICE_OUT_ALL;
+-                adev->devices |= val;
++                adev->out_device = val;
+                 out->device    = val;
+                 select_output_device(adev);
+             }
+@@ -1313,18 +1312,15 @@ static int start_input_stream(struct imx_stream_in *in)
+     int rate = 0, channels = 0, format = 0;
+ 
+     ALOGW("start_input_stream....");
+-//    if(in->device & AUDIO_DEVICE_IN_USB_MIC)
+-//        scan_available_device(adev);
+ 
+     adev->active_input = in;
+     if (adev->mode != AUDIO_MODE_IN_CALL) {
+-        adev->devices &= ~AUDIO_DEVICE_IN_ALL;
+-        adev->devices |= in->device;
++        adev->in_device = in->device;
+         select_input_device(adev);
+     }
+ 
+     for(i = 0; i < MAX_AUDIO_CARD_NUM; i++) {
+-        if((adev->devices & AUDIO_DEVICE_IN_ALL) & adev->card_list[i]->supported_devices) {
++        if(adev->in_device & adev->card_list[i]->supported_devices) {
+             card = adev->card_list[i]->card;
+             port = 0;
+             break;
+@@ -1338,37 +1334,22 @@ static int start_input_stream(struct imx_stream_in *in)
+     in->config.stop_threshold = in->config.period_size * in->config.period_count;
+ 
+     /*Error handler for usb mic plug in/plug out when recording. */
+-/*
+-    if(in->device & AUDIO_DEVICE_IN_USB_MIC) {
+-        if((int)in->config.rate != adev_get_rate_for_device(adev, AUDIO_DEVICE_IN_USB_MIC, PCM_IN) ||
+-           (int)in->config.channels != adev_get_channels_for_device(adev, AUDIO_DEVICE_IN_USB_MIC, PCM_IN)) {
+-           ALOGE("Input 2 does not support this format!");
+-           return -EINVAL;
+-        }
+-    } else {
+-        if(in->config.rate != adev->mm_rate ||
+-           in->config.channels != 2) {
+-           ALOGE("Input 1 does not support this format!");
+-           return -EINVAL;
+-        }
+-    }
+-*/
+     memcpy(&in->config, &pcm_config_mm_in, sizeof(pcm_config_mm_in));
+ 
+-    if (in->device & AUDIO_DEVICE_IN_USB_MIC) {
+-        channels = adev_get_channels_for_device(adev, AUDIO_DEVICE_IN_USB_MIC, PCM_IN);
++    if (in->device & AUDIO_DEVICE_IN_USB_DEVICE) {
++        channels = adev_get_channels_for_device(adev, AUDIO_DEVICE_IN_USB_DEVICE, PCM_IN);
+         if (channels == 2){
+             in->config.channels = 2;
+         } else if (channels == 1) {
+             in->config.channels = 1;
+         } else {
+-              ALOGW("can not get channels for in_device %d ", AUDIO_DEVICE_IN_USB_MIC);
++              ALOGW("can not get channels for in_device %d ", AUDIO_DEVICE_IN_USB_DEVICE);
+               return -EINVAL;
+         }
+ 
+-        rate     = adev_get_rate_for_device(adev, AUDIO_DEVICE_IN_USB_MIC, PCM_IN);
++        rate     = adev_get_rate_for_device(adev, AUDIO_DEVICE_IN_USB_DEVICE, PCM_IN);
+         if( rate == 0) {
+-              ALOGW("can not get rate for in_device %d ", AUDIO_DEVICE_IN_USB_MIC);
++              ALOGW("can not get rate for in_device %d ", AUDIO_DEVICE_IN_USB_DEVICE);
+               return -EINVAL;
+         }
+         in->config.rate     =  rate;
+@@ -1498,7 +1479,7 @@ static int do_input_standby(struct imx_stream_in *in)
+ 
+         adev->active_input = 0;
+         if (adev->mode != AUDIO_MODE_IN_CALL) {
+-            adev->devices &= ~AUDIO_DEVICE_IN_ALL;
++            adev->in_device = AUDIO_DEVICE_NONE;
+             select_input_device(adev);
+         }
+ 
+@@ -1559,11 +1540,11 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
+ 
+     ret = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING, value, sizeof(value));
+     if (ret >= 0) {
+-        val = atoi(value);
++        val = atoi(value) & ~AUDIO_DEVICE_BIT_IN;
+         if ((in->device != val) && (val != 0)) {
+             in->device = val;
+             do_standby = true;
+-            if(in->device & AUDIO_DEVICE_IN_USB_MIC)
++            if(in->device & AUDIO_DEVICE_IN_USB_DEVICE)
+                scan_available_device(adev, false);
+         }
+     }
+@@ -2450,7 +2431,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
+     in->requested_rate    = config->sample_rate;
+     in->requested_format  = PCM_FORMAT_S16_LE;
+     in->requested_channel = channel_count;
+-    in->device  = devices;
++    in->device  = devices & ~AUDIO_DEVICE_BIT_IN;
+ 
+     ALOGW("In channels %d, rate %d, devices 0x%x", channel_count, config->sample_rate, devices);
+     memcpy(&in->config, &pcm_config_mm_in, sizeof(pcm_config_mm_in));
+@@ -2458,50 +2439,9 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
+     //in->config.rate     = *sample_rate;
+     /*fix to 2 channel,  caused by the wm8958 driver*/
+ 
+-    if(in->device & AUDIO_DEVICE_IN_USB_MIC)
++    if (in->device & AUDIO_DEVICE_IN_USB_DEVICE)
+         scan_available_device(ladev, true);
+-/*
+-    config->channel_mask       = AUDIO_CHANNEL_IN_STEREO;
+-    in->config.channels = 2;
+-
+-    if(devices == AUDIO_DEVICE_IN_USB_MIC) {
+-        channels = adev_get_channels_for_device(ladev, AUDIO_DEVICE_IN_USB_MIC, PCM_IN);
+-        if (channels == 2){
+-            in->config.channels = 2;
+-            config->channel_mask       = AUDIO_CHANNEL_IN_STEREO;
+-        } else if (channels == 1) {
+-            in->config.channels = 1;
+-            config->channel_mask       = AUDIO_CHANNEL_IN_MONO;
+-        } else {
+-              ALOGW("can not get channels for in_device %d ", AUDIO_DEVICE_IN_USB_MIC);
+-              return -EINVAL;
+-        }
+-
+-        rate     = adev_get_rate_for_device(ladev, AUDIO_DEVICE_IN_USB_MIC, PCM_IN);
+-        ALOGW("rate %d", rate);
+-        if( rate == 0) {
+-              ALOGW("can not get rate for in_device %d ", AUDIO_DEVICE_IN_USB_MIC);
+-              return -EINVAL;
+-        }
+-        in->config.rate     =  rate;
+-    }
+- 
+-    if (in->requested_rate != in->config.rate) {
+-        in->buf_provider.get_next_buffer = get_next_buffer;
+-        in->buf_provider.release_buffer = release_buffer;
+ 
+-        ret = create_resampler(in->config.rate,
+-                               in->requested_rate,
+-                               in->config.channels,
+-                               RESAMPLER_QUALITY_DEFAULT,
+-                               &in->buf_provider,
+-                               &in->resampler);
+-        if (ret != 0) {
+-            ret = -EINVAL;
+-            goto err;
+-        }
+-    }
+-*/
+     in->dev = ladev;
+     in->standby = 1;
+ 
+@@ -2733,7 +2673,7 @@ static int adev_open(const hw_module_t* module, const char* name,
+         return -ENOMEM;
+ 
+     adev->hw_device.common.tag      = HARDWARE_DEVICE_TAG;
+-    adev->hw_device.common.version  = AUDIO_DEVICE_API_VERSION_1_0;
++    adev->hw_device.common.version  = AUDIO_DEVICE_API_VERSION_2_0;
+     adev->hw_device.common.module   = (struct hw_module_t *) module;
+     adev->hw_device.common.close    = adev_close;
+ 
+@@ -2771,7 +2711,8 @@ static int adev_open(const hw_module_t* module, const char* name,
+     for(i = 0; i < MAX_AUDIO_CARD_NUM; i++)
+         set_route_by_array(adev->mixer[i], adev->card_list[i]->defaults, 1);
+     adev->mode    = AUDIO_MODE_NORMAL;
+-    adev->devices = AUDIO_DEVICE_OUT_SPEAKER | AUDIO_DEVICE_IN_BUILTIN_MIC;
++    adev->out_device = AUDIO_DEVICE_OUT_SPEAKER;
++    adev->in_device  = AUDIO_DEVICE_IN_BUILTIN_MIC & ~AUDIO_DEVICE_BIT_IN;
+     select_output_device(adev);
+ 
+     adev->pcm_modem_dl  = NULL;
+-- 
+1.8.0
+

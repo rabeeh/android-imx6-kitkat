@@ -1,0 +1,120 @@
+From d798be65e3aae1cae0933c50f6a0591ca2193d18 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 20 Dec 2011 22:11:59 +0800
+Subject: [PATCH 258/435] ENGR00170648 vpu: add the option to select different
+ v4l output device
+
+There is more v4l output device on mx6q, what's more, v4l can support
+multi-instances now. So use "-x" option to select different v4l device.
+
+0 - V4L2 of FG device, 1 - IPU lib path (to keep unchanged),
+16 - /dev/video16, 17 - /dev/wvideo17, and so on
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/display.c  | 17 ++++++++++++-----
+ test/mxc_vpu_test/main.c     | 17 +++++++++++------
+ test/mxc_vpu_test/vpu_test.h |  1 +
+ 3 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 8ba5468..1f3193e 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -498,7 +498,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	int disp_left =  dec->cmdl->loff;
+ 	int disp_top =  dec->cmdl->toff;
+ 	int fd = -1, err = 0, out = 0, i = 0;
+-	char v4l_device[80];
++	char v4l_device[80], node[8];
+ 	struct v4l2_cropcap cropcap = {0};
+ 	struct v4l2_crop crop = {0};
+ 	struct v4l2_framebuffer fb = {0};
+@@ -580,10 +580,15 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		return NULL;
+ 	}
+ 
+-	if (cpu_is_mx6q())
+-		strcpy(v4l_device, "/dev/video17");   /* fg for mx6q */
+-	else
+-		strcpy(v4l_device, "/dev/video16");
++	if (!dec->cmdl->video_node) {
++		if (cpu_is_mx6q())
++			dec->cmdl->video_node = 17; /* fg for mx6q */
++		else
++			dec->cmdl->video_node = 16;
++	}
++	sprintf(node, "%d", dec->cmdl->video_node);
++	strcpy(v4l_device, "/dev/video");
++	strcat(v4l_device, node);
+ 
+ 	fd = open(v4l_device, O_RDWR, 0);
+ 	if (fd < 0) {
+@@ -591,6 +596,8 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		goto err;
+ 	}
+ 
++	info_msg("v4l output to %s\n", v4l_device);
++
+ 	if (!cpu_is_mx6q()) {
+ 		err = ioctl(fd, VIDIOC_S_OUTPUT, &out);
+ 		if (err < 0) {
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 5ede71a..032b984 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -35,7 +35,10 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	If no input file is specified, default is network \n "\
+ 	       "  -o <output file> Write output to file \n "\
+ 	       "	If no output is specified, default is LCD \n "\
+-	       "  -x <output method> V4l2(0) or IPU lib(1) \n "\
++	       "  -x <output method> output mode V4l2(0) or IPU lib(1) \n "\
++	       "        0 - V4L2 of FG device, 1 - IPU lib path \n "\
++	       "        Other value means V4L2 with other video node\n "\
++	       "        16 - /dev/video16, 17 - /dev/video17, and so on \n "\
+ 	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, \n "\
+ 	       "	4 - MPEG2, 5 - DIV3, 6 - RV, 7 - MJPG, \n "\
+ 	       "        8 - AVS, 9 - VP8\n "\
+@@ -234,7 +237,7 @@ parse_main_args(int argc, char *argv[])
+ int
+ parse_args(int argc, char *argv[], int i)
+ {
+-	int status = 0, opt;
++	int status = 0, opt, val;
+ 
+ 	do {
+ 		opt = getopt(argc, argv, options);
+@@ -253,12 +256,14 @@ parse_args(int argc, char *argv[], int i)
+ 			input_arg[i].cmd.dst_scheme = PATH_FILE;
+ 			break;
+ 		case 'x':
+-			if (atoi(optarg) == 0) {
+-				input_arg[i].cmd.dst_scheme = PATH_V4L2;
+-				info_msg("Display through V4L2\n");
+-			} else {
++			val = atoi(optarg);
++			if (val == 1) {
+ 				input_arg[i].cmd.dst_scheme = PATH_IPU;
+ 				info_msg("Display through IPU LIB\n");
++			} else {
++				input_arg[i].cmd.dst_scheme = PATH_V4L2;
++				info_msg("Display through V4L2\n");
++				input_arg[i].cmd.video_node = val;
+ 			}
+ 			if (cpu_is_mx27() &&
+ 				(input_arg[i].cmd.dst_scheme == PATH_IPU)) {
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index b01ce9a..6aaab82 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -153,6 +153,7 @@ struct cmd_line {
+ 	char output[MAX_PATH];  /* Output file name */
+ 	int src_scheme;
+ 	int dst_scheme;
++	int video_node;
+ 	int src_fd;
+ 	int dst_fd;
+ 	int width;
+-- 
+1.8.0
+

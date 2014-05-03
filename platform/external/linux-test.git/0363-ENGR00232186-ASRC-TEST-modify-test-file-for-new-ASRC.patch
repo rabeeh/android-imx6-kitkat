@@ -1,0 +1,266 @@
+From f856830e411c6569dad2794078bb73877f275823 Mon Sep 17 00:00:00 2001
+From: Chen Liangjun <b36089@freescale.com>
+Date: Wed, 31 Oct 2012 22:04:46 +0800
+Subject: [PATCH 363/435] ENGR00232186 ASRC TEST: modify test file for new
+ ASRC driver
+
+The origin ASRC test require blocks of input buffer send into ASRC
+driver and the input data flow should be continuous. If not, old input
+data would be send into ASRC again and again and thus noise would be
+heard in output data.
+
+In this patch, test file would send a input buffer into ASRC and wait
+until the corresponding output buffer is send back to test program. In
+this case, test file is not necessary promise the input data flow is
+continuous.
+
+Signed-off-by: Chen Liangjun <b36089@freescale.com>
+---
+ test/mxc_asrc_test/mxc_asrc_test.c | 168 ++++++++++---------------------------
+ 1 file changed, 44 insertions(+), 124 deletions(-)
+
+diff --git a/test/mxc_asrc_test/mxc_asrc_test.c b/test/mxc_asrc_test/mxc_asrc_test.c
+index 79bf552..f2f132b 100644
+--- a/test/mxc_asrc_test/mxc_asrc_test.c
++++ b/test/mxc_asrc_test/mxc_asrc_test.c
+@@ -36,7 +36,6 @@
+  * From 38 kernel, asrc driver only supports one pair of buffer
+  * convertion per time
+  */
+-#define BUF_NUM 2
+ 
+ struct audio_info_s {
+ 	int sample_rate;
+@@ -60,13 +59,12 @@ struct audio_buf {
+ };
+ 
+ #define WAVE_HEAD_SIZE 44 + 14
+-static struct audio_buf input_buf[BUF_NUM];
+-static struct audio_buf output_buf[BUF_NUM];
+ static enum asrc_pair_index pair_index;
+ static char header[WAVE_HEAD_SIZE];
+ 
+ static int *input_buffer;
+ static int *output_buffer;
++static int *input_null;
+ 
+ static enum asrc_inclk inclk;
+ static enum asrc_outclk outclk;
+@@ -142,7 +140,6 @@ int configure_asrc_channel(int fd_asrc, struct audio_info_s *info)
+ 	config.dma_buffer_size = DMA_BUF_SIZE;
+ 	config.input_sample_rate = info->sample_rate;
+ 	config.output_sample_rate = info->output_sample_rate;
+-	config.buffer_num = BUF_NUM;
+ 	config.input_word_width = info->input_word_width;
+ 	config.output_word_width = info->output_word_width;
+ 	config.inclk = inclk;
+@@ -151,28 +148,6 @@ int configure_asrc_channel(int fd_asrc, struct audio_info_s *info)
+ 	if ((err = ioctl(fd_asrc, ASRC_CONFIG_PAIR, &config)) < 0)
+ 		return err;
+ 
+-	for (i = 0; i < config.buffer_num; i++) {
+-		buf_info.buffer_index = i;
+-		if ((err = ioctl(fd_asrc, ASRC_QUERYBUF, &buf_info)) < 0)
+-			return err;
+-		input_buf[i].start =
+-		    mmap(NULL, buf_info.input_length, PROT_READ | PROT_WRITE,
+-			 MAP_SHARED, fd_asrc, buf_info.input_offset);
+-		if(input_buf[i].start == MAP_FAILED) {
+-			printf("mmap error!\r\n");
+-			return -1;
+-		}
+-		input_buf[i].max_len = buf_info.input_length;
+-		output_buf[i].start =
+-		    mmap(NULL, buf_info.output_length, PROT_READ | PROT_WRITE,
+-			 MAP_SHARED, fd_asrc, buf_info.output_offset);
+-		if(output_buf[i].start == MAP_FAILED) {
+-			printf("mmap error!\r\n");
+-			return -1;
+-		}
+-
+-		output_buf[i].max_len = buf_info.output_length;
+-	}
+ 	return 0;
+ }
+ 
+@@ -205,41 +180,54 @@ int play_file(int fd_asrc, struct audio_info_s *info)
+ {
+ 	int err = 0;
+ 	int i = 0;
+-	struct asrc_buffer inbuf, outbuf;
++	struct asrc_convert_buffer buf_info;
+ 	char *input_p;
+ 	char *output_p;
+-
+-	info->output_dma_size =
+-	       	asrc_get_output_buffer_size(DMA_BUF_SIZE,
+-					info->sample_rate,
+-					info->output_sample_rate);
+-	info->output_dma_size = DMA_BUF_SIZE;
++	int output_dma_size;
+ 
+ 	input_p = (char *)input_buffer;
+-
+-	for (i = 0;i < BUF_NUM; i++) {
+-		input_p = (char *)input_buffer + info->input_used;
+-		memcpy(input_buf[i].start, input_p, DMA_BUF_SIZE);
+-		info->input_used += DMA_BUF_SIZE;
+-		inbuf.length = DMA_BUF_SIZE;
+-		inbuf.index = i;
+-		if ((err = ioctl(fd_asrc, ASRC_Q_INBUF, &inbuf)) < 0)
+-			goto error;
+-		outbuf.index = i;
+-		outbuf.length = info->output_dma_size;
+-		if ((err = ioctl(fd_asrc, ASRC_Q_OUTBUF, &outbuf)) < 0)
+-			goto error;
+-	}
++	output_p = (char *)output_buffer;
++	output_dma_size =
++	    asrc_get_output_buffer_size(DMA_BUF_SIZE, info->sample_rate,
++					info->output_sample_rate);
+ 	convert_flag = 1;
++	memset(input_null, 0, DMA_BUF_SIZE);
+ 	if ((err = ioctl(fd_asrc, ASRC_START_CONV, &pair_index)) < 0)
+ 		goto error;
+ 
+-	pthread_create(&output_thread, NULL, asrc_output_thread,(void *)info);
+-	pthread_create(&input_thread, NULL, asrc_input_thread,(void *)info);
+-	pthread_join(input_thread, NULL);
+-	pthread_join(output_thread, NULL);
++	info->output_used = 0;
++	while (convert_flag) {
++		buf_info.input_buffer_length =
++		    (info->input_data_len > DMA_BUF_SIZE) ? DMA_BUF_SIZE : info->input_data_len;
++
++		if (info->input_data_len > 0) {
++			buf_info.input_buffer_vaddr = input_p;
++			input_p = input_p + buf_info.input_buffer_length;
++			info->input_data_len -= buf_info.input_buffer_length;
++			buf_info.input_buffer_length = DMA_BUF_SIZE;
++		} else {
++			buf_info.input_buffer_vaddr = (void *)input_null;
++			buf_info.input_buffer_length = DMA_BUF_SIZE;
++		}
+ 
++		buf_info.output_buffer_length = output_dma_size;
++		buf_info.output_buffer_vaddr = output_p;
++		if ((err = ioctl(fd_asrc, ASRC_CONVERT, &buf_info)) < 0)
++			goto error;
++		if (info->output_data_len > buf_info.output_buffer_length) {
++			info->output_data_len -= buf_info.output_buffer_length;
++			output_p += buf_info.output_buffer_length;
++			info->output_used += buf_info.output_buffer_length;
++		} else {
++			output_p += info->output_data_len;
++			info->output_used += info->output_data_len;
++			info->output_data_len = 0;
++		}
++		if (info->output_data_len == 0)
++			break;
++	}
+ 	err = ioctl(fd_asrc, ASRC_STOP_CONV, &pair_index);
++
+ error:
+ 	return err;
+ }
+@@ -283,9 +271,12 @@ void bitshift(FILE * src, struct audio_info_s *info)
+ 	else
+ 		nleft = (info->input_data_len >> 2);
+ 	/*allocate input buffer*/
+-	input_buffer = (int *)malloc(sizeof(int) * nleft);
++	input_buffer = (int *)malloc(sizeof(int) * nleft + 4096);
+ 	if (input_buffer == NULL)
+ 		printf("allocate input buffer error\n");
++	input_null = (int *)malloc(4096);
++	if (input_null == NULL)
++		printf("allocate input null error\n");
+ 
+ 	if (info->frame_bits <= 16) {
+ 		/*change data format*/
+@@ -323,7 +314,7 @@ void bitshift(FILE * src, struct audio_info_s *info)
+ 	info->input_word_width = ASRC_WIDTH_24_BIT;
+ 	update_sample_bitdepth(info);
+ 	/*allocate input buffer*/
+-	output_buffer = (int *)malloc(info->output_data_len);
++	output_buffer = (int *)malloc(info->output_data_len + 64 * 1024);
+ 	if (output_buffer == NULL)
+ 		printf("output buffer allocate error\n");
+ }
+@@ -627,74 +618,3 @@ int main(int ac, char *av[])
+ 	close(fd_asrc);
+ 	return err;
+ }
+-
+-void *asrc_input_thread(void *info)
+-{
+-	int err;
+-	struct audio_info_s *pinfo = (struct audio_info_s *)info;
+-	struct asrc_buffer inbuf;
+-	unsigned int len;
+-	char *input_p;
+-
+-	while (convert_flag) {
+-		if ((err = ioctl(fd_asrc, ASRC_DQ_INBUF, &inbuf)) < 0) {
+-			printf("ASRC_DQ_INBUF error!\r\n");
+-			goto exit;
+-		}
+-		input_p = (char *)input_buffer + pinfo->input_used;
+-		len = pinfo->input_data_len - pinfo->input_used;
+-
+-		if(len >= DMA_BUF_SIZE) {
+-			memcpy(input_buf[inbuf.index].start, input_p,
+-					DMA_BUF_SIZE);
+-			pinfo->input_used += DMA_BUF_SIZE;
+-		} else {
+-			memcpy(input_buf[inbuf.index].start, input_p, len);
+-			pinfo->input_used += len;
+-		}
+-		if ((err = ioctl(fd_asrc, ASRC_Q_INBUF, &inbuf)) < 0) {
+-			printf("ASRC_Q_INBUF error!\r\n");
+-			goto exit;
+-		}
+-	}
+-exit:
+-	return NULL;
+-}
+-
+-void *asrc_output_thread(void *info)
+-{
+-	int err;
+-	struct audio_info_s *pinfo = (struct audio_info_s *)info;
+-	struct asrc_buffer outbuf;
+-	char *output_p;
+-	unsigned int len;
+-	int output_dma_si = pinfo->output_dma_size;
+-
+-	while(convert_flag) {
+-		if ((err = ioctl(fd_asrc, ASRC_DQ_OUTBUF, &outbuf)) < 0) {
+-			printf("ASRC_DQ_OUTBUF error!\r\n");
+-			goto exit;
+-		}
+-		output_p = (char *)output_buffer + pinfo->output_used;
+-		len = pinfo->output_data_len - pinfo->output_used;
+-		if(len >= output_dma_si) {
+-			memcpy(output_p,output_buf[outbuf.index].start,
+-				       	output_dma_si);
+-			pinfo->output_used += output_dma_si;
+-		} else {
+-			memcpy(output_p, output_buf[outbuf.index].start, len);
+-			pinfo->output_used += len;
+-		}
+-		if(pinfo->output_used == pinfo->output_data_len) {
+-			convert_flag = 0;
+-			break;
+-		}
+-		if ((err = ioctl(fd_asrc, ASRC_Q_OUTBUF, &outbuf)) < 0) {
+-			printf("ASRC_Q_OUTBUF error!\r\n");
+-			goto exit;
+-		}
+-
+-	}
+-exit:
+-	return NULL;
+-}
+-- 
+1.8.0
+

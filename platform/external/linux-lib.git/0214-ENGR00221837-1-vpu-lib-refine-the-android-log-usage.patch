@@ -1,0 +1,291 @@
+From 0c2dc931eb273662f65081a54afccbbe0a7b9988 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Wed, 29 Aug 2012 11:01:05 +0800
+Subject: [PATCH 214/249] ENGR00221837-1 vpu lib: refine the android log usage
+
+As android 4.1 change it's LOG util API to ALOGX.
+We need to adapt it to support each android version.
+
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ vpu/vpu_debug.h | 20 ++++++++++++++++++++
+ vpu/vpu_io.c    | 49 +++++++++++++++++++++++--------------------------
+ vpu/vpu_util.c  |  6 ++----
+ 3 files changed, 45 insertions(+), 30 deletions(-)
+
+diff --git a/vpu/vpu_debug.h b/vpu/vpu_debug.h
+index e5eb528..647b8d0 100644
+--- a/vpu/vpu_debug.h
++++ b/vpu/vpu_debug.h
+@@ -23,11 +23,30 @@
+ #ifndef __VPU_DEBUG_H
+ #define __VPU_DEBUG_H
+ 
++#ifdef BUILD_FOR_ANDROID
++#define LOG_TAG "vpu-lib"
++#include <utils/Log.h>
++#endif
++
+ extern int vpu_lib_dbg_level;
+ 
+ #define dprintf(level, fmt, arg...)     if (vpu_lib_dbg_level >= level) \
+         printf("[DEBUG]\t%s:%d " fmt, __FILE__, __LINE__, ## arg)
+ 
++#ifdef BUILD_FOR_ANDROID
++#ifndef ALOGE
++#define ALOGE LOGE
++#endif
++#ifndef ALOGW
++#define ALOGW LOGW
++#endif
++#ifndef ALOGI
++#define ALOGI LOGI
++#endif
++#define err_msg		ALOGE
++#define info_msg	ALOGI
++#define warn_msg	ALOGW
++#else
+ #define err_msg(fmt, arg...) do { if (vpu_lib_dbg_level >= 1)		\
+ 	printf("[ERR]\t%s:%d " fmt,  __FILE__, __LINE__, ## arg); else \
+ 	printf("[ERR]\t" fmt, ## arg);	\
+@@ -40,6 +59,7 @@ extern int vpu_lib_dbg_level;
+ 	printf("[WARN]\t%s:%d " fmt,  __FILE__, __LINE__, ## arg); else \
+ 	printf("[WARN]\t" fmt, ## arg);	\
+ 	} while (0)
++#endif
+ 
+ #define ENTER_FUNC() dprintf(4, "enter %s()\n", __func__)
+ #define EXIT_FUNC() dprintf(4, "exit %s()\n", __func__)
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index ddb5052..2fba7cf 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -43,12 +43,9 @@
+ #ifdef BUILD_FOR_ANDROID
+ #include <utils/Log.h>
+ #ifdef USE_ION
+-#define LOG_TAG "vpu-ion"
+ #include <linux/ion.h>
+ #include <ion.h>
+ #elif USE_GPU
+-#undef LOG_TAG
+-#define LOG_TAG "gpu-vid"
+ int
+ gcoOS_AllocateVideoMemory(
+     void* Os,
+@@ -165,7 +162,7 @@ int IOSystemInit(void *callback)
+ 
+ 	vpu_fd = open("/dev/mxc_vpu", O_RDWR);
+ 	if (vpu_fd < 0) {
+-		err_msg("Can't open /dev/mxc_vpu\n");
++		err_msg("Can't open /dev/mxc_vpu: %s\n", strerror(errno));
+ 		return -1;
+ 	}
+ 
+@@ -355,7 +352,7 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ #endif
+ 
+ 	if ((!buff) || (!buff->size)) {
+-		LOGE("Error!_IOGetPhyMem:Invalid parameters");
++		err_msg("Error!_IOGetPhyMem:Invalid parameters");
+ 		return -1;
+ 	}
+ 
+@@ -374,7 +371,7 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ 	}
+ 
+ 	if (which != VPU_IOC_PHYMEM_ALLOC) {
+-		LOGE("Error!_IOGetPhyMem unsupported memtype: %d", which);
++		err_msg("Error!_IOGetPhyMem unsupported memtype: %d", which);
+ 		return -1;
+ 	}
+ 
+@@ -383,13 +380,13 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ #ifdef USE_ION
+ 	fd = ion_open();
+ 	if (fd <= 0) {
+-		LOGE("ion open failed!\n");
++		err_msg("ion open failed!\n");
+ 		return -1;
+ 	}
+ 
+ 	err = ion_alloc(fd, buff->size, pagesize, 1, &handle);
+ 	if (err) {
+-		LOGE("ion allocation failed!\n");
++		err_msg("ion allocation failed!\n");
+ 		goto error;
+ 	}
+ 
+@@ -397,13 +394,13 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ 			    PROT_READ|PROT_WRITE, MAP_SHARED,
+ 			    0, &ptr, &share_fd);
+ 	if (err) {
+-		LOGE("ion map failed!\n");
++		err_msg("ion map failed!\n");
+ 		goto error;
+ 	}
+ 
+ 	err = ion_phys(fd, handle);
+ 	if (err == 0) {
+-		LOGE("ion get physical address failed!\n");
++		err_msg("ion get physical address failed!\n");
+ 		goto error;
+ 	}
+ 
+@@ -412,7 +409,7 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ 	buff->cpu_addr = (unsigned long)handle;
+ 	memset((void*)buff->virt_uaddr, 0, buff->size);
+ 	ret = 0;
+-	LOGD("<ion> alloc handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
++	info_msg("<ion> alloc handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
+ 			(unsigned int)handle, (unsigned int)buff->phy_addr,
+ 			(unsigned int)buff->virt_uaddr);
+ error:
+@@ -424,21 +421,21 @@ error:
+         phy_addr = 0; virt_addr = NULL;
+         ret = gcoOS_AllocateVideoMemory(NULL, 1, 0, &bytes, &phy_addr,&virt_addr,&handle);
+         if(ret != 0) {
+-            LOGE("%d, gpu allocator failed to alloc buffer with size %d", ret, buff->size);
++            err_msg("%d, gpu allocator failed to alloc buffer with size %d", ret, buff->size);
+             return ret;
+         }
+ 
+         buff->virt_uaddr = (unsigned long)virt_addr;
+         buff->phy_addr = (unsigned long)phy_addr;
+         buff->cpu_addr = (unsigned long)handle;
+-        LOGD("<gpu> alloc handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
++        info_msg("<gpu> alloc handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
+ 			(unsigned int)handle, (unsigned int)buff->phy_addr,
+ 			(unsigned int)buff->virt_uaddr);
+         return 0;
+ #else
+ 	fd = (unsigned long)open("/dev/pmem_adsp", O_RDWR | O_SYNC);
+ 	if (fd < 0) {
+-		LOGE("Error!_IOGetPhyMem Error,cannot open pmem");
++		err_msg("Error!_IOGetPhyMem Error,cannot open pmem");
+ 		return -1;
+ 	}
+ 
+@@ -448,7 +445,7 @@ error:
+ 			    PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+ 
+ 	if (buff->virt_uaddr == (unsigned long)MAP_FAILED) {
+-		LOGE("Error!mmap(fd=%d, size=%u) failed (%s)",
++		err_msg("Error!mmap(fd=%d, size=%u) failed (%s)",
+ 			fd, buff->size, strerror(errno));
+ 		close(fd);
+ 		return -1;
+@@ -457,7 +454,7 @@ error:
+ 	memset(&region, 0, sizeof(region));
+ 
+ 	if (ioctl(fd, PMEM_GET_PHYS, &region) == -1) {
+-		LOGE("Error!Failed to get physical address of source!");
++		err_msg("Error!Failed to get physical address of source!");
+ 		munmap((void *)buff->virt_uaddr, buff->size);
+ 		close(fd);
+ 		return -1;
+@@ -513,12 +510,12 @@ int _IOFreePhyMem(int which, vpu_mem_desc * buff)
+ 	int fd;
+ 
+ 	if (!buff || !(buff->size) || ((unsigned long)buff->cpu_addr == 0)) {
+-		LOGE("Error!_IOFreePhyMem:Invalid parameters");
++		err_msg("Error!_IOFreePhyMem:Invalid parameters");
+ 		return -1;
+ 	}
+ 
+ 	if (which != VPU_IOC_PHYMEM_FREE) {
+-		LOGE("Error!_IOFreePhyMem unsupported memtype: %d",which);
++		err_msg("Error!_IOFreePhyMem unsupported memtype: %d",which);
+ 		return -1;
+ 	}
+ 
+@@ -526,12 +523,12 @@ int _IOFreePhyMem(int which, vpu_mem_desc * buff)
+ 
+ 	fd = ion_open();
+ 	if (fd <= 0) {
+-		LOGE("ion open failed!\n");
++		err_msg("ion open failed!\n");
+ 		return -1;
+ 	}
+ 
+ 	ion_free(fd, handle);
+-	LOGD("<ion> free handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
++	info_msg("<ion> free handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
+ 			(unsigned int)handle, (unsigned int)buff->phy_addr,
+ 			(unsigned int)buff->virt_uaddr);
+ 	ion_close(fd);
+@@ -542,24 +539,24 @@ int _IOFreePhyMem(int which, vpu_mem_desc * buff)
+         int ret = -1;
+         void *handle = (void *)buff->cpu_addr;
+         if(!handle) {
+-           LOGW("%s: Invalid handle 0x%x", __FUNCTION__, (unsigned int)handle);
++           warn_msg("%s: Invalid handle 0x%x", __FUNCTION__, (unsigned int)handle);
+            return ret;
+         }
+         ret = gcoOS_FreeVideoMemory(NULL, handle);
+         if(ret != 0) {
+-           LOGE("%d, gpu allocator failed to free handle 0x%x", ret, (unsigned int)handle);
++           err_msg("%d, gpu allocator failed to free handle 0x%x", ret, (unsigned int)handle);
+            return ret;
+         }
+ #else
+ 	int fd_pmem;
+ 
+ 	if (!buff || !(buff->size) || ((int)buff->cpu_addr <= 0)) {
+-		LOGE("Error!_IOFreePhyMem:Invalid parameters");
++		err_msg("Error!_IOFreePhyMem:Invalid parameters");
+ 		return -1;
+ 	}
+ 
+ 	if (which != VPU_IOC_PHYMEM_FREE) {
+-		LOGE("Error!_IOFreePhyMem unsupported memtype: %d",which);
++		err_msg("Error!_IOFreePhyMem unsupported memtype: %d",which);
+ 		return -1;
+ 	}
+ 
+@@ -605,7 +602,7 @@ int IOPhyMemCheck(unsigned long phyaddr, const char *name)
+ 	buff.phy_addr = phyaddr;
+ 	if (ioctl(vpu_fd, VPU_IOC_PHYMEM_CHECK, &buff)) {
+ #ifdef BUILD_FOR_ANDROID
+-		LOGE("phy memory check failed!:%s\n", strerror(errno));
++		err_msg("phy memory check failed!:%s\n", strerror(errno));
+ #endif
+ 		err_msg("phy memory check failed!:%s\n", strerror(errno));
+ 		/* if driver don't support this feature, just ignore
+@@ -618,7 +615,7 @@ int IOPhyMemCheck(unsigned long phyaddr, const char *name)
+ 	     name, buff.phy_addr, buff.virt_uaddr, result ? "is" : "isn't");
+ #ifdef BUILD_FOR_ANDROID
+ 	if (result == false)
+-		LOGE("memory phy: %s: %lx va:%lx %s phy memory",
++		err_msg("memory phy: %s: %lx va:%lx %s phy memory",
+ 		     name, buff.phy_addr, buff.virt_uaddr, result ? "is" : "isn't");
+ #endif
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 31650e4..e68161d 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -28,8 +28,6 @@
+ #include "vpu_debug.h"
+ 
+ #ifdef BUILD_FOR_ANDROID
+-#define LOG_TAG "vpulib"
+-#include <utils/Log.h>
+ #include <cutils/properties.h>
+ #endif
+ 
+@@ -1221,9 +1219,9 @@ unsigned char semaphore_wait(semaphore_t *semap, int mutex)
+ 	else if (mutex == REG_MUTEX)
+ 		ret = pthread_mutex_lock_timeout_np(&semap->reg_lock, msec);
+ 	else
+-		LOGE("Not supported mutex\n");
++		err_msg("Not supported mutex\n");
+ 	if (ret) {
+-		LOGE("VPU mutex couldn't be locked,ret = %d\n", ret);
++		err_msg("VPU mutex couldn't be locked,ret = %d\n", ret);
+ 		return false;
+ 	}
+ 	return true;
+-- 
+1.8.0
+

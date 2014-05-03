@@ -1,0 +1,4186 @@
+From b05657dd34a2bea5201bd5d520ed726ed1c6c759 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Thu, 26 Nov 2009 14:39:43 +0800
+Subject: [PATCH 001/486] Initial version of freescale imx51 hardware specify
+ codes
+
+---
+ libaudio/Android.mk            |   61 ++
+ libaudio/AudioHardwareALSA.cpp | 1726 ++++++++++++++++++++++++++++++++++++++++
+ libaudio/AudioHardwareALSA.h   |  324 ++++++++
+ libaudio/NOTICE                |  191 +++++
+ libaudio/acoustics_default.cpp |   85 ++
+ libcamera/Android.mk           |   47 ++
+ libcamera/CameraHal.cpp        | 1411 ++++++++++++++++++++++++++++++++
+ libcamera/CameraHal.h          |  261 ++++++
+ 8 files changed, 4106 insertions(+)
+ create mode 100644 libaudio/Android.mk
+ create mode 100755 libaudio/AudioHardwareALSA.cpp
+ create mode 100644 libaudio/AudioHardwareALSA.h
+ create mode 100644 libaudio/MODULE_LICENSE_APACHE2
+ create mode 100644 libaudio/NOTICE
+ create mode 100644 libaudio/acoustics_default.cpp
+ create mode 100644 libcamera/Android.mk
+ create mode 100644 libcamera/CameraHal.cpp
+ create mode 100644 libcamera/CameraHal.h
+
+diff --git a/libaudio/Android.mk b/libaudio/Android.mk
+new file mode 100644
+index 0000000..9a171dc
+--- /dev/null
++++ b/libaudio/Android.mk
+@@ -0,0 +1,61 @@
++# hardware/libaudio-alsa/Android.mk
++#
++# Copyright 2008 Wind River Systems
++#
++
++ifeq ($(strip $(BOARD_USES_ALSA_AUDIO)),true)
++
++  LOCAL_PATH := $(call my-dir)
++
++  include $(CLEAR_VARS)
++
++  LOCAL_ARM_MODE := arm
++  LOCAL_CFLAGS := -D_POSIX_SOURCE
++  LOCAL_WHOLE_STATIC_LIBRARIES := libasound
++
++  ifneq ($(ALSA_DEFAULT_SAMPLE_RATE),)
++    LOCAL_CFLAGS += -DALSA_DEFAULT_SAMPLE_RATE=$(ALSA_DEFAULT_SAMPLE_RATE)
++  endif
++
++  ifeq ($(strip $(BOARD_HAVE_FM_ROUTING)),true)
++    LOCAL_CFLAGS += -DFM_ROUTE_SUPPORT
++  endif
++
++  LOCAL_C_INCLUDES += external/alsa-lib/include
++
++  LOCAL_SRC_FILES := AudioHardwareALSA.cpp
++
++  LOCAL_MODULE := libaudio
++
++  LOCAL_STATIC_LIBRARIES += libaudiointerface
++
++  LOCAL_SHARED_LIBRARIES := \
++    libcutils \
++    libutils \
++    libmedia \
++    libhardware \
++    libhardware_legacy \
++    libdl \
++    libc
++
++  include $(BUILD_SHARED_LIBRARY)
++
++  include $(CLEAR_VARS)
++
++  LOCAL_PRELINK_MODULE := false
++
++  LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
++
++  LOCAL_CFLAGS := -D_POSIX_SOURCE
++
++  LOCAL_C_INCLUDES += external/alsa-lib/include
++
++  LOCAL_SRC_FILES:= acoustics_default.cpp
++
++  LOCAL_SHARED_LIBRARIES := liblog
++
++  LOCAL_MODULE:= acoustics.default
++
++  include $(BUILD_SHARED_LIBRARY)
++
++endif
+diff --git a/libaudio/AudioHardwareALSA.cpp b/libaudio/AudioHardwareALSA.cpp
+new file mode 100755
+index 0000000..f140129
+--- /dev/null
++++ b/libaudio/AudioHardwareALSA.cpp
+@@ -0,0 +1,1726 @@
++/* AudioHardwareALSA.cpp
++ **
++ ** Copyright 2008-2009 Wind River Systems
++ **
++ ** Licensed under the Apache License, Version 2.0 (the "License");
++ ** you may not use this file except in compliance with the License.
++ ** You may obtain a copy of the License at
++ **
++ **     http://www.apache.org/licenses/LICENSE-2.0
++ **
++ ** Unless required by applicable law or agreed to in writing, software
++ ** distributed under the License is distributed on an "AS IS" BASIS,
++ ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ ** See the License for the specific language governing permissions and
++ ** limitations under the License.
++ */
++
++#include <errno.h>
++#include <stdarg.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <dlfcn.h>
++
++#define LOG_TAG "AudioHardwareALSA"
++#define LOG_NDEBUG 0
++
++#include <utils/Log.h>
++#include <utils/String8.h>
++
++#include <cutils/properties.h>
++#include <media/AudioRecord.h>
++#include <hardware_legacy/power.h>
++
++#include "AudioHardwareALSA.h"
++
++#undef DISABLE_HARWARE_RESAMPLING
++
++#ifndef ALSA_DEFAULT_SAMPLE_RATE
++#define ALSA_DEFAULT_SAMPLE_RATE 44100 // in Hz
++#endif
++
++#define SND_MIXER_VOL_RANGE_MIN  (0)
++#define SND_MIXER_VOL_RANGE_MAX  (100)
++
++#define ALSA_NAME_MAX 128
++
++#define ALSA_STRCAT(x,y) \
++    if (strlen(x) + strlen(y) < ALSA_NAME_MAX) \
++        strcat(x, y);
++
++extern "C"
++{
++    //
++    // Make sure this prototype is consistent with what's in
++    // external/libasound/alsa-lib-1.0.16/src/pcm/pcm_null.c!
++    //
++    extern int snd_pcm_null_open(snd_pcm_t **pcmp,
++                                 const char *name,
++                                 snd_pcm_stream_t stream,
++                                 int mode);
++
++    //
++    // Function for dlsym() to look up for creating a new AudioHardwareInterface.
++    //
++    android::AudioHardwareInterface *createAudioHardware(void) {
++        return new android::AudioHardwareALSA();
++    }
++}         // extern "C"
++
++namespace android
++{
++
++typedef AudioSystem::audio_routes audio_routes;
++
++#define ROUTE_ALL            AudioSystem::ROUTE_ALL
++#define ROUTE_EARPIECE       AudioSystem::ROUTE_EARPIECE
++#define ROUTE_SPEAKER        AudioSystem::ROUTE_SPEAKER
++#define ROUTE_BLUETOOTH_SCO  AudioSystem::ROUTE_BLUETOOTH_SCO
++#define ROUTE_HEADSET        AudioSystem::ROUTE_HEADSET
++#define ROUTE_BLUETOOTH_A2DP AudioSystem::ROUTE_BLUETOOTH_A2DP
++#ifdef FM_ROUTE_SUPPORT
++#define ROUTE_FM             AudioSystem::ROUTE_FM
++#endif
++
++// ----------------------------------------------------------------------------
++
++static const int DEFAULT_SAMPLE_RATE = ALSA_DEFAULT_SAMPLE_RATE;
++
++static const char _nullALSADeviceName[] = "NULL_Device";
++
++static void ALSAErrorHandler(const char *file,
++                             int line,
++                             const char *function,
++                             int err,
++                             const char *fmt,
++                             ...)
++{
++    char buf[BUFSIZ];
++    va_list arg;
++    int l;
++
++    va_start(arg, fmt);
++    l = snprintf(buf, BUFSIZ, "%s:%i:(%s) ", file, line, function);
++    vsnprintf(buf + l, BUFSIZ - l, fmt, arg);
++    buf[BUFSIZ-1] = '\0';
++    LOG(LOG_ERROR, "ALSALib", buf);
++    va_end(arg);
++}
++
++// ----------------------------------------------------------------------------
++
++/* The following table(s) need to match in order of the route bits
++ */
++static const char *deviceSuffix[] = {
++    /* ROUTE_EARPIECE       */ "_Earpiece",
++    /* ROUTE_SPEAKER        */ "_Speaker",
++    /* ROUTE_BLUETOOTH_SCO  */ "_Bluetooth",
++    /* ROUTE_HEADSET        */ "_Headset",
++    /* ROUTE_BLUETOOTH_A2DP */ "_Bluetooth-A2DP",
++#ifdef FM_ROUTE_SUPPORT
++    /* ROUTE_FM             */ "_FM",
++#endif
++};
++
++static const int deviceSuffixLen = (sizeof(deviceSuffix) / sizeof(char *));
++
++struct mixer_info_t;
++
++struct alsa_properties_t
++{
++    const audio_routes  routes;
++    const char         *propName;
++    const char         *propDefault;
++    mixer_info_t       *mInfo;
++};
++
++static alsa_properties_t
++mixerMasterProp[SND_PCM_STREAM_LAST+1] = {
++    { ROUTE_ALL, "alsa.mixer.playback.master",  "PCM",     NULL},
++    { ROUTE_ALL, "alsa.mixer.capture.master",   "Capture", NULL}
++};
++
++static alsa_properties_t
++mixerProp[][SND_PCM_STREAM_LAST+1] = {
++    {
++        {ROUTE_EARPIECE,       "alsa.mixer.playback.earpiece",       "Earpiece", NULL},
++        {ROUTE_EARPIECE,       "alsa.mixer.capture.earpiece",        "Capture",  NULL}
++    },
++    {
++        {ROUTE_SPEAKER,        "alsa.mixer.playback.speaker",        "Speaker", NULL},
++        {ROUTE_SPEAKER,        "alsa.mixer.capture.speaker",         "",        NULL}
++    },
++    {
++        {ROUTE_BLUETOOTH_SCO,  "alsa.mixer.playback.bluetooth.sco",  "Bluetooth",         NULL},
++        {ROUTE_BLUETOOTH_SCO,  "alsa.mixer.capture.bluetooth.sco",   "Bluetooth Capture", NULL}
++    },
++    {
++        {ROUTE_HEADSET,        "alsa.mixer.playback.headset",        "Headphone", NULL},
++        {ROUTE_HEADSET,        "alsa.mixer.capture.headset",         "Capture",   NULL}
++    },
++    {
++        {ROUTE_BLUETOOTH_A2DP, "alsa.mixer.playback.bluetooth.a2dp", "Bluetooth A2DP",         NULL},
++        {ROUTE_BLUETOOTH_A2DP, "alsa.mixer.capture.bluetooth.a2dp",  "Bluetooth A2DP Capture", NULL}
++    },
++#ifdef FM_ROUTE_SUPPORT
++    {
++        {ROUTE_FM,             "alsa.mixer.playback.fm",             "FM", NULL},
++        {ROUTE_FM,             "alsa.mixer.capture.fm",              "",   NULL}
++    },
++#endif
++    {
++        {static_cast<audio_routes>(0), NULL, NULL, NULL},
++        {static_cast<audio_routes>(0), NULL, NULL, NULL}
++    }
++};
++
++// ----------------------------------------------------------------------------
++
++AudioHardwareALSA::AudioHardwareALSA() :
++    mOutput(0),
++    mInput(0),
++    mAcousticDevice(0)
++{
++    snd_lib_error_set_handler(&ALSAErrorHandler);
++    mMixer = new ALSAMixer;
++
++    hw_module_t *module;
++    int err = hw_get_module(ACOUSTICS_HARDWARE_MODULE_ID,
++            (hw_module_t const**)&module);
++
++    if (err == 0) {
++        hw_device_t* device;
++        err = module->methods->open(module, ACOUSTICS_HARDWARE_NAME, &device);
++        if (err == 0) {
++            mAcousticDevice = (acoustic_device_t *)device;
++        }
++    }
++}
++
++AudioHardwareALSA::~AudioHardwareALSA()
++{
++    if (mOutput) delete mOutput;
++    if (mInput) delete mInput;
++    if (mMixer) delete mMixer;
++    if (mAcousticDevice)
++        mAcousticDevice->common.close(&mAcousticDevice->common);
++}
++
++status_t AudioHardwareALSA::initCheck()
++{
++    if (mMixer && mMixer->isValid())
++        return NO_ERROR;
++    else
++        return NO_INIT;
++}
++
++status_t AudioHardwareALSA::setVoiceVolume(float volume)
++{
++    // The voice volume is used by the VOICE_CALL audio stream.
++    if (mMixer)
++        return mMixer->setVolume(ROUTE_EARPIECE, volume);
++    else
++        return INVALID_OPERATION;
++}
++
++status_t AudioHardwareALSA::setMasterVolume(float volume)
++{
++    if (mMixer)
++        return mMixer->setMasterVolume(volume);
++    else
++        return INVALID_OPERATION;
++}
++
++// non-default implementation
++size_t AudioHardwareALSA::getInputBufferSize(uint32_t sampleRate, int format, int channelCount)
++{
++    /*comment for Mp3 recording*/
++ /*
++    if (!((sampleRate == 8000) || (sampleRate == 16000)))  {
++        LOGW("getInputBufferSize bad sampling rate: %d", sampleRate);
++        return 0;
++    }
++  */
++    if (format != AudioSystem::PCM_16_BIT) {
++        LOGW("getInputBufferSize bad format: %d", format);
++        return 0;
++    }
++    if (channelCount != 1) {
++        LOGW("getInputBufferSize bad channel count: %d", channelCount);
++        return 0;
++    }
++
++    return 320;
++}
++
++AudioStreamOut *
++AudioHardwareALSA::openOutputStream(uint32_t devices,
++				    int format,
++                                    int channelCount,
++                                    uint32_t sampleRate,
++                                    status_t *status)
++{
++    AutoMutex lock(mLock);
++
++    // only one output stream allowed
++    if (mOutput) {
++        *status = ALREADY_EXISTS;
++        return 0;
++    }
++
++    AudioStreamOutALSA *out = new AudioStreamOutALSA(this);
++
++    *status = out->set(format, channelCount, sampleRate);
++
++    if (*status == NO_ERROR) {
++        mOutput = out;
++        // Some information is expected to be available immediately after
++        // the device is open.
++        *status = mOutput->setDevice(mMode, mRoutes[mMode]);
++    }
++    else {
++        delete out;
++    }
++
++    return mOutput;
++}
++
++status_t AudioHardwareALSA::setInputStream(uint32_t devices,
++				    int format,
++                                    int channelCount,
++                                    uint32_t sampleRate)
++{
++    status_t ret;
++
++    if (! mOutput) {
++       return NO_ERROR; /*no output stream exist*/
++    }
++
++    LOGV("setInputStream format %d, channalCount %d, sampleRate %d ", format, channelCount, sampleRate);
++
++    ret = mOutput->getOutStreamParam();
++    if(ret){
++       LOGV("ERROR in get the OutputStream parameters");
++       return NO_INIT;
++     }
++
++    ret = mOutput->set(format, channelCount, sampleRate);
++
++    if(ret)
++       LOGV("resetOutputStream set Error");
++
++     uint32_t routes = mRoutes[mMode];
++
++     ret = mOutput->setDevice(mMode, routes);
++
++    if(ret)
++       LOGV("resetOutputStream setDevice Error");
++
++    return NO_ERROR;
++}
++
++status_t AudioHardwareALSA::recoverOutputStream()
++{
++    LOGV("recoverOutputStream");
++    status_t ret;
++    if (! mOutput) {
++        LOGV("recoverOutputStream set Error");
++    return NO_ERROR; /*no output stream exist*/
++    }
++
++   ret = mOutput->set((int)OutStreamParam[0], (int)OutStreamParam[1], OutStreamParam[2]);
++
++   if(ret)
++     LOGV("recoverOutputStream set Error");
++    uint32_t routes = mRoutes[mMode];
++     ret = mOutput->setDevice(mMode, routes);
++   if(ret)
++    LOGV("recoverOutputStream setDevice Error");
++
++    return NO_ERROR;
++}
++
++
++AudioStreamIn *
++AudioHardwareALSA::openInputStream(int      inputSource,
++                                   int      format,
++                                   int      channelCount,
++                                   uint32_t sampleRate,
++                                   status_t *status,
++                                   AudioSystem::audio_in_acoustics acoustics)
++{
++    // check for valid input source
++    if ((inputSource < AudioRecord::DEFAULT_INPUT) ||
++        (inputSource >= AudioRecord::NUM_INPUT_SOURCES)) {
++        return 0;
++    }
++
++    AutoMutex lock(mLock);
++
++    // only one input stream allowed
++    if (mInput) {
++        *status = ALREADY_EXISTS;
++        return 0;
++    }
++    //for the hardware limitation : only one ssi, so it has the set
++    //the streamOut work in the same mode as streamIn
++    if (mOutput){
++         setInputStream(format,channelCount,sampleRate);
++    }
++
++    AudioStreamInALSA *in = new AudioStreamInALSA(this, acoustics);
++
++    *status = in->set(format, channelCount, sampleRate);
++    if (*status == NO_ERROR) {
++        mInput = in;
++        // Some information is expected to be available immediately after
++        // the device is open.
++        *status = mInput->setDevice(mMode, mRoutes[mMode]);
++    }
++    else {
++        delete in;
++    }
++
++    return mInput;
++}
++
++status_t AudioHardwareALSA::doRouting()
++{
++    AutoMutex lock(mLock);
++
++    if (!mOutput)
++        return NO_INIT;
++
++    return mOutput->setDevice(mMode, mRoutes[mMode]);
++}
++
++status_t AudioHardwareALSA::setMicMute(bool state)
++{
++    if (mMixer)
++        return mMixer->setCaptureMuteState(ROUTE_EARPIECE, state);
++
++    return NO_INIT;
++}
++
++status_t AudioHardwareALSA::getMicMute(bool *state)
++{
++    if (mMixer)
++        return mMixer->getCaptureMuteState(ROUTE_EARPIECE, state);
++
++    return NO_ERROR;
++}
++
++status_t AudioHardwareALSA::dump(int fd, const Vector<String16>& args)
++{
++    return NO_ERROR;
++}
++
++// ----------------------------------------------------------------------------
++
++ALSAStreamOps::ALSAStreamOps(AudioHardwareALSA *parent) :
++    mParent(parent),
++    mHandle(0),
++    mHardwareParams(0),
++    mSoftwareParams(0),
++    mMode(-1),
++    mDevice(0),
++    mPowerLock(false)
++{
++    if (snd_pcm_hw_params_malloc(&mHardwareParams) < 0) {
++        LOG_ALWAYS_FATAL("Failed to allocate ALSA hardware parameters!");
++    }
++
++    if (snd_pcm_sw_params_malloc(&mSoftwareParams) < 0) {
++        LOG_ALWAYS_FATAL("Failed to allocate ALSA software parameters!");
++    }
++}
++
++ALSAStreamOps::~ALSAStreamOps()
++{
++    AutoMutex lock(mLock);
++
++    close();
++
++    if (mHardwareParams)
++        snd_pcm_hw_params_free(mHardwareParams);
++
++    if (mSoftwareParams)
++        snd_pcm_sw_params_free(mSoftwareParams);
++}
++
++status_t ALSAStreamOps::set(int      format,
++                            int      channels,
++                            uint32_t rate)
++{
++    if (channels > 0)
++        mDefaults->channels = channels;
++
++    if (rate > 0)
++        mDefaults->sampleRate = rate;
++
++    switch(format) {
++      // format == 0
++        case AudioSystem::DEFAULT:
++            break;
++
++        case AudioSystem::PCM_16_BIT:
++            mDefaults->format = SND_PCM_FORMAT_S16_LE;
++            break;
++
++        case AudioSystem::PCM_8_BIT:
++            mDefaults->format = SND_PCM_FORMAT_S8;
++            break;
++
++        default:
++            LOGE("Unknown PCM format %i. Forcing default", format);
++            break;
++    }
++
++    return NO_ERROR;
++}
++
++uint32_t ALSAStreamOps::sampleRate() const
++{
++    unsigned int rate;
++    int err;
++
++    if (!mHandle)
++        return mDefaults->sampleRate;
++
++    return snd_pcm_hw_params_get_rate(mHardwareParams, &rate, 0) < 0
++        ? 0 : static_cast<uint32_t>(rate);
++}
++
++status_t ALSAStreamOps::sampleRate(uint32_t rate)
++{
++    const char *stream;
++    unsigned int requestedRate;
++    int err;
++
++    if (!mHandle)
++        return NO_INIT;
++
++    stream = streamName();
++    requestedRate = rate;
++    err = snd_pcm_hw_params_set_rate_near(mHandle,
++                                          mHardwareParams,
++                                          &requestedRate,
++                                          0);
++
++    if (err < 0) {
++        LOGE("Unable to set %s sample rate to %u: %s",
++            stream, rate, snd_strerror(err));
++        return BAD_VALUE;
++    }
++    if (requestedRate != rate) {
++        // Some devices have a fixed sample rate, and can not be changed.
++        // This may cause resampling problems; i.e. PCM playback will be too
++        // slow or fast.
++        LOGW("Requested rate (%u HZ) does not match actual rate (%u HZ)",
++            rate, requestedRate);
++    }
++    else {
++        LOGV("Set %s sample rate to %u HZ", stream, requestedRate);
++    }
++    return NO_ERROR;
++}
++
++//
++// Return the number of bytes (not frames)
++//
++size_t ALSAStreamOps::bufferSize() const
++{
++    if (!mHandle)
++        return NO_INIT;
++
++    snd_pcm_uframes_t bufferSize = 0;
++    snd_pcm_uframes_t periodSize = 0;
++    int err;
++
++    err = snd_pcm_get_params(mHandle, &bufferSize, &periodSize);
++
++    if (err < 0)
++        return -1;
++
++    size_t bytes = static_cast<size_t>(snd_pcm_frames_to_bytes(mHandle, bufferSize));
++
++    // Not sure when this happened, but unfortunately it now
++    // appears that the bufferSize must be reported as a
++    // power of 2. This might be the fault of 3rd party
++    // users.
++    for (size_t i = 1; (bytes & ~i) != 0; i<<=1)
++        bytes &= ~i;
++
++    return bytes;
++}
++
++int ALSAStreamOps::format() const
++{
++    snd_pcm_format_t ALSAFormat;
++    int pcmFormatBitWidth;
++    int audioSystemFormat;
++
++    if (!mHandle)
++        return -1;
++
++    if (snd_pcm_hw_params_get_format(mHardwareParams, &ALSAFormat) < 0) {
++        return -1;
++    }
++
++    pcmFormatBitWidth = snd_pcm_format_physical_width(ALSAFormat);
++    audioSystemFormat = AudioSystem::DEFAULT;
++    switch(pcmFormatBitWidth) {
++        case 8:
++            audioSystemFormat = AudioSystem::PCM_8_BIT;
++            break;
++
++        case 16:
++            audioSystemFormat = AudioSystem::PCM_16_BIT;
++            break;
++
++        default:
++            LOG_FATAL("Unknown AudioSystem bit width %i!", pcmFormatBitWidth);
++    }
++
++    return audioSystemFormat;
++}
++
++int ALSAStreamOps::channelCount() const
++{
++    if (!mHandle)
++        return mDefaults->channels;
++
++    unsigned int val;
++    int err;
++
++    err = snd_pcm_hw_params_get_channels(mHardwareParams, &val);
++    if (err < 0) {
++        LOGE("Unable to get device channel count: %s",
++            snd_strerror(err));
++        return mDefaults->channels;
++    }
++
++    return val;
++}
++
++status_t ALSAStreamOps::channelCount(int channels) {
++    int err;
++
++    if (!mHandle)
++        return NO_INIT;
++
++    err = snd_pcm_hw_params_set_channels(mHandle, mHardwareParams, channels);
++    if (err < 0) {
++        LOGE("Unable to set channel count to %i: %s",
++            channels, snd_strerror(err));
++        return BAD_VALUE;
++    }
++
++    LOGV("Using %i %s for %s.",
++        channels, channels == 1 ? "channel" : "channels", streamName());
++
++    return NO_ERROR;
++}
++
++status_t ALSAStreamOps::open(int mode, uint32_t device)
++{
++    const char *stream = streamName();
++    const char *devName = deviceName(mode, device);
++
++    int         err;
++
++    for(;;) {
++        // The PCM stream is opened in blocking mode, per ALSA defaults.  The
++        // AudioFlinger seems to assume blocking mode too, so asynchronous mode
++        // should not be used.
++        err = snd_pcm_open(&mHandle, devName, mDefaults->direction, 0);
++        if (err == 0) break;
++
++        // See if there is a less specific name we can try.
++        // Note: We are changing the contents of a const char * here.
++        char *tail = strrchr(devName, '_');
++        if (!tail) break;
++        *tail = 0;
++    }
++
++    if (err < 0) {
++        // None of the Android defined audio devices exist. Open a generic one.
++        devName = "default";
++        err = snd_pcm_open(&mHandle, devName, mDefaults->direction, 0);
++        if (err < 0) {
++            // Last resort is the NULL device (i.e. the bit bucket).
++            devName = _nullALSADeviceName;
++            err = snd_pcm_open(&mHandle, devName, mDefaults->direction, 0);
++        }
++    }
++
++    mMode   = mode;
++    mDevice = device;
++
++    LOGI("Initialized ALSA %s device %s", stream, devName);
++    return err;
++}
++
++void ALSAStreamOps::close()
++{
++    snd_pcm_t *handle = mHandle;
++    mHandle = NULL;
++
++    if (handle)
++        snd_pcm_close(handle);
++}
++
++status_t ALSAStreamOps::setSoftwareParams()
++{
++    if (!mHandle)
++        return NO_INIT;
++
++    int err;
++
++    // Get the current software parameters
++    err = snd_pcm_sw_params_current(mHandle, mSoftwareParams);
++    if (err < 0) {
++        LOGE("Unable to get software parameters: %s", snd_strerror(err));
++        return NO_INIT;
++    }
++
++    snd_pcm_uframes_t bufferSize = 0;
++    snd_pcm_uframes_t periodSize = 0;
++    snd_pcm_uframes_t startThreshold, stopThreshold;
++
++    // Configure ALSA to start the transfer when the buffer is almost full.
++    snd_pcm_get_params(mHandle, &bufferSize, &periodSize);
++
++    if (mDefaults->direction == SND_PCM_STREAM_PLAYBACK) {
++        // For playback, configure ALSA to start the transfer when the
++        // buffer is full.
++        startThreshold = bufferSize - periodSize;
++        stopThreshold = bufferSize;
++    }
++    else {
++        // For recording, configure ALSA to start the transfer on the
++        // first frame.
++        startThreshold = 1;
++        stopThreshold = bufferSize;
++}
++
++    err = snd_pcm_sw_params_set_start_threshold(mHandle,
++                                                mSoftwareParams,
++                                                startThreshold);
++    if (err < 0) {
++        LOGE("Unable to set start threshold to %lu frames: %s",
++            startThreshold, snd_strerror(err));
++        return NO_INIT;
++    }
++
++    err = snd_pcm_sw_params_set_stop_threshold(mHandle,
++                                               mSoftwareParams,
++                                               stopThreshold);
++    if (err < 0) {
++        LOGE("Unable to set stop threshold to %lu frames: %s",
++            stopThreshold, snd_strerror(err));
++        return NO_INIT;
++    }
++
++    // Allow the transfer to start when at least periodSize samples can be
++    // processed.
++    err = snd_pcm_sw_params_set_avail_min(mHandle,
++                                          mSoftwareParams,
++                                          periodSize);
++    if (err < 0) {
++        LOGE("Unable to configure available minimum to %lu: %s",
++            periodSize, snd_strerror(err));
++        return NO_INIT;
++    }
++
++    // Commit the software parameters back to the device.
++    err = snd_pcm_sw_params(mHandle, mSoftwareParams);
++    if (err < 0) {
++        LOGE("Unable to configure software parameters: %s",
++            snd_strerror(err));
++        return NO_INIT;
++    }
++
++    return NO_ERROR;
++}
++
++status_t ALSAStreamOps::setPCMFormat(snd_pcm_format_t format)
++{
++    const char *formatDesc;
++    const char *formatName;
++    bool validFormat;
++    int err;
++
++    // snd_pcm_format_description() and snd_pcm_format_name() do not perform
++    // proper bounds checking.
++    validFormat = (static_cast<int>(format) > SND_PCM_FORMAT_UNKNOWN) &&
++        (static_cast<int>(format) <= SND_PCM_FORMAT_LAST);
++    formatDesc = validFormat ?
++        snd_pcm_format_description(format) : "Invalid Format";
++    formatName = validFormat ?
++        snd_pcm_format_name(format) : "UNKNOWN";
++
++    err = snd_pcm_hw_params_set_format(mHandle, mHardwareParams, format);
++    if (err < 0) {
++        LOGE("Unable to configure PCM format %s (%s): %s",
++            formatName, formatDesc, snd_strerror(err));
++        return NO_INIT;
++    }
++
++    LOGV("Set %s PCM format to %s (%s)", streamName(), formatName, formatDesc);
++    return NO_ERROR;
++}
++
++status_t ALSAStreamOps::setHardwareResample(bool resample)
++{
++    int err;
++
++    err = snd_pcm_hw_params_set_rate_resample(mHandle,
++                                              mHardwareParams,
++                                              static_cast<int>(resample));
++    if (err < 0) {
++        LOGE("Unable to %s hardware resampling: %s",
++            resample ? "enable" : "disable",
++            snd_strerror(err));
++        return NO_INIT;
++    }
++    return NO_ERROR;
++}
++
++const char *ALSAStreamOps::streamName()
++{
++    // Don't use snd_pcm_stream(mHandle), as the PCM stream may not be
++    // opened yet.  In such case, snd_pcm_stream() will abort().
++    return snd_pcm_stream_name(mDefaults->direction);
++}
++
++//
++// Set playback or capture PCM device.  It's possible to support audio output
++// or input from multiple devices by using the ALSA plugins, but this is
++// not supported for simplicity.
++//
++// The AudioHardwareALSA API does not allow one to set the input routing.
++//
++// If the "routes" value does not map to a valid device, the default playback
++// device is used.
++//
++status_t ALSAStreamOps::setDevice(int mode, uint32_t device)
++{
++    // Close off previously opened device.
++    // It would be nice to determine if the underlying device actually
++    // changes, but we might be manipulating mixer settings (see asound.conf).
++    //
++    close();
++
++    const char *stream = streamName();
++
++    status_t    status = open (mode, device);
++    int     err;
++
++    if (status != NO_ERROR)
++        return status;
++
++    err = snd_pcm_hw_params_any(mHandle, mHardwareParams);
++    if (err < 0) {
++        LOGE("Unable to configure hardware: %s", snd_strerror(err));
++        return NO_INIT;
++    }
++
++    // Set the interleaved read and write format.
++    err = snd_pcm_hw_params_set_access(mHandle, mHardwareParams,
++                                       SND_PCM_ACCESS_RW_INTERLEAVED);
++    if (err < 0) {
++        LOGE("Unable to configure PCM read/write format: %s",
++            snd_strerror(err));
++        return NO_INIT;
++    }
++
++    status = setPCMFormat(mDefaults->format);
++
++    //
++    // Some devices do not have the default two channels.  Force an error to
++    // prevent AudioMixer from crashing and taking the whole system down.
++    //
++    // Note that some devices will return an -EINVAL if the channel count
++    // is queried before it has been set.  i.e. calling channelCount()
++    // before channelCount(channels) may return -EINVAL.
++    //
++    status = channelCount(mDefaults->channels);
++    if (status != NO_ERROR)
++        return status;
++
++    // Don't check for failure; some devices do not support the default
++    // sample rate.
++    sampleRate(mDefaults->sampleRate);
++
++#ifdef DISABLE_HARWARE_RESAMPLING
++    // Disable hardware resampling.
++    status = setHardwareResample(false);
++    if (status != NO_ERROR)
++        return status;
++#endif
++
++    snd_pcm_uframes_t bufferSize = mDefaults->bufferSize;
++
++    // Make sure we have at least the size we originally wanted
++    err = snd_pcm_hw_params_set_buffer_size(mHandle, mHardwareParams, bufferSize);
++    if (err < 0) {
++        LOGE("Unable to set buffer size to %d:  %s",
++             (int)bufferSize, snd_strerror(err));
++        return NO_INIT;
++    }
++
++    unsigned int latency = mDefaults->latency;
++
++    // Setup buffers for latency
++    err = snd_pcm_hw_params_set_buffer_time_near (mHandle, mHardwareParams,
++                                                  &latency, NULL);
++    if (err < 0) {
++        /* That didn't work, set the period instead */
++        unsigned int periodTime = latency / 4;
++        err = snd_pcm_hw_params_set_period_time_near (mHandle, mHardwareParams,
++                                                      &periodTime, NULL);
++        if (err < 0) {
++            LOGE("Unable to set the period time for latency: %s", snd_strerror(err));
++            return NO_INIT;
++        }
++        snd_pcm_uframes_t periodSize;
++        err = snd_pcm_hw_params_get_period_size (mHardwareParams, &periodSize, NULL);
++        if (err < 0) {
++            LOGE("Unable to get the period size for latency: %s", snd_strerror(err));
++            return NO_INIT;
++        }
++        bufferSize = periodSize * 4;
++        if (bufferSize < mDefaults->bufferSize)
++            bufferSize = mDefaults->bufferSize;
++        err = snd_pcm_hw_params_set_buffer_size_near (mHandle, mHardwareParams, &bufferSize);
++        if (err < 0) {
++            LOGE("Unable to set the buffer size for latency: %s", snd_strerror(err));
++            return NO_INIT;
++        }
++    } else {
++        // OK, we got buffer time near what we expect. See what that did for bufferSize.
++        err = snd_pcm_hw_params_get_buffer_size (mHardwareParams, &bufferSize);
++        if (err < 0) {
++            LOGE("Unable to get the buffer size for latency: %s", snd_strerror(err));
++            return NO_INIT;
++        }
++        // Does set_buffer_time_near change the passed value? It should.
++        err = snd_pcm_hw_params_get_buffer_time (mHardwareParams, &latency, NULL);
++        if (err < 0) {
++            LOGE("Unable to get the buffer time for latency: %s", snd_strerror(err));
++            return NO_INIT;
++        }
++        unsigned int periodTime = latency / 4;
++        err = snd_pcm_hw_params_set_period_time_near (mHandle, mHardwareParams,
++                                                      &periodTime, NULL);
++        if (err < 0) {
++            LOGE("Unable to set the period time for latency: %s", snd_strerror(err));
++            return NO_INIT;
++        }
++    }
++
++    LOGV("Buffer size: %d", (int)bufferSize);
++    LOGV("Latency: %d", (int)latency);
++
++    mDefaults->bufferSize = bufferSize;
++    mDefaults->latency = latency;
++
++    // Commit the hardware parameters back to the device.
++    err = snd_pcm_hw_params(mHandle, mHardwareParams);
++    if (err < 0) {
++        LOGE("Unable to set hardware parameters: %s", snd_strerror(err));
++        return NO_INIT;
++    }
++
++    status = setSoftwareParams();
++
++    return status;
++}
++
++const char *ALSAStreamOps::deviceName(int mode, uint32_t device)
++{
++    static char devString[ALSA_NAME_MAX];
++    int hasDevExt = 0;
++
++    strcpy (devString, mDefaults->devicePrefix);
++
++    for (int dev=0; device; dev++)
++        if (device & (1 << dev)) {
++            /* Don't go past the end of our list */
++            if (dev >= deviceSuffixLen)
++                break;
++            ALSA_STRCAT (devString, deviceSuffix[dev]);
++            device &= ~(1 << dev);
++            hasDevExt = 1;
++        }
++
++    if (hasDevExt)
++        switch (mode) {
++            case AudioSystem::MODE_NORMAL:
++                ALSA_STRCAT (devString, "_normal");
++                break;
++            case AudioSystem::MODE_RINGTONE:
++                ALSA_STRCAT (devString, "_ringtone");
++                break;
++            case AudioSystem::MODE_IN_CALL:
++                ALSA_STRCAT (devString, "_incall");
++                break;
++        };
++   switch(mDefaults->sampleRate){
++    case 32000:
++      ALSA_STRCAT (devString, "_32000");
++      break;
++    case 44100:
++      ALSA_STRCAT (devString, "_44100");
++      break;
++    case 48000:
++      ALSA_STRCAT (devString, "_48000");
++      break;
++      case 96000:
++        ALSA_STRCAT (devString, "_96000");
++      break;
++    default :
++    {
++      if (mDefaults->sampleRate < 32000)
++         {
++            ALSA_STRCAT (devString, "_32000");
++          }
++      else if (mDefaults->sampleRate < 44100)
++        {
++          ALSA_STRCAT (devString, "_44100");
++        }
++      else if (mDefaults->sampleRate < 48000)
++        {
++          ALSA_STRCAT (devString, "_48000");
++        }
++      else
++        {
++          ALSA_STRCAT (devString, "_96000");
++        }
++      break;
++    }
++    }
++
++    return devString;
++}
++
++// ----------------------------------------------------------------------------
++
++AudioStreamOutALSA::AudioStreamOutALSA(AudioHardwareALSA *parent) :
++    ALSAStreamOps(parent)
++{
++    static StreamDefaults _defaults = {
++        devicePrefix   : "AndroidPlayback",
++        direction      : SND_PCM_STREAM_PLAYBACK,
++        format         : SND_PCM_FORMAT_S16_LE,   // AudioSystem::PCM_16_BIT
++        channels       : 2,
++        sampleRate     : DEFAULT_SAMPLE_RATE,
++        latency        : 250000,                  // Desired Delay in usec
++        bufferSize     : 6144,                   // Desired Number of samples
++        };
++
++    setStreamDefaults(&_defaults);
++
++    snd_pcm_uframes_t bufferSize = mDefaults->bufferSize;
++
++    // See comment in bufferSize() method.
++    for (size_t i = 1; (bufferSize & ~i) != 0; i<<=1)
++        bufferSize &= ~i;
++
++    mDefaults->bufferSize = bufferSize;
++}
++
++AudioStreamOutALSA::~AudioStreamOutALSA()
++{
++    standby();
++    mParent->mOutput = NULL;
++}
++
++int AudioStreamOutALSA::channelCount() const
++{
++    int c = ALSAStreamOps::channelCount();
++
++    // AudioMixer will seg fault if it doesn't have two channels.
++    LOGW_IF(c != 2,
++        "AudioMixer expects two channels, but only %i found!", c);
++    return c;
++}
++
++status_t AudioStreamOutALSA::setVolume(float volume)
++{
++    if (!mParent->mMixer || !mDevice)
++        return NO_INIT;
++
++    return mParent->mMixer->setVolume (mDevice, volume);
++}
++
++ssize_t AudioStreamOutALSA::write(const void *buffer, size_t bytes)
++{
++    snd_pcm_sframes_t n;
++    size_t            sent = 0;
++    status_t          err;
++
++    AutoMutex lock(mLock);
++
++    if (!mPowerLock) {
++        acquire_wake_lock (PARTIAL_WAKE_LOCK, "AudioOutLock");
++        mPowerLock = true;
++    }
++
++    if (!mHandle)
++        ALSAStreamOps::setDevice(mMode, mDevice);
++
++    do {
++        n = snd_pcm_writei(mHandle,
++                           (char *)buffer + sent,
++                           snd_pcm_bytes_to_frames(mHandle, bytes));
++        if (n == -EBADFD) {
++            // Somehow the stream is in a bad state. The driver probably
++            // has a bug and snd_pcm_recover() doesn't seem to handle this.
++            ALSAStreamOps::setDevice(mMode, mDevice);
++        }
++        else if (n < 0) {
++            if (mHandle) {
++                // snd_pcm_recover() will return 0 if successful in recovering from
++                // an error, or -errno if the error was unrecoverable.
++                n = snd_pcm_recover(mHandle, n, 1);
++                if (n)
++                    return static_cast<ssize_t>(n);
++            }
++        }
++        else
++            sent += static_cast<ssize_t>(snd_pcm_frames_to_bytes(mHandle, n));
++
++    } while (mHandle && sent < bytes);
++
++    return sent;
++}
++
++status_t AudioStreamOutALSA::dump(int fd, const Vector<String16>& args)
++{
++    return NO_ERROR;
++}
++status_t AudioStreamOutALSA::getOutStreamParam()
++{
++    if(!mParent)
++        return NO_INIT;
++    if(!mParent->OutStreamParam)
++        return NO_INIT;
++    if(!(ALSAStreamOps::mDefaults))
++        return NO_INIT;
++    mParent->OutStreamParam[0] =  ALSAStreamOps::mDefaults->format;
++    mParent->OutStreamParam[1] =  ALSAStreamOps::mDefaults->channels;
++    mParent->OutStreamParam[2] =  ALSAStreamOps::mDefaults->sampleRate;
++    return NO_ERROR;
++}
++
++status_t AudioStreamOutALSA::setDevice(int mode, uint32_t newDevice)
++{
++    AutoMutex lock(mLock);
++    return ALSAStreamOps::setDevice(mode, newDevice);
++}
++
++status_t AudioStreamOutALSA::standby()
++{
++    AutoMutex lock(mLock);
++
++    if (mHandle) {
++        snd_pcm_drain (mHandle);
++        close();
++    }
++
++    if (mPowerLock) {
++        release_wake_lock ("AudioOutLock");
++        mPowerLock = false;
++    }
++
++    return NO_ERROR;
++}
++
++#define USEC_TO_MSEC(x) ((x + 999) / 1000)
++
++uint32_t AudioStreamOutALSA::latency() const
++{
++    // Android wants latency in milliseconds.
++    return USEC_TO_MSEC (mDefaults->latency);
++}
++
++// ----------------------------------------------------------------------------
++
++AudioStreamInALSA::AudioStreamInALSA(AudioHardwareALSA *parent,
++                                     AudioSystem::audio_in_acoustics acoustics) :
++    ALSAStreamOps(parent),
++    mAcoustics(acoustics)
++{
++    static StreamDefaults _defaults = {
++        devicePrefix   : "AndroidRecord",
++        direction      : SND_PCM_STREAM_CAPTURE,
++        format         : SND_PCM_FORMAT_S16_LE,   // AudioSystem::PCM_16_BIT
++        channels       : 1,
++        sampleRate     : AudioRecord::DEFAULT_SAMPLE_RATE,
++        latency        : 250000,                  // Desired Delay in usec
++        bufferSize     : 3072,                   // Desired Number of samples
++        };
++
++    setStreamDefaults(&_defaults);
++}
++
++AudioStreamInALSA::~AudioStreamInALSA()
++{
++    standby();
++    mParent->mInput = NULL;
++    mParent->recoverOutputStream();
++}
++
++status_t AudioStreamInALSA::setGain(float gain)
++{
++    if (mParent->mMixer)
++        return mParent->mMixer->setMasterGain (gain);
++    else
++        return NO_INIT;
++}
++
++ssize_t AudioStreamInALSA::read(void *buffer, ssize_t bytes)
++{
++    snd_pcm_sframes_t n, frames = snd_pcm_bytes_to_frames(mHandle, bytes);
++    status_t          err;
++
++    AutoMutex lock(mLock);
++
++    if (!mPowerLock) {
++        acquire_wake_lock (PARTIAL_WAKE_LOCK, "AudioInLock");
++        mPowerLock = true;
++    }
++
++    if (!mHandle)
++        ALSAStreamOps::setDevice(mMode, mDevice);
++
++    n = snd_pcm_readi(mHandle, buffer, frames);
++    if (n < frames) {
++        if (mHandle) {
++            if (n < 0)
++                n = snd_pcm_recover(mHandle, n, 0);
++            else
++                n = snd_pcm_prepare(mHandle);
++        }
++        return static_cast<ssize_t>(n);
++    }
++
++    if (mParent->mAcousticDevice &&
++        mParent->mAcousticDevice->filter) {
++        n = mParent->mAcousticDevice->filter(mHandle, buffer, frames);
++        if (n < 0)
++            return static_cast<ssize_t>(n);
++    }
++
++    return static_cast<ssize_t>(snd_pcm_frames_to_bytes(mHandle, n));
++}
++
++status_t AudioStreamInALSA::dump(int fd, const Vector<String16>& args)
++{
++    return NO_ERROR;
++}
++
++status_t AudioStreamInALSA::setDevice(int mode, uint32_t newDevice)
++{
++    AutoMutex lock(mLock);
++
++    status_t status = ALSAStreamOps::setDevice(mode, newDevice);
++
++    if (status == NO_ERROR && mParent->mAcousticDevice)
++        status = mParent->mAcousticDevice->set_acoustics(mHandle, mAcoustics);
++
++    return status;
++}
++
++status_t AudioStreamInALSA::standby()
++{
++    AutoMutex lock(mLock);
++
++    close();
++
++    if (mPowerLock) {
++        release_wake_lock ("AudioInLock");
++        mPowerLock = false;
++    }
++
++    return NO_ERROR;
++}
++
++// ----------------------------------------------------------------------------
++
++struct mixer_info_t
++{
++    mixer_info_t() :
++        elem(0),
++        min(SND_MIXER_VOL_RANGE_MIN),
++        max(SND_MIXER_VOL_RANGE_MAX),
++        mute(false)
++    {
++    }
++
++    snd_mixer_elem_t *elem;
++    long              min;
++    long              max;
++    long              volume;
++    bool              mute;
++    char              name[ALSA_NAME_MAX];
++};
++
++static int initMixer (snd_mixer_t **mixer, const char *name)
++{
++    int err;
++
++    if ((err = snd_mixer_open(mixer, 0)) < 0) {
++        LOGE("Unable to open mixer: %s", snd_strerror(err));
++        return err;
++    }
++
++    if ((err = snd_mixer_attach(*mixer, name)) < 0) {
++        LOGE("Unable to attach mixer to device %s: %s",
++            name, snd_strerror(err));
++
++        if ((err = snd_mixer_attach(*mixer, "hw:00")) < 0) {
++            LOGE("Unable to attach mixer to device default: %s",
++                snd_strerror(err));
++
++            snd_mixer_close (*mixer);
++            *mixer = NULL;
++            return err;
++        }
++    }
++
++    if ((err = snd_mixer_selem_register(*mixer, NULL, NULL)) < 0) {
++        LOGE("Unable to register mixer elements: %s", snd_strerror(err));
++        snd_mixer_close (*mixer);
++        *mixer = NULL;
++        return err;
++    }
++
++    // Get the mixer controls from the kernel
++    if ((err = snd_mixer_load(*mixer)) < 0) {
++        LOGE("Unable to load mixer elements: %s", snd_strerror(err));
++        snd_mixer_close (*mixer);
++        *mixer = NULL;
++        return err;
++    }
++
++    return 0;
++}
++
++typedef int (*hasVolume_t)(snd_mixer_elem_t*);
++
++static const hasVolume_t hasVolume[] = {
++    snd_mixer_selem_has_playback_volume,
++    snd_mixer_selem_has_capture_volume
++};
++
++typedef int (*getVolumeRange_t)(snd_mixer_elem_t*, long int*, long int*);
++
++static const getVolumeRange_t getVolumeRange[] = {
++    snd_mixer_selem_get_playback_volume_range,
++    snd_mixer_selem_get_capture_volume_range
++};
++
++typedef int (*setVolume_t)(snd_mixer_elem_t*, long int);
++
++static const setVolume_t setVol[] = {
++    snd_mixer_selem_set_playback_volume_all,
++    snd_mixer_selem_set_capture_volume_all
++};
++
++ALSAMixer::ALSAMixer()
++{
++    int err;
++
++    initMixer (&mMixer[SND_PCM_STREAM_PLAYBACK], "AndroidPlayback");
++    initMixer (&mMixer[SND_PCM_STREAM_CAPTURE], "AndroidRecord");
++
++    snd_mixer_selem_id_t *sid;
++    snd_mixer_selem_id_alloca(&sid);
++
++    for (int i = 0; i <= SND_PCM_STREAM_LAST; i++) {
++
++        mixer_info_t *info = mixerMasterProp[i].mInfo = new mixer_info_t;
++
++        property_get (mixerMasterProp[i].propName,
++                      info->name,
++                      mixerMasterProp[i].propDefault);
++
++        for (snd_mixer_elem_t *elem = snd_mixer_first_elem(mMixer[i]);
++             elem;
++             elem = snd_mixer_elem_next(elem)) {
++
++            if (!snd_mixer_selem_is_active(elem))
++                continue;
++
++            snd_mixer_selem_get_id(elem, sid);
++
++            // Find PCM playback volume control element.
++            const char *elementName = snd_mixer_selem_id_get_name(sid);
++
++            if (info->elem == NULL &&
++                strcmp(elementName, info->name) == 0 &&
++                hasVolume[i] (elem)) {
++
++                info->elem = elem;
++                getVolumeRange[i] (elem, &info->min, &info->max);
++                info->volume = info->max;
++                setVol[i] (elem, info->volume);
++                if (i == SND_PCM_STREAM_PLAYBACK &&
++                    snd_mixer_selem_has_playback_switch (elem))
++                    snd_mixer_selem_set_playback_switch_all (elem, 1);
++                break;
++            }
++        }
++
++        LOGV("Mixer: master '%s' %s.", info->name, info->elem ? "found" : "not found");
++
++        for (int j = 0; mixerProp[j][i].routes; j++) {
++
++            mixer_info_t *info = mixerProp[j][i].mInfo = new mixer_info_t;
++
++            property_get (mixerProp[j][i].propName,
++                          info->name,
++                          mixerProp[j][i].propDefault);
++
++            for (snd_mixer_elem_t *elem = snd_mixer_first_elem(mMixer[i]);
++                 elem;
++                 elem = snd_mixer_elem_next(elem)) {
++
++                if (!snd_mixer_selem_is_active(elem))
++                    continue;
++
++                snd_mixer_selem_get_id(elem, sid);
++
++                // Find PCM playback volume control element.
++                const char *elementName = snd_mixer_selem_id_get_name(sid);
++
++               if (info->elem == NULL &&
++                    strcmp(elementName, info->name) == 0 &&
++                    hasVolume[i] (elem)) {
++
++                    info->elem = elem;
++                    getVolumeRange[i] (elem, &info->min, &info->max);
++                    info->volume = info->max;
++                    setVol[i] (elem, info->volume);
++                    if (i == SND_PCM_STREAM_PLAYBACK &&
++                        snd_mixer_selem_has_playback_switch (elem))
++                        snd_mixer_selem_set_playback_switch_all (elem, 1);
++                    break;
++                }
++            }
++            LOGV("Mixer: route '%s' %s.", info->name, info->elem ? "found" : "not found");
++        }
++    }
++    LOGV("mixer initialized.");
++}
++
++ALSAMixer::~ALSAMixer()
++{
++    for (int i = 0; i <= SND_PCM_STREAM_LAST; i++) {
++        if (mMixer[i]) snd_mixer_close (mMixer[i]);
++        if (mixerMasterProp[i].mInfo) {
++            delete mixerMasterProp[i].mInfo;
++            mixerMasterProp[i].mInfo = NULL;
++        }
++        for (int j = 0; mixerProp[j][i].routes; j++) {
++            if (mixerProp[j][i].mInfo) {
++                delete mixerProp[j][i].mInfo;
++                mixerProp[j][i].mInfo = NULL;
++            }
++        }
++    }
++    LOGV("mixer destroyed.");
++}
++
++status_t ALSAMixer::setMasterVolume(float volume)
++{
++    mixer_info_t *info = mixerMasterProp[SND_PCM_STREAM_PLAYBACK].mInfo;
++    if (!info || !info->elem) return INVALID_OPERATION;
++
++    long minVol = info->min;
++    long maxVol = info->max;
++
++    // Make sure volume is between bounds.
++    long vol = minVol + volume * (maxVol - minVol);
++    if (vol > maxVol) vol = maxVol;
++    if (vol < minVol) vol = minVol;
++
++    info->volume = vol;
++    snd_mixer_selem_set_playback_volume_all (info->elem, vol);
++
++    return NO_ERROR;
++}
++
++status_t ALSAMixer::setMasterGain(float gain)
++{
++    mixer_info_t *info = mixerMasterProp[SND_PCM_STREAM_CAPTURE].mInfo;
++    if (!info || !info->elem) return INVALID_OPERATION;
++
++    long minVol = info->min;
++    long maxVol = info->max;
++
++    // Make sure volume is between bounds.
++    long vol = minVol + gain * (maxVol - minVol);
++    if (vol > maxVol) vol = maxVol;
++    if (vol < minVol) vol = minVol;
++
++    info->volume = vol;
++    snd_mixer_selem_set_capture_volume_all (info->elem, vol);
++
++    return NO_ERROR;
++}
++
++status_t ALSAMixer::setVolume(uint32_t device, float volume)
++{
++    for (int j = 0; mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes; j++)
++        if (mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes & device) {
++
++            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_PLAYBACK].mInfo;
++            if (!info || !info->elem) return INVALID_OPERATION;
++
++            long minVol = info->min;
++            long maxVol = info->max;
++
++            // Make sure volume is between bounds.
++            long vol = minVol + volume * (maxVol - minVol);
++            if (vol > maxVol) vol = maxVol;
++            if (vol < minVol) vol = minVol;
++
++            info->volume = vol;
++            snd_mixer_selem_set_playback_volume_all (info->elem, vol);
++        }
++
++    return NO_ERROR;
++}
++
++status_t ALSAMixer::setGain(uint32_t device, float gain)
++{
++    for (int j = 0; mixerProp[j][SND_PCM_STREAM_CAPTURE].routes; j++)
++        if (mixerProp[j][SND_PCM_STREAM_CAPTURE].routes & device) {
++
++            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_CAPTURE].mInfo;
++            if (!info || !info->elem) return INVALID_OPERATION;
++
++            long minVol = info->min;
++            long maxVol = info->max;
++
++            // Make sure volume is between bounds.
++            long vol = minVol + gain * (maxVol - minVol);
++            if (vol > maxVol) vol = maxVol;
++            if (vol < minVol) vol = minVol;
++
++            info->volume = vol;
++            snd_mixer_selem_set_capture_volume_all (info->elem, vol);
++        }
++
++    return NO_ERROR;
++}
++
++status_t ALSAMixer::setCaptureMuteState(uint32_t device, bool state)
++{
++    for (int j = 0; mixerProp[j][SND_PCM_STREAM_CAPTURE].routes; j++)
++        if (mixerProp[j][SND_PCM_STREAM_CAPTURE].routes & device) {
++
++            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_CAPTURE].mInfo;
++            if (!info || !info->elem) return INVALID_OPERATION;
++
++            if (snd_mixer_selem_has_capture_switch (info->elem)) {
++
++                int err = snd_mixer_selem_set_capture_switch_all (info->elem, static_cast<int>(!state));
++                if (err < 0) {
++                    LOGE("Unable to %s capture mixer switch %s",
++                        state ? "enable" : "disable", info->name);
++                    return INVALID_OPERATION;
++                }
++            }
++
++            info->mute = state;
++        }
++
++    return NO_ERROR;
++}
++
++status_t ALSAMixer::getCaptureMuteState(uint32_t device, bool *state)
++{
++    if (!state) return BAD_VALUE;
++
++    for (int j = 0; mixerProp[j][SND_PCM_STREAM_CAPTURE].routes; j++)
++        if (mixerProp[j][SND_PCM_STREAM_CAPTURE].routes & device) {
++
++            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_CAPTURE].mInfo;
++            if (!info || !info->elem) return INVALID_OPERATION;
++
++            *state = info->mute;
++            return NO_ERROR;
++        }
++
++    return BAD_VALUE;
++}
++
++status_t ALSAMixer::setPlaybackMuteState(uint32_t device, bool state)
++{
++    for (int j = 0; mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes; j++)
++        if (mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes & device) {
++
++            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_PLAYBACK].mInfo;
++            if (!info || !info->elem) return INVALID_OPERATION;
++
++            if (snd_mixer_selem_has_playback_switch (info->elem)) {
++
++                int err = snd_mixer_selem_set_playback_switch_all (info->elem, static_cast<int>(!state));
++                if (err < 0) {
++                    LOGE("Unable to %s playback mixer switch %s",
++                        state ? "enable" : "disable", info->name);
++                    return INVALID_OPERATION;
++                }
++            }
++
++            info->mute = state;
++        }
++
++    return NO_ERROR;
++}
++
++status_t ALSAMixer::getPlaybackMuteState(uint32_t device, bool *state)
++{
++    if (!state) return BAD_VALUE;
++
++    for (int j = 0; mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes; j++)
++        if (mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes & device) {
++
++            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_PLAYBACK].mInfo;
++            if (!info || !info->elem) return INVALID_OPERATION;
++
++            *state = info->mute;
++            return NO_ERROR;
++        }
++
++    return BAD_VALUE;
++}
++
++// ----------------------------------------------------------------------------
++
++ALSAControl::ALSAControl(const char *device)
++{
++    snd_ctl_open(&mHandle, device, 0);
++}
++
++ALSAControl::~ALSAControl()
++{
++    if (mHandle) snd_ctl_close(mHandle);
++}
++
++status_t ALSAControl::get(const char *name, unsigned int &value, int index)
++{
++    if (!mHandle) return NO_INIT;
++
++    snd_ctl_elem_id_t *id;
++    snd_ctl_elem_info_t *info;
++    snd_ctl_elem_value_t *control;
++
++    snd_ctl_elem_id_alloca(&id);
++    snd_ctl_elem_info_alloca(&info);
++    snd_ctl_elem_value_alloca(&control);
++
++    snd_ctl_elem_id_set_name(id, name);
++    snd_ctl_elem_info_set_id(info, id);
++
++    int ret = snd_ctl_elem_info(mHandle, info);
++    if (ret < 0) return BAD_VALUE;
++
++    snd_ctl_elem_info_get_id(info, id);
++    snd_ctl_elem_type_t type = snd_ctl_elem_info_get_type(info);
++    unsigned int count = snd_ctl_elem_info_get_count(info);
++    if ((unsigned int)index >= count) return BAD_VALUE;
++
++    snd_ctl_elem_value_set_id(control, id);
++
++    ret = snd_ctl_elem_read(mHandle, control);
++    if (ret < 0) return BAD_VALUE;
++
++    switch (type) {
++        case SND_CTL_ELEM_TYPE_BOOLEAN:
++            value = snd_ctl_elem_value_get_boolean(control, index);
++            break;
++        case SND_CTL_ELEM_TYPE_INTEGER:
++            value = snd_ctl_elem_value_get_integer(control, index);
++            break;
++        case SND_CTL_ELEM_TYPE_INTEGER64:
++            value = snd_ctl_elem_value_get_integer64(control, index);
++            break;
++        case SND_CTL_ELEM_TYPE_ENUMERATED:
++            value = snd_ctl_elem_value_get_enumerated(control, index);
++            break;
++        case SND_CTL_ELEM_TYPE_BYTES:
++            value = snd_ctl_elem_value_get_byte(control, index);
++            break;
++        default:
++            return BAD_VALUE;
++    }
++
++    return NO_ERROR;
++}
++
++status_t ALSAControl::set(const char *name, unsigned int value, int index)
++{
++    if (!mHandle) return NO_INIT;
++
++    snd_ctl_elem_id_t *id;
++    snd_ctl_elem_info_t *info;
++    snd_ctl_elem_value_t *control;
++
++    snd_ctl_elem_id_alloca(&id);
++    snd_ctl_elem_info_alloca(&info);
++    snd_ctl_elem_value_alloca(&control);
++
++    snd_ctl_elem_id_set_name(id, name);
++    snd_ctl_elem_info_set_id(info, id);
++
++    int ret = snd_ctl_elem_info(mHandle, info);
++    if (ret < 0) return BAD_VALUE;
++
++    snd_ctl_elem_info_get_id(info, id);
++    snd_ctl_elem_type_t type = snd_ctl_elem_info_get_type(info);
++    unsigned int count = snd_ctl_elem_info_get_count(info);
++    if ((unsigned int)index >= count) return BAD_VALUE;
++
++    if (index == -1)
++        index = 0; // Range over all of them
++    else
++        count = index + 1; // Just do the one specified
++
++    snd_ctl_elem_value_set_id(control, id);
++
++    for (unsigned int i = index; i < count; i++)
++        switch (type) {
++            case SND_CTL_ELEM_TYPE_BOOLEAN:
++                snd_ctl_elem_value_set_boolean(control, i, value);
++                break;
++            case SND_CTL_ELEM_TYPE_INTEGER:
++                snd_ctl_elem_value_set_integer(control, i, value);
++                break;
++            case SND_CTL_ELEM_TYPE_INTEGER64:
++                snd_ctl_elem_value_set_integer64(control, i, value);
++                break;
++            case SND_CTL_ELEM_TYPE_ENUMERATED:
++                snd_ctl_elem_value_set_enumerated(control, i, value);
++                break;
++            case SND_CTL_ELEM_TYPE_BYTES:
++                snd_ctl_elem_value_set_byte(control, i, value);
++                break;
++            default:
++                break;
++        }
++
++    ret = snd_ctl_elem_write(mHandle, control);
++    return (ret < 0) ? BAD_VALUE : NO_ERROR;
++}
++
++// ----------------------------------------------------------------------------
++
++};        // namespace android
+diff --git a/libaudio/AudioHardwareALSA.h b/libaudio/AudioHardwareALSA.h
+new file mode 100644
+index 0000000..6af9831
+--- /dev/null
++++ b/libaudio/AudioHardwareALSA.h
+@@ -0,0 +1,324 @@
++/* AudioHardwareALSA.h
++ **
++ ** Copyright 2008-2009, Wind River Systems
++ **
++ ** Licensed under the Apache License, Version 2.0 (the "License");
++ ** you may not use this file except in compliance with the License.
++ ** You may obtain a copy of the License at
++ **
++ **     http://www.apache.org/licenses/LICENSE-2.0
++ **
++ ** Unless required by applicable law or agreed to in writing, software
++ ** distributed under the License is distributed on an "AS IS" BASIS,
++ ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ ** See the License for the specific language governing permissions and
++ ** limitations under the License.
++ */
++
++#ifndef ANDROID_AUDIO_HARDWARE_ALSA_H
++#define ANDROID_AUDIO_HARDWARE_ALSA_H
++
++#include <hardware_legacy/AudioHardwareBase.h>
++
++#include <alsa/asoundlib.h>
++
++#include <hardware/hardware.h>
++
++namespace android
++{
++    class AudioHardwareALSA;
++
++    /**
++     * The id of acoustics module
++     */
++#define ACOUSTICS_HARDWARE_MODULE_ID "acoustics"
++#define ACOUSTICS_HARDWARE_NAME "name"
++
++    struct acoustic_device_t {
++        hw_device_t common;
++
++        /**
++         * Set the provided acoustics for a particular ALSA pcm device.
++         *
++         * Returns: 0 on succes, error code on failure.
++         */
++        status_t (*set_acoustics)(snd_pcm_t *, AudioSystem::audio_in_acoustics);
++
++        /**
++         * Read callback with PCM data so that filtering may be applied.
++         *
++         * Returns: frames filtered on success, error code on failure.
++         */
++        ssize_t (*filter)(snd_pcm_t *, void *, ssize_t);
++    };
++
++    // ----------------------------------------------------------------------------
++
++    class ALSAMixer
++    {
++        public:
++                                    ALSAMixer();
++            virtual                ~ALSAMixer();
++
++            bool                    isValid() { return !!mMixer[SND_PCM_STREAM_PLAYBACK]; }
++            status_t                setMasterVolume(float volume);
++            status_t                setMasterGain(float gain);
++
++            status_t                setVolume(uint32_t device, float volume);
++            status_t                setGain(uint32_t device, float gain);
++
++            status_t                setCaptureMuteState(uint32_t device, bool state);
++            status_t                getCaptureMuteState(uint32_t device, bool *state);
++            status_t                setPlaybackMuteState(uint32_t device, bool state);
++            status_t                getPlaybackMuteState(uint32_t device, bool *state);
++
++        private:
++            snd_mixer_t            *mMixer[SND_PCM_STREAM_LAST+1];
++    };
++
++    class ALSAControl
++    {
++        public:
++                                    ALSAControl(const char *device = "default");
++            virtual                ~ALSAControl();
++
++            status_t                get(const char *name, unsigned int &value, int index = 0);
++            status_t                set(const char *name, unsigned int value, int index = -1);
++
++        private:
++            snd_ctl_t              *mHandle;
++    };
++
++    class ALSAStreamOps
++    {
++        protected:
++            friend class AudioStreamOutALSA;
++            friend class AudioStreamInALSA;
++
++            struct StreamDefaults
++            {
++                const char *        devicePrefix;
++                snd_pcm_stream_t    direction;       // playback or capture
++                snd_pcm_format_t    format;
++                int                 channels;
++                uint32_t            sampleRate;
++                unsigned int        latency;         // Delay in usec
++                unsigned int        bufferSize;      // Size of sample buffer
++            };
++
++                                    ALSAStreamOps(AudioHardwareALSA *parent);
++            virtual                ~ALSAStreamOps();
++
++            status_t                set(int format,
++                                        int channels,
++                                        uint32_t rate);
++            virtual uint32_t        sampleRate() const;
++            status_t                sampleRate(uint32_t rate);
++            virtual size_t          bufferSize() const;
++            virtual int             format() const;
++            virtual int             channelCount() const;
++            status_t                channelCount(int channels);
++
++            status_t                open(int mode, uint32_t device);
++            void                    close();
++            status_t                setSoftwareParams();
++            status_t                setPCMFormat(snd_pcm_format_t format);
++            status_t                setHardwareResample(bool resample);
++
++            status_t                setDevice(int mode, uint32_t device);
++
++            const char             *streamName();
++            const char             *deviceName(int mode, uint32_t device);
++
++            void                    setStreamDefaults(StreamDefaults *dev) {
++                mDefaults = dev;
++            }
++
++        private:
++            AudioHardwareALSA      *mParent;
++            snd_pcm_t              *mHandle;
++            snd_pcm_hw_params_t    *mHardwareParams;
++            snd_pcm_sw_params_t    *mSoftwareParams;
++            int                     mMode;
++            uint32_t                mDevice;
++
++            StreamDefaults         *mDefaults;
++
++            Mutex                   mLock;
++            bool                    mPowerLock;
++};
++
++    // ----------------------------------------------------------------------------
++
++    class AudioStreamOutALSA : public AudioStreamOut, public ALSAStreamOps
++    {
++        public:
++                                    AudioStreamOutALSA(AudioHardwareALSA *parent);
++            virtual                ~AudioStreamOutALSA();
++
++            status_t                set(int format          = 0,
++                                        int channelCount    = 0,
++                                        uint32_t sampleRate = 0) {
++                return ALSAStreamOps::set(format, channelCount, sampleRate);
++            }
++
++            virtual uint32_t        sampleRate() const
++            {
++                return ALSAStreamOps::sampleRate();
++            }
++
++            virtual size_t          bufferSize() const
++            {
++                return ALSAStreamOps::bufferSize();
++            }
++
++            virtual int             channelCount() const;
++
++            virtual int             format() const
++            {
++                return ALSAStreamOps::format();
++            }
++
++            virtual uint32_t        latency() const;
++
++            virtual ssize_t         write(const void *buffer, size_t bytes);
++            virtual status_t        dump(int fd, const Vector<String16>& args);
++            status_t                getOutStreamParam();
++
++            status_t                setVolume(float volume);
++
++            virtual status_t        standby();
++
++        protected:
++            friend class AudioHardwareALSA;
++
++            status_t                setDevice(int mode, uint32_t newDevice);
++    };
++
++    class AudioStreamInALSA : public AudioStreamIn, public ALSAStreamOps
++    {
++        public:
++                                    AudioStreamInALSA(AudioHardwareALSA *parent,
++                                                      AudioSystem::audio_in_acoustics acoustics);
++            virtual                ~AudioStreamInALSA();
++
++            status_t                set(int      format       = 0,
++                                        int      channelCount = 0,
++                                        uint32_t sampleRate   = 0) {
++                return ALSAStreamOps::set(format, channelCount, sampleRate);
++            }
++
++            virtual uint32_t        sampleRate() {
++                return ALSAStreamOps::sampleRate();
++            }
++
++            virtual size_t          bufferSize() const
++            {
++                return ALSAStreamOps::bufferSize();
++            }
++
++            virtual int             channelCount() const
++            {
++                return ALSAStreamOps::channelCount();
++            }
++
++            virtual int             format() const
++            {
++                return ALSAStreamOps::format();
++            }
++
++            virtual ssize_t         read(void* buffer, ssize_t bytes);
++            virtual status_t        dump(int fd, const Vector<String16>& args);
++
++            virtual status_t        setGain(float gain);
++
++            virtual status_t        standby();
++
++        protected:
++            friend class AudioHardwareALSA;
++
++            status_t                setDevice(int mode, uint32_t newDevice);
++
++        private:
++            AudioSystem::audio_in_acoustics mAcoustics;
++    };
++
++    class AudioHardwareALSA : public AudioHardwareBase
++    {
++        public:
++                                    AudioHardwareALSA();
++            virtual                ~AudioHardwareALSA();
++
++            /**
++             * check to see if the audio hardware interface has been initialized.
++             * return status based on values defined in include/utils/Errors.h
++             */
++            virtual status_t        initCheck();
++
++            /** set the audio volume of a voice call. Range is between 0.0 and 1.0 */
++            virtual status_t        setVoiceVolume(float volume);
++
++            /**
++             * set the audio volume for all audio activities other than voice call.
++             * Range between 0.0 and 1.0. If any value other than NO_ERROR is returned,
++             * the software mixer will emulate this capability.
++             */
++            virtual status_t        setMasterVolume(float volume);
++
++            // mic mute
++            virtual status_t        setMicMute(bool state);
++            virtual status_t        getMicMute(bool* state);
++
++            virtual size_t getInputBufferSize(uint32_t sampleRate, int format, int channelCount);
++            status_t        setInputStream(int format,
++	    					int channelCount,
++						uint32_t sampleRate);
++            status_t        recoverOutputStream();
++
++            /** This method creates and opens the audio hardware output stream */
++            virtual AudioStreamOut* openOutputStream(
++	        uint32_t devices,
++                int format=0,
++                int channelCount=0,
++                uint32_t sampleRate=0,
++                status_t *status=0);
++
++            /** This method creates and opens the audio hardware input stream */
++            virtual AudioStreamIn*  openInputStream(
++	        uint32_t devices,
++                int inputSource,
++                int format,
++                int channelCount,
++                uint32_t sampleRate,
++                status_t *status,
++                AudioSystem::audio_in_acoustics acoustics);
++
++        protected:
++            /**
++             * doRouting actually initiates the routing. A call to setRouting
++             * or setMode may result in a routing change. The generic logic calls
++             * doRouting when required. If the device has any special requirements these
++             * methods can be overriden.
++             */
++            virtual status_t    doRouting();
++
++            virtual status_t    dump(int fd, const Vector<String16>& args);
++
++            friend class AudioStreamOutALSA;
++            friend class AudioStreamInALSA;
++
++            ALSAMixer          *mMixer;
++            AudioStreamOutALSA *mOutput;
++            AudioStreamInALSA  *mInput;
++
++            acoustic_device_t *mAcousticDevice;
++
++        private:
++            Mutex               mLock;
++            uint32_t            OutStreamParam[3];
++    };
++
++    // ----------------------------------------------------------------------------
++
++};        // namespace android
++#endif    // ANDROID_AUDIO_HARDWARE_ALSA_H
+diff --git a/libaudio/MODULE_LICENSE_APACHE2 b/libaudio/MODULE_LICENSE_APACHE2
+new file mode 100644
+index 0000000..e69de29
+diff --git a/libaudio/NOTICE b/libaudio/NOTICE
+new file mode 100644
+index 0000000..ada44e1
+--- /dev/null
++++ b/libaudio/NOTICE
+@@ -0,0 +1,191 @@
++
++   Copyright (c) 2005-2008, The Android Open Source Project
++   Copyright 2008 Wind River Systems
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
+diff --git a/libaudio/acoustics_default.cpp b/libaudio/acoustics_default.cpp
+new file mode 100644
+index 0000000..91a169d
+--- /dev/null
++++ b/libaudio/acoustics_default.cpp
+@@ -0,0 +1,85 @@
++/* acoustics_default.cpp
++ **
++ ** Copyright 2009 Wind River Systems
++ **
++ ** Licensed under the Apache License, Version 2.0 (the "License");
++ ** you may not use this file except in compliance with the License.
++ ** You may obtain a copy of the License at
++ **
++ **     http://www.apache.org/licenses/LICENSE-2.0
++ **
++ ** Unless required by applicable law or agreed to in writing, software
++ ** distributed under the License is distributed on an "AS IS" BASIS,
++ ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ ** See the License for the specific language governing permissions and
++ ** limitations under the License.
++ */
++
++
++#define LOG_TAG "AudioHardwareALSA"
++#include <utils/Log.h>
++
++#include "AudioHardwareALSA.h"
++
++namespace android
++{
++    static int s_device_open(const hw_module_t*, const char*, hw_device_t**);
++    static int s_device_close (hw_device_t*);
++    static status_t s_set_acoustics (snd_pcm_t *, AudioSystem::audio_in_acoustics);
++    static ssize_t s_filter (snd_pcm_t *, void *, ssize_t);
++
++    static hw_module_methods_t s_module_methods = {
++        open: s_device_open
++    };
++
++    extern "C" const hw_module_t HAL_MODULE_INFO_SYM = {
++            tag: HARDWARE_MODULE_TAG,
++            version_major: 1,
++            version_minor: 0,
++            id: ACOUSTICS_HARDWARE_MODULE_ID,
++            name: "ALSA acoustics module",
++            author: "Wind River",
++            methods: &s_module_methods,
++            reserved: {}
++    };
++
++    static int s_device_open(const hw_module_t* module,
++                             const char* name,
++                             hw_device_t** device)
++    {
++        acoustic_device_t *dev;
++        dev = (acoustic_device_t *)malloc(sizeof(*dev));
++        if (! dev) return -ENOMEM;
++
++        memset(dev, 0, sizeof(*dev));
++
++        /* initialize the procs */
++        dev->common.tag = HARDWARE_DEVICE_TAG;
++        dev->common.version = 0;
++        dev->common.module = (hw_module_t *)module;
++        dev->common.close = s_device_close;
++        dev->set_acoustics = s_set_acoustics;
++        dev->filter = s_filter;
++
++        *device = &dev->common;
++        return 0;
++    }
++
++    static int s_device_close (hw_device_t* device)
++    {
++        free(device);
++        return 0;
++    }
++
++    static status_t s_set_acoustics (snd_pcm_t *handle, AudioSystem::audio_in_acoustics acoustics)
++    {
++        LOGD("Acoustics set_acoustics stub called with %d.", (int)acoustics);
++        return NO_ERROR;
++    }
++
++    static ssize_t s_filter (snd_pcm_t *handle, void *buffer, ssize_t frames)
++    {
++        // Default acoustics doesn't apply any filtering
++        return frames;
++    }
++}
+diff --git a/libcamera/Android.mk b/libcamera/Android.mk
+new file mode 100644
+index 0000000..20126ea
+--- /dev/null
++++ b/libcamera/Android.mk
+@@ -0,0 +1,47 @@
++LOCAL_PATH:= $(call my-dir)
++
++include $(CLEAR_VARS)
++
++LOCAL_SRC_FILES:=               \
++    CameraHal.cpp
++
++LOCAL_CPPFLAGS += -DUSE_FSL_JPEG_ENC -DDUMP_CAPTURE_YUVxx -DCAPTURE_ONLY_TESTxx
++
++LOCAL_SHARED_LIBRARIES:= \
++    libui \
++    libutils \
++    libcutils \
++    libsgl \
++    libc
++
++LOCAL_C_INCLUDES += \
++	kernel_imx/include \
++	frameworks/base/include/ui \
++	frameworks/base/camera/libcameraservice
++
++ifeq ($(BOARD_CAMERA_NV12),true)
++    LOCAL_CPPFLAGS += -DRECORDING_FORMAT_NV12
++else
++    LOCAL_CPPFLAGS += -DRECORDING_FORMAT_YUV420
++endif
++
++ifeq ($(TARGET_BOARD_PLATFORM), imx51_BBG)
++    LOCAL_CPPFLAGS += -DIMX51_BBG
++endif
++
++ifeq ($(HAVE_FSL_IMX_CODEC),true)
++LOCAL_SHARED_LIBRARIES += libfsl_jpeg_enc_arm11_elinux
++LOCAL_CPPFLAGS += -DUSE_FSL_JPEG_ENC -DDUMP_CAPTURE_YUVxx
++ifeq ($(PREBUILT_FSL_IMX_CODEC),true)	
++    LOCAL_C_INCLUDES += prebuilt/android-arm/fsl_imx_codec/ghdr	
++else
++    LOCAL_C_INCLUDES += external/fsl_imx_codec/fsl_mad_multimedia_codec/ghdr	
++endif
++endif	
++	
++LOCAL_MODULE:= libcamera
++
++LOCAL_CFLAGS += -fno-short-enums
++
++include $(BUILD_SHARED_LIBRARY)
++
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+new file mode 100644
+index 0000000..b2e5683
+--- /dev/null
++++ b/libcamera/CameraHal.cpp
+@@ -0,0 +1,1411 @@
++/*
++ *   Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * Copyright (C) Texas Instruments - http://www.ti.com/
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++/**
++* @file CameraHal.cpp
++*
++* This file maps the Camera Hardware Interface to V4L2.
++*
++*/
++#define LOG_TAG "CameraHal"
++#include "CameraHal.h"
++
++#define FB_DEVICE               "/dev/graphics/fb0"
++#define VIDEO_DEVICE        	"/dev/video0"
++#define MIN_WIDTH           	208  
++#define MIN_HEIGHT          	154 
++#define DISPLAY_WIDTH		480	//lcd width
++#define DISPLAY_HEIGHT		640	//lcd height
++#define PREVIEW_WIDTH	    	640	//default preview width
++#define PREVIEW_HEIGHT	    	480	//default preview height
++#define PREVIEW_FORMAT	    	"yuv422i"
++#define PREVIEW_FRAMERATE   	30
++#define PICTURE_WIDTH   	640 	//default picture width
++#define PICTURE_HEIGHT  	480 	//default picture height
++#define PICTURE_FROMAT		V4L2_PIX_FMT_YUV420	//default picture format
++#define RECORDING_WIDTH   	352 	//default recording width
++#define RECORDING_HEIGHT  	288 	//default recording height
++#ifdef  RECORDING_FORMAT_NV12
++#define RECORDING_FORMAT      	V4L2_PIX_FMT_NV12    //recording format
++#else
++#define RECORDING_FORMAT        V4L2_PIX_FMT_YUV420  //recording format
++#endif
++#define CAPTURE_BUFFER_NUM 	3
++#define LOG_FUNCTION_NAME    	LOGD("%d: %s() Executing...", __LINE__, __FUNCTION__);
++
++namespace android {
++int CameraHal::camera_device = -1;
++int CameraHal::g_sensor_width = PREVIEW_WIDTH;
++int CameraHal::g_sensor_height = PREVIEW_HEIGHT;
++int CameraHal::g_sensor_top = 0;
++int CameraHal::g_sensor_left = 0;
++int CameraHal::g_display_width = DISPLAY_WIDTH;
++int CameraHal::g_display_height = DISPLAY_HEIGHT;
++int CameraHal::g_display_top = 0;
++int CameraHal::g_display_left = 0;
++int CameraHal::g_rotate=0;
++int CameraHal::g_display_lcd = 0;
++int CameraHal::g_capture_mode = 0;	//0:low resolution, 1:high resolution
++int CameraHal::g_preview_width = PREVIEW_WIDTH;
++int CameraHal::g_preview_height = PREVIEW_HEIGHT;
++
++//Camera Take Picture Parameter
++int CameraHal::g_pic_width = PICTURE_WIDTH;
++int CameraHal::g_pic_height = PICTURE_HEIGHT;
++int CameraHal::g_still_bpp = 16;
++
++struct picbuffer CameraHal::buffers[3];
++
++#ifdef USE_FSL_JPEG_ENC 
++JPEG_ENC_UINT32 CameraHal::g_JpegDataSize = 0;//Total size of g_JpegData
++JPEG_ENC_UINT32 CameraHal::g_JpegDataLen = 0;//Valid data len of g_JpegData
++JPEG_ENC_UINT8 *CameraHal::g_JpegData = NULL;//Buffer to hold jpeg data
++#endif
++
++#ifdef DUMP_CAPTURE_YUV
++FILE * CameraHal::record_yuvFile = 0;
++FILE * CameraHal::capture_yuvFile = 0;
++#endif
++
++wp<CameraHardwareInterface> CameraHal::singleton;
++
++CameraHal::CameraHal()
++                  : mParameters(),
++		    mRawHeap(0),
++                    mHeap(0),
++                    mPictureHeap(0),
++                    fcount(6),
++                    previewStopped(true),
++                    recordStopped(true),
++                    doubledPreviewWidth(false),
++                    doubledPreviewHeight(false),
++                    mPreviewFrameSize(0),
++                    mRawPictureCallback(0),
++                    mJpegPictureCallback(0),
++		    mPreviewRunning(0),
++                    mPictureCallbackCookie(0),
++                    mPreviewCallback(0),
++                    mPreviewCallbackCookie(0),
++		    mRecordFrameSize(0),
++                    mRecordCallback(0),
++                    mRecordCallbackCookie(0),
++		    mCurrentRecordFrame(0),
++		    mVideoHeap(0),
++                    mAutoFocusCallback(0),
++                    mAutoFocusCallbackCookie(0),
++                    mCurrentPreviewFrame(0),
++		    nCameraBuffersQueued(0),
++		    mCameraOpened(0),
++		    mIsTakingPic(0)
++{
++    for(int i = 0; i < videoBufferCount; i++)
++    {
++        mVideoBuffer[i] = 0;
++        mVideoBufferUsing[i] = 0;
++    }
++
++    initDefaultParameters();
++}
++
++void CameraHal::initDefaultParameters()
++{
++    CameraParameters p;
++
++    p.setPreviewSize(PREVIEW_WIDTH, PREVIEW_HEIGHT);
++    p.setPreviewFrameRate(PREVIEW_FRAMERATE);
++    p.setPreviewFormat(PREVIEW_FORMAT);
++
++    p.setPictureSize(PICTURE_WIDTH, PICTURE_HEIGHT);
++    p.setPictureFormat("jpeg");
++
++    if (setParameters(p) != NO_ERROR) {
++        LOGE("Failed to set default parameters?!");
++    }
++
++}
++
++CameraHal::~CameraHal()
++{
++    int err = 0;
++    
++    LOG_FUNCTION_NAME
++    LOGD(">>> Release");
++
++    LOGD("<<< Release");
++
++    singleton.clear();
++}
++
++int CameraHal::CameraOpen()
++{
++    int err;
++
++    LOG_FUNCTION_NAME
++
++    if(mCameraOpened == 0){
++    	camera_device = open(VIDEO_DEVICE, O_RDWR, 0);
++    	if (camera_device < 0) {
++        	LOGE ("Could not open the camera device: %s",  strerror(errno) );
++        	return -1;
++    	}
++    	mCameraOpened = 1;
++    	LOGD("Camera Created - Success");
++    }else{
++	LOGE ("Camera device has been opened!");
++    }
++
++    return 0;
++}
++
++
++int CameraHal::CameraClose()
++{
++    int err;
++
++    if(mCameraOpened == 1){
++    	close(camera_device);
++    	camera_device = -1;
++    	mCameraOpened = 0;
++    	LOGD("Camera Destroyed - Success");
++    }else{
++	LOGE ("Camera device has been closed!");
++    }
++
++    return 0;
++}
++
++int CameraHal::CameraGetFBInfo()
++{
++        int fd_fb = 0;
++        struct fb_fix_screeninfo fix;
++        struct fb_var_screeninfo var;
++
++        if ((fd_fb = open(FB_DEVICE, O_RDWR )) < 0)     {
++                LOGD("Unable to open frame buffer\n");
++                return -1;
++        }
++
++        if (ioctl(fd_fb, FBIOGET_VSCREENINFO, &var) < 0) {
++                close(fd_fb);
++                return -1;
++        }
++        if (ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix) < 0) {
++                close(fd_fb);
++                return -1;
++        }
++
++        g_display_width = var.xres;
++        g_display_height = var.yres;
++        LOGD("var.xres = %d", var.xres);
++        LOGD("var.yres = %d", var.yres);
++        LOGD("var.bits_per_pixel = %d", var.bits_per_pixel);
++        close(fd_fb);
++
++        return 0;
++}
++
++int CameraHal::CameraPreviewConfig(int fd_v4l)
++{
++        LOG_FUNCTION_NAME
++        
++        struct v4l2_streamparm parm;
++        v4l2_std_id id;
++        struct v4l2_control ctl;
++        struct v4l2_crop crop;
++	struct v4l2_format fmt;
++
++        if (ioctl(fd_v4l, VIDIOC_S_OUTPUT, &g_display_lcd) < 0)
++        {
++                LOGE("VIDIOC_S_OUTPUT failed\n");
++                return -1;
++        }
++
++        ctl.id = V4L2_CID_PRIVATE_BASE;
++	ctl.value = g_rotate;
++        if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctl) < 0)
++        {
++                LOGE("set control failed\n");
++                return -1;
++        }
++
++        crop.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
++        crop.c.left = g_sensor_left;
++        crop.c.top = g_sensor_top;
++        crop.c.width = g_sensor_width;
++        crop.c.height = g_sensor_height;
++        if (ioctl(fd_v4l, VIDIOC_S_CROP, &crop) < 0)
++        {
++                LOGE("set cropping failed\n");
++                return -1;
++        }
++
++        fmt.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
++        fmt.fmt.win.w.top=  g_display_top ;
++        fmt.fmt.win.w.left= g_display_left;
++        fmt.fmt.win.w.width=g_preview_width;
++        fmt.fmt.win.w.height=g_preview_height;
++
++        if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
++        {
++                LOGE("set format failed\n");
++                return -1;
++        }
++
++	//Camera Preview VIDIOC_S_PARM
++        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        parm.parm.capture.timeperframe.numerator = 1;
++        parm.parm.capture.timeperframe.denominator = PREVIEW_FRAMERATE;
++	parm.parm.capture.capturemode = g_capture_mode;
++
++        if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0)
++        {
++                LOGE("VIDIOC_S_PARM failed\n");
++                return -1;
++        }
++
++        return 0;
++}
++
++int CameraHal::CameraTakePicConfig(int fd_v4l)
++{
++        struct v4l2_streamparm parm;
++        struct v4l2_format fmt;
++        struct v4l2_crop crop;
++
++	memset(&fmt, 0, sizeof(fmt));
++        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        fmt.fmt.pix.pixelformat = PICTURE_FROMAT;
++        fmt.fmt.pix.width = g_pic_width;
++        fmt.fmt.pix.height = g_pic_height;
++        fmt.fmt.pix.sizeimage = fmt.fmt.pix.width * fmt.fmt.pix.height * g_still_bpp / 8;
++        fmt.fmt.pix.bytesperline = g_pic_width * g_still_bpp / 8;
++
++        if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
++        {
++                LOGE("set format failed\n");
++                return -1;
++        }
++
++        crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        crop.c.left = 0;
++        crop.c.top = 0;
++        crop.c.width = g_pic_width;
++        crop.c.height = g_pic_height;
++        if (ioctl(fd_v4l, VIDIOC_S_CROP, &crop) < 0)
++        {
++                LOGE("set cropping failed\n");
++                return -1;
++        }
++
++	//Camera Picture VIDIOC_S_PARM
++	//avoid taking time to reconfig the sensor
++/*
++        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        parm.parm.capture.timeperframe.numerator = 1;
++	parm.parm.capture.timeperframe.denominator = PREVIEW_FRAMERATE;
++	parm.parm.capture.capturemode = g_capture_mode;
++
++        if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0)
++        {
++                LOGE("VIDIOC_S_PARM failed\n");
++                return -1;
++        }
++*/
++
++        return NO_ERROR;
++}
++
++int CameraHal::CameraRecordingConfig(int fd_v4l)
++{
++        struct v4l2_format fmt;
++        struct v4l2_control ctrl;
++        struct v4l2_streamparm parm;
++
++        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	fmt.fmt.pix.pixelformat = RECORDING_FORMAT;
++        fmt.fmt.pix.width = RECORDING_WIDTH;
++        fmt.fmt.pix.height = RECORDING_HEIGHT;
++
++	fmt.fmt.pix.bytesperline = RECORDING_WIDTH;
++	fmt.fmt.pix.priv = 0;
++       	fmt.fmt.pix.sizeimage = 0;
++
++	if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
++        {
++                LOGE("set format failed\n");
++                return -1;
++        }
++
++	//Camera Recording VIDIOC_S_PARM
++        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        parm.parm.capture.timeperframe.numerator = 1;
++        parm.parm.capture.timeperframe.denominator = PREVIEW_FRAMERATE;
++	parm.parm.capture.capturemode = g_capture_mode;
++
++        if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0)
++        {
++                LOGE("VIDIOC_S_PARM failed\n");
++                return -1;
++        }
++
++        // Set rotation
++        ctrl.id = V4L2_CID_PRIVATE_BASE + 0;
++        ctrl.value = g_rotate;
++        if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctrl) < 0)
++        {
++                LOGE("set ctrl failed\n");
++                return -1;
++        }
++
++        struct v4l2_requestbuffers req;
++        memset(&req, 0, sizeof (req));
++        req.count = CAPTURE_BUFFER_NUM;
++        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        req.memory = V4L2_MEMORY_MMAP;
++
++        if (ioctl(fd_v4l, VIDIOC_REQBUFS, &req) < 0)
++        {
++                LOGE("v4l_capture_setup: VIDIOC_REQBUFS failed\n");
++                return -1;
++        }
++
++        return 0;
++}
++
++int CameraHal::CameraStartRecording(int fd_v4l)
++{
++        unsigned int i;
++        struct v4l2_buffer buf;
++        enum v4l2_buf_type type;
++
++        for (i = 0; i < CAPTURE_BUFFER_NUM; i++)
++        {
++                memset(&buf, 0, sizeof (buf));
++                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++                buf.index = i;
++                if (ioctl(fd_v4l, VIDIOC_QUERYBUF, &buf) < 0)
++                {
++                        LOGE("VIDIOC_QUERYBUF error\n");
++                        return -1;
++                }else{
++			LOGE("VIDIOC_QUERYBUF ok\n");
++		}
++
++                buffers[i].length = buf.length;
++                buffers[i].offset = (size_t) buf.m.offset;
++                buffers[i].start = (unsigned char *)mmap (NULL, buffers[i].length,
++                    PROT_READ | PROT_WRITE, MAP_SHARED,
++                    fd_v4l, buffers[i].offset);
++				memset(buffers[i].start, 0xFF, buffers[i].length);
++		LOGE("buffers[%d].length = %d\n", i, buffers[i].length);
++		LOGE("buffers[%d].offset = 0x%x\n", i, buffers[i].offset);
++		LOGE("buffers[%d].start = 0x%x\n", i, buffers[i].start);
++        }
++
++        for (i = 0; i < CAPTURE_BUFFER_NUM; i++)
++        {
++                memset(&buf, 0, sizeof (buf));
++                buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++                buf.memory = V4L2_MEMORY_MMAP;
++                buf.index = i;
++		buf.m.offset = buffers[i].offset;
++
++                if (ioctl (fd_v4l, VIDIOC_QBUF, &buf) < 0) {
++                        LOGE("VIDIOC_QBUF error\n");
++                        return -1;
++                }else{
++			LOGE("VIDIOC_QBUF ok\n");
++		}
++		nCameraBuffersQueued++;
++        }
++
++        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        if (ioctl (fd_v4l, VIDIOC_STREAMON, &type) < 0) {
++                LOGE("VIDIOC_STREAMON error\n");
++                return -1;
++        }else{
++		LOGE("VIDIOC_STREAMON ok\n");
++	}
++        return 0;
++}
++
++bool CameraHal::initHeapLocked()
++{
++    LOG_FUNCTION_NAME
++
++    int width, height;
++    int nSizeBytes;
++    struct v4l2_requestbuffers creqbuf;
++
++    mParameters.getPreviewSize(&width, &height);
++
++    LOGD("initHeapLocked: preview size=%dx%d", width, height);
++
++    // Note that we enforce yuv422 in setParameters().
++    int how_big = width * height * 2;
++    nSizeBytes =  how_big;
++
++    if (nSizeBytes & 0xfff)
++    {
++        how_big = (nSizeBytes & 0xfffff000) + 0x1000;
++    }
++
++    mPreviewFrameSize = how_big;
++    LOGD("mPreviewFrameSize = 0x%x = %d", mPreviewFrameSize, mPreviewFrameSize);
++
++
++    int buffer_count = mOverlay->getBufferCount();
++    LOGD("mOverlay->getBufferCount=%d",buffer_count);
++
++    buffer_count = CAPTURE_BUFFER_NUM;
++    LOGD("number of buffers = %d\n", buffer_count);
++    // Check that the camera can accept that many buffers */
++    creqbuf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    creqbuf.memory = V4L2_MEMORY_MMAP;
++    creqbuf.count  = buffer_count;
++
++    return true;
++
++}
++
++sp<IMemoryHeap> CameraHal::getPreviewHeap() const
++{
++    LOG_FUNCTION_NAME
++
++    return mSurfaceFlingerHeap;
++}
++
++sp<IMemoryHeap> CameraHal::getRawHeap() const
++{
++    return mRawHeap;
++}
++
++
++// ---------------------------------------------------------------------------
++
++int CameraHal::previewThread()
++{
++    int w, h;
++    unsigned long offset;
++    void *croppedImage;
++    overlay_buffer_t overlaybuffer;    
++    struct v4l2_buffer cfilledbuffer;
++    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    cfilledbuffer.memory = V4L2_MEMORY_MMAP; 
++ 
++    return NO_ERROR;
++}
++
++int CameraHal::recordThread()
++{
++    int w, h;
++    unsigned long offset;
++    void *croppedImage;
++    overlay_buffer_t overlaybuffer;    
++    struct v4l2_buffer cfilledbuffer;
++    memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
++    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    cfilledbuffer.memory = V4L2_MEMORY_MMAP; 
++
++    if (!recordStopped){
++
++        /* De-queue the next avaliable buffer */
++	nCameraBuffersQueued--;    
++        while (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
++            LOGE("VIDIOC_DQBUF Failed");
++        }
++
++        mCurrentRecordFrame++;
++
++        //LOGD("recordThread: CurrentRecordFrame %d", mCurrentRecordFrame);
++       
++	if(mRecordCallback){
++        	int i;
++		nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
++        	for(i = 0 ; i < videoBufferCount; i ++)
++        	{
++            		if(0 == mVideoBufferUsing[i])
++            		{
++                		//LOGD("send buffer:%d pointer:0x%x", i,(unsigned int)(mVideoBuffer[i]->pointer()));
++#ifdef DUMP_CAPTURE_YUV        
++       		if(record_yuvFile)
++       		{
++            		int len = fwrite(buffers[cfilledbuffer.index].start, 1, mRecordFrameSize, record_yuvFile);
++            		//LOGI("CameraHal:: WRITE FILE len %d",len);            
++       		}        
++#endif
++                		memcpy(mVideoBuffer[i]->pointer(),(void*)buffers[cfilledbuffer.index].start,mRecordFrameSize);
++                		mVideoBufferUsing[i] = 1;
++                		mRecordCallback(timeStamp, mVideoBuffer[i], mRecordCallbackCookie);
++                		break;
++            		}else{
++                		//LOGD("no Buffer can be used \n");
++            		}
++        	}
++    	}
++        
++	nCameraBuffersQueued++;
++	if (ioctl(camera_device, VIDIOC_QBUF, &cfilledbuffer) < 0) {
++        	LOGE("nextPreview VIDIOC_QBUF Failed!!!");
++    	}
++    }
++    return NO_ERROR;
++}
++
++status_t CameraHal::setOverlay(const sp<Overlay> &overlay)
++{
++    Mutex::Autolock lock(mLock);
++    if (overlay == NULL)
++        LOGE("Trying to set overlay, but overlay is null!");
++    mOverlay = overlay;
++    return NO_ERROR;
++}
++
++#ifdef CAPTURE_ONLY_TEST
++status_t CameraHal::startPreview(preview_callback cb, void* user)
++{
++    LOG_FUNCTION_NAME
++
++    Mutex::Autolock lock(mLock);
++    if (mPreviewThread != 0) {
++        // already running
++        return INVALID_OPERATION;
++    }
++
++    int width, height;
++    mParameters.setPreviewSize(PICTURE_WIDTH, PICTURE_HEIGHT);
++    mParameters.getPreviewSize(&width, &height);
++    LOGI("w=%d h=%d", width, height);
++
++    previewStopped = false;
++    mPreviewRunning = true;
++    mPreviewCallback = cb;
++    mPreviewCallbackCookie = user;
++    mPreviewThread = new PreviewThread(this);
++    return NO_ERROR;
++}
++#else
++status_t CameraHal::startPreview(preview_callback cb, void* user)
++{
++    LOG_FUNCTION_NAME
++
++    mPreviewCallback = cb;
++    mPreviewCallbackCookie = user;
++
++    Mutex::Autolock lock(mLock);
++    if (mPreviewThread != 0) {
++        // already running
++        return INVALID_OPERATION;
++    }
++
++if(mIsTakingPic == 0){
++#ifdef DUMP_CAPTURE_YUV        
++       capture_yuvFile = fopen("/sdcard/capture.yuv","wb");
++       LOGD ("capture.yuv file opened!");
++#endif
++
++    CameraGetFBInfo();
++
++    if (CameraOpen() < 0) {
++        LOGE ("Could not open the camera device: %d, errno: %d", camera_device, errno);
++        return -1;
++    }else{
++        LOGE ("Opened the camera device in preview!");
++    }
++
++    int width, height;
++    mParameters.getPreviewSize(&width, &height);
++    LOGI("Original Preview Width=%d Height=%d", width, height);
++
++#ifdef IMX51_BBG
++    mParameters.getPreviewSize(&g_preview_width, &g_preview_height);
++    g_display_left = 15;
++    g_display_top = (g_display_height - g_preview_height) / 2;
++#else
++    mParameters.getPreviewSize(&g_preview_height, &g_preview_width);
++    g_display_top = 15;
++    g_display_left = (g_display_width - g_preview_width) / 2;
++#endif
++
++    CameraPreviewConfig(camera_device);
++}else{
++    mIsTakingPic = 0;
++    LOGD("Camera taking picture closed!");
++}
++
++    /* turn on streaming */
++    int overlay = 1;
++
++    if (ioctl(camera_device, VIDIOC_OVERLAY, &overlay) < 0)
++    {
++          LOGE("VIDIOC_OVERLAY start failed\n");
++		return -1;
++    }
++    else LOGE("VIDIOC_OVERLAY started\n");
++    LOGD("camera is in viewfinder mode...");
++
++    previewStopped = false;
++    mPreviewRunning = true;
++    mPreviewThread = new PreviewThread(this);
++    return NO_ERROR;
++}
++#endif
++
++#ifdef CAPTURE_ONLY_TEST
++void CameraHal::stopPreview()
++{
++    LOG_FUNCTION_NAME
++
++    sp<PreviewThread> previewThread;
++    struct v4l2_requestbuffers creqbuf;
++
++    { // scope for the lock
++        Mutex::Autolock lock(mLock);
++        previewStopped = true;
++        mPreviewRunning = false;
++    }
++
++    { // scope for the lock
++        Mutex::Autolock lock(mLock);
++        previewThread = mPreviewThread;
++    }
++
++    // don't hold the lock while waiting for the thread to quit
++    if (previewThread != 0) {
++        previewThread->requestExitAndWait();
++    }
++
++    Mutex::Autolock lock(mLock);
++    mPreviewThread.clear();
++}
++#else
++void CameraHal::stopPreview()
++{
++    LOG_FUNCTION_NAME
++
++    sp<PreviewThread> previewThread;
++    struct v4l2_requestbuffers creqbuf;
++
++    { // scope for the lock
++        Mutex::Autolock lock(mLock);
++        previewStopped = true;
++    }
++
++    if (mPreviewThread != 0) {
++
++        /* Turn off streaming */
++        int overlay = 0;
++        if (ioctl(camera_device, VIDIOC_OVERLAY, &overlay) < 0)
++        {
++                LOGE("VIDIOC_OVERLAY stop failed\n");
++        }
++        LOGD("Turned off Viewfinder Mode\n");
++
++if(mIsTakingPic == 0){
++        CameraClose();
++#ifdef DUMP_CAPTURE_YUV        
++       fclose(capture_yuvFile);
++       LOGD ("capture.yuv file closed!");
++#endif
++}
++    }
++
++    { // scope for the lock
++        Mutex::Autolock lock(mLock);
++        previewThread = mPreviewThread;
++    }
++
++    // don't hold the lock while waiting for the thread to quit
++    if (previewThread != 0) {
++        previewThread->requestExitAndWait();
++    }
++
++    Mutex::Autolock lock(mLock);
++    mPreviewThread.clear();
++
++    singleton.clear();
++}
++#endif
++
++bool CameraHal::previewEnabled()
++{
++    return (!previewStopped);
++}
++
++status_t CameraHal::startRecording(recording_callback cb, void* user)
++{
++    LOG_FUNCTION_NAME 
++
++    if (mRecordThread != 0) {
++        return INVALID_OPERATION;
++    }
++
++    mRecordCallback = cb;
++    mRecordCallbackCookie = user;
++
++#ifdef DUMP_CAPTURE_YUV
++    record_yuvFile = fopen("/sdcard/recording.yuv","wb");
++#endif
++
++#ifdef CAPTURE_ONLY_TEST
++    if (CameraOpen() < 0) {
++        LOGE ("Could not open the camera device in recording: %d, errno: %d", camera_device, errno);
++        return -1;
++    }else{
++        LOGE ("Opened the camera device in recording!");
++    }
++#endif
++
++    CameraRecordingConfig(camera_device);
++
++    struct v4l2_format fmt; 
++    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    if (ioctl(camera_device, VIDIOC_G_FMT, &fmt) < 0)
++    {
++            LOGD("get format failed\n");
++            return -1;
++    }else{
++            LOGD("\t Width = %d", fmt.fmt.pix.width);
++            LOGD("\t Height = %d", fmt.fmt.pix.height);
++            LOGD("\t Image size = %d\n", fmt.fmt.pix.sizeimage);
++            LOGD("\t pixelformat = %d\n", fmt.fmt.pix.pixelformat);
++    }
++
++    // Just for the same size case
++    //mRecordFrameSize = mPreviewFrameSize;
++    mRecordFrameSize = fmt.fmt.pix.sizeimage;
++    LOGD("mRecordFrameSize = %d\n", mRecordFrameSize);
++
++    if(mRecordCallback)
++    {
++        int i = 0;
++        LOGD("Clear the old memory ");
++        mVideoHeap.clear();
++        for(i = 0; i < videoBufferCount; i++)
++        {
++            mVideoBuffer[i].clear();
++        }
++        LOGD("Init the video Memory %d", mRecordFrameSize);
++        mVideoHeap = new MemoryHeapBase(mRecordFrameSize * videoBufferCount);
++        for(i = 0; i < videoBufferCount; i++)
++        {
++            LOGD("Init Video Buffer:%d ",i);
++            mVideoBuffer[i] = new MemoryBase(mVideoHeap, mRecordFrameSize*i, mRecordFrameSize);
++        }
++    }
++    
++    CameraStartRecording(camera_device);
++
++    LOGD("Recording:camera is streaming...");
++
++    recordStopped = false;
++    mRecordThread = new RecordThread(this);
++    return NO_ERROR;
++}
++
++void CameraHal::stopRecording()
++{
++    LOG_FUNCTION_NAME
++
++    sp<RecordThread> recordThread;
++    struct v4l2_requestbuffers creqbuf;
++
++    {// scope for the lock
++        Mutex::Autolock lock(mLock);
++        recordStopped = true;
++    }
++
++    if (mRecordThread != 0) {
++
++        struct v4l2_buffer cfilledbuffer;
++        cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        cfilledbuffer.memory = V4L2_MEMORY_MMAP;
++        
++   	while(nCameraBuffersQueued){
++		LOGD("DQUEUING UNDQUEUED BUFFERS = %d",nCameraBuffersQueued);
++        	nCameraBuffersQueued--;
++        	if (ioctl(camera_device, VIDIOC_DQBUF, &cfilledbuffer) < 0) {
++        		LOGE("VIDIOC_DQBUF Failed!!!");
++        	}
++    	}
++
++       	/* Turn off streaming */
++        creqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        if (ioctl(camera_device, VIDIOC_STREAMOFF, &creqbuf.type) == -1) {
++            LOGE("VIDIOC_STREAMOFF Failed");
++        }
++        LOGD("Recording:Turned off streaming\n");
++    }
++
++#ifdef DUMP_CAPTURE_YUV
++    fclose(record_yuvFile);
++    LOGD("Closed recorded_yuvfile captured\n");
++#endif
++
++    {// scope for the lock
++        Mutex::Autolock lock(mLock);
++        recordThread = mRecordThread;
++    }
++
++    // don't hold the lock while waiting for the thread to quit
++    if (recordThread != 0) {
++        recordThread->requestExitAndWait();
++    }
++
++#ifdef CAPTURE_ONLY_TEST
++    CameraClose();
++#endif
++
++    Mutex::Autolock lock(mLock);
++    mRecordThread.clear();
++
++    mRecordCallback = NULL;
++    mRecordCallbackCookie = NULL;
++}
++
++bool CameraHal::recordingEnabled()
++{
++    LOG_FUNCTION_NAME
++    return (!recordStopped);
++}
++
++void CameraHal::releaseRecordingFrame(const sp<IMemory>& mem)
++{
++    //LOG_FUNCTION_NAME
++    ssize_t offset;
++    size_t  size;
++    int index;
++    offset = mem->offset();
++    size   = mem->size();
++    index = offset / size;
++    //LOGD("Index[%d] Buffer has been released,pointer = %p",index,mem->pointer());
++    mVideoBufferUsing[index] = 0;
++}
++
++
++// ---------------------------------------------------------------------------
++
++int CameraHal::beginAutoFocusThread(void *cookie)
++{
++    LOG_FUNCTION_NAME
++
++    CameraHal *c = (CameraHal *)cookie;
++    return c->autoFocusThread();
++}
++
++int CameraHal::autoFocusThread()
++{
++    LOG_FUNCTION_NAME
++
++    if (mAutoFocusCallback != NULL) {
++        mAutoFocusCallback(true, mAutoFocusCallbackCookie);
++        mAutoFocusCallback = NULL;
++
++    LOG_FUNCTION_NAME
++
++        return NO_ERROR;
++    }
++    return UNKNOWN_ERROR;
++}
++
++status_t CameraHal::autoFocus(autofocus_callback af_cb,
++                                       void *user)
++{
++    LOG_FUNCTION_NAME
++
++    Mutex::Autolock lock(mLock);
++
++    if (mAutoFocusCallback != NULL) {
++        return mAutoFocusCallback == af_cb ? NO_ERROR : INVALID_OPERATION;
++    }
++
++    mAutoFocusCallback = af_cb;
++    mAutoFocusCallbackCookie = user;
++    if (createThread(beginAutoFocusThread, this) == false)
++        return UNKNOWN_ERROR;
++    return NO_ERROR;
++}
++
++/*static*/ int CameraHal::beginPictureThread(void *cookie)
++{
++    LOG_FUNCTION_NAME
++
++    CameraHal *c = (CameraHal *)cookie;
++    return c->pictureThread();
++}
++
++int CameraHal::pictureThread()
++{
++
++    int w, h;
++    int pictureSize;
++    unsigned long base, offset;
++    struct v4l2_streamparm parm;
++    struct v4l2_format fmt;
++    sp<MemoryBase> mPictureBuffer;
++    sp<MemoryBase> memBase;
++    char *buf1;
++    
++    LOG_FUNCTION_NAME
++
++    if (mShutterCallback)
++
++    mParameters.setPictureSize(g_pic_width, g_pic_height);
++    mParameters.getPictureSize(&w, &h);
++    LOGD("Picture Size: Width = %d \tHeight = %d", w, h);
++
++    if(CameraTakePicConfig(camera_device) < 0){
++	    return -1;
++    }
++
++    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    if (ioctl(camera_device, VIDIOC_G_FMT, &fmt) < 0) {
++            LOGE("get format failed\n");
++            return -1;
++    }
++
++    buf1 = (char *)malloc(fmt.fmt.pix.sizeimage);
++    if (!buf1){
++            LOGE("buffer malloc error!\n");
++            free(buf1);
++	    return -1;
++    }
++
++    memset(buf1, 0, fmt.fmt.pix.sizeimage);
++
++    if (read(camera_device, buf1, fmt.fmt.pix.sizeimage) != fmt.fmt.pix.sizeimage) {
++            LOGE("v4l2 read error.\n");
++   	    free(buf1);
++	    return -1;
++    }
++
++    LOGD("pictureThread: generated a picture");
++
++    if (mJpegPictureCallback) {
++        //LOGI("CameraHal::pictureThread buffer 0x%x,sizeimage %d",
++        //    buf1,fmt.fmt.pix.sizeimage);      
++
++#ifdef DUMP_CAPTURE_YUV        
++       if(capture_yuvFile)
++       {
++            int len = fwrite((void*)buf1, 1, fmt.fmt.pix.sizeimage, capture_yuvFile);
++            LOGI("CameraHal:: WRITE FILE len %d",len);            
++       }
++#endif
++
++#ifdef USE_FSL_JPEG_ENC
++        sp<MemoryBase> jpegMemBase = encodeImage((void*)buf1, fmt.fmt.pix.sizeimage);
++        if (mJpegPictureCallback)
++            mJpegPictureCallback(jpegMemBase, mPictureCallbackCookie);  
++
++#else
++        LOGI("CameraHal::pictureThread get default image");     
++        sp<MemoryHeapBase> heap = new MemoryHeapBase(kCannedJpegSize);
++        sp<MemoryBase> mem = new MemoryBase(heap, 0, kCannedJpegSize);
++        memcpy(heap->base(), kCannedJpeg, kCannedJpegSize);
++        if (mJpegPictureCallback)
++            mJpegPictureCallback(mem, mPictureCallbackCookie);
++#endif
++    }
++
++exit0:
++    if (buf1)
++            free(buf1);
++
++    return NO_ERROR;
++}
++
++status_t CameraHal::takePicture(shutter_callback shutter_cb,
++                                         raw_callback raw_cb,
++                                         jpeg_callback jpeg_cb,
++                                         void* user)
++{
++    LOG_FUNCTION_NAME
++
++    mIsTakingPic = 1;
++    LOGD("Camera taking picture opened!");
++
++    stopPreview();
++
++    mShutterCallback = shutter_cb;
++    mRawPictureCallback = raw_cb;
++    mJpegPictureCallback = jpeg_cb;
++    mPictureCallbackCookie = user;
++    LOGD("Creating Picture Thread");
++    //##############################TODO use  thread
++    //if (createThread(beginPictureThread, this) == false)
++        //return -1;
++
++    pictureThread();
++
++    return NO_ERROR;
++}
++
++status_t CameraHal::cancelPicture(bool cancel_shutter,
++                                           bool cancel_raw,
++                                           bool cancel_jpeg)
++{
++    LOG_FUNCTION_NAME
++
++    if (cancel_shutter) mShutterCallback = NULL;
++    if (cancel_raw) mRawPictureCallback = NULL;
++    if (cancel_jpeg) mJpegPictureCallback = NULL;
++    return NO_ERROR;
++}
++
++status_t CameraHal::dump(int fd, const Vector<String16>& args) const
++{
++    return NO_ERROR;
++}
++
++int CameraHal::validateSize(int w, int h)
++{
++    LOG_FUNCTION_NAME
++
++    if ((w < MIN_WIDTH) || (h < MIN_HEIGHT)){
++        return false;
++    }
++
++    return true;
++}
++
++
++status_t CameraHal::setParameters(const CameraParameters& params)
++{
++    LOG_FUNCTION_NAME
++
++    int w, h;
++    int framerate;
++
++    Mutex::Autolock lock(mLock);
++
++    if (strcmp(params.getPreviewFormat(), PREVIEW_FORMAT) != 0) {
++        LOGE("Only yuv422i preview is supported");
++        return -1;
++    }
++
++    if (strcmp(params.getPictureFormat(), "jpeg") != 0) {
++        LOGE("Only jpeg still pictures are supported");
++        return -1;
++    }
++
++    params.getPreviewSize(&w, &h);
++    if (!validateSize(w, h)) {
++        LOGE("Preview size not supported");
++        return -1;
++    }
++
++    params.getPictureSize(&w, &h);
++    if (!validateSize(w, h)) {
++        LOGE("Picture size not supported");
++        return -1;
++    }
++
++    framerate = params.getPreviewFrameRate();
++
++    mParameters = params;
++
++    mParameters.getPreviewSize(&w, &h);
++    doubledPreviewWidth = false;
++    doubledPreviewHeight = false;
++    if (w < MIN_WIDTH){
++        LOGE("Preview Width < MIN");
++        return -1;
++    }
++    if (h < MIN_HEIGHT){
++        LOGE("Preview Height < MIN");
++        return -1;
++    }
++    mParameters.setPreviewSize(w, h);
++
++    /* This is a hack. MMS APP is not setting the resolution correctly. So hardcoding it. */
++    mParameters.setPictureSize(PICTURE_WIDTH, PICTURE_HEIGHT);
++
++    return NO_ERROR;
++}
++
++CameraParameters CameraHal::getParameters() const
++{
++    LOG_FUNCTION_NAME
++    CameraParameters params;
++
++    {
++        Mutex::Autolock lock(mLock);
++        params = mParameters;
++    }
++
++    int w, h;
++    params.getPreviewSize(&w, &h);
++    if (doubledPreviewWidth){
++        w = w >> 1;
++    }
++    if (doubledPreviewHeight){
++        h= h >> 1;
++    }
++    params.setPreviewSize(w, h);
++    return params;
++}
++
++void CameraHal::release()
++{
++    LOG_FUNCTION_NAME
++
++    close(camera_device);
++}
++
++
++sp<CameraHardwareInterface> CameraHal::createInstance()
++{
++    LOG_FUNCTION_NAME
++
++    if (singleton != 0) {
++        sp<CameraHardwareInterface> hardware = singleton.promote();
++        if (hardware != 0) {
++            return hardware;
++        }
++    }
++
++    sp<CameraHardwareInterface> hardware(new CameraHal());
++
++    singleton = hardware;
++    return hardware;
++}
++
++#ifdef USE_FSL_JPEG_ENC
++JPEG_ENC_UINT8 CameraHal::pushJpegOutput(JPEG_ENC_UINT8 ** out_buf_ptrptr,JPEG_ENC_UINT32 *out_buf_len_ptr,
++    JPEG_ENC_UINT8 flush, void * context, JPEG_ENC_MODE enc_mode)
++{
++    JPEG_ENC_UINT32 i;
++    if(*out_buf_ptrptr == NULL)
++    {
++        /* This function is called for the 1'st time from the
++         * codec */
++        *out_buf_ptrptr = g_JpegData;
++        *out_buf_len_ptr = g_JpegDataSize;
++    }
++
++    else if(flush == 1)
++    {
++        /* Flush the buffer*/
++        g_JpegDataLen += *out_buf_len_ptr;
++        LOGI("jpeg output data len %d",g_JpegDataLen);
++    }
++    else
++    {
++        LOGI("Not enough buffer for encoding");
++        return 0;
++    }
++
++    return(1); /* Success */
++}
++
++
++sp<MemoryBase> CameraHal::encodeImage(void *buffer, uint32_t bufflen)
++{
++    int width, height, size,index;
++    JPEG_ENC_UINT8 * i_buff = NULL;
++    JPEG_ENC_UINT8 * y_buff = NULL;
++    JPEG_ENC_UINT8 * u_buff = NULL;
++    JPEG_ENC_UINT8 * v_buff = NULL;
++    JPEG_ENC_RET_TYPE return_val;
++    jpeg_enc_parameters * params = NULL;
++    jpeg_enc_object * obj_ptr = NULL;
++    JPEG_ENC_UINT8 number_mem_info;
++    jpeg_enc_memory_info * mem_info = NULL;
++    sp<MemoryBase> jpegPtr = NULL;
++    
++    mParameters.getPictureSize(&width, &height);    
++
++    if((width== 0)||(height == 0)|!buffer||(bufflen == 0))
++    {
++        LOGI("Error!Invalid parameters");
++        return NULL;
++    }
++    g_JpegDataSize = 0;//Total size of g_JpegData
++    g_JpegDataLen = 0;//Valid data len of g_JpegData
++    g_JpegData = NULL;//Buffer to hold jpeg data
++    size = width*height*3/2;
++    LOGI("CameraHal::encodeImage:buffer 0x%x, bufflen %d,width %d,height %d",buffer,bufflen,width,height);
++    sp<MemoryHeapBase> mJpegImageHeap = new MemoryHeapBase(size);
++
++    g_JpegData = (JPEG_ENC_UINT8 *)(mJpegImageHeap->getBase());
++    g_JpegDataSize = size;
++    if(!g_JpegData)
++    {
++        LOGI("Cannot allocate jpeg data");
++        return NULL;
++    }
++        
++    /* --------------------------------------------
++     * Allocate memory for Encoder Object
++     * -------------------------------------------*/
++    obj_ptr = (jpeg_enc_object *) malloc(sizeof(jpeg_enc_object));
++    if(!obj_ptr)
++    {
++        LOGE("Error!Cannot allocate enc obj");
++        return NULL;
++    }
++    memset(obj_ptr, 0, sizeof(jpeg_enc_object));
++    
++    /* Assign the function for streaming output */
++    obj_ptr->jpeg_enc_push_output = pushJpegOutput;
++    obj_ptr->context=NULL;   //user can put private variables into it
++    /* --------------------------------------------
++     * Fill up the parameter structure of JPEG Encoder
++     * -------------------------------------------*/
++    params = &(obj_ptr->parameters);
++
++    params->compression_method = JPEG_ENC_SEQUENTIAL;
++    params->mode = JPEG_ENC_MAIN_ONLY;
++    params->quality = 75;
++    params->restart_markers = 0;
++    params->y_width = width;
++    params->y_height = height;
++    params->u_width = params->y_width/2;
++    params->u_height = params->y_height/2;
++    params->v_width = params->y_width/2;
++    params->v_height = params->y_height/2;
++    params->primary_image_height = height;
++    params->primary_image_width = width;
++    params->yuv_format = JPEG_ENC_YUV_420_NONINTERLEAVED;
++    params->exif_flag = 0;
++
++    params->y_left = 0;
++    params->y_top = 0;
++    params->y_total_width = 0;
++    params->y_total_height = 0;
++    params->raw_dat_flag= 0;	
++
++    if(params->y_total_width==0)
++    {
++         params->y_left=0;
++	  params->u_left=0;
++	  params->v_left=0;
++    	  params->y_total_width=params->y_width;  // no cropping
++    	  params->u_total_width=params->u_width;  // no cropping
++    	  params->v_total_width=params->v_width;  // no cropping
++    }
++
++    if(params->y_total_height==0)
++    {
++        params->y_top=0;
++	  params->u_top=0;
++	  params->v_top=0;		
++    	  params->y_total_height=params->y_height; // no cropping
++    	  params->u_total_height=params->u_height; // no cropping
++    	  params->v_total_height=params->v_height; // no cropping
++    }
++
++     /* Pixel size is unknown by default */
++    params->jfif_params.density_unit = 0;
++    /* Pixel aspect ratio is square by default */
++    params->jfif_params.X_density = 1;
++    params->jfif_params.Y_density = 1;
++
++    y_buff = (JPEG_ENC_UINT8 *)buffer;
++    u_buff = y_buff+width*height;
++    v_buff = u_buff+width*height/4;
++    i_buff = NULL;
++    LOGI("version: %s\n", jpege_CodecVersionInfo());	
++    
++    /* --------------------------------------------
++     * QUERY MEMORY REQUIREMENTS
++     * -------------------------------------------*/
++    return_val = jpeg_enc_query_mem_req(obj_ptr);
++
++    if(return_val != JPEG_ENC_ERR_NO_ERROR)
++    {
++        LOGI("JPEG encoder returned an error when jpeg_enc_query_mem_req was called \n");
++        LOGI("Return Val %d\n",return_val);
++        goto done;
++    }
++    LOGI("jpeg_enc_query_mem_req success");
++    /* --------------------------------------------
++     * ALLOCATE MEMORY REQUESTED BY CODEC
++     * -------------------------------------------*/
++    number_mem_info = obj_ptr->mem_infos.no_entries;
++    for(index = 0; index < number_mem_info; index++)
++    {
++        /* This example code ignores the 'alignment' and
++         * 'memory_type', but some other applications might want
++         * to allocate memory based on them */
++        mem_info = &(obj_ptr->mem_infos.mem_info[index]);
++        mem_info->memptr = (void *) malloc(mem_info->size);
++	if(mem_info->memptr==NULL)
++	{
++		LOGI("Malloc error after query\n");
++		goto done;
++	}
++    }
++
++
++    return_val = jpeg_enc_init(obj_ptr);
++    if(return_val != JPEG_ENC_ERR_NO_ERROR)
++    {
++        LOGI("JPEG encoder returned an error when jpeg_enc_init was called \n");
++        LOGI("Return Val %d\n",return_val);
++        goto done;
++    }
++    LOGI("jpeg_enc_init success");
++    return_val = jpeg_enc_encodeframe(obj_ptr, i_buff,
++                                      y_buff, u_buff, v_buff);
++
++    if(return_val != JPEG_ENC_ERR_ENCODINGCOMPLETE)
++    {
++        LOGI("JPEG encoder returned an error in jpeg_enc_encodeframe \n");
++        LOGI("Return Val %d\n",return_val);
++        goto done;
++    }
++    LOGI("jpeg_enc_encodeframe success");    
++    // Make an IMemory for each frame
++    jpegPtr = new MemoryBase(mJpegImageHeap, 0, g_JpegDataLen);    
++    
++done:
++    /* --------------------------------------------
++     * FREE MEMORY REQUESTED BY CODEC
++     * -------------------------------------------*/
++    if(obj_ptr)
++    {
++        number_mem_info = obj_ptr->mem_infos.no_entries;
++        for(index = 0; index < number_mem_info; index++)
++        {
++            mem_info = &(obj_ptr->mem_infos.mem_info[index]);
++            if(mem_info)
++                free(mem_info->memptr);
++        }
++        free(obj_ptr);
++    }
++    return jpegPtr;
++}
++
++#endif
++
++extern "C" sp<CameraHardwareInterface> openCameraHardware()
++{
++    LOGD("Opening Freescale Camera HAL\n");
++
++    return CameraHal::createInstance();
++}
++
++}; // namespace android
++
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+new file mode 100644
+index 0000000..239d637
+--- /dev/null
++++ b/libcamera/CameraHal.h
+@@ -0,0 +1,261 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * Copyright (C) Texas Instruments - http://www.ti.com/
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++
++
++#ifndef ANDROID_HARDWARE_CAMERA_HARDWARE_H
++#define ANDROID_HARDWARE_CAMERA_HARDWARE_H
++
++#include <string.h>
++#include <unistd.h>
++#include <time.h>
++#include <dlfcn.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <linux/time.h>
++#include <linux/videodev2.h>
++#include <linux/mxcfb.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <utils/Log.h>
++#include <utils/threads.h>
++#include <utils/MemoryBase.h>
++#include <utils/MemoryHeapBase.h>
++#include <utils/threads.h>
++#include <ui/CameraHardwareInterface.h>
++#include <ui/Overlay.h>
++
++#ifdef USE_FSL_JPEG_ENC
++#include "jpeg_enc_interface.h" 
++#endif
++#include "CannedJpeg.h"
++
++struct picbuffer
++{
++        unsigned char *start;
++        size_t offset;
++        unsigned int length;
++};
++
++namespace android {
++class CameraHal : public CameraHardwareInterface {
++public:
++    virtual sp<IMemoryHeap> getPreviewHeap() const;
++    virtual sp<IMemoryHeap> getRawHeap() const;
++
++    virtual status_t    startPreview(preview_callback cb, void* user);
++    virtual bool        useOverlay() { return true; }
++    virtual status_t    setOverlay(const sp<Overlay> &overlay);
++    virtual void        stopPreview();
++    virtual bool        previewEnabled();
++
++    virtual status_t    startRecording(recording_callback cb, void* user);
++    virtual void        stopRecording();
++    virtual bool        recordingEnabled();
++    virtual void        releaseRecordingFrame(const sp<IMemory>& mem);
++
++    virtual status_t    autoFocus(autofocus_callback, void *user);
++    virtual status_t    takePicture(shutter_callback,
++                                    raw_callback,
++                                    jpeg_callback,
++                                    void* user);
++    virtual status_t    cancelPicture(bool cancel_shutter,
++                                      bool cancel_raw,
++                                      bool cancel_jpeg);
++    virtual status_t    dump(int fd, const Vector<String16>& args) const;
++    virtual status_t    setParameters(const CameraParameters& params);
++    virtual CameraParameters  getParameters() const;
++    virtual void release();
++
++    static sp<CameraHardwareInterface> createInstance();
++    
++#ifdef USE_FSL_JPEG_ENC   
++    static JPEG_ENC_UINT8 pushJpegOutput(JPEG_ENC_UINT8 ** out_buf_ptrptr,
++                                            JPEG_ENC_UINT32 *out_buf_len_ptr,
++                                            JPEG_ENC_UINT8 flush, 
++                                            void * context, 
++                                            JPEG_ENC_MODE enc_mode);
++#endif
++
++private:
++                        CameraHal();
++    virtual             ~CameraHal();
++
++    static wp<CameraHardwareInterface> singleton;
++
++    class PreviewThread : public Thread {
++        CameraHal* mHardware;
++    public:
++        PreviewThread(CameraHal* hw)
++            : Thread(false), mHardware(hw) { }
++        virtual void onFirstRef() {
++            run("CameraPreviewThread", PRIORITY_URGENT_DISPLAY);
++        }
++        virtual bool threadLoop() {
++            mHardware->previewThread();
++            // loop until we need to quit
++            return true;
++        }
++    };
++
++    class RecordThread : public Thread {
++        CameraHal* mHardware;
++    public:
++        RecordThread(CameraHal* hw)
++            : Thread(false), mHardware(hw) { }
++        virtual void onFirstRef() {
++            run("CameraRecordThread", PRIORITY_URGENT_DISPLAY);
++        }
++        virtual bool threadLoop() {
++            mHardware->recordThread();
++            // loop until we need to quit
++            return true;
++        }
++    };
++
++    void initDefaultParameters();
++    bool initHeapLocked();
++
++    int previewThread();
++    int recordThread();
++
++    static int beginAutoFocusThread(void *cookie);
++    int autoFocusThread();
++
++    static int beginPictureThread(void *cookie);
++    int pictureThread();
++
++    int validateSize(int w, int h);
++    void* cropImage(unsigned long buffer);
++    void convertYUYVtoYUV422SP(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height);
++#if USE_FSL_JPEG_ENC
++    void convertYUYVtoUYVY(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height);
++    sp<MemoryBase> encodeImage(void *buffer, uint32_t bufflen);
++#else
++    sp<MemoryBase> encodeImage(void *buffer, uint32_t bufflen);
++#endif
++
++    int CameraOpen();
++    int CameraClose();
++    int CameraPreviewConfig(int fd_v4l);
++    int CameraRecordingConfig(int fd_v4l);
++    int CameraStartRecording(int fd_v4l);
++    int CameraTakePicConfig(int fd_v4l);
++    int CameraGetFBInfo(void);
++
++    int fcount;
++    mutable Mutex       mLock;
++
++    CameraParameters    mParameters;
++
++    sp<MemoryHeapBase>  mHeap;
++    sp<MemoryHeapBase>  mSurfaceFlingerHeap;
++    sp<MemoryHeapBase>  mPictureHeap;
++    sp<MemoryHeapBase>  mRawHeap;
++    sp<MemoryBase>      mSurfaceFlingerBuffer;
++
++    bool                mPreviewRunning;
++    int                 mPreviewFrameSize;
++
++    shutter_callback    mShutterCallback;
++    raw_callback        mRawPictureCallback;
++    jpeg_callback       mJpegPictureCallback;
++    void                *mPictureCallbackCookie;
++    
++    // protected by mLock
++    sp<Overlay>         mOverlay;
++    sp<PreviewThread>   mPreviewThread;
++    preview_callback    mPreviewCallback;
++    void                *mPreviewCallbackCookie;
++
++    bool                mCameraOpened;
++    bool                mIsTakingPic;;
++
++    sp<RecordThread>    mRecordThread;
++    int 		mRecordFrameSize;
++    bool                mRecordRunning;
++    recording_callback  mRecordCallback;
++    void                *mRecordCallbackCookie;
++    int                 mCurrentRecordFrame;
++    int 		nCameraBuffersQueued;
++   
++    static const int    videoBufferCount = 3;
++    sp<MemoryHeapBase>  mVideoHeap;
++    sp<MemoryBase>      mVideoBuffer[videoBufferCount];
++    int   		mVideoBufferUsing[videoBufferCount];
++
++    autofocus_callback  mAutoFocusCallback;
++    void                *mAutoFocusCallbackCookie;
++
++    // only used from PreviewThread
++    int                 mCurrentPreviewFrame;
++
++    bool previewStopped;
++    bool recordStopped;
++    bool doubledPreviewWidth;
++    bool doubledPreviewHeight;
++
++    static int camera_device;
++    static int g_camera_framerate;
++
++    //used for priview
++    static int g_sensor_width;
++    static int g_sensor_height;
++    static int g_sensor_top;
++    static int g_sensor_left;
++    static int g_display_width;
++    static int g_display_height;
++    static int g_display_top;
++    static int g_display_left;
++    static int g_rotate;
++    static int g_display_lcd;
++    static int g_preview_width;
++    static int g_preview_height;
++
++    //used for taking picture
++    static int g_pic_width;
++    static int g_pic_height;
++    static int g_still_bpp;
++
++    //used for recording
++    static int g_capture_mode;		//0:low resolution 1:high resolution
++    static struct picbuffer buffers[3];
++
++#ifdef DUMP_CAPTURE_YUV
++    static FILE *record_yuvFile;
++    static FILE *capture_yuvFile;
++#endif
++
++#ifdef USE_FSL_JPEG_ENC 
++    static JPEG_ENC_UINT32 g_JpegDataSize;//Total size of g_JpegData
++    static JPEG_ENC_UINT32 g_JpegDataLen;//Valid data len of g_JpegData
++    static JPEG_ENC_UINT8 *g_JpegData;//Buffer to hold jpeg data
++#endif
++};
++
++}; // namespace android
++
++#endif
++
+-- 
+1.8.0
+

@@ -1,0 +1,112 @@
+From 9aea55c7f8ad3c13966f20b8d3c50d3fbe7cb4a3 Mon Sep 17 00:00:00 2001
+From: Nitin Garg <nitin.garg@freescale.com>
+Date: Wed, 17 Oct 2012 23:20:35 -0500
+Subject: [PATCH 03/10] ENGR00230334: Fix the adb screenshots and splash logo
+
+Fix ADB screenshots to read the framebuffer in multiples
+of 512 bytes and convert 16-bit logo image to display correctly
+on 32-bit framebuffer.
+
+Change-Id: I3bf745c8868018f99909f9b5ec5174252a950e93
+Signed-off-by: Nitin Garg <nitin.garg@freescale.com>
+---
+ adb/framebuffer_service.c | 12 ++++++------
+ init/logo.c               | 29 ++++++++++++++++++++++++-----
+ 2 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/adb/framebuffer_service.c b/adb/framebuffer_service.c
+index 20c08d2..806c258 100644
+--- a/adb/framebuffer_service.c
++++ b/adb/framebuffer_service.c
+@@ -56,7 +56,7 @@ void framebuffer_service(int fd, void *cookie)
+ {
+     struct fbinfo fbinfo;
+     unsigned int i;
+-    char buf[640];
++    char buf[1024];
+     int fd_screencap;
+     int w, h, f;
+     int fds[2];
+@@ -164,12 +164,12 @@ void framebuffer_service(int fd, void *cookie)
+     if(writex(fd, &fbinfo, sizeof(fbinfo))) goto done;
+ 
+     /* write data */
+-    for(i = 0; i < fbinfo.size; i += sizeof(buf)) {
+-      if(readx(fd_screencap, buf, sizeof(buf))) goto done;
+-      if(writex(fd, buf, sizeof(buf))) goto done;
++    for(i = 0; i < fbinfo.size; i += w/2) {
++      if(readx(fd_screencap, buf, w/2)) goto done;
++      if(writex(fd, buf, w/2)) goto done;
+     }
+-    if(readx(fd_screencap, buf, fbinfo.size % sizeof(buf))) goto done;
+-    if(writex(fd, buf, fbinfo.size % sizeof(buf))) goto done;
++    if(readx(fd_screencap, buf, fbinfo.size % (w/2))) goto done;
++    if(writex(fd, buf, fbinfo.size % (w/2))) goto done;
+ 
+ done:
+     TEMP_FAILURE_RETRY(waitpid(pid, NULL, 0));
+diff --git a/init/logo.c b/init/logo.c
+index 614224c..aae70c8 100644
+--- a/init/logo.c
++++ b/init/logo.c
+@@ -49,7 +49,9 @@ struct FB {
+ 
+ #define fb_width(fb) ((fb)->vi.xres)
+ #define fb_height(fb) ((fb)->vi.yres)
+-#define fb_size(fb) ((fb)->vi.xres * (fb)->vi.yres * 2)
++#define fb_bpp(fb) ((fb)->vi.bits_per_pixel)
++#define fb_size(fb) ((fb)->vi.xres * (fb)->vi.yres * \
++	((fb)->vi.bits_per_pixel/8))
+ 
+ static int fb_open(struct FB *fb)
+ {
+@@ -84,9 +86,9 @@ static void fb_close(struct FB *fb)
+ static void fb_update(struct FB *fb)
+ {
+     fb->vi.yoffset = 1;
+-    ioctl(fb->fd, FBIOPUT_VSCREENINFO, &fb->vi);
++    ioctl(fb->fd, FBIOPAN_DISPLAY, &fb->vi);
+     fb->vi.yoffset = 0;
+-    ioctl(fb->fd, FBIOPUT_VSCREENINFO, &fb->vi);
++    ioctl(fb->fd, FBIOPAN_DISPLAY, &fb->vi);
+ }
+ 
+ static int vt_set_mode(int graphics)
+@@ -107,6 +109,7 @@ int load_565rle_image(char *fn)
+     struct FB fb;
+     struct stat s;
+     unsigned short *data, *bits, *ptr;
++    uint32_t rgb32, red, green, blue, alpha;
+     unsigned count, max;
+     int fd;
+ 
+@@ -138,8 +141,24 @@ int load_565rle_image(char *fn)
+         unsigned n = ptr[0];
+         if (n > max)
+             break;
+-        android_memset16(bits, ptr[1], n << 1);
+-        bits += n;
++        if (fb_bpp(&fb) == 16) {
++            android_memset16(bits, ptr[1], n << 1);
++            bits += n;
++        } else {
++            /* convert 16 bits to 32 bits */
++            red = ((ptr[1] >> 11) & 0x1F);
++            red = (red << 3) | (red >> 2);
++            green = ((ptr[1] >> 5) & 0x3F);
++            green = (green << 2) | (green >> 4);
++            blue = ((ptr[1]) & 0x1F);
++            blue = (blue << 3) | (blue >> 2);
++            alpha = 0xff;
++            rgb32 = (alpha << 24) | (red << 16)
++                    | (green << 8) | (blue << 0);
++            android_memset32((uint32_t *)bits, rgb32, n << 2);
++            bits += (n * 2);
++        }
++
+         max -= n;
+         ptr += 2;
+         count -= 4;
+-- 
+1.8.0
+

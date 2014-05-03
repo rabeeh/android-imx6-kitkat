@@ -1,0 +1,115 @@
+From ae3fc61ee73c2cbad8e0e2f3ca89190e25001563 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Thu, 20 Oct 2011 11:13:57 +0800
+Subject: [PATCH 194/486] ENGR00160408 make dual video can work on one display
+ in imx6q.
+
+fix some bugs to support dual video playback in one display for imx6q.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/hwcomposer/blit_ipu.cpp   | 22 ++++++++++++++++++++++
+ mx6/hwcomposer/hwcomposer.cpp |  9 ++++-----
+ 2 files changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/mx6/hwcomposer/blit_ipu.cpp b/mx6/hwcomposer/blit_ipu.cpp
+index 98c107f..bb54eda 100755
+--- a/mx6/hwcomposer/blit_ipu.cpp
++++ b/mx6/hwcomposer/blit_ipu.cpp
+@@ -100,6 +100,26 @@ static void fill_buffer(char *pbuf, int len)
+     k = (k+1)%3;
+ }
+ 
++static void dump_ipu_task(struct ipu_task *t)
++{
++    HWCOMPOSER_LOG_ERR("======ipu task=====");
++    HWCOMPOSER_LOG_ERR("input:");
++    HWCOMPOSER_LOG_ERR("\tbuffer: %d", t->input.paddr);
++    HWCOMPOSER_LOG_ERR("\twidth: %d", t->input.width);
++    HWCOMPOSER_LOG_ERR("\theight: %d", t->input.height);
++    HWCOMPOSER_LOG_ERR("\tcrop.w =%d", t->input.crop.w);
++    HWCOMPOSER_LOG_ERR("\tcrop.h =%d", t->input.crop.h);
++    HWCOMPOSER_LOG_ERR("\tcrop.pos.x =%d", t->input.crop.pos.x);
++    HWCOMPOSER_LOG_ERR("\tcrop.pos.y =%d", t->input.crop.pos.y);
++    HWCOMPOSER_LOG_ERR("output:");
++    HWCOMPOSER_LOG_ERR("\twidth: %d", t->output.width);
++    HWCOMPOSER_LOG_ERR("\theight: %d", t->output.height);
++    HWCOMPOSER_LOG_ERR("\tcrop.w =%d", t->output.crop.w);
++    HWCOMPOSER_LOG_ERR("\tcrop.h =%d", t->output.crop.h);
++    HWCOMPOSER_LOG_ERR("\tcrop.pos.x =%d", t->output.crop.pos.x);
++    HWCOMPOSER_LOG_ERR("\tcrop.pos.y =%d", t->output.crop.pos.y);
++}
++
+ int blit_ipu::blit(hwc_layer_t *layer, hwc_buffer *out_buf)
+ {
+ 	  int status = -EINVAL;
+@@ -166,6 +186,7 @@ int blit_ipu::blit(hwc_layer_t *layer, hwc_buffer *out_buf)
+     while(ret != IPU_CHECK_OK && ret > IPU_CHECK_ERR_MIN) {
+         ret = ioctl(mIpuFd, IPU_CHECK_TASK, &mTask);
+         HWCOMPOSER_LOG_RUNTIME("%s:%d, IPU_CHECK_TASK ret=%d", __FUNCTION__, __LINE__, ret);
++        //dump_ipu_task(&mTask);
+         switch(ret) {
+             case IPU_CHECK_OK:
+                 break;
+@@ -182,6 +203,7 @@ int blit_ipu::blit(hwc_layer_t *layer, hwc_buffer *out_buf)
+                 mTask.output.crop.h -= 8;;
+                 break;
+             default:
++                //dump_ipu_task(&mTask);
+                 HWCOMPOSER_LOG_ERR("%s:%d, IPU_CHECK_TASK ret=%d", __FUNCTION__, __LINE__, ret);
+                 return status;
+         }
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index 6a46ee0..fadaa3e 100755
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -158,7 +158,7 @@ static int hwc_modify_property(hwc_context_t *dev, private_handle_t *handle)
+ 
+ 	if(dev->display_mode & DISPLAY_MODE_OVERLAY_DISP0){
+ 			handle->usage |= GRALLOC_USAGE_HWC_OVERLAY_DISP0;
+-			dev->display_mode &= ~DISPLAY_MODE_OVERLAY_DISP0;
++			//dev->display_mode &= ~DISPLAY_MODE_OVERLAY_DISP0;
+ 	}
+ 	else if(dev->display_mode & DISPLAY_MODE_OVERLAY_DISP1)
+ 			handle->usage |= GRALLOC_USAGE_HWC_OVERLAY_DISP1;
+@@ -502,7 +502,6 @@ static int hwc_set(hwc_composer_device_t *dev,
+     if(getActiveOuputDevice(ctx) == 0) {return 0;}//eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur); return 0;}
+ 
+     int status = -EINVAL;
+-	HWCOMPOSER_LOG_RUNTIME("==============hwc_set=4==============\n");
+ 	hwc_buffer out_buffer[MAX_OUTPUT_DISPLAY];
+     char bufs_state[MAX_OUTPUT_DISPLAY];
+     memset(bufs_state, 0, sizeof(bufs_state));
+@@ -530,7 +529,6 @@ static int hwc_set(hwc_composer_device_t *dev,
+             int retv = 0;
+             int m_usage = 0;
+             int i_usage = handle->usage & GRALLOC_USAGE_OVERLAY_DISPLAY_MASK;
+-    	    HWCOMPOSER_LOG_RUNTIME("==============hwc_set=5==============\n");
+             if(!i_usage) continue;
+             do {
+     			output_device *outdev = NULL;
+@@ -543,10 +541,12 @@ static int hwc_set(hwc_composer_device_t *dev,
+                 }
+                 
+     			if(outdev != NULL) {
+-                    if(!bufs_state[index] && ctx->m_using[i]) {
++                    if(!bufs_state[index] && ctx->m_using[index]) {
+                         outdev->fetch(&out_buffer[index]);
+                         bufs_state[index] = 1;
+                     }
++                    if(!bufs_state[index])
++                        continue;
+     				status = bltdev->blit(layer, &(out_buffer[index]));
+     				if(status < 0){
+     					HWCOMPOSER_LOG_ERR("Error! bltdev->blit() failed!");
+@@ -557,7 +557,6 @@ static int hwc_set(hwc_composer_device_t *dev,
+ 
+ 		}//end if
+     }//end for
+-
+     for(int i = 0; i < MAX_OUTPUT_DISPLAY; i++) {
+ 				if(ctx->m_using[i] && bufs_state[i]) {
+ 						status = ctx->m_out[i]->post(&out_buffer[i]);
+-- 
+1.8.0
+

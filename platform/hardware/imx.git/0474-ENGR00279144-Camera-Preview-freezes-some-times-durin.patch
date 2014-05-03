@@ -1,0 +1,127 @@
+From 3739a850de293a3c77c82cf399f7ebba3993ce2a Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Tue, 24 Sep 2013 16:23:35 +0800
+Subject: [PATCH 474/486] ENGR00279144 Camera: Preview freezes some times
+ during 1080p recording
+
+It's caused by libGLESv2_VIVANTE.so, glEGLImageTargetTexture2DOES
+do free/alloc each time. Update this so can fix it.
+
+Also, when 1080p recording, although g2d_copy is fast, but vpu encode is slower.
+So slow down g2d_copy to free bus, then vpu encode run faster,
+It's a balance.
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ mx6/libcamera2/DeviceAdapter.cpp | 39 +++++++++++++++++++++++++++++++++++++--
+ mx6/libcamera2/DeviceAdapter.h   |  3 +++
+ mx6/libcamera2/StreamAdapter.cpp |  8 ++++++++
+ 3 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/mx6/libcamera2/DeviceAdapter.cpp b/mx6/libcamera2/DeviceAdapter.cpp
+index a26d85a..02c1d9e 100755
+--- a/mx6/libcamera2/DeviceAdapter.cpp
++++ b/mx6/libcamera2/DeviceAdapter.cpp
+@@ -20,7 +20,7 @@
+ #include "Ov5642Csi.h"
+ #include "Ov5640Csi.h"
+ #include "TVINDevice.h"
+-
++#include <stdlib.h>
+ sp<DeviceAdapter>DeviceAdapter::Create(const CameraInfo& info)
+ {
+     sp<DeviceAdapter> devAdapter;
+@@ -53,7 +53,7 @@ sp<DeviceAdapter>DeviceAdapter::Create(const CameraInfo& info)
+ }
+ 
+ DeviceAdapter::DeviceAdapter()
+-    : mCameraHandle(-1), mQueued(0)
++    : mCameraHandle(-1), mQueued(0), mCpuNum(0)
+ {}
+ 
+ DeviceAdapter::~DeviceAdapter()
+@@ -129,6 +129,38 @@ void DeviceAdapter::setPicturePixelFormat()
+                             mAvailableFormats, MAX_SENSOR_FORMAT);
+ }
+ 
++static int GetCpuNum()
++{
++    int fd;
++    int n;
++    int cpuNum = 0;
++    char data[1024];
++    char *subStr = NULL;
++    
++    fd = open("/proc/cpuinfo", O_RDONLY);    
++    if(fd < 0) {
++        return 0;
++    }
++
++    n = read(fd, data, 1023);
++    close(fd);
++
++    if(n < 0 || n > 1023) {
++        return 0;
++    }
++
++    data[n] = 0;
++
++    subStr = data;
++    while((subStr = strstr(subStr, "processor"))) {
++        subStr++;
++        cpuNum++;
++        if(cpuNum > 100) //avoid dead cycle
++            return 0;
++    }
++
++    return cpuNum;    
++}
+ status_t DeviceAdapter::initialize(const CameraInfo& info)
+ {
+     if (info.name == NULL) {
+@@ -189,6 +221,9 @@ status_t DeviceAdapter::initialize(const CameraInfo& info)
+     mVideoInfo->isStreamOn = false;
+     mImageCapture          = false;
+ 
++    mCpuNum = GetCpuNum();
++    ALOGE("cpu num %d", mCpuNum);
++        
+     return NO_ERROR;
+ }
+ 
+diff --git a/mx6/libcamera2/DeviceAdapter.h b/mx6/libcamera2/DeviceAdapter.h
+index 63a5a5c..29d8f78 100755
+--- a/mx6/libcamera2/DeviceAdapter.h
++++ b/mx6/libcamera2/DeviceAdapter.h
+@@ -161,6 +161,9 @@ protected:
+     PixelFormat mPicturePixelFormat;
+     PixelFormat mPreviewPixelFormat;
+     sp<MetadaManager> mMetadaManager;
++
++public:
++	int mCpuNum;
+ };
+ 
+ #endif // ifndef _DEVICE_ADAPTER_H_
+diff --git a/mx6/libcamera2/StreamAdapter.cpp b/mx6/libcamera2/StreamAdapter.cpp
+index 575a783..dd40c22 100755
+--- a/mx6/libcamera2/StreamAdapter.cpp
++++ b/mx6/libcamera2/StreamAdapter.cpp
+@@ -350,6 +350,14 @@ int StreamAdapter::processFrame(CameraFrame *frame)
+         d_buf.buf_vaddr = buffer.mVirtAddr;
+         g2d_copy(g2dHandle, &d_buf, &s_buf, size);
+         g2d_finish(g2dHandle);
++
++        //when 1080p recording, although g2d_copy is fast, but vpu encode is slower,
++        //so slow down g2d_copy to free bus, then vpu encode run faster,
++        //It's a balance.
++        if( (mDeviceAdapter.get() != NULL) && (mDeviceAdapter->mCpuNum == 2) &&
++            (mWidth == 1920) && (mHeight == 1080) ) {
++            usleep(33000);
++        }
+     }
+     else {
+         memcpy(buffer.mVirtAddr, (void *)frame->mVirtAddr, size);
+-- 
+1.8.0
+

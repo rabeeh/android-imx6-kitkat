@@ -1,0 +1,176 @@
+From c2c15e9192430f16bff70e5b06f296eec880d914 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Thu, 28 Nov 2013 10:07:47 +0800
+Subject: [PATCH 479/486] ENGR00215174 fix HDMI hotplug issue as second
+ display.
+
+When HDMI plug out, the framebuffer device should be closed.
+It needs to open framebuffer device and acquire display info
+again after plug in.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/hwcomposer/hwc_display.cpp         |  5 ++++
+ mx6/hwcomposer/hwc_uevent.cpp          | 16 +++++++++---
+ mx6/libgralloc_wrapper/framebuffer.cpp | 46 +++++++++++++---------------------
+ 3 files changed, 35 insertions(+), 32 deletions(-)
+
+diff --git a/mx6/hwcomposer/hwc_display.cpp b/mx6/hwcomposer/hwc_display.cpp
+index d34def4..28d3c71 100644
+--- a/mx6/hwcomposer/hwc_display.cpp
++++ b/mx6/hwcomposer/hwc_display.cpp
+@@ -158,6 +158,11 @@ int hwc_get_framebuffer_info(displayInfo *pInfo)
+ 
+     memset(fb_path, 0, sizeof(fb_path));
+     snprintf(fb_path, HWC_PATH_LENGTH, HWC_FB_PATH"%d", pInfo->fb_num);
++    if (pInfo->fd > 0) {
++        close(pInfo->fd);
++        pInfo->fd = 0;
++    }
++
+     pInfo->fd = open(fb_path, O_RDWR);
+     if(pInfo->fd < 0) {
+         ALOGE("open %s failed", fb_path);
+diff --git a/mx6/hwcomposer/hwc_uevent.cpp b/mx6/hwcomposer/hwc_uevent.cpp
+index 6d8268d..816c4d4 100644
+--- a/mx6/hwcomposer/hwc_uevent.cpp
++++ b/mx6/hwcomposer/hwc_uevent.cpp
+@@ -57,9 +57,7 @@ void UeventThread::handleHdmiUevent(const char *buff, int len, int dispid) {
+                 ALOGE("unrecognized fb num for hdmi");
+             } else {
+                 ALOGI("HDMI Plugin detected");
+-                if (mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].xres == 0) {
+-                    hwc_get_framebuffer_info(&mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL]);
+-                }
++                hwc_get_framebuffer_info(&mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL]);
+             }
+         } else if (!strncmp(s, "EVENT=plugout", strlen("EVENT=plugout"))) {
+             if (dispid == HWC_DISPLAY_PRIMARY) {
+@@ -76,7 +74,9 @@ void UeventThread::handleHdmiUevent(const char *buff, int len, int dispid) {
+             break;
+     }
+ 
+-    if (fbid >= 0 && mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] == NULL && mCtx->m_gralloc_module != NULL) {
++    if (fbid >= 0 && mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] == NULL &&
++            mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected &&
++            mCtx->m_gralloc_module != NULL) {
+         ALOGI("HDMI Gralloc Framebuffer opening. ");
+         mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] = reinterpret_cast<framebuffer_device_t*>(fbid);
+         char fbname[HWC_STRING_LENGTH];
+@@ -89,6 +89,14 @@ void UeventThread::handleHdmiUevent(const char *buff, int len, int dispid) {
+ 
+     mCtx->m_callback->hotplug(mCtx->m_callback, HWC_DISPLAY_EXTERNAL,
+                               mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected);
++
++    if (mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] != NULL &&
++            !mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected &&
++            mCtx->m_gralloc_module != NULL) {
++        ALOGI("HDMI Gralloc Framebuffer close. ");
++        framebuffer_close(mCtx->mFbDev[HWC_DISPLAY_EXTERNAL]);
++        mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] = NULL;
++    }
+ }
+ 
+ bool UeventThread::threadLoop() {
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 18971eb..58d1c75 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -360,7 +360,7 @@ static int mapFrameBufferWithFbid(struct private_module_t* module, int fbid)
+ 
+     int err;
+     size_t fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
+-    module->framebuffer = new private_handle_t(dup(fd), fbSize,
++    module->framebuffer = new private_handle_t(fd, fbSize,
+             private_handle_t::PRIV_FLAGS_USES_DRV);
+ 
+     module->numBuffers = info.yres_virtual / ALIGN_PIXEL_128(info.yres);
+@@ -374,6 +374,7 @@ static int mapFrameBufferWithFbid(struct private_module_t* module, int fbid)
+     module->framebuffer->base = intptr_t(vaddr);
+     module->framebuffer->phys = intptr_t(finfo.smem_start);
+     memset(vaddr, 0, fbSize);
++
+     return 0;
+ }
+ 
+@@ -392,7 +393,6 @@ static int mapFrameBuffer(struct private_module_t* module)
+ 
+ static int unMapFrameBuffer(fb_context_t* ctx, struct private_module_t* module)
+ {
+-    int err = 0;
+     pthread_mutex_lock(&module->lock);
+ 
+     size_t fbSize = module->framebuffer->size;
+@@ -402,41 +402,25 @@ static int unMapFrameBuffer(fb_context_t* ctx, struct private_module_t* module)
+     delete (module->framebuffer);
+     module->framebuffer = NULL;
+ 
+-    int blank = 1;
+-    if(ioctl(fd, FBIOBLANK, blank) < 0) {
+-        ALOGE("<%s, %d> ioctl FBIOBLANK failed", __FUNCTION__, __LINE__);
+-    }
+-
+-    if(ctx->mainDisp_fd > 0) {
+-        blank = FB_BLANK_UNBLANK;
+-        if(ioctl(ctx->mainDisp_fd, FBIOBLANK, blank) < 0) {
+-            ALOGE("<%s, %d> ioctl FBIOBLANK failed", __FUNCTION__, __LINE__);
+-        }
+-    }
+     close(fd);
+     pthread_mutex_unlock(&module->lock);
+ 
+-    return err;
++    return 0;
+ }
+ /*****************************************************************************/
+ 
+ static int fb_close(struct hw_device_t *dev)
+ {
+     fb_context_t* ctx = (fb_context_t*)dev;
+-    if(ctx) free(ctx);
+-    return 0;
+-#if 0
+-    fb_context_t* ctx = (fb_context_t*)dev;
+-    if (ctx) {
+-        if (ctx->priv_m != NULL) {
+-            //unMapFrameBuffer(ctx, ctx->priv_m);
+-            if(!ctx->isMainDisp)
+-                free(ctx->priv_m);
++    if(ctx) {
++        if (!ctx->isMainDisp) {
++            unMapFrameBuffer(ctx, ctx->priv_m);
+         }
++
+         free(ctx);
+     }
++
+     return 0;
+-#endif
+ }
+ 
+ static void fb_device_init(private_module_t* m, fb_context_t *dev)
+@@ -506,11 +490,17 @@ int fb_device_open(hw_module_t const* module, const char* name,
+             dev->isMainDisp = 1;
+         } else {
+             private_module_t* orig_m = (private_module_t*)module;
+-            private_module_t* priv_m = (private_module_t*)malloc(sizeof(*priv_m));
+-            memset(priv_m, 0, sizeof(*priv_m));
+-            memcpy(priv_m, orig_m, sizeof(*priv_m));
++            private_module_t* priv_m = NULL;
++            if (orig_m->external_module == NULL) {
++                priv_m = (private_module_t*)malloc(sizeof(*priv_m));
++                memset(priv_m, 0, sizeof(*priv_m));
++                memcpy(priv_m, orig_m, sizeof(*priv_m));
+ 
+-            orig_m->external_module = priv_m;
++                orig_m->external_module = priv_m;
++            }
++            else {
++                priv_m = orig_m->external_module;
++            }
+ 
+             dev->device.common.module = (hw_module_t*)(priv_m);
+             priv_m->framebuffer = NULL;
+-- 
+1.8.0
+

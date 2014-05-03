@@ -1,0 +1,1126 @@
+From db981c8121a1d350edfe937fc103efea89231ea9 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 11 Nov 2008 11:18:33 +0800
+Subject: [PATCH 029/249] ENGR00089947 vpu: support multi-instances in vpu
+ lib/driver
+
+vpu unit test application supported multi-instances in multi-threads with
+protection previously. However, it couldn't support multi-processes to decode
+and/or encode simultaneously and wasn't flexible.  Here, we move multi-instances
+support to vpu lib/driver, then vpu protection is transparent for application.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_io.c   |  50 +++++----
+ vpu/vpu_io.h   |   1 +
+ vpu/vpu_lib.c  | 315 ++++++++++++++++++++++++++-------------------------------
+ vpu/vpu_util.c |  88 ++++++++++++++--
+ vpu/vpu_util.h |  30 ++++++
+ 5 files changed, 274 insertions(+), 210 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index 6e83ba0..2441bef 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -38,13 +38,13 @@
+ #include "vpu_reg.h"
+ #include "vpu_io.h"
+ #include "vpu_lib.h"
++#include "vpu_util.h"
+ 
+ static int vpu_fd = -1;
+ static unsigned long vpu_reg_base;
+-static pthread_mutex_t powermutex = PTHREAD_MUTEX_INITIALIZER;
+-int power_refcount;
+ 
+ unsigned int system_rev;
++semaphore_t *vpu_semap;
+ 
+ /*
+  * Note: the order does not correspond to the bit order in BIT_AXI_SRAM_USE
+@@ -209,19 +209,24 @@ int IOSystemInit(void *callback)
+ 	struct iram_t iram;
+ 	int ret;
+ 
++	vpu_semap = vpu_semaphore_open("/dev/shm/vpu.shm");
++
++	if (vpu_semap == NULL) {
++		err_msg("Error: Unable to open vpu shared memory file\n");
++		return -1;
++	}
++
+ 	ret = get_system_rev();
+ 	if (ret == -1) {
+ 		err_msg("Error: Unable to obtain system rev information\n");
+ 		return -1;
+ 	}
+ 
+-	/* check if the device has been opened */
+-	if (vpu_fd > 0)
+-		return 0;
+-
++	LockVpu(vpu_semap);
+ 	vpu_fd = open("/dev/mxc_vpu", O_RDWR);
+ 	if (vpu_fd < 0) {
+ 		err_msg("Can't open /dev/mxc_vpu\n");
++		UnlockVpu(vpu_semap);
+ 		return -1;
+ 	}
+ 
+@@ -233,14 +238,17 @@ int IOSystemInit(void *callback)
+ 		err_msg("Can't map register\n");
+ 		close(vpu_fd);
+ 		vpu_fd = -1;
++		UnlockVpu(vpu_semap);
+ 		return -1;
+ 	}
+ 
+ 	bit_work_addr.size = WORK_BUF_SIZE + PARA_BUF_SIZE +
+ 	    					CODE_BUF_SIZE + PARA_BUF2_SIZE;
+ 
+-	if (IOGetPhyMem(&bit_work_addr) != 0)
++	if (ioctl(vpu_fd, VPU_IOC_GET_WORK_ADDR, &bit_work_addr) < 0) {
++		err_msg("Get bitwork address failed!\n");
+ 		goto err;
++	}
+ 
+ 	if (IOGetVirtMem(&bit_work_addr) <= 0)
+ 		goto err;
+@@ -253,10 +261,12 @@ int IOSystemInit(void *callback)
+ 			set_iram(iram, use_iram_table, 4);
+ 	}
+ 
++	UnlockVpu(vpu_semap);
+ 	return 0;
+ 
+       err:
+ 	err_msg("Error in IOSystemInit()");
++	UnlockVpu(vpu_semap);
+ 	IOSystemShutdown();
+ 	return -1;
+ }
+@@ -278,12 +288,8 @@ int IOSystemInit(void *callback)
+  */
+ int IOSystemShutdown(void)
+ {
++	LockVpu(vpu_semap);
+ 	IOFreeVirtMem(&bit_work_addr);
+-	IOFreePhyMem(&bit_work_addr);
+-
+-	IOClkGateSet(true);
+-	VpuWriteReg(BIT_INT_ENABLE, 0);	/* PIC_RUN irq disable */
+-	IOClkGateSet(false);
+ 
+ 	if (munmap((void *)vpu_reg_base, BIT_REG_MARGIN) != 0)
+ 		err_msg("munmap failed\n");
+@@ -293,6 +299,9 @@ int IOSystemShutdown(void)
+ 		vpu_fd = -1;
+ 	}
+ 
++	UnlockVpu(vpu_semap);
++	vpu_semaphore_close(vpu_semap);
++
+ 	return 0;
+ }
+ 
+@@ -447,21 +456,8 @@ int IOClkGateSet(int on)
+ {
+ 	int ret = 0;
+ 
+-	pthread_mutex_lock(&powermutex);
+-
+-	if (on) {
+-		if (++power_refcount == 1)
+-			ret = ioctl(vpu_fd, VPU_IOC_CLKGATE_SETTING, &on);
+-
+-		dprintf(3, "on power_refcount = %d\n", power_refcount);
+-
+-	} else {
+-		if (power_refcount > 0 && !(--power_refcount))
+-			ret = ioctl(vpu_fd, VPU_IOC_CLKGATE_SETTING, &on);
+-		dprintf(3, "off power_refcount = %d\n", power_refcount);
+-	}
+-
+-	pthread_mutex_unlock(&powermutex);
++	ret = ioctl(vpu_fd, VPU_IOC_CLKGATE_SETTING, &on);
++	dprintf(3, "vpu clock gate setting = %d\n", on);
+ 
+ 	return ret;
+ }
+diff --git a/vpu/vpu_io.h b/vpu/vpu_io.h
+index 0c71693..8f47a74 100644
+--- a/vpu/vpu_io.h
++++ b/vpu/vpu_io.h
+@@ -56,6 +56,7 @@ typedef struct iram_t {
+ #define	VPU_IOC_VL2CC_FLUSH	_IO(VPU_IOC_MAGIC, 5)
+ #define	VPU_IOC_IRAM_BASE	_IO(VPU_IOC_MAGIC, 6)
+ #define	VPU_IOC_CLKGATE_SETTING	_IO(VPU_IOC_MAGIC, 7)
++#define VPU_IOC_GET_WORK_ADDR   _IO(VPU_IOC_MAGIC, 8)
+ 
+ typedef void (*vpu_callback) (int status);
+ 
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 4577dc8..1b0ac95 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -50,8 +50,6 @@
+ 
+ #define ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
+ 
+-extern CodecInst codecInstPool[MAX_NUM_INSTANCE];
+-
+ static PhysicalAddress rdPtrRegAddr[] = {
+ 	BIT_RD_PTR_0,
+ 	BIT_RD_PTR_1,
+@@ -74,16 +72,13 @@ static PhysicalAddress disFlagRegAddr[] = {
+ };
+ 
+ /* If a frame is started, pendingInst is set to the proper instance. */
+-static CodecInst *pendingInst;
+-
+-static PhysicalAddress workBuffer;
+-static PhysicalAddress codeBuffer;
+-static PhysicalAddress paraBuffer;
++static CodecInst **ppendingInst;
+ 
+ unsigned long *virt_paraBuf;
+ unsigned long *virt_paraBuf2;
+ 
+ extern vpu_mem_desc bit_work_addr;
++extern semaphore_t *vpu_semap;
+ 
+ /*!
+  * @brief
+@@ -132,22 +127,10 @@ RetCode vpu_Init(PhysicalAddress workBuf)
+ 	Uint32 virt_codeBuf;
+ 	CodecInst *pCodecInst;
+ 	Uint16 *bit_code = NULL;
++	PhysicalAddress workBuffer, codeBuffer, paraBuffer;
+ 
+ 	ENTER_FUNC();
+ 
+-	bit_code = malloc(MAX_FW_BINARY_LEN * sizeof(Uint16));
+-
+-	if (bit_code == NULL) {
+-		err_msg("Failed to allocate bit_code\n");
+-		return RETCODE_FAILURE;
+-	}
+-
+-	memset(bit_code, 0, MAX_FW_BINARY_LEN * sizeof(Uint16));
+-	if (LoadBitCodeTable(bit_code, &size) != RETCODE_SUCCESS) {
+-		free(bit_code);
+-		return RETCODE_FAILURE;
+-	}
+-
+ 	codeBuffer = workBuf;
+ 	workBuffer = codeBuffer + CODE_BUF_SIZE;
+ 	paraBuffer = workBuffer + WORK_BUF_SIZE + PARA_BUF2_SIZE;
+@@ -158,78 +141,96 @@ RetCode vpu_Init(PhysicalAddress workBuf)
+ 	virt_paraBuf2 = (unsigned long *)(virt_codeBuf + CODE_BUF_SIZE +
+ 					  WORK_BUF_SIZE);
+ 
+-	/* Copy full Microcode to Code Buffer allocated on SDRAM */
+-	if (cpu_is_mx51()) {
+-		for (i = 0; i < size; i += 4) {
+-			data = (bit_code[i + 0] << 16) | bit_code[i + 1];
+-			((unsigned int *)virt_codeBuf)[i / 2 + 1] = data;
+-			data = (bit_code[i + 2] << 16) | bit_code[i + 3];
+-			((unsigned int *)virt_codeBuf)[i / 2] = data;
++	ppendingInst = (CodecInst **) (&vpu_semap->pendingInst);
++
++	if (!isVpuInitialized()) {
++		bit_code = malloc(MAX_FW_BINARY_LEN * sizeof(Uint16));
++		if (bit_code == NULL) {
++			err_msg("Failed to allocate bit_code\n");
++			return RETCODE_FAILURE;
++		}
++		memset(bit_code, 0, MAX_FW_BINARY_LEN * sizeof(Uint16));
++		if (LoadBitCodeTable(bit_code, &size) != RETCODE_SUCCESS) {
++			free(bit_code);
++			return RETCODE_FAILURE;
+ 		}
+-	} else {
+-		for (i = 0; i < size; i += 2) {
+-			data = (unsigned int)((bit_code[i] << 16) |
+-					      bit_code[i + 1]);
+-			if (cpu_is_mx37())
+-				data = swab32(data);
+ 
+-			((unsigned int *)virt_codeBuf)[i / 2] = data;
++		/* Copy full Microcode to Code Buffer allocated on SDRAM */
++		if (cpu_is_mx51()) {
++			for (i = 0; i < size; i += 4) {
++				data =
++				    (bit_code[i + 0] << 16) | bit_code[i + 1];
++				((unsigned int *)virt_codeBuf)[i / 2 + 1] =
++				    data;
++				data =
++				    (bit_code[i + 2] << 16) | bit_code[i + 3];
++				((unsigned int *)virt_codeBuf)[i / 2] = data;
++			}
++		} else {
++			for (i = 0; i < size; i += 2) {
++				data = (unsigned int)((bit_code[i] << 16) |
++						      bit_code[i + 1]);
++				if (cpu_is_mx37())
++					data = swab32(data);
++				((unsigned int *)virt_codeBuf)[i / 2] = data;
++			}
+ 		}
+-	}
+ 
+-	IOClkGateSet(true);
+-	VpuWriteReg(BIT_WORK_BUF_ADDR, workBuffer);
+-	VpuWriteReg(BIT_PARA_BUF_ADDR, paraBuffer);
+-	VpuWriteReg(BIT_CODE_BUF_ADDR, codeBuffer);
++		IOClkGateSet(true);
++		VpuWriteReg(BIT_WORK_BUF_ADDR, workBuffer);
++		VpuWriteReg(BIT_PARA_BUF_ADDR, paraBuffer);
++		VpuWriteReg(BIT_CODE_BUF_ADDR, codeBuffer);
+ 
+-	if (!cpu_is_mx51())
+-		VpuWriteReg(BIT_RESET_CTRL, 0);
++		if (!cpu_is_mx51())
++			VpuWriteReg(BIT_RESET_CTRL, 0);
+ 
+-	pCodecInst = &codecInstPool[0];
+-	for (i = 0; i < MAX_NUM_INSTANCE; ++i, ++pCodecInst) {
+-		pCodecInst->instIndex = i;
+-		pCodecInst->inUse = 0;
+-	}
+-	VpuWriteReg(BIT_BIT_STREAM_PARAM, 0);
++		for (i = 0; i < MAX_NUM_INSTANCE; ++i) {
++			pCodecInst =
++			    (CodecInst *) (&vpu_semap->codecInstPool[i]);
++			pCodecInst->instIndex = i;
++			pCodecInst->inUse = 0;
++		}
++		VpuWriteReg(BIT_BIT_STREAM_PARAM, 0);
+ 
+-	if (!cpu_is_mx27()) {
+-		if (VpuReadReg(BIT_CUR_PC) != 0) {
+-			/* IRQ is disabled during shutdown */
+-			VpuWriteReg(BIT_INT_ENABLE, 8);
+-			IOClkGateSet(false);
+-			return RETCODE_SUCCESS;
++		if (!cpu_is_mx27()) {
++			if (VpuReadReg(BIT_CUR_PC) != 0) {
++				/* IRQ is disabled during shutdown */
++				VpuWriteReg(BIT_INT_ENABLE, 8);
++				IOClkGateSet(false);
++				return RETCODE_SUCCESS;
++			}
+ 		}
+-	}
+ 
+-	VpuWriteReg(BIT_CODE_RUN, 0);
++		VpuWriteReg(BIT_CODE_RUN, 0);
+ 
+-	/* Download BIT Microcode to Program Memory */
+-	for (i = 0; i < 2048; ++i) {
+-		data = bit_code[i];
+-		VpuWriteReg(BIT_CODE_DOWN, (i << 16) | data);
+-	}
++		/* Download BIT Microcode to Program Memory */
++		for (i = 0; i < 2048; ++i) {
++			data = bit_code[i];
++			VpuWriteReg(BIT_CODE_DOWN, (i << 16) | data);
++		}
+ 
+-	data =
+-	    STREAM_ENDIAN | STREAM_FULL_EMPTY_CHECK_DISABLE <<
+-	    BIT_BUF_CHECK_DIS;
+-	data |=
+-	    BUF_PIC_FLUSH << BIT_BUF_PIC_FLUSH | BUF_PIC_RESET <<
+-	    BIT_BUF_PIC_RESET;
+-	VpuWriteReg(BIT_BIT_STREAM_CTRL, data);
+-	VpuWriteReg(BIT_FRAME_MEM_CTRL, IMAGE_ENDIAN);
+-	VpuWriteReg(BIT_INT_ENABLE, 8);	/* PIC_RUN irq enable */
++		data =
++		    STREAM_ENDIAN | STREAM_FULL_EMPTY_CHECK_DISABLE <<
++		    BIT_BUF_CHECK_DIS;
++		data |=
++		    BUF_PIC_FLUSH << BIT_BUF_PIC_FLUSH | BUF_PIC_RESET <<
++		    BIT_BUF_PIC_RESET;
++		VpuWriteReg(BIT_BIT_STREAM_CTRL, data);
++		VpuWriteReg(BIT_FRAME_MEM_CTRL, IMAGE_ENDIAN);
++		VpuWriteReg(BIT_INT_ENABLE, 8);	/* PIC_RUN irq enable */
+ 
+-	if (cpu_is_mx51())
+-		VpuWriteReg(BIT_AXI_SRAM_USE, 0);	/* not use SRAM */
++		if (cpu_is_mx51())
++			VpuWriteReg(BIT_AXI_SRAM_USE, 0);	/* not use SRAM */
+ 
+-	if (cpu_is_mx27()) {
+-		ResetVpu();
+-	}
++		if (cpu_is_mx27()) {
++			ResetVpu();
++		}
+ 
+-	VpuWriteReg(BIT_CODE_RUN, 1);
+-	IOClkGateSet(false);
++		VpuWriteReg(BIT_CODE_RUN, 1);
++		IOClkGateSet(false);
+ 
+-	free(bit_code);
++		free(bit_code);
++	}
+ 
+ 	EXIT_FUNC();
+ 	return RETCODE_SUCCESS;
+@@ -251,11 +252,7 @@ RetCode vpu_GetVersionInfo(vpu_versioninfo * verinfo)
+ 		return RETCODE_NOT_INITIALIZED;
+ 	}
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 	VpuWriteReg(RET_VER_NUM, 0);
+ 
+ 	BitIssueCommand(0, 0, FIRMWARE_GET);
+@@ -263,7 +260,7 @@ RetCode vpu_GetVersionInfo(vpu_versioninfo * verinfo)
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	ver = VpuReadReg(RET_VER_NUM);
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	if (ver == 0)
+ 		return RETCODE_FAILURE;
+@@ -345,11 +342,14 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 		return ret;
+ 	}
+ 
++	LockVpu(vpu_semap);
+ 	ret = GetCodecInstance(&pCodecInst);
+ 	if (ret == RETCODE_FAILURE) {
+ 		*pHandle = 0;
++		UnlockVpu(vpu_semap);
+ 		return RETCODE_FAILURE;
+ 	}
++	UnlockVpu(vpu_semap);
+ 
+ 	*pHandle = pCodecInst;
+ 	instIdx = pCodecInst->instIndex;
+@@ -383,7 +383,7 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	pEncInfo->dynamicAllocEnable = pop->dynamicAllocEnable;
+ 	pEncInfo->ringBufferEnable = pop->ringBufferEnable;
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 	VpuWriteReg(pEncInfo->streamRdPtrRegAddr, pEncInfo->streamRdPtr);
+ 	VpuWriteReg(pEncInfo->streamWrPtrRegAddr, pEncInfo->streamBufStartAddr);
+ 
+@@ -401,7 +401,7 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	}
+ 
+ 	VpuWriteReg(BIT_BIT_STREAM_CTRL, val);
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -428,21 +428,19 @@ RetCode vpu_EncClose(EncHandle handle)
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
++
++	LockVpu(vpu_semap);
+ 	if (pEncInfo->initialInfoObtained) {
+-		IOClkGateSet(true);
+ 		BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+ 				SEQ_END);
+ 		while (VpuReadReg(BIT_BUSY_FLAG)) ;
+-		IOClkGateSet(false);
+ 	}
+ 
+ 	FreeCodecInstance(pCodecInst);
++	UnlockVpu(vpu_semap);
++
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -478,10 +476,6 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	if (info == 0) {
+ 		return RETCODE_INVALID_PARAM;
+ 	}
+@@ -497,7 +491,7 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	picWidth = encOP.picWidth;
+ 	picHeight = encOP.picHeight;
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 
+ 	data = (picWidth << BIT_PIC_WIDTH_OFFSET) | picHeight;
+ 	VpuWriteReg(CMD_ENC_SEQ_SRC_SIZE, data);
+@@ -617,10 +611,10 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	if (VpuReadReg(RET_ENC_SEQ_SUCCESS) == 0) {
+-		IOClkGateSet(false);
++		UnlockVpu(vpu_semap);
+ 		return RETCODE_FAILURE;
+ 	}
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	if (pCodecInst->codecMode == MJPG_ENC)
+ 		info->minFrameBufferCount = 0;
+@@ -664,10 +658,6 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
+@@ -695,6 +685,7 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+ 	pEncInfo->numFrameBuffers = num;
+ 	pEncInfo->stride = stride;
+ 
++	LockVpu(vpu_semap);
+ 	if (cpu_is_mx51()) {
+ 		if (pCodecInst->codecMode != MJPG_ENC) {
+ 			/* Need to swap word between Dword(64bit) */
+@@ -721,8 +712,6 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+ 		}
+ 	}
+ 
+-	IOClkGateSet(true);
+-
+ 	/* Tell the codec how much frame buffers were allocated. */
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_NUM, num);
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_STRIDE, stride);
+@@ -731,7 +720,7 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+ 			SET_FRAME_BUF);
+ 
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -874,10 +863,6 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
+@@ -895,7 +880,7 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	rotMirEnable = 0;
+ 	rotMirMode = 0;
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 
+ 	if (pEncInfo->rotationEnable) {
+ 		rotMirEnable = 0x10;	/* Enable rotator */
+@@ -963,7 +948,7 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+-	pendingInst = pCodecInst;
++	*ppendingInst = pCodecInst;
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -1001,11 +986,11 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
+-	if (pendingInst == 0) {
++	if (*ppendingInst == 0) {
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+ 	}
+ 
+-	if (pCodecInst != pendingInst) {
++	if (pCodecInst != *ppendingInst) {
+ 		return RETCODE_INVALID_HANDLE;
+ 	}
+ 
+@@ -1059,9 +1044,8 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 		info->mbQpInfo = virt_paraBuf - PARA_BUF2_SIZE;
+ 	}
+ 
+-	IOClkGateSet(false);
+-
+-	pendingInst = 0;
++	*ppendingInst = 0;
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -1091,13 +1075,11 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 		return ret;
+ 	}
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
++	LockVpu(vpu_semap);
++
+ 	switch (cmd) {
+ 	case ENABLE_ROTATION:
+ 		{
+@@ -1248,7 +1230,6 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 
+ 			scRamParam = (SearchRamParam *) param;
+ 
+-			IOClkGateSet(true);
+ 			if (cpu_is_mx51()) {
+ 				VpuWriteReg(CMD_ENC_SEARCH_BASE,
+ 					    scRamParam->searchRamAddr);
+@@ -1257,7 +1238,6 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 			} else
+ 				VpuWriteReg(BIT_SEARCH_RAM_BASE_ADDR,
+ 					    scRamParam->searchRamAddr);
+-			IOClkGateSet(false);
+ 
+ 			break;
+ 		}
+@@ -1415,6 +1395,7 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 		return RETCODE_INVALID_COMMAND;
+ 	}
+ 
++	UnlockVpu(vpu_semap);
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -1447,11 +1428,14 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 		return ret;
+ 	}
+ 
++	LockVpu(vpu_semap);
+ 	ret = GetCodecInstance(&pCodecInst);
+ 	if (ret == RETCODE_FAILURE) {
+ 		*pHandle = 0;
++		UnlockVpu(vpu_semap);
+ 		return RETCODE_FAILURE;
+ 	}
++	UnlockVpu(vpu_semap);
+ 
+ 	*pHandle = pCodecInst;
+ 	instIdx = pCodecInst->instIndex;
+@@ -1508,11 +1492,14 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	pDecInfo->initialInfoObtained = 0;
+ 	pDecInfo->vc1BframeDisplayValid = 0;
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 	VpuWriteReg(pDecInfo->streamRdPtrRegAddr, pDecInfo->streamBufStartAddr);
+ 	VpuWriteReg(pDecInfo->streamWrPtrRegAddr, pDecInfo->streamWrPtr);
+ 	VpuWriteReg(pDecInfo->frameDisplayFlagRegAddr, 0);
+-	IOClkGateSet(false);
++
++	VpuWriteReg(BIT_BIT_STREAM_PARAM,
++		    VpuReadReg(BIT_BIT_STREAM_PARAM) | 1 << (instIdx + 2));
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -1539,14 +1526,10 @@ RetCode vpu_DecClose(DecHandle handle)
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 	if (pDecInfo->initialInfoObtained) {
+ 		if (cpu_is_mx51()) {
+ 			if (pDecInfo->openParam.bitstreamFormat == STD_DIV3)
+@@ -1558,8 +1541,9 @@ RetCode vpu_DecClose(DecHandle handle)
+ 				SEQ_END);
+ 		while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	}
+-	IOClkGateSet(false);
+ 	FreeCodecInstance(pCodecInst);
++	UnlockVpu(vpu_semap);
++
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -1578,14 +1562,14 @@ RetCode vpu_DecSetEscSeqInit(DecHandle handle, int escape)
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 	if (escape == 0)
+ 		VpuWriteReg(CMD_DEC_SEQ_INIT_ESCAPE,
+ 			    VpuReadReg(CMD_DEC_SEQ_INIT_ESCAPE) & ~0x01);
+ 	else
+ 		VpuWriteReg(CMD_DEC_SEQ_INIT_ESCAPE,
+ 			    VpuReadReg(CMD_DEC_SEQ_INIT_ESCAPE) | 0x01);
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -1622,10 +1606,6 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		return RETCODE_INVALID_PARAM;
+ 	}
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+@@ -1633,12 +1613,12 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		return RETCODE_CALLED_BEFORE;
+ 	}
+ 
++	LockVpu(vpu_semap);
+ 	if (DecBitstreamBufEmpty(pDecInfo)) {
++		UnlockVpu(vpu_semap);
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+ 	}
+ 
+-	IOClkGateSet(true);
+-
+ 	VpuWriteReg(CMD_DEC_SEQ_BB_START, pDecInfo->streamBufStartAddr);
+ 	VpuWriteReg(CMD_DEC_SEQ_BB_SIZE, pDecInfo->streamBufSize / 1024);
+ 
+@@ -1693,7 +1673,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	if (VpuReadReg(RET_DEC_SEQ_SUCCESS) == 0) {
+-		IOClkGateSet(false);
++		UnlockVpu(vpu_semap);
+ 		return RETCODE_FAILURE;
+ 	}
+ 
+@@ -1764,12 +1744,12 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		    (VpuReadReg(RET_DEC_SEQ_JPG_PARA) & 0x07);
+ 		if (pDecInfo->openParam.mjpg_thumbNailDecEnable == 1)
+ 			if (info->mjpg_thumbNailEnable == 0) {
+-				IOClkGateSet(false);
++				UnlockVpu(vpu_semap);
+ 				return RETCODE_FAILURE;
+ 			}
+ 	}
+ 
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	pDecInfo->initialInfo = *info;
+ 	pDecInfo->initialInfoObtained = 1;
+@@ -1810,10 +1790,6 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+@@ -1841,6 +1817,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 	pDecInfo->numFrameBuffers = num;
+ 	pDecInfo->stride = stride;
+ 
++	LockVpu(vpu_semap);
+ 	if (!cpu_is_mx51()) {
+ 		/* Let the codec know the addresses of the frame buffers. */
+ 		for (i = 0; i < num; ++i) {
+@@ -1891,7 +1868,6 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 		}
+ 	}
+ 
+-	IOClkGateSet(true);
+ 	/* Tell the decoder how much frame buffers were allocated. */
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_NUM, num);
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_STRIDE, stride);
+@@ -1914,7 +1890,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 			SET_FRAME_BUF);
+ 
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -2070,10 +2046,6 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+@@ -2082,8 +2054,6 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+ 	}
+ 
+-	IOClkGateSet(true);
+-
+ 	rotMir = 0;
+ 	if (pDecInfo->rotationEnable) {
+ 		rotMir |= 0x10;	/* Enable rotator */
+@@ -2128,6 +2098,8 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 		}
+ 	}
+ 
++	LockVpu(vpu_semap);
++
+ 	if ((cpu_is_mx37() || cpu_is_mx51()) && pDecInfo->deringEnable) {
+ 		rotMir |= 0x20;	/* Enable Dering Filter */
+ 	}
+@@ -2158,7 +2130,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 					    pDecInfo->deBlockingFilterOutput.
+ 					    bufCr);
+ 			} else {
+-				IOClkGateSet(false);
++				UnlockVpu(vpu_semap);
+ 				return RETCODE_DEBLOCKING_OUTPUT_NOT_SET;
+ 			}
+ 		}
+@@ -2220,7 +2192,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+-	pendingInst = pCodecInst;
++	*ppendingInst = pCodecInst;
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -2242,9 +2214,14 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	DecInfo *pDecInfo;
+ 	RetCode ret;
+ 	Uint32 val = 0;
++	PhysicalAddress paraBuffer;
+ 
+ 	ENTER_FUNC();
+ 
++	paraBuffer =
++	    bit_work_addr.phy_addr + CODE_BUF_SIZE + WORK_BUF_SIZE +
++	    PARA_BUF2_SIZE;
++
+ 	ret = CheckDecInstanceValidity(handle);
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+@@ -2256,11 +2233,11 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+-	if (pendingInst == 0) {
++	if (*ppendingInst == 0) {
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+ 	}
+ 
+-	if (pCodecInst != pendingInst) {
++	if (pCodecInst != *ppendingInst) {
+ 		return RETCODE_INVALID_HANDLE;
+ 	}
+ 
+@@ -2351,9 +2328,9 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		}
+ 	}
+ 
+-	IOClkGateSet(false);
++	*ppendingInst = 0;
++	UnlockVpu(vpu_semap);
+ 
+-	pendingInst = 0;
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -2369,10 +2346,6 @@ RetCode vpu_DecBitBufferFlush(DecHandle handle)
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+@@ -2381,7 +2354,7 @@ RetCode vpu_DecBitBufferFlush(DecHandle handle)
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+ 	}
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 	if (cpu_is_mx51()) {
+ 		if (pDecInfo->openParam.bitstreamFormat == STD_DIV3)
+ 			VpuWriteReg(BIT_RUN_AUX_STD, 1);
+@@ -2396,7 +2369,7 @@ RetCode vpu_DecBitBufferFlush(DecHandle handle)
+ 
+ 	pDecInfo->streamWrPtr = pDecInfo->streamBufStartAddr;
+ 	VpuWriteReg(pDecInfo->streamWrPtrRegAddr, pDecInfo->streamBufStartAddr);
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -2423,10 +2396,10 @@ RetCode vpu_DecClrDispFlag(DecHandle handle, int index)
+ 	if ((index < 0) || (index > (pDecInfo->numFrameBuffers - 1)))
+ 		return RETCODE_INVALID_PARAM;
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 	val = (~(1 << index) & VpuReadReg(pDecInfo->frameDisplayFlagRegAddr));
+ 	VpuWriteReg(pDecInfo->frameDisplayFlagRegAddr, val);
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -2455,10 +2428,6 @@ RetCode vpu_DecGiveCommand(DecHandle handle, CodecCommand cmd, void *param)
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (pendingInst) {
+-		return RETCODE_FRAME_NOT_COMPLETE;
+-	}
+-
+ 	if (cpu_is_mx27() && (cmd == DEC_SET_DEBLOCK_OUTPUT)) {
+ 		return RETCODE_NOT_SUPPORTED;
+ 	}
+@@ -2717,7 +2686,7 @@ void SaveQpReport(PhysicalAddress qpReportAddr, int picWidth, int picHeight,
+ 		return;
+ 	}
+ 
+-	IOClkGateSet(true);
++	LockVpu(vpu_semap);
+ 
+ 	MBx = picWidth / 16;
+ 	MBxof1 = MBx % 4;
+@@ -2750,7 +2719,7 @@ void SaveQpReport(PhysicalAddress qpReportAddr, int picWidth, int picHeight,
+ 				MBx * i + j + MBxof4, lastQp[j]);
+ 		}
+ 	}
+-	IOClkGateSet(false);
++	UnlockVpu(vpu_semap);
+ 
+ 	fclose(fp);
+ }
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 88bf3e7..c01188d 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -17,11 +17,18 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <assert.h>
++#include <pthread.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <errno.h>
+ 
+ #include "vpu_util.h"
+ #include "vpu_io.h"
+ #include "vpu_debug.h"
+ 
++#define TIMEOUT  6		/* condition timeout is 6s */
++
+ /*
+  * VPU binary file header format:
+  * 12-byte: platform version, eg, MX27, MX37, and so on.
+@@ -32,13 +39,8 @@ typedef struct {
+ 	Uint32 size;
+ } headerInfo;
+ 
+-CodecInst codecInstPool[MAX_NUM_INSTANCE];
+-
+-extern PhysicalAddress workBuffer;
+-extern PhysicalAddress codeBuffer;
+-extern PhysicalAddress paraBuffer;
+ extern unsigned long *virt_paraBuf;
+-extern unsigned long *virt_paraBuf2;
++extern semaphore_t *vpu_semap;
+ 
+ RetCode LoadBitCodeTable(Uint16 * pBitCode, int *size)
+ {
+@@ -112,8 +114,8 @@ RetCode GetCodecInstance(CodecInst ** ppInst)
+ 	int i;
+ 	CodecInst *pCodecInst;
+ 
+-	pCodecInst = &codecInstPool[0];
+-	for (i = 0; i < MAX_NUM_INSTANCE; ++i, ++pCodecInst) {
++	for (i = 0; i < MAX_NUM_INSTANCE; ++i) {
++		pCodecInst = (CodecInst *) (&vpu_semap->codecInstPool[i]);
+ 		if (!pCodecInst->inUse)
+ 			break;
+ 	}
+@@ -136,8 +138,8 @@ RetCode CheckInstanceValidity(CodecInst * pci)
+ 	CodecInst *pCodecInst;
+ 	int i;
+ 
+-	pCodecInst = &codecInstPool[0];
+-	for (i = 0; i < MAX_NUM_INSTANCE; ++i, ++pCodecInst) {
++	for (i = 0; i < MAX_NUM_INSTANCE; ++i) {
++		pCodecInst = (CodecInst *) (&vpu_semap->codecInstPool[i]);
+ 		if (pCodecInst == pci)
+ 			return RETCODE_SUCCESS;
+ 	}
+@@ -747,3 +749,69 @@ RetCode SetHecMode(EncHandle handle, int mode)
+ 
+ 	return RETCODE_SUCCESS;
+ }
++
++semaphore_t *vpu_semaphore_open(char *semaphore_name)
++{
++	int fd;
++	semaphore_t *semap;
++	pthread_mutexattr_t psharedm;
++	pthread_condattr_t psharedc;
++
++	fd = open(semaphore_name, O_RDWR, 0666);
++	if (fd < 0) {
++		fd = open(semaphore_name, O_RDWR | O_CREAT | O_EXCL, 0666);
++		if (fd < 0)
++			return NULL;
++		ftruncate(fd, sizeof(semaphore_t));
++		pthread_mutexattr_init(&psharedm);
++		pthread_mutexattr_setpshared(&psharedm, PTHREAD_PROCESS_SHARED);
++		pthread_condattr_init(&psharedc);
++		pthread_condattr_setpshared(&psharedc, PTHREAD_PROCESS_SHARED);
++		semap = (semaphore_t *) mmap(NULL, sizeof(semaphore_t),
++					     PROT_READ | PROT_WRITE, MAP_SHARED,
++					     fd, 0);
++		pthread_mutex_init(&semap->lock, &psharedm);
++		pthread_cond_init(&semap->nonzero, &psharedc);
++		semap->count = 1;
++	} else {
++		semap = (semaphore_t *) mmap(NULL, sizeof(semaphore_t),
++					     PROT_READ | PROT_WRITE, MAP_SHARED,
++					     fd, 0);
++	}
++	close(fd);
++	return semap;
++}
++
++void semaphore_post(semaphore_t * semap)
++{
++	pthread_mutex_lock(&semap->lock);
++	if (semap->count == 0)
++		pthread_cond_signal(&semap->nonzero);
++	semap->count++;
++	pthread_mutex_unlock(&semap->lock);
++}
++
++void semaphore_wait(semaphore_t * semap)
++{
++	struct timespec ts;
++
++	ts.tv_sec = time(NULL) + TIMEOUT;
++	ts.tv_nsec = 0;
++	pthread_mutex_lock(&semap->lock);
++	while (semap->count == 0) {
++		if (pthread_cond_timedwait(&semap->nonzero, &semap->lock, &ts)
++		    == ETIMEDOUT) {
++			pthread_mutex_unlock(&semap->lock);
++			printf
++			    ("VPU: Another thread/task is possibly exited abnormally.\n");
++			return;
++		}
++	}
++	semap->count--;
++	pthread_mutex_unlock(&semap->lock);
++}
++
++void vpu_semaphore_close(semaphore_t * semap)
++{
++	munmap((void *)semap, sizeof(semaphore_t));
++}
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index abe16b1..7ec3524 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -16,8 +16,11 @@
+ #ifndef _VPU_UTIL_H_
+ #define _VPU_UTIL_H_
+ 
++#include <sys/types.h>
++
+ #include "vpu_reg.h"
+ #include "vpu_lib.h"
++#include "vpu_io.h"
+ 
+ #define MAX_FW_BINARY_LEN		100000
+ #define MAX_NUM_INSTANCE		4
+@@ -78,6 +81,15 @@ enum {
+ 	FIRMWARE_GET = 0xf
+ };
+ 
++typedef struct {
++	pthread_mutex_t lock;
++	pthread_cond_t nonzero;
++	unsigned count;
++	/* VPU data for sharing */
++	CodecInst codecInstPool[MAX_NUM_INSTANCE];
++	CodecInst *pendingInst;
++} semaphore_t;
++
+ void BitIssueCommand(int instIdx, int cdcMode, int cmd);
+ 
+ RetCode LoadBitCodeTable(Uint16 * pBitCode, int *size);
+@@ -104,4 +116,22 @@ RetCode SetFramerate(EncHandle handle, Uint32 *framerate);
+ RetCode SetIntraRefreshNum(EncHandle handle, Uint32 *pIntraRefreshNum);
+ RetCode SetSliceMode(EncHandle handle, EncSliceMode *pSliceMode);
+ RetCode SetHecMode(EncHandle handle, int mode);
++
++semaphore_t *vpu_semaphore_open(char *semaphore_name);
++void semaphore_post(semaphore_t *semap);
++void semaphore_wait(semaphore_t *semap);
++void vpu_semaphore_close(semaphore_t *semap);
++
++static inline void LockVpu(semaphore_t *semap)
++{
++	semaphore_wait(semap);
++	IOClkGateSet(1);
++}
++
++static inline void UnlockVpu(semaphore_t *semap)
++{
++	semaphore_post(semap);
++	IOClkGateSet(0);
++}
++
+ #endif
+-- 
+1.8.0
+

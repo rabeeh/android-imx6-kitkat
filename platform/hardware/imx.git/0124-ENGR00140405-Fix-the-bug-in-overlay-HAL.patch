@@ -1,0 +1,130 @@
+From a5fa3625c97d526c69cb569f1e35ab677a3e1eca Mon Sep 17 00:00:00 2001
+From: Yaoming Qin <b10945@freescale.com>
+Date: Tue, 8 Mar 2011 18:29:17 +0800
+Subject: [PATCH 124/486] ENGR00140405 Fix the bug in overlay HAL
+
+When enable the animation, the overlay display position may
+have some changed, so it need to flush the output frame buffer
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ liboverlay/overlay.cpp      | 11 +++++++----
+ liboverlay/overlay_thread.h | 25 ++++++++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+index 21c28c9..be06a96 100755
+--- a/liboverlay/overlay.cpp
++++ b/liboverlay/overlay.cpp
+@@ -50,6 +50,9 @@ static int bits_per_pixel(int32_t format);
+ 
+ using namespace android;
+ 
++int fill_frame_back(char * frame,int frame_size, int xres, int yres, unsigned int pixelformat);
++
++
+ /*****************************************************************************/
+ class OverlayThread;
+ class overlay_object;
+@@ -271,14 +274,13 @@ public:
+ 
+ #include "overlay_thread.h"
+ 
++
+ /*
+ *   Fill the rgb alpha buffer with alpha_val
+ */
+ static int fill_alpha_buffer(void *alpha_buf, int buf_w,
+                              WIN_REGION *fill_region,char alpha_val);
+ 
+-static int fill_frame_back(char * frame, int xres,
+-                           int yres, unsigned int pixelformat);
+ 
+ static int overlay_init_fbdev(struct overlay_control_context_t *dev);
+ 
+@@ -556,7 +558,7 @@ static int fill_alpha_buffer(void *alpha_buf, int buf_w,
+ }
+ 
+ //pixelformat format for v4l2 setting
+-static int fill_frame_back(char * frame,int frame_size, int xres,
++int fill_frame_back(char * frame,int frame_size, int xres,
+                            int yres, unsigned int pixelformat)
+ {
+     int ret = 0;
+@@ -1515,7 +1517,8 @@ int overlay_data_queueBuffer(struct overlay_data_device_t *dev,
+ 
+ 
+     //Insert buffer to display buffer queue
+-    if(data_shared->queued_count >= ctx->queue_threshold) {
++    if(data_shared->queued_count >= ctx->queue_threshold ||
++        ((data_shared->queued_count == (ctx->queue_threshold-1))&&(data_shared->buf_mixing == true))) {
+         //Wait a buffer be mixered
+         data_shared->wait_buf_flag = 1;
+         //post sempore to notify mixer thread, give mixer thread a chance to free a buffer
+diff --git a/liboverlay/overlay_thread.h b/liboverlay/overlay_thread.h
+index ede8b3d..a6bf505 100755
+--- a/liboverlay/overlay_thread.h
++++ b/liboverlay/overlay_thread.h
+@@ -18,6 +18,7 @@
+ 
+ #include <utils/threads.h>
+ 
++
+ class OverlayThread: public Thread {
+     struct overlay_control_context_t *m_dev;
+     struct v4l2_buffer mLatestQueuedBuf;
+@@ -25,6 +26,10 @@ class OverlayThread: public Thread {
+     ipu_lib_output_param_t mIPUOutputParam; 
+     ipu_lib_handle_t            mIPUHandle;
+     int mIPURet;
++	unsigned int ClearBufMask;
++	unsigned int DisplayChanged;
++	unsigned int DisplayBufMask;
++
+     public:
+     OverlayThread(struct overlay_control_context_t *dev)
+         : Thread(false),m_dev(dev){
+@@ -32,6 +37,9 @@ class OverlayThread: public Thread {
+         memset(&mIPUOutputParam,0,sizeof(mIPUOutputParam));
+         memset(&mIPUHandle,0,sizeof(mIPUHandle));
+         memset(&mLatestQueuedBuf,0,sizeof(mLatestQueuedBuf));
++		ClearBufMask = 0;
++		DisplayBufMask =0;
++		DisplayChanged = 0;
+     }
+ 
+     virtual void onFirstRef() {
+@@ -267,7 +275,10 @@ class OverlayThread: public Thread {
+                       
+             //Check whether refill the origin area to black
+             if(outchange0||outchange1) {
+-                OVERLAY_LOG_RUNTIME("Mixer thread refill the origin area to black");
++				DisplayChanged = 1;
++				ClearBufMask |= DisplayBufMask;
++				DisplayBufMask = 0;
++                OVERLAY_LOG_INFO("Mixer thread refill the origin area to black");
+             }
+ 
+             //Check whether need copy back the latest frame to current frame
+@@ -301,6 +312,18 @@ class OverlayThread: public Thread {
+                 pV4LBuf = &v4lbuf;
+             }
+ 
++            {	//record the displayed mask
++                unsigned int CurBufMask = 1 << (pV4LBuf->index);
++                DisplayBufMask |= CurBufMask;
++                if(DisplayChanged == 1){
++                    if ((ClearBufMask & CurBufMask) != 0){
++                        fill_frame_back(m_dev->v4lbuf_addr[pV4LBuf->index], pV4LBuf->length, m_dev->xres, m_dev->yres, m_dev->outpixelformat);
++                        ClearBufMask &= ~CurBufMask;
++                    }
++                    if (ClearBufMask == 0)
++                        DisplayChanged = 0;
++                }
++            }
+ 
+             OVERLAY_LOG_RUNTIME("DQBUF from v4l 0x%x:index %d, vir 0x%x, phy 0x%x, len %d",
+                                 pV4LBuf,pV4LBuf->index,m_dev->v4lbuf_addr[pV4LBuf->index],
+-- 
+1.8.0
+

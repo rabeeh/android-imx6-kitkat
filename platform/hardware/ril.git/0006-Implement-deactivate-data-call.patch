@@ -1,0 +1,68 @@
+From 0da19b0d6a2b274efa146c7de2e3c084c74bf01f Mon Sep 17 00:00:00 2001
+From: Brian Liu <brian.liu@freescale.com>
+Date: Wed, 4 Aug 2010 13:29:09 +0800
+Subject: [PATCH 06/38] Implement deactivate data call
+
+One bug was reported by customer that after Wifi is enabled (and then
+disabled), 3G can't be used. The root cause is that when Wifi is
+enabled, 3G should be shutdown (correct behavior) but we didn't
+implement data call deactivation function. As a result, the 3G data
+call state in framework level (e.g. MobileDataConnectionTracker) is
+not correct.
+In RIL, stop PPPd firstly and then deactivate PDP context when
+deactivating data call request is received.
+---
+ reference-ril/reference-ril.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 215afa0..7a0e8e7 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -1634,6 +1634,33 @@ error2:
+     RIL_onRequestComplete(t, RIL_E_SMS_SEND_FAIL_RETRY, &response, sizeof(response));
+ }
+ 
++static void requestDeactivateDataCall(void *data, size_t datalen, RIL_Token t)
++{
++    const char *cid;
++    char *cmd;
++    int err;
++
++    cid = ((const char **)data)[0];
++    LOGD("requesting deactivating data connection with CID '%s'", cid);
++
++    /* Stop PPPd firstly */
++    LOGD("Stopping PPPD");
++    property_set("ctl.stop", SERVICE_PPPD_GPRS);
++
++    /* Dactivate PDP Context */
++    asprintf(&cmd, "AT+CGACT=0,%s", cid);
++    err = at_send_command(cmd, NULL);
++
++    if (err < 0 ) {
++	LOGW("Dactivate PDP failure");
++    }
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
++    free(cmd);
++
++    return;
++}
++
+ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
+ {
+     const char *apn;
+@@ -2256,6 +2283,9 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
+         case RIL_REQUEST_SETUP_DATA_CALL:
+             requestSetupDataCall(data, datalen, t);
+             break;
++        case RIL_REQUEST_DEACTIVATE_DATA_CALL:
++            requestDeactivateDataCall(data, datalen, t);
++            break;
+         case RIL_REQUEST_SMS_ACKNOWLEDGE:
+             requestSMSAcknowledge(data, datalen, t);
+             break;
+-- 
+1.8.0
+

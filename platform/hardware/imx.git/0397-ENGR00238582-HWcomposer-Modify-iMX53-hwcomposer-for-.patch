@@ -1,0 +1,170 @@
+From 7b8c51e4bab6f3c2178287761ccd83f2901db73e Mon Sep 17 00:00:00 2001
+From: Nitin Garg <nitin.garg@freescale.com>
+Date: Wed, 2 Jan 2013 14:33:24 -0600
+Subject: [PATCH 397/486] ENGR00238582: HWcomposer: Modify iMX53 hwcomposer
+ for Jellybean 4.2
+
+Modify iMX53 SMD hwcomposer as per Jellybean 4.2 HAL requirements.
+
+Signed-off-by: Nitin Garg <nitin.garg@freescale.com>
+---
+ mx5x/hwcomposer/Android.mk     |  1 -
+ mx5x/hwcomposer/hwc_context.h  |  4 ++--
+ mx5x/hwcomposer/hwcomposer.cpp | 49 +++++++++++++++++++-----------------------
+ 3 files changed, 24 insertions(+), 30 deletions(-)
+
+diff --git a/mx5x/hwcomposer/Android.mk b/mx5x/hwcomposer/Android.mk
+index 474afbe..2ebf180 100755
+--- a/mx5x/hwcomposer/Android.mk
++++ b/mx5x/hwcomposer/Android.mk
+@@ -26,7 +26,6 @@ LOCAL_SRC_FILES := hwcomposer.cpp hwc_vsync.cpp
+ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+ LOCAL_C_INCLUDES += hardware/imx/mx5x/libgralloc
+ LOCAL_CFLAGS:= -DLOG_TAG=\"hwcomposer\"
+-LOCAL_CFLAGS += -DENABLE_VSYNC 
+ #LOCAL_CFLAGS += -DDEBUG_HWC_VSYNC_TIMING
+ 
+ LOCAL_MODULE_TAGS := optional
+diff --git a/mx5x/hwcomposer/hwc_context.h b/mx5x/hwcomposer/hwc_context.h
+index f4ad5fe..babada7 100755
+--- a/mx5x/hwcomposer/hwc_context.h
++++ b/mx5x/hwcomposer/hwc_context.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2013 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -39,7 +39,7 @@
+ class VSyncThread;
+ 
+ struct hwc_context_t {
+-    hwc_composer_device_t device;
++    hwc_composer_device_1_t device;
+     /* our private state goes below here */
+ 
+     int m_mainfb_fd;
+diff --git a/mx5x/hwcomposer/hwcomposer.cpp b/mx5x/hwcomposer/hwcomposer.cpp
+index b62312d..a8272fc 100755
+--- a/mx5x/hwcomposer/hwcomposer.cpp
++++ b/mx5x/hwcomposer/hwcomposer.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2009-2013 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -75,29 +75,29 @@ static void dump_layer(hwc_layer_t const* l) {
+ 
+ /***********************************************************************/
+ 
+-static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list)
++static int hwc_prepare(hwc_composer_device_1_t *dev,
++        size_t numDisplays, hwc_display_contents_1_t** displays)
+ {
+     return 0;
+ }
+ 
+-static int hwc_set(hwc_composer_device_t *dev,
+-        hwc_display_t dpy,
+-        hwc_surface_t sur,
+-        hwc_layer_list_t* list)
++static int hwc_set(hwc_composer_device_1_t *dev,
++        size_t numDisplays, hwc_display_contents_1_t** displays)
+ {
+     struct hwc_context_t *ctx = (struct hwc_context_t *)dev;
+     bool clear_needed = false;
+     EGLBoolean success = EGL_TRUE;
+-    int i;
++    unsigned int i;
+ 
+-    if (dpy !=NULL && sur !=NULL) {
+-        success = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
++    if (displays[0]->dpy !=NULL && displays[0]->sur !=NULL) {
++        success = eglSwapBuffers((EGLDisplay)displays[0]->dpy,
++            (EGLSurface)displays[0]->sur);;
+     }
+ 
+-    if ( list != NULL) {
+-        for (i =0 ; i < list->numHwLayers; i++)
++    if ( displays != NULL) {
++        for (i =0 ; i < displays[0]->numHwLayers; i++)
+         {
+-            private_handle_t *handle = (private_handle_t *)(list->hwLayers[i].handle);
++            private_handle_t *handle = (private_handle_t *)(displays[0]->hwLayers[i].handle);
+             if (handle)
+             {
+                 if ((handle->format == HAL_PIXEL_FORMAT_YV12) ||
+@@ -141,8 +141,7 @@ static int hwc_device_close(struct hw_device_t *dev)
+     return 0;
+ }
+ 
+-#ifdef ENABLE_VSYNC
+-static void hwc_registerProcs(struct hwc_composer_device* dev,
++static void hwc_registerProcs(struct hwc_composer_device_1 *dev,
+             hwc_procs_t const* procs) {
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+     if(ctx) {
+@@ -150,7 +149,7 @@ static void hwc_registerProcs(struct hwc_composer_device* dev,
+     }
+ }
+ 
+-static int hwc_eventControl(struct hwc_composer_device* dev, int event, int enabled)
++static int hwc_eventControl(struct hwc_composer_device_1* dev, int disp, int event, int enabled)
+ {
+      hwc_context_t *ctx = (hwc_context_t *) dev;
+ #ifdef DEBUG_HWC_VSYNC_TIMING
+@@ -175,11 +174,12 @@ static int hwc_eventControl(struct hwc_composer_device* dev, int event, int enab
+      }
+ }
+ 
+-static const struct hwc_methods hwc_methods = {
+-    eventControl: hwc_eventControl
+-};
++static int hwc_blank(struct hwc_composer_device_1* dev, int disp, int blank)
++{
++    return 0;
++}
+ 
+-static int hwc_query(struct hwc_composer_device* dev,
++static int hwc_query(struct hwc_composer_device_1 *dev,
+         int what, int* value)
+ {
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+@@ -226,7 +226,6 @@ static int hwc_get_framebuffer_info(struct hwc_context_t* ctx)
+     return 0;
+ }
+ 
+-#endif
+ /*****************************************************************************/
+ 
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+@@ -247,20 +246,16 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+ 
+         dev->device.prepare = hwc_prepare;
+         dev->device.set = hwc_set;
+-#ifdef ENABLE_VSYNC
+-        dev->device.common.version = HWC_DEVICE_API_VERSION_0_3;
++        dev->device.blank = hwc_blank;
++        dev->device.common.version = HWC_DEVICE_API_VERSION_1_0;
+         dev->device.registerProcs = hwc_registerProcs;
+-        dev->device.methods = &hwc_methods;
++        dev->device.eventControl = hwc_eventControl;
+         dev->device.query = hwc_query;
+ 
+         /* our private state goes below here */
+         dev->m_mainfb_fd = open(HWC_MAIN_FB, O_RDWR);
+         dev->m_vsync_thread = new VSyncThread(dev);
+         hwc_get_framebuffer_info(dev);
+-#else
+-        dev->device.common.version = 0;
+-#endif
+-        const hw_module_t *hwc_module;
+ 
+ nor_exit:
+ 
+-- 
+1.8.0
+

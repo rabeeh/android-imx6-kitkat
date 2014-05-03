@@ -1,0 +1,451 @@
+From ef4241c18ac7a9830292670771014fe143523854 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Wed, 7 Nov 2012 17:32:40 +0800
+Subject: [PATCH 3/5] ENGR00232884-1 basic porting for ntfs-3g
+
+Basic porting on Android build env.
+Add the statvfs implementation.
+Refine 64bit lseek, pread and pwrite.
+Fix build error on mntopt.
+Add Android make file to build ntfs-3g binary.
+
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ Android.mk                        | 45 ++++++++++++++++++++++++++++++++++++
+ androidglue/include/androidglue.h | 28 +++++++++++++++++++++++
+ androidglue/include/sys/statvfs.h | 39 +++++++++++++++++++++++++++++++
+ androidglue/statvfs.c             | 48 +++++++++++++++++++++++++++++++++++++++
+ config.h                          | 14 ++++--------
+ config.log                        |  4 ++--
+ include/ntfs-3g/ntfstime.h        | 10 --------
+ libfuse-lite/fusermount.c         |  4 ++++
+ libfuse-lite/mount_util.c         |  1 +
+ libntfs-3g/realpath.c             |  1 -
+ libntfs-3g/security.c             |  5 ++++
+ libntfs-3g/unix_io.c              |  6 ++---
+ libntfs-3g/volume.c               |  4 ++++
+ 13 files changed, 183 insertions(+), 26 deletions(-)
+ create mode 100644 Android.mk
+ create mode 100644 androidglue/include/androidglue.h
+ create mode 100644 androidglue/include/sys/statvfs.h
+ create mode 100644 androidglue/statvfs.c
+
+diff --git a/Android.mk b/Android.mk
+new file mode 100644
+index 0000000..7eeeeb4
+--- /dev/null
++++ b/Android.mk
+@@ -0,0 +1,45 @@
++
++# libfuse lite
++LOCAL_PATH := $(call my-dir)
++include $(CLEAR_VARS)
++LOCAL_SRC_FILES := \
++	libfuse-lite/fuse.c libfuse-lite/fusermount.c libfuse-lite/fuse_kern_chan.c \
++	libfuse-lite/fuse_loop.c libfuse-lite/fuse_lowlevel.c \
++	libfuse-lite/fuse_opt.c libfuse-lite/fuse_session.c libfuse-lite/fuse_signals.c\
++	libfuse-lite/helper.c libfuse-lite/mount.c libfuse-lite/mount_util.c androidglue/statvfs.c
++LOCAL_C_INCLUDES :=$(LOCAL_PATH)/include/fuse-lite $(LOCAL_PATH)/androidglue/include
++LOCAL_CFLAGS := -O2 -g -W -Wall -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64  -DHAVE_CONFIG_H
++LOCAL_MODULE := libfuse
++LOCAL_MODULE_TAGS := eng
++LOCAL_SYSTEM_SHARED_LIBRARIES := libc libcutils
++include $(BUILD_STATIC_LIBRARY)
++
++# libntfs-3g
++include $(CLEAR_VARS)
++LOCAL_SRC_FILES :=libntfs-3g/acls.c libntfs-3g/attrib.c libntfs-3g/attrlist.c \
++	libntfs-3g/bitmap.c libntfs-3g/bootsect.c libntfs-3g/cache.c libntfs-3g/collate.c \
++	libntfs-3g/compat.c libntfs-3g/compress.c libntfs-3g/debug.c libntfs-3g/device.c \
++	libntfs-3g/dir.c libntfs-3g/efs.c libntfs-3g/index.c libntfs-3g/inode.c \
++	libntfs-3g/lcnalloc.c libntfs-3g/logfile.c libntfs-3g/logging.c libntfs-3g/mft.c \
++	libntfs-3g/misc.c libntfs-3g/mst.c libntfs-3g/object_id.c libntfs-3g/reparse.c \
++	libntfs-3g/runlist.c libntfs-3g/security.c libntfs-3g/unistr.c\
++	libntfs-3g/unix_io.c libntfs-3g/volume.c libntfs-3g/realpath.c
++LOCAL_C_INCLUDES := $(LOCAL_PATH)/include/fuse-lite  $(LOCAL_PATH)/include/ntfs-3g
++LOCAL_CFLAGS := -O2 -g -W -Wall -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64  -DHAVE_CONFIG_H
++LOCAL_MODULE := libntfs-3g
++LOCAL_MODULE_TAGS := eng
++LOCAL_SYSTEM_SHARED_LIBRARIES := libc libcutils
++include $(BUILD_STATIC_LIBRARY)
++
++#ntfs-3g
++include $(CLEAR_VARS)
++LOCAL_SRC_FILES := src/ntfs-3g.c src/ntfs-3g_common.c
++
++LOCAL_C_INCLUDES := $(LOCAL_PATH)/include/fuse-lite $(LOCAL_PATH)/include/ntfs-3g \
++			$(LOCAL_PATH)/androidglue/include $(LOCAL_PATH)/src
++LOCAL_CFLAGS := -O2 -g -W -Wall -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64 -DHAVE_CONFIG_H
++LOCAL_MODULE := ntfs-3g
++LOCAL_MODULE_TAGS := eng
++LOCAL_SYSTEM_SHARED_LIBRARIES := libc
++LOCAL_STATIC_LIBRARIES := libfuse libntfs-3g
++include $(BUILD_EXECUTABLE)
+diff --git a/androidglue/include/androidglue.h b/androidglue/include/androidglue.h
+new file mode 100644
+index 0000000..b1116fb
+--- /dev/null
++++ b/androidglue/include/androidglue.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
++ *
++ */
++#ifndef _ANDROIDGLUE_H_
++#define _ANDROIDGLUE_H_
++
++# define setfsuid(x) (x)
++# define setfsgid(x) (x)
++
++# define fdatasync(fd) fsync(fd)
++
++# define lutimes(fd, tv) utimes(fd, tv)
++#endif
+diff --git a/androidglue/include/sys/statvfs.h b/androidglue/include/sys/statvfs.h
+new file mode 100644
+index 0000000..0d770dd
+--- /dev/null
++++ b/androidglue/include/sys/statvfs.h
+@@ -0,0 +1,39 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
++ *
++ */
++
++#ifndef _SYS_STATVFS_H_
++#define _SYS_STATVFS_H_
++#include <sys/types.h>
++
++struct statvfs {
++	unsigned long  f_bsize;    /* file system block size */
++	unsigned long  f_frsize;   /* fragment size */
++	fsblkcnt_t     f_blocks;   /* size of fs in f_frsize units */
++	fsblkcnt_t     f_bfree;    /* # free blocks */
++	fsblkcnt_t     f_bavail;   /* # free blocks for non-root */
++	fsfilcnt_t     f_files;    /* # inodes */
++	fsfilcnt_t     f_ffree;    /* # free inodes */
++	fsfilcnt_t     f_favail;   /* # free inodes for non-root */
++	unsigned long  f_fsid;     /* file system ID */
++	unsigned long  f_flag;     /* mount flags */
++	unsigned long  f_namemax;  /* maximum filename length */
++};
++
++int statvfs(const char *, struct statvfs *);
++#endif
+diff --git a/androidglue/statvfs.c b/androidglue/statvfs.c
+new file mode 100644
+index 0000000..7cec574
+--- /dev/null
++++ b/androidglue/statvfs.c
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
++ *
++ */
++
++#include "sys/statvfs.h"
++#include <sys/statfs.h>
++
++#define MAP(to,from) vfs->to = sfs.from
++
++int statvfs(const char *path, struct statvfs *vfs) {
++    struct statfs sfs;
++    int ret;
++    int *fsid;
++    if ((ret = statfs(path, &sfs)) != 0)
++        return ret;
++
++    MAP(f_bsize,   f_bsize);
++    MAP(f_frsize,  f_frsize);
++    MAP(f_blocks,  f_blocks);
++    MAP(f_bfree,   f_bfree);
++    MAP(f_bavail,  f_bavail);
++    MAP(f_files,   f_files);
++    MAP(f_ffree,   f_ffree);
++    MAP(f_namemax, f_namelen);
++
++    vfs->f_favail = 0;
++    vfs->f_flag   = 0;
++
++    fsid = (int *)&sfs.f_fsid;
++    vfs->f_fsid   = (fsid[0] << sizeof(fsid[0])) | fsid[1];
++
++    return ret;
++}
+diff --git a/config.h b/config.h
+index 8aff196..3325e17 100644
+--- a/config.h
++++ b/config.h
+@@ -45,9 +45,6 @@
+ /* Define to 1 if you have the `dup2' function. */
+ #define HAVE_DUP2 1
+ 
+-/* Define to 1 if you have the <endian.h> header file. */
+-#define HAVE_ENDIAN_H 1
+-
+ /* Define to 1 if you have the <errno.h> header file. */
+ #define HAVE_ERRNO_H 1
+ 
+@@ -67,7 +64,7 @@
+ #define HAVE_FORK 1
+ 
+ /* Define to 1 if you have the `getmntent' function. */
+-#define HAVE_GETMNTENT 
++#define HAVE_GETMNTENT 1
+ 
+ /* Define to 1 if you have the <getopt.h> header file. */
+ #define HAVE_GETOPT_H 1
+@@ -79,7 +76,7 @@
+ #define HAVE_GETTIMEOFDAY 1
+ 
+ /* Define to 1 if you have the `hasmntopt' function. */
+-#define HAVE_HASMNTOPT 1
++/* #undef HAVE_HASMNTOPT */
+ 
+ /* Define to 1 if you have the <inttypes.h> header file. */
+ #define HAVE_INTTYPES_H 1
+@@ -138,9 +135,6 @@
+ /* Define to 1 if you have the `setlocale' function. */
+ #define HAVE_SETLOCALE 1
+ 
+-/* Define to 1 if you have the `setxattr' function. */
+-#define HAVE_SETXATTR 1
+-
+ /* Define to 1 if `stat' has the bug that it succeeds when given the
+    zero-length file name argument. */
+ /* #undef HAVE_STAT_EMPTY_STRING_BUG */
+@@ -197,7 +191,7 @@
+ #define HAVE_STRTOUL 1
+ 
+ /* Define to 1 if `st_atim' is member of `struct stat'. */
+-#define HAVE_STRUCT_STAT_ST_ATIM 1
++/* #undef HAVE_STRUCT_STAT_ST_ATIM */
+ 
+ /* Define to 1 if `st_atimensec' is member of `struct stat'. */
+ /* #undef HAVE_STRUCT_STAT_ST_ATIMENSEC */
+@@ -267,7 +261,7 @@
+ #define HAVE_UTIME 1
+ 
+ /* Define to 1 if you have the `utimensat' function. */
+-#define HAVE_UTIMENSAT 1
++/* #undef HAVE_UTIMENSAT */
+ 
+ /* Define to 1 if you have the <utime.h> header file. */
+ #define HAVE_UTIME_H 1
+diff --git a/config.log b/config.log
+index 18d9b98..fa4618a 100644
+--- a/config.log
++++ b/config.log
+@@ -2514,7 +2514,7 @@ configure:23790: $? = 0
+ configure:23808: result: yes
+ configure:23815: checking for _doprnt
+ configure:23871: gcc -o conftest -g -O2   conftest.c  >&5
+-/tmp/ccQtN82q.o: In function `main':
++/tmp/cc6c9p3d.o: In function `main':
+ /home/b03824/android-jb/external/ntfs-3g_ntfsprogs-2012.1.15/conftest.c:110: undefined reference to `_doprnt'
+ collect2: ld returned 1 exit status
+ configure:23877: $? = 1
+@@ -2749,7 +2749,7 @@ configure:24007: $? = 0
+ configure:24025: result: yes
+ configure:23945: checking for clock_gettime
+ configure:24001: gcc -o conftest -g -O2   conftest.c  >&5
+-/tmp/ccWCzzKB.o: In function `main':
++/tmp/ccVCm62p.o: In function `main':
+ /home/b03824/android-jb/external/ntfs-3g_ntfsprogs-2012.1.15/conftest.c:137: undefined reference to `clock_gettime'
+ collect2: ld returned 1 exit status
+ configure:24007: $? = 1
+diff --git a/include/ntfs-3g/ntfstime.h b/include/ntfs-3g/ntfstime.h
+index 236c0fb..426269d 100644
+--- a/include/ntfs-3g/ntfstime.h
++++ b/include/ntfs-3g/ntfstime.h
+@@ -37,16 +37,6 @@
+ #include "types.h"
+ 
+ /*
+- * assume "struct timespec" is not defined if st_mtime is not defined
+- */
+-#if !defined(st_mtime) & !defined(__timespec_defined)
+-struct timespec {
+-	time_t tv_sec;
+-	long tv_nsec;
+-} ;
+-#endif
+-
+-/*
+  * There are four times more conversions of internal representation
+  * to ntfs representation than any other conversion, so the most
+  * efficient internal representation is ntfs representation
+diff --git a/libfuse-lite/fusermount.c b/libfuse-lite/fusermount.c
+index 6537e44..1348552 100644
+--- a/libfuse-lite/fusermount.c
++++ b/libfuse-lite/fusermount.c
+@@ -27,6 +27,7 @@
+ #include <sys/socket.h>
+ #include <sys/utsname.h>
+ #include <grp.h>
++#include <paths.h>
+ 
+ #define FUSE_DEV_NEW "/dev/fuse"
+ 
+@@ -34,6 +35,9 @@
+ #define MS_DIRSYNC 128
+ #endif
+ 
++#define setmntent(f,m) fopen(f,m)
++#define endmntent(f) fclose(f)
++
+ static const char *progname = "ntfs-3g-mount";
+ 
+ static int mount_max = 1000;
+diff --git a/libfuse-lite/mount_util.c b/libfuse-lite/mount_util.c
+index 75a7ee6..883fb05 100644
+--- a/libfuse-lite/mount_util.c
++++ b/libfuse-lite/mount_util.c
+@@ -20,6 +20,7 @@
+ #include <sys/wait.h>
+ #include <sys/mount.h>
+ #include <sys/param.h>
++#include <paths.h>
+ 
+ static int mtab_needs_update(const char *mnt)
+ {
+diff --git a/libntfs-3g/realpath.c b/libntfs-3g/realpath.c
+index a93bc69..56d9423 100644
+--- a/libntfs-3g/realpath.c
++++ b/libntfs-3g/realpath.c
+@@ -31,7 +31,6 @@ char *ntfs_realpath(const char *path, char *resolved_path)
+ }
+ #endif
+ 
+-
+ #ifdef linux
+ 
+ /*
+diff --git a/libntfs-3g/security.c b/libntfs-3g/security.c
+index 5e70c21..b5df43f 100644
+--- a/libntfs-3g/security.c
++++ b/libntfs-3g/security.c
+@@ -2133,6 +2133,7 @@ int ntfs_get_posix_acl(struct SECURITY_CONTEXT *scx, ntfs_inode *ni,
+  *	returns -1 if there is a problem
+  */
+ 
++#if 0
+ static int ntfs_get_perm(struct SECURITY_CONTEXT *scx,
+ 		ntfs_inode *ni,	mode_t request)
+ {
+@@ -2236,6 +2237,7 @@ static int ntfs_get_perm(struct SECURITY_CONTEXT *scx,
+ 	}
+ 	return (perm);
+ }
++#endif
+ 
+ #endif /* POSIXACLS */
+ 
+@@ -3246,6 +3248,7 @@ int ntfs_allowed_access(struct SECURITY_CONTEXT *scx,
+ 		ntfs_inode *ni,
+ 		int accesstype) /* access type required (S_Ixxx values) */
+ {
++#if 0
+ 	int perm;
+ 	int res;
+ 	int allow;
+@@ -3314,6 +3317,8 @@ int ntfs_allowed_access(struct SECURITY_CONTEXT *scx,
+ 			allow = 0;
+ 	}
+ 	return (allow);
++#endif
++	return 1;
+ }
+ 
+ #if 0 /* not needed any more */
+diff --git a/libntfs-3g/unix_io.c b/libntfs-3g/unix_io.c
+index 64b41d3..17c2899 100644
+--- a/libntfs-3g/unix_io.c
++++ b/libntfs-3g/unix_io.c
+@@ -223,7 +223,7 @@ static int ntfs_device_unix_io_close(struct ntfs_device *dev)
+ static s64 ntfs_device_unix_io_seek(struct ntfs_device *dev, s64 offset,
+ 		int whence)
+ {
+-	return lseek(DEV_FD(dev), offset, whence);
++	return lseek64(DEV_FD(dev), offset, whence);
+ }
+ 
+ /**
+@@ -277,7 +277,7 @@ static s64 ntfs_device_unix_io_write(struct ntfs_device *dev, const void *buf,
+ static s64 ntfs_device_unix_io_pread(struct ntfs_device *dev, void *buf,
+ 		s64 count, s64 offset)
+ {
+-	return pread(DEV_FD(dev), buf, count, offset);
++	return pread64(DEV_FD(dev), buf, count, offset);
+ }
+ 
+ /**
+@@ -299,7 +299,7 @@ static s64 ntfs_device_unix_io_pwrite(struct ntfs_device *dev, const void *buf,
+ 		return -1;
+ 	}
+ 	NDevSetDirty(dev);
+-	return pwrite(DEV_FD(dev), buf, count, offset);
++	return pwrite64(DEV_FD(dev), buf, count, offset);
+ }
+ 
+ /**
+diff --git a/libntfs-3g/volume.c b/libntfs-3g/volume.c
+index a18109f..091d517 100644
+--- a/libntfs-3g/volume.c
++++ b/libntfs-3g/volume.c
+@@ -71,6 +71,10 @@
+ #include "realpath.h"
+ #include "misc.h"
+ 
++#define MOUNTED "/etc/mtab"
++#define setmntent(f,m) fopen(f,m)
++#define endmntent(f) fclose(f)
++
+ const char *ntfs_home = 
+ "News, support and information:  http://tuxera.com\n";
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,140 @@
+From 5ae126c923933605ccdb4a3f0d62b59083092457 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 29 Apr 2010 14:29:45 +0800
+Subject: [PATCH 107/249] ENGR00121871 Change vpu lib to sync with v1.3.10
+ firmware on mx51 an mx53
+
+Change vpu lib to sync with v1.3.10 firmware on mx51 an mx53.
+API is changed in this patch.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c | 20 ++++++++++++++++----
+ vpu/vpu_lib.h | 16 ++++++++++++++--
+ vpu/vpu_reg.h |  4 ++--
+ 3 files changed, 32 insertions(+), 8 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 32dc9d5..ac61504 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -709,19 +709,23 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 		data |= (encOP.EncStdParam.avcParam.avc_audEnable << 2);
+ 		data |= (encOP.EncStdParam.avcParam.avc_fmoEnable << 4);
+ 	}
+-	if (pEncInfo->openParam.userQpMax && pEncInfo->openParam.userQpMin) {
++	if (pEncInfo->openParam.userQpMinEnable) {
+ 		data |= (1 << 6);
+ 		VpuWriteReg(CMD_ENC_SEQ_RC_QP_MIN_MAX,
+ 			    (pEncInfo->openParam.userQpMin << 8) |
+ 			    (pEncInfo->openParam.userQpMax & 0xFF));
+ 	}
+-	if (pEncInfo->openParam.userGamma) {
++	if (pEncInfo->openParam.userQpMaxEnable) {
+ 		data |= (1 << 7);
+-		VpuWriteReg(CMD_ENC_SEQ_RC_GAMMA, pEncInfo->openParam.userGamma);
++		VpuWriteReg(CMD_ENC_SEQ_RC_QP_MIN_MAX,
++			    (pEncInfo->openParam.userQpMin << 8) |
++			    (pEncInfo->openParam.userQpMax & 0xFF));
+ 	}
+-	if (pEncInfo->openParam.avcIntra16x16OnlyModeEnable) {
++	if (pEncInfo->openParam.userGamma) {
+ 		data |= (1 << 8);
++		VpuWriteReg(CMD_ENC_SEQ_RC_GAMMA, pEncInfo->openParam.userGamma);
+ 	}
++
+ 	VpuWriteReg(CMD_ENC_SEQ_OPTION, data);
+ 
+ 	VpuWriteReg(CMD_ENC_SEQ_RC_INTERVAL_MODE,
+@@ -1147,6 +1151,10 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	       pEncInfo->secAxiUse.useHostOvlEnable << 10 | pEncInfo->secAxiUse.useHostMeEnable << 11);
+ 	VpuWriteReg(BIT_AXI_SRAM_USE, val);
+ 
++	val = (((param->refMbClk & 0xff) << 8) | ((param->pulseWidth & 0x3f) << 2) |
++	       ((param->accumulativeMode & 0x1) << 1) | ((param->underrunEnable & 0x1)));
++	VpuWriteReg(BIT_RTC_HOST_CTRL, val);
++
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+@@ -2819,6 +2827,10 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	       pDecInfo->secAxiUse.useHostDbkEnable << 9 | pDecInfo->secAxiUse.useHostOvlEnable << 10);
+ 	VpuWriteReg(BIT_AXI_SRAM_USE, val);
+ 
++	val = (((param->refMbClk & 0xff) << 8) | ((param->pulseWidth & 0x3f) << 2) |
++	       ((param->accumulativeMode & 0x1) << 1) | ((param->underrunEnable & 0x1)));
++	VpuWriteReg(BIT_RTC_HOST_CTRL, val);
++
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 06d8788..0fef4a7 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -243,6 +243,11 @@ typedef struct {
+ 	int chunkSize;
+ 	int picStartByteOffset;
+ 	PhysicalAddress picStreamBufferAddr;
++
++	int underrunEnable;
++	int accumulativeMode;
++	int pulseWidth;
++	int refMbClk;
+ } DecParam;
+ 
+ typedef	struct {
+@@ -375,11 +380,13 @@ typedef struct {
+ 
+ 	int userQpMin;
+ 	int userQpMax;
++	int userQpMinEnable;
++	int userQpMaxEnable;
++
+ 	Uint32 userGamma;
+ 	int RcIntervalMode;		/* 0:normal, 1:frame_level, 2:slice_level, 3: user defined Mb_level */
+ 	int MbInterval;			/* use when RcintervalMode is 3 */
+ 	int avcIntra16x16OnlyModeEnable;
+-
+ } EncOpenParam;
+ 
+ typedef struct {
+@@ -401,6 +408,11 @@ typedef struct {
+ 	PhysicalAddress picStreamBufferAddr;
+ 	int picStreamBufferSize;
+ 	int enableAutoSkip;
++
++	int underrunEnable;
++	int accumulativeMode;
++	int pulseWidth;
++	int refMbClk;
+ } EncParam;
+ 
+ typedef	struct {
+@@ -500,7 +512,7 @@ typedef struct vpu_versioninfo {
+  * v4.1.2 [2008.08.22] update MX37 VPU firmware to V1.0.5
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 0, 3)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 0, 4)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 55fcd62..6cfbe2e 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -100,8 +100,8 @@
+ 
+ #define BIT_MSG_0			0x1F0
+ #define BIT_MSG_1			0x1F4
+-#define BIT_MSG_2			0x1F8
+-#define BIT_MSG_3			0x1FC
++
++#define BIT_RTC_HOST_CTRL		0x1FC
+ 
+ /*---------------------------------------------------------------------------
+  * [DEC SEQ INIT] COMMAND
+-- 
+1.8.0
+

@@ -1,0 +1,400 @@
+From ccf3af219baac7337b3a83a50cc527356eb0019a Mon Sep 17 00:00:00 2001
+From: Robby Cai <R63905@freescale.com>
+Date: Fri, 9 Mar 2012 14:19:45 +0800
+Subject: [PATCH 282/435] ENGR00176473: Add doc generating framework and
+ change autorun script framework
+
+Add doc generating framwork
+---------------------------
+Use `asciidoc' to generate multiple-format doc.
+Currently enabled chunked html output, PDF format can be enabled in doc/Makefile.
+The generated file 'ut_um.html' or 'ut_um.pdf' will be put under /unit_tests
+of rootfs when do daily building.
+Single-html format output can be added later on if it's required. (For example,
+single-html file per test case is easily to be searched/browsed when investigate
+a failed case).
+
+For developers, the user manual shall be added under doc directory of each test case.
+The file name should be in accordance with the one in all-suite.txt.
+So usually at least the following files should be touched.
+*) linux-test/all-suite.txt
+*) linux-test/test/XXX/doc/FSL-UT-XXX-YYY.txt
+*) linux-test/test/doc/ut_um.toc
+
+Please also see the comment in all-suite.txt for the rule to add a new test
+case in it.
+
+Change autorun script framework
+-------------------------------
+Remove autorun-suite.txt, which will be generated from all-suite.txt at run-time
+by the filters whether it's automated & whether it's available on that platform.
+
+TODO:
+* Clean Test Cases by the rule -- one test case does one thing.
+* Add the script to get daily build image.
+* Differentiate the platforms in a unified way(one method to generate the autorun
+  script suites and the test cases user manual.)
+* linux-test/test/doc/ut_um.toc will be generated automatically in upcoming patch.
+
+Signed-off-by: Robby Cai <R63905@freescale.com>
+---
+ Makefile                                  |  9 ++++--
+ all-suite.txt                             | 11 ++++++++
+ autorun-suite.txt                         | 28 -------------------
+ autorun.sh                                | 13 +++++++--
+ test/doc/Makefile                         | 20 ++++++++++++++
+ test/doc/def.cfg                          |  3 ++
+ test/doc/ut_um.toc                        | 14 ++++++++++
+ test/pxp_lib_test/Makefile                |  3 +-
+ test/pxp_lib_test/doc/FSL-UT-PXP-001.txt  | 38 +++++++++++++++++++++++++
+ test/pxp_v4l2_test/doc/FSL-UT-PXP-002.txt | 46 +++++++++++++++++++++++++++++++
+ test/wdog/doc/FSL-UT-WDOG-001.txt         | 35 +++++++++++++++++++++++
+ 11 files changed, 187 insertions(+), 33 deletions(-)
+ create mode 100644 all-suite.txt
+ delete mode 100644 autorun-suite.txt
+ create mode 100644 test/doc/Makefile
+ create mode 100644 test/doc/def.cfg
+ create mode 100644 test/doc/ut_um.toc
+ create mode 100644 test/pxp_lib_test/doc/FSL-UT-PXP-001.txt
+ create mode 100644 test/pxp_v4l2_test/doc/FSL-UT-PXP-002.txt
+ create mode 100644 test/wdog/doc/FSL-UT-WDOG-001.txt
+
+diff --git a/Makefile b/Makefile
+index 216d16d..d1f088d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -31,7 +31,7 @@ endif
+ #
+ export INC CROSS_COMPILE LINUXPATH PLATFORM TOPDIR OBJDIR
+ 
+-.PHONY: test module_test clean distclean pkg install
++.PHONY: test module_test doc clean distclean pkg install
+ 
+ all : test module_test
+ 
+@@ -45,6 +45,11 @@ module_test:
+ 	@echo Building test modules...
+ 	$(MAKE) -C $(TOPDIR)/module_test OBJDIR=$(OBJDIR)/modules
+ 
++doc:
++	@echo
++	@echo Generating user manual...
++	$(MAKE) -C $(TOPDIR)/doc
++
+ install: $(install_target)
+ 
+ install_dummy:
+@@ -56,7 +61,7 @@ install_actual:
+ 	mkdir -p $(DESTDIR)
+ 	-rm -rf $(DESTDIR)/*
+ 	cp -rf $(OBJDIR)/* $(DESTDIR)
+-	cp autorun.sh test-utils.sh autorun-suite.txt $(DESTDIR)
++	cp autorun.sh test-utils.sh all-suite.txt $(DESTDIR)
+ 
+ distclean: clean
+ 
+diff --git a/all-suite.txt b/all-suite.txt
+new file mode 100644
+index 0000000..a0e58a3
+--- /dev/null
++++ b/all-suite.txt
+@@ -0,0 +1,11 @@
++# all-suite.txt
++#
++# There are three fields, delimited by ':'
++# <UT ID>:<SCRIPT NAME>:<PLATFORM LISTS>
++# If <SCRIPT NAME> is prefixed with "autorun", it will get run
++# every night when we run autorun.sh.
++# Refer to linux-test/test-utils.sh for available <PLATFORM LISTS>
++#
++FSL-UT-PXP-0001:autorun-pxp.sh:IMX6
++FSL-UT-PXP-0002:pxp_v4l2_out_test.sh:
++FSL-UT-WDOG-0001:autorun-wdog.sh:IMX6
+diff --git a/autorun-suite.txt b/autorun-suite.txt
+deleted file mode 100644
+index 6851192..0000000
+--- a/autorun-suite.txt
++++ /dev/null
+@@ -1,28 +0,0 @@
+-# autorun-suite.txt
+-#
+-# These are the cases that actually get run every night when we run autorun.sh
+-#
+-FSL-UT-UART-MXC-0040:autorun-mxc_uart.sh
+-FSL-UT-FB-0010:autorun-fb.sh
+-FSL-UT-KEYPAD-0010:autorun-keypad.sh
+-FSL-UT-MMC-0010:autorun-mmc.sh
+-FSL-UT-ATA-0010:autorun-ata.sh
+-FSL-UT-MU-0010:autorun-mu.sh
+-FSL-UT-WDOG-0010:autorun-wdog.sh
+-FSL-UT-FIRI-0010:autorun-firi.sh
+-FSL-UT-RTIC-0020:autorun-rtic.sh
+-FSL-UT-HACC-0010:autorun-hacc.sh
+-FSL-UT-1WIRE-0020:autorun-owire.sh
+-FSL-UT-SAHARA-0010:autorun-sahara.sh
+-FSL-UT-PF-0010:autorun-pf.sh
+-FSL-UT-SCC-0010:autorun-scc.sh
+-FSL-UT-OPROFILE-0010:autorun-oprofile.sh
+-FSL-UT-V4L2-0010:autorun-v4l2.sh
+-FSL-UT-VPU-0010:autorun-vpu.sh
+-FSL-UT-PMIC-0010:autorun-pmic.sh
+-FSL-UT-MBX-Services-0010 FSL-UT-MBX-EGL-0010:autorun-mbx.sh
+-FSL-UT-PMIC-SC55112_Light-0020:autorun-pmic-light.sh
+-FSL-UT-PMIC-SC55112_Power-0010:autorun-pmic-power.sh
+-FSL-UT-ALSA-0010 FSL-UT-ALSA-0020 FSL-UT-ALSA-0030:autorun-sound.sh
+-FSL-UT-HANTRO-0010:autorun-hantro.sh
+-FSL-UT-RTC-0010:autorun-rtc.sh
+diff --git a/autorun.sh b/autorun.sh
+index a76e01a..a964d24 100755
+--- a/autorun.sh
++++ b/autorun.sh
+@@ -58,6 +58,9 @@ run_test_id()
+ make_clean_todo_list()
+ {
+     rm -f /unit_tests/autorun-todo.txt
++    rm -f /unit_tests/autorun-suite.txt
++    grep 'FSL-UT-' /unit_tests/all-suite.txt|egrep -v '#' | grep 'autorun' | grep "$(platform)" | \
++	cut -d: -f1-2 > /unit_tests/autorun-suite.txt
+     grep 'FSL-UT-' /unit_tests/autorun-suite.txt|egrep -v '#'| \
+ 	cut -d: -f1|cut -d' ' -f1|sed -r 's,(FSL-UT-.*),\1 TODO,' > /unit_tests/autorun-todo.txt
+ }
+@@ -76,7 +79,7 @@ run_todo_list()
+ 			fi
+ 		fi
+ 	done < /unit_tests/autorun-todo.txt
+-	echo "autorun.sh: completed test suite"
++	echo "autorun.sh: completed test suite - run_todo_list"
+ }
+ 
+ # If we are running on read-only rootfs, can't make todo list.
+@@ -86,7 +89,7 @@ run_autorun_suite()
+ 		id=$(echo "$id"|cut -d\  -f1)
+ 		run_test_id $id
+ 	done < /unit_tests/autorun-suite.txt
+-	echo "autorun.sh: completed test suite"
++	echo "autorun.sh: completed test suite - run_autorun_suite"
+ }
+ 
+ #=================================================================
+@@ -124,6 +127,12 @@ if [ $pass_count -ne 0 ] && [ $pass_count -eq $total_count ]; then
+ 	exit 0
+ fi
+ 
++if [ $total_count -eq 0 ]; then
++	echo "imx-test suite: ALREADY DONE BEFORE."
++	echo "Remove /unit_tests/autorun-todo.txt, and re-run autorun.sh"
++	exit 0
++fi
++
+ echo "imx-test suite: FAIL"
+ exit 1
+ 
+diff --git a/test/doc/Makefile b/test/doc/Makefile
+new file mode 100644
+index 0000000..df65a68
+--- /dev/null
++++ b/test/doc/Makefile
+@@ -0,0 +1,20 @@
++DOCMAIN :=$(wildcard *.toc)
++PLATFORMLOWER := $(shell echo $(PLATFORM) | tr A-Z a-z)
++
++all: chunked single
++
++chunked: $(DOCMAIN)
++	echo "// Don't edit it manually!" > def.cfg
++	echo ":chip: $(PLATFORM)" >> def.cfg
++	echo ":$(PLATFORMLOWER):" >> def.cfg
++	asciidoc -a toc $<
++	cp -f *.html $(OBJDIR)
++single:
++
++pdf: $(DOCMAIN)
++	a2x -dbook -f pdf $<
++	cp -f *.pdf $(OBJDIR)
++
++.PHONY: clean
++clean:
++	rm -f *.pdf *.html
+diff --git a/test/doc/def.cfg b/test/doc/def.cfg
+new file mode 100644
+index 0000000..380054d
+--- /dev/null
++++ b/test/doc/def.cfg
+@@ -0,0 +1,3 @@
++// Don't edit it manually!
++:chip: IMX6Q
++:imx6q:
+diff --git a/test/doc/ut_um.toc b/test/doc/ut_um.toc
+new file mode 100644
+index 0000000..a587f94
+--- /dev/null
++++ b/test/doc/ut_um.toc
+@@ -0,0 +1,14 @@
++// modules listed in alphabetical order
++include::def.cfg[]
++
++{chip} Linux BSP Unit Test User Manual
++======================================
++
++PXP
++---
++include::../pxp_lib_test/doc/FSL-UT-PXP-001.txt[]
++include::../pxp_v4l2_test/doc/FSL-UT-PXP-002.txt[]
++
++WDOG
++----
++include::../wdog/doc/FSL-UT-WDOG-001.txt[]
+diff --git a/test/pxp_lib_test/Makefile b/test/pxp_lib_test/Makefile
+index 853d91a..20a9e41 100644
+--- a/test/pxp_lib_test/Makefile
++++ b/test/pxp_lib_test/Makefile
+@@ -5,7 +5,8 @@ SRCS = pxp_test.c utils.c
+ CFLAGS += -lpxp -lpthread
+ 
+ ifeq ($(PLATFORM),$(findstring $(PLATFORM),$(INCLUDE_LIST)))
+-OBJS = $(OBJDIR)/pxp_test.out
++OBJS = $(OBJDIR)/pxp_test.out \
++	$(OBJDIR)/autorun-pxp.sh
+ $(OBJS): $(SRCS)
+ 	mkdir -p $(OBJDIR)
+ 	$(VERBOSE) $(CC) -g $(INC) $(CFLAGS) $^ $(LIBS) -o $@
+diff --git a/test/pxp_lib_test/doc/FSL-UT-PXP-001.txt b/test/pxp_lib_test/doc/FSL-UT-PXP-001.txt
+new file mode 100644
+index 0000000..738b643
+--- /dev/null
++++ b/test/pxp_lib_test/doc/FSL-UT-PXP-001.txt
+@@ -0,0 +1,38 @@
++FSL-UT-PXP-001
++~~~~~~~~~~~~~~
++
++[cols=">s,6a",frame="topbot",options="header"]
++|====================================================================
++|Name | Description
++
++| Summary |
++Test multiple instances of PxP DMAENGINE clients
++
++| Automated |
++YES
++
++| Kernel Config Option |
++ CONFIG_IMX_HAVE_PLATFORM_IMX_PXP=y
++ CONFIG_MXC_PXP_V2=y
++ CONFIG_MXC_PXP_CLIENT_DEVICE=y
++ CONFIG_DMA_ENGINE=y
++
++| Software Dependency |
++Need /usr/lib/libpxp.so
++
++| Non-default Hardware Configuration |
++N/A
++
++| Test Procedure |
++. run the following command on target board,
++
++ $ /unit_tests/autorun-pxp.sh
++
++| Expected Result |
++Should get the following message:
++
++ autorun-pxp.sh: Exiting PASS
++
++|====================================================================
++
++<<<
+diff --git a/test/pxp_v4l2_test/doc/FSL-UT-PXP-002.txt b/test/pxp_v4l2_test/doc/FSL-UT-PXP-002.txt
+new file mode 100644
+index 0000000..8aa2f9b
+--- /dev/null
++++ b/test/pxp_v4l2_test/doc/FSL-UT-PXP-002.txt
+@@ -0,0 +1,46 @@
++FSL-UT-PXP-002
++~~~~~~~~~~~~~~
++
++[cols=">s,6a",frame="topbot",options="header"]
++|====================================================================
++|Name | Description
++
++| Summary |
++PxP function test (via V4L2 interface)
++
++| Automated |
++NO
++
++| Kernel Config Option |
++ CONFIG_MXC_PXP=y
++ CONFIG_DMA_ENGINE=y
++ CONFIG_VIDEO_MXC_PXP_V4L2=y
++ CONFIG_VIDEO_V4L2=y
++ ...
++
++| Software Dependency |
++N/A
++
++| Non-default Hardware Configuration |
++ifdef::imx50[]
++Use SEIKO LCD panel on J13 or J12, or use use CLAA LCD panel on J12.
++
++Please refer to release note for kernel cmdline setting.
++endif::[]
++ifdef::imx6q[]
++TBD
++endif::[]
++
++| Test Procedure |
++. run ./pxp_v4l2_test.out -h for available test parameters.
++. run a real case, for example (or refer to pxp_v4l2_out_test.sh in rootfs)
++
++  $ cd /unit_tests/
++  $ ./pxp_v4l2_test.out -sx 480 -sy 272 -res 352:240 -a 100 fb-352x240.yuv BLANK
++
++| Expected Result |
++The video streaming can be viewed on LCD
++
++|====================================================================
++
++<<<
+diff --git a/test/wdog/doc/FSL-UT-WDOG-001.txt b/test/wdog/doc/FSL-UT-WDOG-001.txt
+new file mode 100644
+index 0000000..894c456
+--- /dev/null
++++ b/test/wdog/doc/FSL-UT-WDOG-001.txt
+@@ -0,0 +1,35 @@
++FSL-UT-WDOG-001
++~~~~~~~~~~~~~~~
++
++[cols=">s,6a",frame="topbot",options="header"]
++|====================================================================
++|Name | Description
++
++| Summary |
++Check WatchDog device node
++
++| Automated |
++YES
++
++| Kernel Config Option |
++CONFIG_WATCHDOG=y
++
++| Software Dependency |
++N/A
++
++| Non-default Hardware Configuration |
++N/A
++
++| Test Procedure |
++. run the following command on target board,
++
++ $ /unit_tests/autorun-wdog.sh
++
++| Expected Result |
++Should get the following message:
++
++ autorun-wdog.sh: Exiting PASS
++
++|====================================================================
++
++<<<
+-- 
+1.8.0
+

@@ -1,0 +1,1689 @@
+From b18f4baafbd4b0046bdb72a2b992a216c0bd7221 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 26 Oct 2011 20:20:09 +0800
+Subject: [PATCH 164/249] ENGR00160802 vpu: support MJPG decoder with
+ linebuffer mode in lib
+
+Support MJPG decoder with linebuffer mode in vpu lib. There is API
+change in it.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/Makefile   |   2 +-
+ vpu/sw_gbu.h   |  47 +++----
+ vpu/vpu_lib.c  | 339 +++++++++++++++++++++++++++++-----------------
+ vpu/vpu_lib.h  |  26 ++--
+ vpu/vpu_util.c | 417 +++++++++++++++++++++++++++------------------------------
+ vpu/vpu_util.h | 107 ++++++++-------
+ 6 files changed, 515 insertions(+), 423 deletions(-)
+
+diff --git a/vpu/Makefile b/vpu/Makefile
+index 7272698..2a2f134 100644
+--- a/vpu/Makefile
++++ b/vpu/Makefile
+@@ -7,7 +7,7 @@ INCLUDE_LIST:= IMX27ADS IMX51 IMX53 IMX6Q
+ OBJ = vpu_io.o vpu_util.o vpu_lib.o vpu_gdi.o
+ 
+ LIBNAME = libvpu
+-SONAMEVERSION=1
++SONAMEVERSION=2
+ 
+ ifeq ($(PLATFORM), $(findstring $(PLATFORM), $(INCLUDE_LIST)))
+ 
+diff --git a/vpu/sw_gbu.h b/vpu/sw_gbu.h
+index 6a2f8c5..9946955 100644
+--- a/vpu/sw_gbu.h
++++ b/vpu/sw_gbu.h
+@@ -201,23 +201,23 @@ static inline int get_xbits(GetBitContext * s, int n)
+ 	register int sign;
+ 	register int32_t cache;
+ 	OPEN_READER(re, s)
+-	    UPDATE_CACHE(re, s)
+-	    cache = GET_CACHE(re, s);
++	UPDATE_CACHE(re, s)
++	cache = GET_CACHE(re, s);
+ 	sign = (~cache) >> 31;
+ 	LAST_SKIP_BITS(re, s, n)
+-	    CLOSE_READER(re, s)
+-	    return (NEG_USR32(sign ^ cache, n) ^ sign) - sign;
++	CLOSE_READER(re, s)
++	return (NEG_USR32(sign ^ cache, n) ^ sign) - sign;
+ }
+ 
+ static inline int get_sbits(GetBitContext * s, int n)
+ {
+ 	register int tmp;
+ 	OPEN_READER(re, s)
+-	    UPDATE_CACHE(re, s)
+-	    tmp = SHOW_SBITS(re, s, n);
++	UPDATE_CACHE(re, s)
++	tmp = SHOW_SBITS(re, s, n);
+ 	LAST_SKIP_BITS(re, s, n)
+-	    CLOSE_READER(re, s)
+-	    return tmp;
++	CLOSE_READER(re, s)
++	return tmp;
+ }
+ 
+ /**
+@@ -228,11 +228,14 @@ static inline unsigned int get_bits(GetBitContext * s, int n)
+ {
+ 	register int tmp;
+ 	OPEN_READER(re, s)
+-	    UPDATE_CACHE(re, s)
+-	    tmp = SHOW_UBITS(re, s, n);
++	if (s->index > s->size_in_bits)
++		return -1;
++
++	UPDATE_CACHE(re, s)
++	tmp = SHOW_UBITS(re, s, n);
+ 	LAST_SKIP_BITS(re, s, n)
+-	    CLOSE_READER(re, s)
+-	    return tmp;
++	CLOSE_READER(re, s)
++	return tmp;
+ }
+ 
+ /**
+@@ -243,18 +246,18 @@ static inline unsigned int show_bits(GetBitContext * s, int n)
+ {
+ 	register int tmp;
+ 	OPEN_READER(re, s)
+-	    UPDATE_CACHE(re, s)
+-	    tmp = SHOW_UBITS(re, s, n);
++	UPDATE_CACHE(re, s)
++	tmp = SHOW_UBITS(re, s, n);
+ 	return tmp;
+ }
+ 
+ static inline void skip_bits(GetBitContext * s, int n)
+ {
+-	//Note gcc seems to optimize this to s->index+=n for the ALT_READER :))
++	/* Note gcc seems to optimize this to s->index+=n for the ALT_READER :)) */
+ 	OPEN_READER(re, s)
+-	    UPDATE_CACHE(re, s)
+-	    LAST_SKIP_BITS(re, s, n)
+-	    CLOSE_READER(re, s)
++	UPDATE_CACHE(re, s)
++	LAST_SKIP_BITS(re, s, n)
++	CLOSE_READER(re, s)
+ }
+ 
+ static inline unsigned int get_bits1(GetBitContext * s)
+@@ -355,14 +358,6 @@ static inline void init_get_bits(GetBitContext * s,
+ 	s->buffer_end = buffer + buffer_size;
+ #ifdef ALT_BITSTREAM_READER
+ 	s->index = 0;
+-#elif defined LIBMPEG2_BITSTREAM_READER
+-	s->buffer_ptr = (uint8_t *) ((intptr_t) buffer & (~1));
+-	s->bit_count = 16 + 8 * ((intptr_t) buffer & 1);
+-	skip_bits_long(s, 0);
+-#elif defined A32_BITSTREAM_READER
+-	s->buffer_ptr = (uint32_t *) ((intptr_t) buffer & (~3));
+-	s->bit_count = 32 + 8 * ((intptr_t) buffer & 3);
+-	skip_bits_long(s, 0);
+ #endif
+ }
+ 
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 712c915..356f43b 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -72,22 +72,59 @@ static __inline int is_mx6q_mjpg_codec(int codecMode)
+  */
+ int vpu_IsBusy()
+ {
+-	int vpu_busy;
++	Uint32 val, vpu_busy = 0, jpu_busy = 0;
++	CodecInst *pCodecInst;
+ 
+ 	ENTER_FUNC();
+ 
+ 	IOClkGateSet(true);
++
+ 	vpu_busy = VpuReadReg(BIT_BUSY_FLAG);
++	if (cpu_is_mx6q()) {
++		pCodecInst = *ppendingInst;
++		if (pCodecInst &&
++		    (pCodecInst->codecMode == MJPG_ENC ||
++		     pCodecInst->codecMode == MJPG_DEC)) {
++			val = VpuReadReg(MJPEG_PIC_STATUS_REG);
++			if (val & (1 << INT_JPU_DONE) ||
++			    val & (1 << INT_JPU_ERROR))
++				jpu_busy = 0;
++			else
++				jpu_busy = 1;
++		}
++	}
+ 	IOClkGateSet(false);
+ 
+-	return vpu_busy != 0;
++	return (vpu_busy != 0 || jpu_busy != 0);
+ }
+ 
+ int vpu_WaitForInt(int timeout_in_ms)
+ {
++	int ret;
++	Uint32 val;
++	CodecInst *pCodecInst;
++
+ 	ENTER_FUNC();
+ 
+-	return IOWaitForInt(timeout_in_ms);
++	ret = IOWaitForInt(timeout_in_ms);
++
++	if (cpu_is_mx6q()) {
++		pCodecInst = *ppendingInst;
++		if (pCodecInst &&
++		    (pCodecInst->codecMode == MJPG_DEC) &&
++		    pCodecInst->CodecInfo.decInfo.jpgInfo.lineBufferMode) {
++			/* Need to clear bit buffer empty interrupt since the interrupt
++			   has higher priority than PIC DONE */
++			IOClkGateSet(true);
++			val = VpuReadReg(MJPEG_PIC_STATUS_REG);
++			if (val & 1 << INT_JPU_BIT_BUF_EMPTY) {
++				VpuWriteReg(MJPEG_PIC_STATUS_REG, val);
++				ret = -1;
++			}
++			IOClkGateSet(false);
++		}
++	}
++	return ret;
+ }
+ 
+ /*!
+@@ -667,28 +704,6 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
+-		VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG, pEncInfo->streamBufStartAddr);
+-		VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pEncInfo->streamBufEndAddr);
+-		VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pEncInfo->streamBufStartAddr);
+-		VpuWriteReg(MJPEG_BBC_RD_PTR_REG, pEncInfo->streamBufStartAddr);
+-		VpuWriteReg(MJPEG_BBC_CUR_POS_REG, 0);
+-		VpuWriteReg(MJPEG_BBC_DATA_CNT_REG, 256 / 4);
+-		VpuWriteReg(MJPEG_BBC_EXT_ADDR_REG, pEncInfo->streamBufStartAddr);
+-		VpuWriteReg(MJPEG_BBC_INT_ADDR_REG, 0);
+-
+-		VpuWriteReg(MJPEG_GBU_BT_PTR_REG, 0);
+-		VpuWriteReg(MJPEG_GBU_WD_PTR_REG, 0);
+-		VpuWriteReg(MJPEG_GBU_BBSR_REG, 0);
+-
+-		VpuWriteReg(MJPEG_GBU_BBER_REG, ((256 / 4) * 2) - 1);
+-		VpuWriteReg(MJPEG_GBU_BBIR_REG, 256 / 4);
+-		VpuWriteReg(MJPEG_GBU_BBHR_REG, 256 / 4);
+-
+-		VpuWriteReg(MJPEG_PIC_CTRL_REG, 0x18);
+-
+-		VpuWriteReg(MJPEG_PIC_SIZE_REG, pEncInfo->jpgInfo.alignedWidth<<16 | pEncInfo->jpgInfo.alignedHeight);
+-		VpuWriteReg(MJPEG_ROT_INFO_REG, 0);
+-
+ 		if (pEncInfo->jpgInfo.format == FORMAT_400) {
+ 			pEncInfo->jpgInfo.compInfo[1] = 0;
+ 			pEncInfo->jpgInfo.compInfo[2] = 0;
+@@ -721,28 +736,6 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 			pEncInfo->jpgInfo.busReqNum = 4;
+ 			pEncInfo->jpgInfo.compInfo[0] = 5;
+ 		}
+-		VpuWriteReg(MJPEG_MCU_INFO_REG, pEncInfo->jpgInfo.mcuBlockNum << 16 |
+-			     pEncInfo->jpgInfo.compNum << 12 |
+-			     pEncInfo->jpgInfo.compInfo[0] << 8 |
+-			     pEncInfo->jpgInfo.compInfo[1] << 4 |
+-			     pEncInfo->jpgInfo.compInfo[2]);
+-
+-		VpuWriteReg(MJPEG_SCL_INFO_REG, 0);
+-		VpuWriteReg(MJPEG_DPB_CONFIG_REG, IMAGE_ENDIAN << 1);
+-		VpuWriteReg(MJPEG_RST_INTVAL_REG, pEncInfo->jpgInfo.rstIntval);
+-		VpuWriteReg(MJPEG_BBC_CTRL_REG, ((STREAM_ENDIAN & 3) << 1) | 1);
+-
+-		VpuWriteReg(MJPEG_OP_INFO_REG, pEncInfo->jpgInfo.busReqNum);
+-
+-		if (!JpgEncLoadHuffTab(pEncInfo)) {
+-			UnlockVpu(vpu_semap);
+-			return RETCODE_INVALID_PARAM;
+-		}
+-
+-		if (!JpgEncLoadQMatTab(pEncInfo)) {
+-			UnlockVpu(vpu_semap);
+-			return RETCODE_INVALID_PARAM;
+-		}
+ 
+ 		info->minFrameBufferCount = 0;
+ 
+@@ -1390,6 +1383,53 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	}
+ 
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
++		VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG, pEncInfo->streamBufStartAddr);
++		VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pEncInfo->streamBufEndAddr);
++		VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pEncInfo->streamBufStartAddr);
++		VpuWriteReg(MJPEG_BBC_RD_PTR_REG, pEncInfo->streamBufStartAddr);
++		VpuWriteReg(MJPEG_BBC_CUR_POS_REG, 0);
++		VpuWriteReg(MJPEG_BBC_DATA_CNT_REG, 256 / 4);
++		VpuWriteReg(MJPEG_BBC_EXT_ADDR_REG, pEncInfo->streamBufStartAddr);
++		VpuWriteReg(MJPEG_BBC_INT_ADDR_REG, 0);
++
++		VpuWriteReg(MJPEG_GBU_BT_PTR_REG, 0);
++		VpuWriteReg(MJPEG_GBU_WD_PTR_REG, 0);
++		VpuWriteReg(MJPEG_GBU_BBSR_REG, 0);
++
++		VpuWriteReg(MJPEG_GBU_BBER_REG, ((256 / 4) * 2) - 1);
++		VpuWriteReg(MJPEG_GBU_BBIR_REG, 256 / 4);
++		VpuWriteReg(MJPEG_GBU_BBHR_REG, 256 / 4);
++
++		VpuWriteReg(MJPEG_PIC_CTRL_REG, 0x18);
++
++		VpuWriteReg(MJPEG_PIC_SIZE_REG, pEncInfo->jpgInfo.alignedWidth << 16 |
++						pEncInfo->jpgInfo.alignedHeight);
++		VpuWriteReg(MJPEG_ROT_INFO_REG, 0);
++
++		VpuWriteReg(MJPEG_MCU_INFO_REG, pEncInfo->jpgInfo.mcuBlockNum << 16 |
++						pEncInfo->jpgInfo.compNum << 12 |
++						pEncInfo->jpgInfo.compInfo[0] << 8 |
++						pEncInfo->jpgInfo.compInfo[1] << 4 |
++						pEncInfo->jpgInfo.compInfo[2]);
++
++		VpuWriteReg(MJPEG_SCL_INFO_REG, 0);
++		VpuWriteReg(MJPEG_DPB_CONFIG_REG,
++			    pEncInfo->openParam.chromaInterleave);
++		VpuWriteReg(MJPEG_RST_INTVAL_REG, pEncInfo->jpgInfo.rstIntval);
++		VpuWriteReg(MJPEG_BBC_CTRL_REG, 1);
++
++		VpuWriteReg(MJPEG_OP_INFO_REG, pEncInfo->jpgInfo.busReqNum);
++
++		if (!JpgEncLoadHuffTab(pEncInfo)) {
++			UnlockVpu(vpu_semap);
++			return RETCODE_INVALID_PARAM;
++		}
++
++		if (!JpgEncLoadQMatTab(pEncInfo)) {
++			UnlockVpu(vpu_semap);
++			return RETCODE_INVALID_PARAM;
++		}
++
+ 		if (rotMirMode & 1)
+ 			VpuWriteReg(MJPEG_PIC_SIZE_REG,
+ 				pEncInfo->jpgInfo.alignedHeight << 16 |
+@@ -1612,6 +1652,7 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 		info->bitstreamBuffer = pEncInfo->streamBufStartAddr;
+ 		info->bitstreamSize = VpuReadReg(MJPEG_BBC_WR_PTR_REG) -
+ 					pEncInfo->streamBufStartAddr;
++		VpuWriteReg(MJPEG_BBC_FLUSH_CMD_REG, 0);
+ 		pEncInfo->jpgInfo.frameIdx++;
+ 		info->picType = 0;
+ 		info->numOfSlices = 0;
+@@ -2344,6 +2385,10 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	pDecInfo->streamBufSize = pop->bitstreamBufferSize;
+ 	pDecInfo->streamBufEndAddr =
+ 	    pop->bitstreamBuffer + pop->bitstreamBufferSize;
++	pDecInfo->pBitStream = pop->pBitStream;
++	pDecInfo->jpgInfo.frameOffset = 0;
++	pDecInfo->jpgInfo.lineBufferMode = pop->jpgLineBufferMode;
++
+ 	pDecInfo->frameBufPool = 0;
+ 
+ 	pDecInfo->rotationEnable = 0;
+@@ -2561,44 +2606,17 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		if (!LockVpu(vpu_semap))
+ 			return RETCODE_FAILURE_TIMEOUT;
+ 
+-		if (!JpegDecodeHeader(pDecInfo)) {
++		if (!JpegDecodeHeader(pDecInfo, pDecInfo->pBitStream, pDecInfo->streamBufSize)) {
+ 			UnlockVpu(vpu_semap);
+ 			err_msg("JpegDecodeHeader failure\n");
+ 			return RETCODE_FAILURE;
+ 		}
+ 
+-		VpuWriteReg(MJPEG_GBU_TT_CNT_REG, 0);
+-		VpuWriteReg(MJPEG_PIC_CTRL_REG, pDecInfo->jpgInfo.huffAcIdx << 10 |
+-				pDecInfo->jpgInfo.huffDcIdx << 7 |
+-				pDecInfo->jpgInfo.userHuffTab << 6);
+-		VpuWriteReg(MJPEG_PIC_SIZE_REG, pDecInfo->jpgInfo.alignedWidth << 16 |
+-				pDecInfo->jpgInfo.alignedHeight);
+-		VpuWriteReg(MJPEG_ROT_INFO_REG, 0);
+-		VpuWriteReg(MJPEG_OP_INFO_REG, pDecInfo->jpgInfo.busReqNum);
+-		VpuWriteReg(MJPEG_MCU_INFO_REG, pDecInfo->jpgInfo.mcuBlockNum << 16 |
+-				pDecInfo->jpgInfo.compNum << 12 |
+-				pDecInfo->jpgInfo.compInfo[0] << 8 |
+-				pDecInfo->jpgInfo.compInfo[1] << 4 |
+-				pDecInfo->jpgInfo.compInfo[2]);
+-		VpuWriteReg(MJPEG_SCL_INFO_REG, 0);
+-		VpuWriteReg(MJPEG_DPB_CONFIG_REG, IMAGE_ENDIAN << 1);
+-		VpuWriteReg(MJPEG_RST_INTVAL_REG, pDecInfo->jpgInfo.rstIntval);
+-
+-		if (pDecInfo->jpgInfo.userHuffTab && !JpgDecHuffTabSetUp(pDecInfo)) {
+-			UnlockVpu(vpu_semap);
+-			err_msg("JpgDecHuffTabSetUp failure\n");
+-			return RETCODE_INVALID_PARAM;
+-		}
+-		if (!JpgDecQMatTabSetUp(pDecInfo)) {
+-			UnlockVpu(vpu_semap);
+-			err_msg("JpgDecQMatTabSetUp failure\n");
+-			return RETCODE_INVALID_PARAM;
+-		}
+ 		info->picWidth = pDecInfo->jpgInfo.picWidth;
+ 		info->picHeight = pDecInfo->jpgInfo.picHeight;
+ 		info->minFrameBufferCount = 1;
+ 		info->mjpg_sourceFormat = pDecInfo->jpgInfo.format;
+-		info->mjpg_ecsPtr = pDecInfo->jpgInfo.ecsPtr;
++		info->streamInfoObtained = 1;
+ 		pDecInfo->initialInfo = *info;
+ 		pDecInfo->initialInfoObtained = 1;
+ 
+@@ -3148,8 +3166,8 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
+ 		if (size == 0) {
+-			val = (wrPtr-pDecInfo->streamBufStartAddr) / 256;
+-			if ((wrPtr-pDecInfo->streamBufStartAddr) % 256)
++			val = (wrPtr - pDecInfo->streamBufStartAddr) / 256;
++			if ((wrPtr - pDecInfo->streamBufStartAddr) % 256)
+ 				val += 1;
+ 			VpuWriteReg(MJPEG_BBC_STRM_CTRL_REG, (1 << 31 | val));
+ 		} else {
+@@ -3238,7 +3256,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	DecInfo *pDecInfo;
+ 	DecParam *pDecParam;
+ 	Uint32 rotMir;
+-	Uint32 val = 0;
++	Uint32 val = 0, i;
+ 	RetCode ret;
+ 
+ 	ENTER_FUNC();
+@@ -3253,7 +3271,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	memcpy(pDecParam, param, sizeof(*pDecParam));
+ 
+ 	/* This means frame buffers have not been registered. */
+-	if (pDecInfo->frameBufPool == 0) {
++	if (!is_mx6q_mjpg_codec(pCodecInst->codecMode) && pDecInfo->frameBufPool == 0) {
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+ 	}
+ 
+@@ -3305,6 +3323,82 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
++		if (pDecInfo->jpgInfo.lineBufferMode) {
++			if (param->chunkSize <= 0) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_INVALID_PARAM;
++			}
++
++			val = JpegDecodeHeader(pDecInfo, param->virtJpgChunkBase, param->chunkSize);
++			if (val == 0) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_FAILURE;
++			} else if (val == -1) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_JPEG_BIT_EMPTY;
++			}
++
++			pDecInfo->streamBufStartAddr = param->phyJpgChunkBase;
++			VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pDecInfo->streamBufStartAddr + param->chunkSize);
++			VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG, pDecInfo->streamBufStartAddr);
++			VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pDecInfo->streamBufStartAddr + param->chunkSize);
++
++			val = (pDecInfo->streamBufStartAddr + param->chunkSize) / 256;
++			if ((pDecInfo->streamBufStartAddr + param->chunkSize) % 256)
++				val = val + 1;
++			VpuWriteReg(MJPEG_BBC_STRM_CTRL_REG, (1 << 31 | val));
++		} else {
++			if (pDecInfo->jpgInfo.frameOffset < 0) {
++				*ppendingInst = pCodecInst;
++				return RETCODE_JPEG_EOS;
++			}
++
++			val = JpegDecodeHeader(pDecInfo, pDecInfo->pBitStream + pDecInfo->jpgInfo.frameOffset,
++				    pDecInfo->streamBufSize - pDecInfo->jpgInfo.frameOffset);
++			if (val == 0) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_FAILURE;
++			} else if (val == -1) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_JPEG_BIT_EMPTY;
++			}
++
++			VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG, pDecInfo->streamBufStartAddr);
++			VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pDecInfo->streamBufEndAddr);
++			VpuWriteReg(MJPEG_BBC_STRM_CTRL_REG, 0);
++		}
++
++		VpuWriteReg(MJPEG_GBU_TT_CNT_REG, 0);
++		VpuWriteReg(MJPEG_GBU_TT_CNT_REG + 4, 0);
++		VpuWriteReg(MJPEG_PIC_CTRL_REG, pDecInfo->jpgInfo.huffAcIdx << 10 |
++						pDecInfo->jpgInfo.huffDcIdx << 7 |
++						pDecInfo->jpgInfo.userHuffTab << 6);
++		VpuWriteReg(MJPEG_PIC_SIZE_REG, pDecInfo->jpgInfo.alignedWidth << 16 |
++						pDecInfo->jpgInfo.alignedHeight);
++
++		VpuWriteReg(MJPEG_ROT_INFO_REG, 0);
++		VpuWriteReg(MJPEG_OP_INFO_REG, pDecInfo->jpgInfo.busReqNum);
++		VpuWriteReg(MJPEG_MCU_INFO_REG, pDecInfo->jpgInfo.mcuBlockNum << 16 |
++						pDecInfo->jpgInfo.compNum << 12 |
++						pDecInfo->jpgInfo.compInfo[0] << 8 |
++						pDecInfo->jpgInfo.compInfo[1] << 4 |
++						pDecInfo->jpgInfo.compInfo[2]);
++		VpuWriteReg(MJPEG_SCL_INFO_REG, 0);
++		VpuWriteReg(MJPEG_DPB_CONFIG_REG,
++			    pDecInfo->openParam.chromaInterleave);
++		VpuWriteReg(MJPEG_RST_INTVAL_REG, pDecInfo->jpgInfo.rstIntval);
++
++		if (pDecInfo->jpgInfo.userHuffTab) {
++			if (!JpgDecHuffTabSetUp(pDecInfo)) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_FAILURE;
++			}
++		}
++
++		if (!JpgDecQMatTabSetUp(pDecInfo)) {
++			UnlockVpu(vpu_semap);
++			return RETCODE_FAILURE;
++		}
+ 
+ 		JpgDecGramSetup(pDecInfo);
+ 
+@@ -3315,7 +3409,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 		VpuWriteReg(MJPEG_DPCM_DIFF_CB_REG, 0);
+ 		VpuWriteReg(MJPEG_DPCM_DIFF_CR_REG, 0);
+ 
+-		VpuWriteReg(MJPEG_GBU_FF_RPTR_REG, 0);
++		VpuWriteReg(MJPEG_GBU_FF_RPTR_REG, pDecInfo->jpgInfo.bitPtr);
+ 		VpuWriteReg(MJPEG_GBU_CTRL_REG, 3);
+ 
+ 		VpuWriteReg(MJPEG_ROT_INFO_REG, rotMir);
+@@ -3347,6 +3441,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 							pDecInfo->stride);
+ 			VpuWriteReg(GDI_INFO_PIC_SIZE, (pDecInfo->jpgInfo.alignedWidth << 16) |
+ 							pDecInfo->jpgInfo.alignedHeight);
++
+ 			VpuWriteReg(GDI_INFO_BASE_Y,  pDecInfo->frameBufPool[val].bufY);
+ 			VpuWriteReg(GDI_INFO_BASE_CB,  pDecInfo->frameBufPool[val].bufCb);
+ 			VpuWriteReg(GDI_INFO_BASE_CR,  pDecInfo->frameBufPool[val].bufCr);
+@@ -3568,6 +3663,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	CodecInst *pCodecInst;
+ 	DecInfo *pDecInfo;
+ 	RetCode ret;
++	Uint8 *pSoi, *pBas;
+ 	Uint32 val = 0;
+ 	Uint32 val2 = 0;
+ 	PhysicalAddress paraBuffer;
+@@ -3601,20 +3697,49 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+  	/* Clock is gated off when received interrupt in driver, so need to gate on here. */
+ 	IOClkGateSet(true);
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
+-		val = VpuReadReg(MJPEG_PIC_STATUS_REG);
++		if (pDecInfo->jpgInfo.frameOffset < 0) {
++			info->indexFrameDisplay = -1;
++			*ppendingInst = 0;
++			UnlockVpu(vpu_semap);
++			return RETCODE_SUCCESS;
++		}
+ 
+-		if ((val & 0x4) >> 2)
+-			return RETCODE_WRONG_CALL_SEQUENCE;
++		info->decPicWidth = pDecInfo->jpgInfo.alignedWidth;
++		info->decPicHeight = pDecInfo->jpgInfo.alignedHeight;
++		info->indexFrameDecoded = 0;
++		info->indexFrameDisplay = (pDecInfo->jpgInfo.frameIdx % pDecInfo->numFrameBuffers);
++		info->consumedByte = VpuReadReg(MJPEG_GBU_TT_CNT_REG) / 8;
++		if (pDecInfo->jpgInfo.lineBufferMode)
++			pDecInfo->jpgInfo.frameOffset = 0;
++		else {
++			pBas = pDecInfo->pBitStream + pDecInfo->jpgInfo.frameOffset;
++			pSoi = pBas + (info->consumedByte+pDecInfo->jpgInfo.ecsPtr) - 16;
++			while (1) {
++				if (pSoi[0] == 0xff && pSoi[1] == 0xd9) // find eoi
++					break;
++				pSoi++;
++				if (pSoi > (pDecInfo->pBitStream+pDecInfo->streamBufSize)) {
++					pSoi = pDecInfo->pBitStream;
++					pDecInfo->jpgInfo.frameOffset = 0;
++				}
++			}
++			pSoi += 2; /* position to SOI of next frame */
++			if (pSoi[0] == 0xff && pSoi[1] == 0xd8)	{   /* check if the next data is jpeg header. */
++				if ((int)(pSoi-pBas) < 0)
++					pDecInfo->jpgInfo.frameOffset +=
++						    (Uint32)pSoi - (Uint32)pDecInfo->pBitStream;
++				else
++					pDecInfo->jpgInfo.frameOffset += (Uint32)pSoi - (Uint32)pBas;
++			} else
++				pDecInfo->jpgInfo.frameOffset = -1;
++		}
++
++		pDecInfo->jpgInfo.frameIdx++;
+ 
+-		if ((val & 0x1)) {
++		val = VpuReadReg(MJPEG_PIC_STATUS_REG);
++		if (val & (1 << INT_JPU_DONE))
+ 			info->decodingSuccess = 1;
+-			info->decPicWidth = pDecInfo->jpgInfo.alignedWidth;
+-			info->decPicHeight = pDecInfo->jpgInfo.alignedHeight;
+-			info->indexFrameDecoded = 0;
+-			info->indexFrameDisplay = (pDecInfo->jpgInfo.frameIdx%pDecInfo->numFrameBuffers);
+-			info->consumedByte = VpuReadReg(MJPEG_GBU_TT_CNT_REG)/8;
+-			pDecInfo->jpgInfo.frameIdx++;
+-		} else {
++		else {
+ 			info->numOfErrMBs = VpuReadReg(MJPEG_PIC_ERRMB_REG);
+ 			info->decodingSuccess = 0;
+ 		}
+@@ -4359,18 +4484,6 @@ RetCode vpu_DecGiveCommand(DecHandle handle, CodecCommand cmd, void *param)
+ 			break;
+ 		}
+ 
+-	case SET_JPG_HEADER_BUFFER:
+-		{
+-			JpegHeaderBufInfo *pJpgHeaderInfo;
+-
+-			if (param == 0)
+-				return RETCODE_INVALID_PARAM;
+-
+-			pJpgHeaderInfo = (JpegHeaderBufInfo *)param;
+-			pDecInfo->jpgInfo.pHeader = pJpgHeaderInfo->pHeader;
+-			pDecInfo->jpgInfo.headerSize = pJpgHeaderInfo->headerSize;
+-			break;
+-		}
+ 	default:
+ 		return RETCODE_INVALID_COMMAND;
+ 	}
+@@ -4383,7 +4496,7 @@ void SaveGetEncodeHeader(EncHandle handle, int encHeaderType, char *filename)
+ 	FILE *fp = NULL;
+ 	Uint8 *pHeader = NULL;
+ 	EncParamSet encHeaderParam = { 0 };
+-	int i;
++	int i,n;
+ 	Uint32 dword1, dword2;
+ 	Uint32 *pBuf;
+ 	Uint32 byteSize;
+@@ -4413,7 +4526,7 @@ void SaveGetEncodeHeader(EncHandle handle, int encHeaderType, char *filename)
+ 		if (encHeaderParam.size > 0) {
+ 			fp = fopen(filename, "wb");
+ 			if (fp) {
+-				fwrite(pHeader, sizeof(Uint8),
++				n = fwrite(pHeader, sizeof(Uint8),
+ 				       encHeaderParam.size, fp);
+ 				fclose(fp);
+ 			}
+@@ -4422,17 +4535,3 @@ void SaveGetEncodeHeader(EncHandle handle, int encHeaderType, char *filename)
+ 		free(pHeader);
+ 	}
+ }
+-
+-int jpu_IsBusy()
+-{
+-	Uint32 val;
+-
+-	IOClkGateSet(true);
+-	val = VpuReadReg(MJPEG_PIC_STATUS_REG);
+-	IOClkGateSet(false);
+-
+-	if (val & 0x01 || val & 0x02)
+-		return 0;
+-
+-	return 1;
+-}
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index d6147c4..229df0f 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -52,6 +52,11 @@ typedef Uint32 VirtualAddress;
+ 
+ #define MAX_NUM_INSTANCE		8
+ 
++#define DC_TABLE_INDEX0		    0
++#define AC_TABLE_INDEX0		    1
++#define DC_TABLE_INDEX1		    2
++#define AC_TABLE_INDEX1		    3
++
+ typedef enum {
+ 	STD_MPEG4 = 0,
+ 	STD_H263 = 1,
+@@ -84,7 +89,9 @@ typedef enum {
+ 	RETCODE_NOT_SUPPORTED = -15,
+ 	RETCODE_REPORT_BUF_NOT_SET = -16,
+ 	RETCODE_FAILURE_TIMEOUT = -17,
+-	RETCODE_MEMORY_ACCESS_VIOLATION = -18
++	RETCODE_MEMORY_ACCESS_VIOLATION = -18,
++	RETCODE_JPEG_EOS = -19,
++	RETCODE_JPEG_BIT_EMPTY = -20
+ } RetCode;
+ 
+ typedef enum {
+@@ -133,12 +140,7 @@ typedef enum {
+ 	DEC_SET_REPORT_MVINFO,
+ 	DEC_SET_REPORT_USERDATA,
+ 	SET_DBK_OFFSET,
+-
+-	SET_MC_CACHE_CONFIG,
+-	ENABLE_MC_CACHE,
+-	DISABLE_MC_CACHE,
+ 	SET_WRITE_MEM_PROTECT,
+-	SET_JPG_HEADER_BUFFER,
+ 
+ 	ENC_SET_SUB_FRAME_SYNC,
+ 	ENC_ENABLE_SUB_FRAME_SYNC,
+@@ -198,6 +200,7 @@ typedef DecInst *DecHandle;
+ typedef struct {
+ 	CodStd bitstreamFormat;
+ 	PhysicalAddress bitstreamBuffer;
++	Uint8 *pBitStream;
+ 	int bitstreamBufferSize;
+ 	int qpReport;
+ 	int mp4DeblkEnable;
+@@ -209,7 +212,7 @@ typedef struct {
+ 	int avcExtension;	/* Not used on none mx6 */
+ 	int dynamicAllocEnable; /* Not used on mx6 */
+ 	int streamStartByteOffset;
+-	int mjpg_thumbNailDecEnable;
++	int mjpg_thumbNailDecEnable; /* Not used on mx6 */
+ 	PhysicalAddress psSaveBuffer;
+ 	int psSaveBufferSize;
+ 	int mp4Class;
+@@ -217,6 +220,7 @@ typedef struct {
+ 	int mapType;
+ 	int tiled2LinearEnable;
+ 	int bitstreamMode;
++	int jpgLineBufferMode; /* mx6 */
+ 
+ } DecOpenParam;
+ 
+@@ -314,6 +318,12 @@ typedef struct {
+ 	int chunkSize;      /* Not used on mx6 */
+ 	int picStartByteOffset;   /* Not used on mx6 */
+ 	PhysicalAddress picStreamBufferAddr;  /* Not used on mx6 */
++	int mjpegScaleDownRatioWidth;  /* mx6 */
++	int mjpegScaleDownRatioHeight;  /* mx6 */
++
++	PhysicalAddress phyJpgChunkBase;
++	unsigned char *virtJpgChunkBase;
++
+ } DecParam;
+ 
+ typedef	struct {
+@@ -639,7 +649,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 3, 4)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 3, 5)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 4729e96..d0c0765 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -595,10 +595,17 @@ RetCode CheckDecOpenParam(DecOpenParam * pop)
+ 	if (pop->bitstreamBuffer % 4) {	/* not 4-bit aligned */
+ 		return RETCODE_INVALID_PARAM;
+ 	}
+-	if (pop->bitstreamBufferSize % 1024 ||
+-	    pop->bitstreamBufferSize < 1024 ||
+-	    pop->bitstreamBufferSize > 16383 * 1024) {
+-		return RETCODE_INVALID_PARAM;
++
++	if (cpu_is_mx6q() & (pop->bitstreamFormat == STD_MJPG)) {
++		if (!pop->jpgLineBufferMode) {
++			if (pop->bitstreamBufferSize % 1024 ||
++			    pop->bitstreamBufferSize < 1024)
++				return RETCODE_INVALID_PARAM;
++		}
++	} else if (pop->bitstreamBufferSize % 1024 ||
++		 pop->bitstreamBufferSize < 1024 ||
++		 pop->bitstreamBufferSize > 16383 * 1024) {
++			return RETCODE_INVALID_PARAM;
+ 	}
+ 
+ 	/* Workaround for STD_H263 support: Force to convert STD_H263
+@@ -1353,7 +1360,7 @@ int JpgEncLoadQMatTab(EncInfo * pEncInfo)
+ 		t = (comp==0)? Q_COMPONENT0 :
+ 		    (comp==1)? Q_COMPONENT1 : Q_COMPONENT2;
+ 		VpuWriteReg(MJPEG_QMAT_CTRL_REG, 0x3 + t);
+-		for (i=0; i<64; i++) {
++		for (i = 0; i < 64; i++) {
+ 			divisor = pEncInfo->jpgInfo.pQMatTab[quantID][i];
+ 			quotient= dividend / divisor;
+ 			VpuWriteReg(MJPEG_QMAT_DATA_REG, (int) quotient);
+@@ -1364,7 +1371,7 @@ int JpgEncLoadQMatTab(EncInfo * pEncInfo)
+ 	return 1;
+ }
+ 
+-int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
++int JpgEncEncodeHeader(EncHandle handle, EncParamSet *para)
+ {
+ 	CodecInst *pCodecInst;
+ 	EncInfo *pEncInfo;
+@@ -1379,7 +1386,7 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 	len = para->size;
+ 
+ 	// SOI Header
+-	PUT_BYTE(p, 0xff);
++	PUT_BYTE(p, 0xFF);
+ 	PUT_BYTE(p, 0xD8);
+ 	// APP9 Header
+ 	PUT_BYTE(p, 0xFF);
+@@ -1409,9 +1416,9 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 
+ 	PUT_BYTE(p, 0x00);
+ 
+-	for (i = 0; i < 64; i++)
++	for (i = 0; i < 64; i++) {
+ 		PUT_BYTE(p, pEncInfo->jpgInfo.pQMatTab[0][i]);
+-
++	}
+ 	if (pEncInfo->jpgInfo.format != FORMAT_400) {
+ 		PUT_BYTE(p, 0xFF);
+ 		PUT_BYTE(p, 0xDB);
+@@ -1419,8 +1426,9 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 		PUT_BYTE(p, 0x43);
+ 		PUT_BYTE(p, 0x01);
+ 
+-		for (i = 0; i < 64; i++)
++		for (i = 0; i < 64; i++) {
+ 			PUT_BYTE(p, pEncInfo->jpgInfo.pQMatTab[1][i]);
++		}
+ 	}
+ 
+ 	// DHT Header
+@@ -1430,11 +1438,13 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 	PUT_BYTE(p, 0x1F);
+ 	PUT_BYTE(p, 0x00);
+ 
+-	for (i = 0; i < 16; i++)
++	for (i = 0; i < 16; i++) {
+ 		PUT_BYTE(p, pEncInfo->jpgInfo.pHuffBits[0][i]);
++	}
+ 
+-	for (i = 0; i < 12; i++)
++	for (i = 0; i < 12; i++) {
+ 		PUT_BYTE(p, pEncInfo->jpgInfo.pHuffVal[0][i]);
++	}
+ 
+ 	PUT_BYTE(p, 0xFF);
+ 	PUT_BYTE(p, 0xC4);
+@@ -1442,11 +1452,13 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 	PUT_BYTE(p, 0xB5);
+ 	PUT_BYTE(p, 0x10);
+ 
+-	for (i = 0; i < 16; i++)
++	for (i = 0; i < 16; i++) {
+ 		PUT_BYTE(p, pEncInfo->jpgInfo.pHuffBits[1][i]);
++	}
+ 
+-	for (i = 0; i < 162; i++)
++	for (i = 0; i < 162; i++) {
+ 		PUT_BYTE(p, pEncInfo->jpgInfo.pHuffVal[1][i]);
++	}
+ 
+ 	if (pEncInfo->jpgInfo.format != FORMAT_400) {
+ 		PUT_BYTE(p, 0xFF);
+@@ -1455,11 +1467,12 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 		PUT_BYTE(p, 0x1F);
+ 		PUT_BYTE(p, 0x01);
+ 
+-		for (i=0; i<16; i++)
++		for (i=0; i<16; i++) {
+ 			PUT_BYTE(p, pEncInfo->jpgInfo.pHuffBits[2][i]);
+-
+-		for (i=0; i<12; i++)
++		}
++		for (i=0; i<12; i++) {
+ 			PUT_BYTE(p, pEncInfo->jpgInfo.pHuffVal[2][i]);
++		}
+ 
+ 		PUT_BYTE(p, 0xFF);
+ 		PUT_BYTE(p, 0xC4);
+@@ -1467,11 +1480,13 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 		PUT_BYTE(p, 0xB5);
+ 		PUT_BYTE(p, 0x11);
+ 
+-		for (i = 0; i < 16; i++)
++		for (i = 0; i < 16; i++) {
+ 			PUT_BYTE(p, pEncInfo->jpgInfo.pHuffBits[3][i]);
++		}
+ 
+-		for (i = 0; i < 162; i++)
++		for (i = 0; i < 162; i++) {
+ 			PUT_BYTE(p, pEncInfo->jpgInfo.pHuffVal[3][i]);
++		}
+ 	}
+ 
+ 	/* SOF header */
+@@ -1487,7 +1502,7 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 	PUT_BYTE(p, pEncInfo->jpgInfo.compNum);
+ 
+ 	for (i=0; i<pEncInfo->jpgInfo.compNum; i++) {
+-		PUT_BYTE(p, (i+1));
++		PUT_BYTE(p, (i + 1));
+ 		PUT_BYTE(p, ((pEncInfo->jpgInfo.pCInfoTab[i][1]<<4) & 0xF0) +
+ 				 (pEncInfo->jpgInfo.pCInfoTab[i][2] & 0x0F));
+ 		PUT_BYTE(p, pEncInfo->jpgInfo.pCInfoTab[i][3]);
+@@ -1496,9 +1511,10 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para)
+ 	pad = 0;
+ 	if (tot % 8) {
+ 		pad = tot % 8;
+-		pad = 8-pad;
+-		for (i=0; i<pad; i++)
++		pad = 8 - pad;
++		for (i = 0; i < pad; i++) {
+ 			PUT_BYTE(p, 0x00);
++		}
+ 	}
+ 
+ 	pEncInfo->jpgInfo.frameIdx++;
+@@ -1515,51 +1531,31 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 	VpuWriteReg(MJPEG_HUFF_CTRL_REG, 0x003);
+ 
+ 	/* DC Luma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffMin[0][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp <<5) | (temp<<4) |
+-		       (temp<<3) | (temp<<2) | (temp<<1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* DC Chroma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffMin[2][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp << 5) | (temp << 4) |
+-		       (temp << 3) | (temp << 2) | (temp << 1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* AC Luma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffMin[1][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp <<5) | (temp<<4) | (temp<<3) |
+-		       (temp<<2) | (temp<<1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* AC Chroma */
+-	for(j=0; j<16; j++) {
++	for(j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffMin[3][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp <<5) | (temp<<4) |
+-		       (temp<<3) | (temp<<2) | (temp<<1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* MAX Tables */
+@@ -1567,51 +1563,31 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 	VpuWriteReg(MJPEG_HUFF_ADDR_REG, 0x440);
+ 
+ 	/* DC Luma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffMax[0][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp <<5) | (temp<<4) |
+-		       (temp<<3) | (temp<<2) | (temp<<1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* DC Chroma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffMax[2][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp <<5) | (temp<<4) |
+-		       (temp<<3) | (temp<<2) | (temp<<1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* AC Luma */
+ 	for (j=0; j<16; j++) {
+ 		HuffData = jpg->huffMax[1][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp <<5) | (temp<<4) | (temp<<3) |
+-		       (temp<<2) | (temp<<1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* AC Chroma */
+ 	for (j=0; j<16; j++) {
+ 		HuffData = jpg->huffMax[3][j];
+-		temp = (HuffData & 0x8000) >> 15;
+-		temp = (temp << 15) | (temp << 14) | (temp << 13) |
+-		       (temp << 12) | (temp << 11) | (temp << 10) |
+-		       (temp << 9) | (temp << 8) | (temp << 7 ) |
+-		       (temp << 6) | (temp <<5) | (temp<<4) | (temp<<3) |
+-		      (temp<<2) | (temp<<1)| (temp) ;
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFF) << 16) | HuffData));
++		temp = ((HuffData & 0x8000) != 0) ? 0xFFFF0000 + HuffData : HuffData & 0xFFFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* PTR Tables */
+@@ -1619,55 +1595,31 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 	VpuWriteReg (MJPEG_HUFF_ADDR_REG, 0x880);
+ 
+ 	/* DC Luma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffPtr[0][j];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* DC Chroma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffPtr[2][j];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* AC Luma */
+-	for (j=0; j<16; j++) {
++	for (j = 0; j < 16; j++) {
+ 		HuffData = jpg->huffPtr[1][j];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* AC Chroma */
+ 	for (j=0; j<16; j++) {
+ 		HuffData = jpg->huffPtr[3][j];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+ 
+ 	/* VAL Tables */
+@@ -1675,77 +1627,50 @@ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo)
+ 
+ 	/* VAL DC Luma */
+ 	HuffLength = 0;
+-	for(i=0; i<12; i++)
++	for(i = 0; i < 12; i++)
+ 		HuffLength += jpg->huffBits[0][i];
+-
+-	for (i=0; i<HuffLength; i++) {
++	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[0][i];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+-
+-	for (i=0; i<12-HuffLength; i++)
++	for (i = 0; i < 12 - HuffLength; i++)
+ 		VpuWriteReg(MJPEG_HUFF_DATA_REG, 0xFFFFFFFF);
+ 
+ 	/* VAL DC Chroma */
+ 	HuffLength = 0;
+-	for(i=0; i<12; i++)
++	for(i = 0; i < 12; i++)
+ 		HuffLength += jpg->huffBits[2][i];
+-	for (i=0; i<HuffLength; i++) {
++	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[2][i];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
+-	}
+-	for (i=0; i<12-HuffLength; i++)
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
++	}
++	for (i = 0; i < 12 - HuffLength; i++)
+ 		VpuWriteReg(MJPEG_HUFF_DATA_REG, 0xFFFFFFFF);
+ 
+ 	/* VAL AC Luma */
+ 	HuffLength = 0;
+-	for(i=0; i<162; i++)
++	for(i = 0; i < 162; i++)
+ 		HuffLength += jpg->huffBits[1][i];
+-	for (i=0; i<HuffLength; i++) {
++	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[1][i];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
+-	}
+-	for (i=0; i<162-HuffLength; i++)
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
++	}
++	for (i = 0; i < 162 - HuffLength; i++)
+ 		VpuWriteReg(MJPEG_HUFF_DATA_REG, 0xFFFFFFFF);
+ 
+ 	/* VAL AC Chroma */
+ 	HuffLength = 0;
+-	for (i=0; i<162; i++)
++	for (i = 0; i < 162; i++)
+ 		HuffLength += jpg->huffBits[3][i];
+-	for (i=0; i<HuffLength; i++) {
++	for (i = 0; i < HuffLength; i++) {
+ 		HuffData = jpg->huffVal[3][i];
+-		temp = (HuffData & 0x80) >> 7;
+-		temp = (temp<<23)|(temp<<22)|(temp<<21)|(temp<<20)|
+-		       (temp<<19)|(temp<<18)|(temp<<17)|(temp<<16)|
+-		       (temp<<15)|(temp<<14)|(temp<<13)|(temp<<12)|
+-		       (temp<<11)|(temp<<10)|(temp<<9)|(temp<<8)|
+-		       (temp<<7)|(temp<<6)|(temp<<5)|(temp<<4)|
+-		       (temp<<3)|(temp<<2)|(temp<<1)|(temp);
+-		VpuWriteReg (MJPEG_HUFF_DATA_REG, (((temp & 0xFFFFFF) << 8) | HuffData));
++		temp = ((HuffData & 0x80) != 0) ? 0xFFFFFF00 + HuffData : HuffData & 0xFF;
++		VpuWriteReg (MJPEG_HUFF_DATA_REG, temp);
+ 	}
+-
+-	for (i=0; i<162-HuffLength; i++)
++	for (i = 0; i < 162 - HuffLength; i++)
+ 		VpuWriteReg(MJPEG_HUFF_DATA_REG, 0xFFFFFFFF);
+ 
+ 	/* end SerPeriHuffTab */
+@@ -1761,7 +1686,7 @@ RetCode JpgDecQMatTabSetUp(DecInfo *pDecInfo)
+ 
+ 	VpuWriteReg(MJPEG_QMAT_CTRL_REG, 0x03);
+ 	table = jpg->cInfoTab[0][3];
+-	for (i=0; i<64; i++) {
++	for (i = 0; i < 64; i++) {
+ 		val = jpg->qMatTab[table][i];
+ 		VpuWriteReg(MJPEG_QMAT_DATA_REG, val);
+ 	}
+@@ -1769,7 +1694,7 @@ RetCode JpgDecQMatTabSetUp(DecInfo *pDecInfo)
+ 
+ 	VpuWriteReg(MJPEG_QMAT_CTRL_REG, 0x43);
+ 	table = jpg->cInfoTab[1][3];
+-	for (i=0; i<64; i++) {
++	for (i = 0; i < 64; i++) {
+ 		val = jpg->qMatTab[table][i];
+ 		VpuWriteReg(MJPEG_QMAT_DATA_REG, val);
+ 	}
+@@ -1777,7 +1702,7 @@ RetCode JpgDecQMatTabSetUp(DecInfo *pDecInfo)
+ 
+ 	VpuWriteReg(MJPEG_QMAT_CTRL_REG, 0x83);
+ 	table = jpg->cInfoTab[2][3];
+-	for (i=0; i<64; i++) {
++	for (i = 0; i < 64; i++) {
+ 		val = jpg->qMatTab[table][i];
+ 		VpuWriteReg(MJPEG_QMAT_DATA_REG, val);
+ 	}
+@@ -1791,11 +1716,8 @@ void JpgDecGramSetup(DecInfo * pDecInfo)
+ 	int dExtBitBufBaseAddr;
+ 	int dMibStatus;
+ 
+-	if (pDecInfo->jpgInfo.seqInited==1)
+-		return;
+-
+ 	dMibStatus = 1;
+-	dExtBitBufCurPos = 0;
++	dExtBitBufCurPos = pDecInfo->jpgInfo.pagePtr;
+ 	dExtBitBufBaseAddr = pDecInfo->streamBufStartAddr;
+ 
+ 	VpuWriteReg(MJPEG_BBC_CUR_POS_REG, dExtBitBufCurPos);
+@@ -1824,15 +1746,20 @@ void JpgDecGramSetup(DecInfo * pDecInfo)
+ 
+ 	VpuWriteReg(MJPEG_BBC_CUR_POS_REG, dExtBitBufCurPos);
+ 	VpuWriteReg(MJPEG_BBC_CTRL_REG, 1);
+-	VpuWriteReg(MJPEG_GBU_WD_PTR_REG, 0);
++	VpuWriteReg(MJPEG_GBU_WD_PTR_REG, pDecInfo->jpgInfo.wordPtr);
+ 	VpuWriteReg(MJPEG_GBU_BBSR_REG, 0);
+ 	VpuWriteReg(MJPEG_GBU_BBER_REG, ((256 / 4) * 2) - 1);
+-	VpuWriteReg(MJPEG_GBU_BBIR_REG, 256 / 4);
+-	VpuWriteReg(MJPEG_GBU_BBHR_REG, 256 / 4);
++	if (pDecInfo->jpgInfo.pagePtr & 1) {
++		VpuWriteReg(MJPEG_GBU_BBIR_REG, 0);
++		VpuWriteReg(MJPEG_GBU_BBHR_REG, 0);
++	} else {
++		VpuWriteReg(MJPEG_GBU_BBIR_REG, 256 / 4);
++		VpuWriteReg(MJPEG_GBU_BBHR_REG, 256 / 4);
++	}
++
+ 	VpuWriteReg(MJPEG_GBU_CTRL_REG, 4);
+-	VpuWriteReg(MJPEG_GBU_FF_RPTR_REG, 0);
++	VpuWriteReg(MJPEG_GBU_FF_RPTR_REG, pDecInfo->jpgInfo.bitPtr);
+ 
+-	pDecInfo->jpgInfo.seqInited=1;
+ }
+ 
+ const Uint8 cDefHuffBits[4][16] =
+@@ -1945,15 +1872,16 @@ int decode_app_header(JpgDecInfo *jpg)
+ {
+ 	int length;
+ 
++	if (get_bits_left(&jpg->gbc) < 16)
++		return 0;
++
+ 	length = get_bits(&jpg->gbc, 16);
+ 	length -= 2;
+ 
+-	while (length-- > 0)
++	while (length-- > 0) {
++		if (get_bits_left(&jpg->gbc) < 8)
++			return 0;
+ 		get_bits(&jpg->gbc, 8);
+-
+-	if (!check_start_code(jpg)) {
+-		find_start_code(jpg);
+-		return 0;
+ 	}
+ 
+ 	return 1;
+@@ -1962,15 +1890,13 @@ int decode_app_header(JpgDecInfo *jpg)
+ 
+ int decode_dri_header(JpgDecInfo *jpg)
+ {
++	if (get_bits_left(&jpg->gbc) < 16 * 2)
++		return 0;
++
+ 	get_bits(&jpg->gbc, 16);
+ 
+ 	jpg->rstIntval = get_bits(&jpg->gbc, 16);
+ 
+-	if (!check_start_code(jpg)) {
+-		find_start_code(jpg);
+-		return 0;
+-	}
+-
+ 	return 1;
+ }
+ 
+@@ -1978,13 +1904,15 @@ int decode_dqt_header(JpgDecInfo *jpg)
+ {
+ 	int Pq, Tq, i;
+ 
++	if (get_bits_left(&jpg->gbc) < 16 + 4 + 4 + 8 * 64)
++		return 0;
++
+ 	get_bits(&jpg->gbc, 16);
+ 
+ 	do {
+ 		Pq = get_bits(&jpg->gbc, 4);
+ 		Tq = get_bits(&jpg->gbc, 4);
+-
+-		for (i=0; i<64; i++)
++		for (i = 0; i < 64; i++)
+ 			jpg->qMatTab[Tq][i] = get_bits(&jpg->gbc, 8);
+ 	} while(!check_start_code(jpg));
+ 
+@@ -1998,23 +1926,31 @@ int decode_dth_header(JpgDecInfo *jpg)
+ {
+ 	int Tc, Th, ThTc, bitCnt, i;
+ 
++	if (get_bits_left(&jpg->gbc) < 16)
++		return 0;
++
+ 	get_bits(&jpg->gbc, 16);
+ 
+ 	do {
++		if (get_bits_left(&jpg->gbc) < 8 + 8 * 16)
++			return 0;
++
+ 		Tc = get_bits(&jpg->gbc, 4);
+ 		Th = get_bits(&jpg->gbc, 4);
+-		ThTc = ((Th&1)<<1) | (Tc&1);
++		ThTc = ((Th & 1) << 1) | (Tc & 1);
+ 
+ 		bitCnt = 0;
+-		for (i=0; i<16;i++) {
++		for (i = 0; i < 16; i++) {
+ 			jpg->huffBits[ThTc][i] = get_bits(&jpg->gbc, 8);
+ 			bitCnt += jpg->huffBits[ThTc][i];
+ 
+ 			if (cDefHuffBits[ThTc][i] != jpg->huffBits[ThTc][i])
+-			jpg->userHuffTab = 1;
++				jpg->userHuffTab = 1;
+ 		}
+ 
+-		for (i=0; i<bitCnt; i++)  {
++		if (get_bits_left(&jpg->gbc) <  8 * bitCnt)
++			return 0;
++		for (i = 0; i < bitCnt; i++)  {
+ 			jpg->huffVal[ThTc][i] = get_bits(&jpg->gbc, 8);
+ 
+ 			if (cDefHuffVal[ThTc][i] != jpg->huffVal[ThTc][i])
+@@ -2030,6 +1966,9 @@ int decode_sof_header(JpgDecInfo *jpg)
+ 	int samplePrecision, sampleFactor, i, Tqi, compID;
+ 	int hSampFact[3], vSampFact[3], picX, picY, numComp;
+ 
++	if (get_bits_left(&jpg->gbc) < 16 + 8 + 16 + 16 + 8)
++		return 0;
++
+ 	get_bits(&jpg->gbc, 16);
+ 	samplePrecision = get_bits(&jpg->gbc, 8);
+ 
+@@ -2054,6 +1993,9 @@ int decode_sof_header(JpgDecInfo *jpg)
+ 	if (numComp > 3)
+ 		info_msg("Picture Horizontal Size limits Maximum size\n");
+ 
++	if (get_bits_left(&jpg->gbc) < numComp * ( 8 + 4 + 4 + 8))
++		return 0;
++
+ 	for (i=0; i<numComp; i++) {
+ 		compID = get_bits(&jpg->gbc, 8);
+ 		hSampFact[i] = get_bits(&jpg->gbc, 4);
+@@ -2066,14 +2008,15 @@ int decode_sof_header(JpgDecInfo *jpg)
+ 		jpg->cInfoTab[i][3] = Tqi;
+ 	}
+ 
+-	if ((hSampFact[0]>2) || (vSampFact[0]>2) || ((numComp == 3) &&
+-	    ((hSampFact[1]!=1) || (hSampFact[2]!=1) || (vSampFact[1]!=1) || (vSampFact[2]!=1))))
++	if ((hSampFact[0] > 2) || (vSampFact[0] > 2) || ((numComp == 3) &&
++	    ((hSampFact[1] != 1) || (hSampFact[2] != 1) ||
++	     (vSampFact[1] != 1) || (vSampFact[2] != 1))))
+ 		info_msg("Not Supported Sampling Factor\n");
+ 
+ 	if (numComp == 1)
+ 		sampleFactor = SAMPLE_400;
+ 	else
+-		sampleFactor = ((hSampFact[0]&3)<<2) | (vSampFact[0]&3);
++		sampleFactor = ((hSampFact[0] & 3) << 2) | (vSampFact[0] & 3);
+ 
+ 	switch(sampleFactor) {
+ 		case SAMPLE_420:
+@@ -2101,21 +2044,42 @@ int decode_sof_header(JpgDecInfo *jpg)
+ int decode_sos_header(JpgDecInfo *jpg)
+ {
+ 	int i, j, len, numComp, compID;
+-	int ss, se, ah, al;
++	int ss, se, ah, al, ecsPtr;
+ 	int dcHufTblIdx[3], acHufTblIdx[3];
+ 
++	if (get_bits_left(&jpg->gbc) < 8)
++		return 0;
++
+ 	len = get_bits(&jpg->gbc, 16);
+ 
+-	jpg->ecsPtr = get_bits_count(&jpg->gbc)/8 + len - 2 ;
++	jpg->ecsPtr = get_bits_count(&jpg->gbc) / 8 + len - 2 ;
++
++	ecsPtr = jpg->ecsPtr + jpg->frameOffset;
++	jpg->pagePtr = ecsPtr / 256;
++	jpg->wordPtr = (ecsPtr % 256) / 4;	/* word unit */
++	if (jpg->pagePtr & 1)
++		jpg->wordPtr += 64;
++	if (jpg->wordPtr & 1)
++		jpg->wordPtr -= 1; /* to make even */
++
++	jpg->bitPtr = (ecsPtr % 4) * 8; /* bit unit */
++	if (((ecsPtr % 256) / 4) & 1)
++		jpg->bitPtr += 32;
++
++	if (get_bits_left(&jpg->gbc) < 8)
++		return 0;
+ 
+ 	numComp = get_bits(&jpg->gbc, 8);
+ 
+-	for (i=0; i<numComp; i++) {
++	if (get_bits_left(&jpg->gbc) < numComp * (8 + 4 + 4))
++		return 0;
++
++	for (i = 0; i < numComp; i++) {
+ 		compID = get_bits(&jpg->gbc, 8);
+ 		dcHufTblIdx[i] = get_bits(&jpg->gbc, 4);
+ 		acHufTblIdx[i] = get_bits(&jpg->gbc, 4);
+ 
+-		for (j=0; j<numComp; j++) {
++		for (j = 0; j < numComp; j++) {
+ 			if (compID == jpg->cInfoTab[j][0]) {
+ 				jpg->cInfoTab[j][4] = dcHufTblIdx[i];
+ 				jpg->cInfoTab[j][5] = acHufTblIdx[i];
+@@ -2123,6 +2087,9 @@ int decode_sos_header(JpgDecInfo *jpg)
+ 		}
+ 	}
+ 
++	if (get_bits_left(&jpg->gbc) < 8 + 8 + 4 + 4)
++		return 0;
++
+ 	ss = get_bits(&jpg->gbc, 8);
+ 	se = get_bits(&jpg->gbc, 8);
+ 	ah = get_bits(&jpg->gbc, 4);
+@@ -2136,7 +2103,7 @@ int decode_sos_header(JpgDecInfo *jpg)
+ 	return 1;
+ }
+ 
+-static void genDecHuffTab(JpgDecInfo *jpg, int tabNum)
++void genDecHuffTab(JpgDecInfo *jpg, int tabNum)
+ {
+ 	unsigned char *huffPtr, *huffBits;
+ 	unsigned int *huffMax, *huffMin;
+@@ -2149,7 +2116,7 @@ static void genDecHuffTab(JpgDecInfo *jpg, int tabNum)
+ 	huffMax = (unsigned int *)(jpg->huffMax[tabNum]);
+ 	huffMin = (unsigned int *)(jpg->huffMin[tabNum]);
+ 
+-	for (i=0; i<16; i++) {
++	for (i = 0; i < 16; i++) {
+ 		if (huffBits[i]) {
+ 			huffPtr[i] = ptrCnt;
+ 			ptrCnt += huffBits[i];
+@@ -2173,24 +2140,19 @@ static void genDecHuffTab(JpgDecInfo *jpg, int tabNum)
+ 	}
+ }
+ 
+-int JpegDecodeHeader(DecInfo * pDecInfo)
++int JpegDecodeHeader(DecInfo *pDecInfo, unsigned char *b, int size)
+ {
+ 	unsigned int code;
+ 	int i, temp;
+ 	JpgDecInfo *jpg = &pDecInfo->jpgInfo;
+-	Uint8 *b = pDecInfo->jpgInfo.pHeader;
+-	int size = pDecInfo->jpgInfo.headerSize;
+ 
+ 	if (!b || !size)
+ 		return 0;
+ 
+-	memset(jpg, 0x00, sizeof(JpgDecInfo));
+-	memset(&jpg->gbc, 0x00, sizeof(GetBitContext));
+-
+-	init_get_bits(&jpg->gbc, b, size*8);
++	init_get_bits(&jpg->gbc, b, size * 8);
+ 
+ 	/* Initialize component information table */
+-	for (i=0; i<4; i++) {
++	for (i = 0; i < 4; i++) {
+ 		jpg->cInfoTab[i][0] = 0;
+ 		jpg->cInfoTab[i][1] = 0;
+ 		jpg->cInfoTab[i][2] = 0;
+@@ -2201,31 +2163,36 @@ int JpegDecodeHeader(DecInfo * pDecInfo)
+ 
+ 	for (;;) {
+ 		if (find_start_code(jpg) == 0)
+-			return 0;
++			return -1;
+ 
+ 		code = get_bits(&jpg->gbc, 16);
+-
+ 		switch (code) {
+ 		case SOI_Marker:
+ 			break;
+ 		case JFIF_CODE:
+ 		case EXIF_CODE:
+-			decode_app_header(jpg);
++			if (!decode_app_header(jpg))
++				return -1;
+ 			break;
+ 		case DRI_Marker:
+-			decode_dri_header(jpg);
++			if (!decode_dri_header(jpg))
++				return -1;
+ 			break;
+ 		case DQT_Marker:
+-			decode_dqt_header(jpg);
++			if (!decode_dqt_header(jpg))
++				return -1;
+ 			break;
+ 		case DHT_Marker:
+-			decode_dth_header(jpg);
++			if (!decode_dth_header(jpg))
++				return -1;
+ 			break;
+ 		case SOF_Marker:
+-			decode_sof_header(jpg);
++			if (!decode_sof_header(jpg))
++				return -1;
+ 			break;
+ 		case SOS_Marker:
+-			decode_sos_header(jpg);
++			if (!decode_sos_header(jpg))
++				return -1;
+ 			goto DONE_DEC_HEADER;
+ 			break;
+ 		case EOI_Marker:
+@@ -2237,7 +2204,8 @@ int JpegDecodeHeader(DecInfo * pDecInfo)
+ 				if (get_bits_left(&jpg->gbc) <=0 )
+ 					return 0;
+ 				else {
+-					decode_app_header(jpg);
++					if (!decode_app_header(jpg))
++						return -1;
+ 					break;
+ 				}
+ 			default:
+@@ -2249,8 +2217,11 @@ int JpegDecodeHeader(DecInfo * pDecInfo)
+ 	}
+ 
+ DONE_DEC_HEADER:
++	if (!jpg->ecsPtr)
++		return 0;
++
+ 	/* Generate Huffman table information */
+-	for (i=0; i<4; i++)
++	for (i = 0; i < 4; i++)
+ 		genDecHuffTab(jpg, i);
+ 
+ 	temp = jpg->cInfoTab[0][3];
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 47f125b..1541f61 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -27,9 +27,20 @@
+ 
+ #define MAX_FW_BINARY_LEN		200 * 1024
+ 
+-#define INT_BIT_PIC_RUN			3
+-#define INT_BIT_BIT_BUF_FULL		15
+-#define INT_BIT_BIT_BUF_EMPTY		14
++typedef enum {
++	INT_BIT_PIC_RUN = 3,
++	INT_BIT_BIT_BUF_EMPTY = 14,
++	INT_BIT_BIT_BUF_FULL = 15
++}InterruptBit;
++
++typedef enum {
++	INT_JPU_DONE = 0,
++	INT_JPU_ERROR = 1,
++	INT_JPU_BIT_BUF_EMPTY = 2,
++	INT_JPU_BIT_BUF_FULL = 2,
++	INT_JPU_PARIAL_OVERFLOW = 3
++}InterruptJpu;
++
+ 
+ #if defined(IMX6Q)
+ #define BIT_WORK_SIZE			47 * 1024
+@@ -275,7 +286,7 @@ typedef struct {
+ 	Uint32 huffSize[4][256];
+ 	Uint8 *pHuffVal[4];
+ 	Uint8 *pHuffBits[4];
+-	Uint8 *pCInfoTab[4];
++	Uint8 *pCInfoTab[5];
+ 	Uint8 *pQMatTab[4];
+ 
+ } JpgEncInfo;
+@@ -320,42 +331,47 @@ typedef struct {
+ } EncInfo;
+ 
+ typedef struct {
+-    /* for Nieuport */
+-    int picWidth;
+-    int picHeight;
+-    int alignedWidth;
+-    int alignedHeight;
+-
+-    int ecsPtr;
+-    int format;
+-    int rstIntval;
+-
+-    int userHuffTab;
+-
+-    int huffDcIdx;
+-    int huffAcIdx;
+-    int Qidx;
+-
+-    Uint8 huffVal[4][162];
+-    Uint8 huffBits[4][256];
+-    Uint8 cInfoTab[4][6];
+-    Uint8 qMatTab[4][64];
+-
+-    Uint32 huffMin[4][16];
+-    Uint32 huffMax[4][16];
+-    Uint8 huffPtr[4][16];
+-
+-    int busReqNum;
+-    int compNum;
+-    int mcuBlockNum;
+-    int compInfo[3];
+-
+-    int frameIdx;
+-    int seqInited;
+-
+-    Uint8 *pHeader;
+-    int headerSize;
+-    GetBitContext gbc;
++	/* for Nieuport */
++	int picWidth;
++	int picHeight;
++	int alignedWidth;
++	int alignedHeight;
++	int frameOffset;
++	int ecsPtr;
++	int pagePtr;
++	int wordPtr;
++	int bitPtr;
++	int format;
++	int rstIntval;
++
++	int userHuffTab;
++
++	int huffDcIdx;
++	int huffAcIdx;
++	int Qidx;
++
++	Uint8 huffVal[4][162];
++	Uint8 huffBits[4][256];
++	Uint8 cInfoTab[4][6];
++	Uint8 qMatTab[4][64];
++
++	Uint32 huffMin[4][16];
++	Uint32 huffMax[4][16];
++	Uint8 huffPtr[4][16];
++
++	int busReqNum;
++	int compNum;
++	int mcuBlockNum;
++	int compInfo[3];
++
++	int frameIdx;
++	int seqInited;
++
++	Uint8 *pHeader;
++	int headerSize;
++	GetBitContext gbc;
++	int lineBufferMode;
++
+ } JpgDecInfo;
+ 
+ typedef struct {
+@@ -366,6 +382,7 @@ typedef struct {
+ 	PhysicalAddress streamBufStartAddr;
+ 	PhysicalAddress streamBufEndAddr;
+ 	int streamBufSize;
++	Uint8 *pBitStream;
+ 
+ 	FrameBuffer *frameBufPool;
+ 	int numFrameBuffers;
+@@ -502,13 +519,13 @@ static inline void UnlockVpuReg(semaphore_t *semap)
+ }
+ 
+ int vpu_mx6q_swreset(int forcedReset);
+-int JpgEncLoadHuffTab(EncInfo * pEncInfo);
+-int JpgEncLoadQMatTab(EncInfo * pEncInfo);
+-int JpgEncEncodeHeader(EncHandle handle, EncParamSet * para);
+-void JpgDecGramSetup(DecInfo * pDecInfo);
++int JpgEncLoadHuffTab(EncInfo *pEncInfo);
++int JpgEncLoadQMatTab(EncInfo *pEncInfo);
++int JpgEncEncodeHeader(EncHandle handle, EncParamSet *para);
++void JpgDecGramSetup(DecInfo *pDecInfo);
+ RetCode JpgDecHuffTabSetUp(DecInfo *pDecInfo);
+ RetCode JpgDecQMatTabSetUp(DecInfo *pDecInfo);
+-int JpegDecodeHeader(DecInfo * pDecInfo);
++int JpegDecodeHeader(DecInfo *pDecInfo, unsigned char *b, int size);
+ 
+ #define swab32(x) \
+ 	((Uint32)( \
+-- 
+1.8.0
+

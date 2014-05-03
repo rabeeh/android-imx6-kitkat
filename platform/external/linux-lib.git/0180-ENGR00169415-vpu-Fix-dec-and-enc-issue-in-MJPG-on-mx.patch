@@ -1,0 +1,282 @@
+From 52040afdeafdbc8dafa18324315365e7f68ccd55 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 13 Dec 2011 21:06:56 +0800
+Subject: [PATCH 180/249] ENGR00169415 vpu: Fix dec and enc issue in MJPG on
+ mx6q
+
+Add more protection to fix segmentation fault and error handler
+in MJPG decoder and encoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c  | 42 +++++++++++++++++++++++++++++++++++++++---
+ vpu/vpu_util.c | 46 +++++++++++++++++++++++++++++++++++-----------
+ vpu/vpu_util.h |  4 +++-
+ 3 files changed, 77 insertions(+), 15 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 003938e..f20deb9 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -146,10 +146,13 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 							VpuWriteReg(MJPEG_BBC_END_ADDR_REG,
+ 									wrPtr & 0xFFFFFE00);
+ 					} else if (rdPtr == bbcEnd && !(status & 0x3)) {
++						VpuWriteReg(GDI_BUS_CTRL, 0x11);
++						while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
++						VpuWriteReg(GDI_BUS_CTRL, 0x00);
++						IOSysSWReset(); /* reset JPU */
++
+ 						VpuWriteReg(MJPEG_PIC_STATUS_REG,
+ 								1 << INT_JPU_BIT_BUF_EMPTY);
+-						usleep(2); /* adding delay before reset */
+-						IOSysSWReset(); /* reset JPU */
+ 						if (pDecInfo->streamEndflag)
+ 							pDecInfo->jpgInfo.quitCodec = 1;
+ 						else {
+@@ -166,7 +169,11 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 					else
+ 						ret = -1;
+ 				} else if (pDecInfo->streamEndflag && !status && (rdPtr >= bbcEnd)) {
++					VpuWriteReg(GDI_BUS_CTRL, 0x11);
++					while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
++					VpuWriteReg(GDI_BUS_CTRL, 0x00);
+ 					IOSysSWReset(); /* reset JPU */
++
+ 					pDecInfo->jpgInfo.quitCodec = 1;
+ 					ret = 0;
+ 				}
+@@ -349,6 +356,9 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+ 	if (cpu_is_mx6q()) {
++		VpuWriteReg(GDI_BUS_CTRL, 0x11);
++		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
++		VpuWriteReg(GDI_BUS_CTRL, 0x00);
+ 		IOSysSWReset();
+ 
+ 		VpuWriteReg(BIT_BUSY_FLAG, 1);
+@@ -1446,6 +1456,9 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 		VpuWriteReg(MJPEG_GBU_BT_PTR_REG, 0);
+ 		VpuWriteReg(MJPEG_GBU_WD_PTR_REG, 0);
+ 		VpuWriteReg(MJPEG_GBU_BBSR_REG, 0);
++		VpuWriteReg(MJPEG_BBC_STRM_CTRL_REG, 0);
++		VpuWriteReg(MJPEG_GBU_CTRL_REG, 0);
++		VpuWriteReg(MJPEG_GBU_FF_RPTR_REG, 0);
+ 
+ 		VpuWriteReg(MJPEG_GBU_BBER_REG, ((256 / 4) * 2) - 1);
+ 		VpuWriteReg(MJPEG_GBU_BBIR_REG, 256 / 4);
+@@ -1695,8 +1708,10 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
+ 		val = VpuReadReg(MJPEG_PIC_STATUS_REG);
+-		if ((val & 0x4) >> 2)
++		if ((val & 0x4) >> 2) {
++			UnlockVpu(vpu_semap);
+ 			return RETCODE_WRONG_CALL_SEQUENCE;
++		}
+ 
+ 		if (val != 0)
+ 			VpuWriteReg(MJPEG_PIC_STATUS_REG, val);
+@@ -1709,6 +1724,14 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 		info->picType = 0;
+ 		info->numOfSlices = 0;
+ 		*ppendingInst = 0;
++
++		/* Workaround to reset JPU after each encoder: decoder may be blocked
++		 * after encoder randomly if not do reset. Fixme later */
++		VpuWriteReg(GDI_BUS_CTRL, 0x11);
++		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
++		VpuWriteReg(GDI_BUS_CTRL, 0x00);
++		IOSysSWReset();
++
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_SUCCESS;
+ 	}
+@@ -3464,6 +3487,9 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 			if (val == 0) {
+ 				UnlockVpu(vpu_semap);
+ 				return RETCODE_FAILURE;
++			} else if (val == -3) {
++				UnlockVpu(vpu_semap);
++				return RETCODE_JPEG_BIT_EMPTY;
+ 			} else if (val == -2) { /* wrap around in header case */
+ 				pDecInfo->jpgInfo.frameOffset = 0;
+ 				pDecInfo->jpgInfo.ecsPtr = 0;
+@@ -3471,6 +3497,9 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 				if (val == 0) {
+ 					UnlockVpu(vpu_semap);
+ 					return RETCODE_FAILURE;
++				} else if (val == -3) {
++					UnlockVpu(vpu_semap);
++					return RETCODE_JPEG_BIT_EMPTY;
+ 				} else if (val == -1) {
+ 					UnlockVpu(vpu_semap);
+ 					if (pDecInfo->streamEndflag == 1) {
+@@ -3848,6 +3877,13 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		if (val != 0)
+ 			VpuWriteReg(MJPEG_PIC_STATUS_REG, val);
+ 
++		/* Workaround to reset JPU after each decoder: encoder may be blocked
++		 * after decoder randomly if not do reset. Fixme later */
++		VpuWriteReg(GDI_BUS_CTRL, 0x11);
++		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
++		VpuWriteReg(GDI_BUS_CTRL, 0x00);
++		IOSysSWReset();
++
+ 		*ppendingInst = 0;
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_SUCCESS;
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 41d4680..66c746d 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1819,6 +1819,9 @@ const Uint8 cDefHuffVal[4][162] =
+ 
+ int check_start_code(JpgDecInfo *jpg)
+ {
++	if (get_bits_left(&jpg->gbc) < 8 + 24)
++		return 0;
++
+ 	if (show_bits(&jpg->gbc, 8) == 0xFF)
+ 		return 1;
+ 	else
+@@ -1917,8 +1920,11 @@ int decode_dqt_header(JpgDecInfo *jpg)
+ 	do {
+ 		if (get_bits_left(&jpg->gbc) < (4 + 4 + 8 * 64 + 24))
+ 			return 0;
++
+ 		Pq = get_bits(&jpg->gbc, 4);
+ 		Tq = get_bits(&jpg->gbc, 4);
++		if (Tq > 3)
++			return 0;
+ 		for (i = 0; i < 64; i++)
+ 			jpg->qMatTab[Tq][i] = get_bits(&jpg->gbc, 8);
+ 	} while(!check_start_code(jpg));
+@@ -1945,7 +1951,8 @@ int decode_dth_header(JpgDecInfo *jpg)
+ 		Tc = get_bits(&jpg->gbc, 4);
+ 		Th = get_bits(&jpg->gbc, 4);
+ 		ThTc = ((Th & 1) << 1) | (Tc & 1);
+-
++		if (ThTc > 3)
++			return 0;
+ 		bitCnt = 0;
+ 		for (i = 0; i < 16; i++) {
+ 			jpg->huffBits[ThTc][i] = get_bits(&jpg->gbc, 8);
+@@ -1958,10 +1965,13 @@ int decode_dth_header(JpgDecInfo *jpg)
+ 		if (get_bits_left(&jpg->gbc) <  8 * bitCnt + 24)
+ 			return 0;
+ 		for (i = 0; i < bitCnt; i++)  {
+-			jpg->huffVal[ThTc][i] = get_bits(&jpg->gbc, 8);
+-
+-			if (cDefHuffVal[ThTc][i] != jpg->huffVal[ThTc][i])
+-				jpg->userHuffTab = 1;
++			if (i < HUFF_VAL_SIZE) {
++				jpg->huffVal[ThTc][i] = get_bits(&jpg->gbc, 8);
++				if (cDefHuffVal[ThTc][i] != jpg->huffVal[ThTc][i])
++					jpg->userHuffTab = 1;
++			}
++			else
++				get_bits(&jpg->gbc, 8);
+ 		}
+ 	} while(!check_start_code(jpg));
+ 
+@@ -2155,6 +2165,10 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 	Uint8 *b, *temp_buf = NULL;
+ 	JpgDecInfo *jpg = &pDecInfo->jpgInfo;
+ 
++	/* Init some variable in jpgInfo */
++	jpg->rstIntval = 0;
++	jpg->userHuffTab = 0;
++
+ 	if (jpg->lineBufferMode) {
+ 		b = jpg->pVirtJpgChunkBase;
+ 		size = jpg->chunkSize;
+@@ -2177,6 +2191,10 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 		if (!jpg->ecsPtr) {
+ 			int nextOffset = 0, soiOffset = 0;
+ 
++			/* workaround to avoid to find current incomplete header looply */
++			if (jpg->wrappedHeader && jpg->consumeByte == 0)
++				jpg->consumeByte++;
++
+ 			if (jpg->consumeByte != 0)	{ /* meaning is frameIdx > 0 */
+ 				nextOffset = jpg->consumeByte;
+ 				if (nextOffset <= 0)
+@@ -2286,6 +2304,7 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 			goto DONE_DEC_HEADER;
+ 			break;
+ 		case EOI_Marker:
++			ret = -3;
+ 			goto DONE_DEC_HEADER;
+ 		default:
+ 			switch (code & 0xFFF0) {
+@@ -2307,10 +2326,6 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 				dprintf(4, "code = [%x]\n", code);
+ 				if (jpg->lineBufferMode)
+ 					return 0;
+-				else {
+-					jpg->frameOffset += get_bits_count(&pDecInfo->jpgInfo.gbc) / 8;
+-					return	-2;
+-				}
+ 			}
+ 			break;
+ 		}
+@@ -2324,14 +2339,23 @@ DONE_DEC_HEADER:
+ 		if (ret == -1) {
+ 			if (wrOffset < jpg->frameOffset) {
+ 				dprintf(4, "wrap around in header parsing\n");
++				jpg->wrappedHeader = 1;
+ 				goto proc_wrap;
+ 			}
+ 			return -1;
+ 		}
+ 	}
+ 
+-	if (!jpg->ecsPtr)
+-		return 0;
++	if (!jpg->ecsPtr || ret == -3) {
++		if (pDecInfo->jpgInfo.lineBufferMode)
++			return 0;
++		else {
++			/* Skip the bitstream to EOI if EOI marker is found */
++			jpg->frameOffset += get_bits_count(&jpg->gbc) / 8 + 2;
++			jpg->consumeByte = 0;
++			return -3;
++		}
++	}
+ 
+ 	if (!jpg->lineBufferMode) {
+ 		/* Workaround to avoid the case that JPU is run over without interrupt */
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index fdaec96..da06401 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -72,6 +72,7 @@ typedef enum {
+ #define Q_COMPONENT0		    0
+ #define Q_COMPONENT1		    0x40
+ #define Q_COMPONENT2		    0x80
++#define HUFF_VAL_SIZE		    162
+ 
+ /* SW Reset command */
+ #define VPU_SW_RESET_BPU_CORE   0x008
+@@ -352,7 +353,7 @@ typedef struct {
+ 	int huffAcIdx;
+ 	int Qidx;
+ 
+-	Uint8 huffVal[4][162];
++	Uint8 huffVal[4][HUFF_VAL_SIZE];
+ 	Uint8 huffBits[4][256];
+ 	Uint8 cInfoTab[4][6];
+ 	Uint8 qMatTab[4][64];
+@@ -379,6 +380,7 @@ typedef struct {
+ 	Uint32 bbcStreamCtl;
+ 	int quitCodec;
+ 	int rollBack;
++	int wrappedHeader;
+ } JpgDecInfo;
+ 
+ typedef struct {
+-- 
+1.8.0
+

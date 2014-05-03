@@ -1,0 +1,143 @@
+From 0ed45ca9bb2ead6168d9302cf762718e74ebbab7 Mon Sep 17 00:00:00 2001
+From: Liu Ying <b17645@freescale.com>
+Date: Fri, 2 Jul 2010 16:07:48 +0800
+Subject: [PATCH 165/435] ENGR00124833 VPU:Support video deinterlace test
+ using IPU library
+
+Support video deinterlace test using IPU library in VPU unit test.
+
+Signed-off-by: Liu Ying <b17645@freescale.com>
+---
+ test/mxc_vpu_test/display.c  | 50 +++++++++++++++++++++++++++++++++++++++-----
+ test/mxc_vpu_test/vpu_test.h |  1 +
+ 2 files changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 779db7e..0750339 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -134,7 +134,7 @@ void * disp_loop_thread(void *arg)
+ 	struct decode *dec = (struct decode *)arg;
+ 	DecHandle handle = dec->handle;
+ 	struct vpu_display *disp = dec->disp;
+-	int index = -1, disp_clr_index, err, mode;
++	int index = -1, disp_clr_index, tmp_idx[3] = {0,0,0}, err, mode;
+ 	pthread_attr_t attr;
+ 
+ 	ipu_running = 1;
+@@ -155,11 +155,18 @@ void * disp_loop_thread(void *arg)
+ 			}
+ 		}
+ 
+-		if (disp->ncount == 0)
++		if (disp->ncount == 0) {
+ 			disp->input.user_def_paddr[0] = disp->ipu_bufs[index].ipu_paddr;
+-		else if (disp->ncount == 1) {
++			/* For video de-interlace, Low/Medium motion */
++			tmp_idx[0] = index;
++		} else if ((disp->deinterlaced == 1) && (disp->input.motion_sel != HIGH_MOTION) && (disp->ncount == 1)) {
+ 			disp->input.user_def_paddr[1] = disp->ipu_bufs[index].ipu_paddr;
+-			mode = OP_STREAM_MODE | TASK_PP_MODE;
++			/* For video de-interlace, Low/Medium motion */
++			tmp_idx[1] = index;
++		} else if ((disp->ncount == 1) || ((disp->deinterlaced == 1) && (disp->input.motion_sel != HIGH_MOTION) &&
++						 (disp->ncount == 2))) {
++			disp->input.user_def_paddr[disp->ncount] = disp->ipu_bufs[index].ipu_paddr;
++			mode = (disp->deinterlaced == 1) ? (OP_STREAM_MODE | TASK_VDI_VF_MODE) : (OP_STREAM_MODE | TASK_PP_MODE);
+ 			err = mxc_ipu_lib_task_init(&(disp->input), NULL, &(disp->output), mode, &(disp->ipu_handle));
+ 			if (err < 0) {
+ 				err_msg("mxc_ipu_lib_task_init failed, err %d\n", err);
+@@ -173,6 +180,10 @@ void * disp_loop_thread(void *arg)
+ 				quitflag = 1;
+ 				break;
+ 			}
++			/* For video de-interlace, Low/Medium motion */
++			tmp_idx[2] = index;
++			if ((disp->deinterlaced == 1) && (disp->input.motion_sel != HIGH_MOTION))
++				disp_clr_index = tmp_idx[0];
+ 		} else {
+ 			err = mxc_ipu_lib_task_buf_update(&(disp->ipu_handle), disp->ipu_bufs[index].ipu_paddr,
+ 					0, 0, NULL, NULL);
+@@ -181,9 +192,17 @@ void * disp_loop_thread(void *arg)
+ 				quitflag = 1;
+ 				break;
+ 			}
++			/* For video de-interlace, Low/Medium motion */
++			if ((disp->deinterlaced == 1) && (disp->input.motion_sel != HIGH_MOTION)) {
++				tmp_idx[0] = tmp_idx[1];
++				tmp_idx[1] = tmp_idx[2];
++				tmp_idx[2] = index;
++				disp_clr_index = tmp_idx[0];
++			}
+ 		}
+ 
+-		if ((dec->cmdl->format != STD_MJPG) && (disp_clr_index >= 0) && (!disp->stopping)) {
++		if ((dec->cmdl->format != STD_MJPG) && (disp_clr_index >= 0) && (!disp->stopping) &&
++		    !((disp->deinterlaced == 1) && (disp->input.motion_sel != HIGH_MOTION) && (disp->ncount < 2))) {
+ 			err = vpu_DecClrDispFlag(handle, disp_clr_index);
+ 			if (err) {
+ 				err_msg("vpu_DecClrDispFlag failed Error code %d\n", err);
+@@ -211,6 +230,7 @@ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	int bottom = cropRect.bottom;
+ 	int disp_width = dec->cmdl->width;
+ 	int disp_height = dec->cmdl->height;
++	char motion_mode = dec->cmdl->vdi_motion;
+ 	int err = 0, i;
+ 	struct vpu_display *disp;
+ 	struct mxcfb_gbl_alpha alpha;
+@@ -280,6 +300,21 @@ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	disp->input.input_crop_win.pos.y = top;
+ 	disp->input.input_crop_win.win_w = right - left;
+ 	disp->input.input_crop_win.win_h = bottom - top;
++
++	/* Set VDI motion algorithm. */
++	if (motion_mode) {
++		if (motion_mode == 'h') {
++			disp->input.motion_sel = HIGH_MOTION;
++		} else if (motion_mode == 'l') {
++			disp->input.motion_sel = LOW_MOTION;
++		} else if (motion_mode == 'm') {
++			disp->input.motion_sel = MED_MOTION;
++		} else {
++			disp->input.motion_sel = MED_MOTION;
++			info_msg("%c unknown motion mode, medium, the default is used\n", motion_mode);
++		}
++	}
++
+ 	if (dec->cmdl->chromaInterleave == 0)
+ 		disp->input.fmt = V4L2_PIX_FMT_YUV420;
+ 	else
+@@ -317,6 +352,7 @@ void ipu_display_close(struct vpu_display *disp)
+ 	int i;
+ 
+ 	disp->stopping = 1;
++	disp->deinterlaced = 0;
+ 	while(ipu_running && ((queue_size(&(disp->ipu_q)) > 0) || !ipu_waiting)) usleep(10000);
+ 	if (ipu_running) {
+ 		wakeup_queue();
+@@ -335,6 +371,10 @@ void ipu_display_close(struct vpu_display *disp)
+ int ipu_put_data(struct vpu_display *disp, int index, int field)
+ {
+ 	disp->ipu_bufs[index].field = field;
++	if (field == V4L2_FIELD_TOP || field == V4L2_FIELD_BOTTOM ||
++	    field == V4L2_FIELD_INTERLACED_TB ||
++	    field == V4L2_FIELD_INTERLACED_BT)
++		disp->deinterlaced = 1;
+ 	queue_buf(&(disp->ipu_q), index);
+ 	wakeup_queue();
+ 
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 95e5784..bd1e7cf 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -123,6 +123,7 @@ struct vpu_display {
+ 	struct ipu_queue ipu_q;
+ 	struct ipu_buf ipu_bufs[MAX_BUF_NUM];
+ 	int stopping;
++	int deinterlaced;
+ };
+ 
+ struct capture_testbuffer {
+-- 
+1.8.0
+

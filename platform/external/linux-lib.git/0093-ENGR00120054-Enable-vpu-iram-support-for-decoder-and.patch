@@ -1,0 +1,390 @@
+From bd80cb059604f8efa06001fad0541d1dd2123391 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 15 Jan 2010 15:48:11 +0800
+Subject: [PATCH 093/249] ENGR00120054 Enable vpu iram support for decoder and
+ encoder on mx51
+
+Add IRAM support for decoder and encoder on MX51. Max supported
+resolution is 720p for decoder and D1 for encoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c  | 56 ++++++++++++++++++++++++++++++++--------
+ vpu/vpu_lib.h  |  4 +--
+ vpu/vpu_reg.h  |  8 +++++-
+ vpu/vpu_util.c | 61 ++++++++++++++++++++++++++++++++++++++++++-
+ vpu/vpu_util.h | 81 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 195 insertions(+), 15 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 034074f..553401e 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -729,6 +729,12 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 		VpuWriteReg(CMD_ENC_SEQ_FMO, data);
+ 	}
+ 
++	/* Set secondAXI IRAM */
++	SetEncSecondAXIIRAM(&pEncInfo->secAxiUse, encOP.picWidth);
++
++	VpuWriteReg(CMD_ENC_SEARCH_BASE, pEncInfo->secAxiUse.searchRamAddr);
++	VpuWriteReg(CMD_ENC_SEARCH_SIZE, pEncInfo->secAxiUse.searchRamSize);
++
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, SEQ_INIT);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+@@ -844,6 +850,14 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle,
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_NUM, num);
+ 	VpuWriteReg(CMD_SET_FRAME_BUF_STRIDE, stride);
+ 
++	if (cpu_is_mx51()) {
++		VpuWriteReg(CMD_SET_FRAME_AXI_BIT_ADDR, pEncInfo->secAxiUse.bufBitUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_IPACDC_ADDR, pEncInfo->secAxiUse.bufIpAcDcUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_DBKY_ADDR, pEncInfo->secAxiUse.bufDbkYUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_DBKC_ADDR, pEncInfo->secAxiUse.bufDbkCUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_OVL_ADDR, pEncInfo->secAxiUse.bufOvlUse);
++	}
++
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+ 			SET_FRAME_BUF);
+ 
+@@ -973,6 +987,7 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	FrameBuffer *pSrcFrame;
+ 	Uint32 rotMirEnable;
+ 	Uint32 rotMirMode;
++	Uint32 val;
+ 	RetCode ret;
+ 
+ 	ENTER_FUNC();
+@@ -1117,6 +1132,13 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 		}
+ 	}
+ 
++	val = (pEncInfo->secAxiUse.useBitEnable | pEncInfo->secAxiUse.useIpEnable << 1 |
++	       pEncInfo->secAxiUse.useDbkEnable << 2 | pEncInfo->secAxiUse.useOvlEnable << 3 |
++	       pEncInfo->secAxiUse.useMeEnable << 4 | pEncInfo->secAxiUse.useHostBitEnable << 7 |
++	       pEncInfo->secAxiUse.useHostIpEnable << 8 | pEncInfo->secAxiUse.useHostDbkEnable << 9 |
++	       pEncInfo->secAxiUse.useHostOvlEnable << 10 | pEncInfo->secAxiUse.useHostMeEnable << 11);
++	VpuWriteReg(BIT_AXI_SRAM_USE, val);
++
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+@@ -1468,6 +1490,10 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 
+ 	case ENC_SET_SEARCHRAM_PARAM:
+ 		{
++			/* dummy this command for i.MX51 platform */
++			if (cpu_is_mx51())
++				break;
++
+ 			SearchRamParam *scRamParam = NULL;
+ 			int EncPicX;
+ 			if (param == 0) {
+@@ -1482,14 +1508,8 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 			if (!LockVpu(vpu_semap))
+ 				return RETCODE_FAILURE_TIMEOUT;
+ 
+-			if (cpu_is_mx51()) {
+-				VpuWriteReg(CMD_ENC_SEARCH_BASE,
+-					    scRamParam->searchRamAddr);
+-				VpuWriteReg(CMD_ENC_SEARCH_SIZE,
+-					    scRamParam->SearchRamSize);
+-			} else
+-				VpuWriteReg(BIT_SEARCH_RAM_BASE_ADDR,
+-					    scRamParam->searchRamAddr);
++			VpuWriteReg(BIT_SEARCH_RAM_BASE_ADDR,
++				    scRamParam->searchRamAddr);
+ 			UnlockVpu(vpu_semap);
+ 
+ 			break;
+@@ -2213,6 +2233,10 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	pDecInfo->initialInfo = *info;
+ 	pDecInfo->initialInfoObtained = 1;
+ 
++	/* Set secondAXI IRAM */
++	if (!cpu_is_mx37())
++		SetDecSecondAXIIRAM(&pDecInfo->secAxiUse, (info->picWidth + 15) & ~15);
++
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -2338,8 +2362,14 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 
+ 	if (cpu_is_mx37() && pDecInfo->openParam.bitstreamFormat != STD_VC1)
+ 		vpu_setting_iram();
+-	else
+-		VpuWriteReg(BIT_AXI_SRAM_USE, 0);	/* not use SRAM */
++	else if (cpu_is_mx51()) {
++		VpuWriteReg(CMD_SET_FRAME_AXI_BIT_ADDR, pDecInfo->secAxiUse.bufBitUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_IPACDC_ADDR, pDecInfo->secAxiUse.bufIpAcDcUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_DBKY_ADDR, pDecInfo->secAxiUse.bufDbkYUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_DBKC_ADDR, pDecInfo->secAxiUse.bufDbkCUse);
++		VpuWriteReg(CMD_SET_FRAME_AXI_OVL_ADDR, pDecInfo->secAxiUse.bufOvlUse);
++	} else
++		VpuWriteReg(BIT_AXI_SRAM_USE, 0);       /* not use SRAM */
+ 
+ 	if (pCodecInst->codecMode == AVC_DEC) {
+ 		VpuWriteReg(CMD_SET_FRAME_SLICE_BB_START,
+@@ -2768,6 +2798,12 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 			VpuWriteReg(BIT_RUN_AUX_STD, 0);
+ 	}
+ 
++	val = (pDecInfo->secAxiUse.useBitEnable | pDecInfo->secAxiUse.useIpEnable << 1 |
++	       pDecInfo->secAxiUse.useDbkEnable << 2 | pDecInfo->secAxiUse.useOvlEnable << 3 |
++	       pDecInfo->secAxiUse.useHostBitEnable << 7 | pDecInfo->secAxiUse.useHostIpEnable << 8 |
++	       pDecInfo->secAxiUse.useHostDbkEnable << 9 | pDecInfo->secAxiUse.useHostOvlEnable << 10);
++	VpuWriteReg(BIT_AXI_SRAM_USE, val);
++
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 51159ff..a622a33 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -492,7 +492,7 @@ typedef struct vpu_versioninfo {
+  * v4.1.2 [2008.08.22] update MX37 VPU firmware to V1.0.5
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(4, 7, 4)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(4, 7, 5)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 3eefae9..e127f73 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -296,6 +296,12 @@
+ #define CMD_SET_FRAME_SLICE_BB_START    0x188
+ #define CMD_SET_FRAME_SLICE_BB_SIZE     0x18C
+ 
++#define CMD_SET_FRAME_AXI_BIT_ADDR      0x190
++#define CMD_SET_FRAME_AXI_IPACDC_ADDR   0x194
++#define CMD_SET_FRAME_AXI_DBKY_ADDR     0x198
++#define CMD_SET_FRAME_AXI_DBKC_ADDR     0x19C
++#define CMD_SET_FRAME_AXI_OVL_ADDR      0x1A0
++
+ /*---------------------------------------------------------------------------
+  * [ENC HEADER] COMMAND
+  *-------------------------------------------------------------------------*/
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index c710027..7a8fa27 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -814,6 +814,65 @@ RetCode SetHecMode(EncHandle handle, int mode)
+ 	return RETCODE_SUCCESS;
+ }
+ 
++void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width)
++{
++	iram_t iram;
++
++	memset(psecAxiIramInfo, 0, sizeof(SecAxiUse));
++
++	IOGetIramBase(&iram);
++
++	if ((width > DEC_MAX_WIDTH_IRAM_SUPPORT) ||
++	    (iram.end - iram.start) < VPU_DEC_TOTAL_IRAM_SIZE) {
++		warn_msg("VPU iram is less than needed, not use iram\n");
++	} else {
++		/* i.MX51 has no secondary AXI memory, but use on chip RAM
++		   Set the useHoseXXX as 1 to enable corresponding IRAM
++		   Set the useXXXX as 0 at the same time to use IRAM  */
++		psecAxiIramInfo->useHostBitEnable = 1;
++		psecAxiIramInfo->useHostIpEnable = 1;
++		psecAxiIramInfo->useHostDbkEnable = 1;
++		psecAxiIramInfo->useHostOvlEnable = 1;
++
++		psecAxiIramInfo->bufBitUse = iram.start + VPU_DEC_BIT_IRAM_OFFSET;
++		psecAxiIramInfo->bufIpAcDcUse = iram.start + VPU_DEC_IP_IRAM_OFFSET;
++		psecAxiIramInfo->bufDbkYUse = iram.start + VPU_DEC_DBKY_IRAM_OFFSET;
++		psecAxiIramInfo->bufDbkCUse = iram.start + VPU_DEC_DBKC_IRAM_OFFSET;
++		psecAxiIramInfo->bufOvlUse = iram.start + VPU_DEC_OVL_IRAM_OFFSET;
++	}
++}
++
++void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width)
++{
++	iram_t iram;
++
++	memset(psecAxiIramInfo, 0, sizeof(SecAxiUse));
++
++	IOGetIramBase(&iram);
++	if (width > ENC_MAX_WIDTH_IRAM_SUPPORT ||
++	   (iram.end - iram.start) < VPU_ENC_TOTAL_IRAM_SIZE) {
++		warn_msg("VPU iram is less than needed, not use iram\n");
++	} else {
++		/* i.MX51 has no secondary AXI memory, but use on chip RAM
++		   Set the useHoseXXX as 1 to enable corresponding IRAM
++		   Set the useXXXX as 0 at the same time to use IRAM  */
++		psecAxiIramInfo->useHostBitEnable = 1;
++		psecAxiIramInfo->useHostIpEnable = 1;
++		psecAxiIramInfo->useHostDbkEnable = 1;
++		psecAxiIramInfo->useHostOvlEnable = 0; /* no need to enable ovl in encoder */
++		psecAxiIramInfo->useHostMeEnable = 1; /* For ME search */
++
++		psecAxiIramInfo->bufBitUse = iram.start + VPU_ENC_BIT_IRAM_OFFSET;
++		psecAxiIramInfo->bufIpAcDcUse = iram.start + VPU_ENC_IP_IRAM_OFFSET;
++		psecAxiIramInfo->bufDbkYUse = iram.start + VPU_ENC_DBKY_IRAM_OFFSET;
++		psecAxiIramInfo->bufDbkCUse = iram.start + VPU_ENC_OVL_IRAM_OFFSET;
++		psecAxiIramInfo->bufOvlUse = 0;
++
++		psecAxiIramInfo->searchRamAddr = iram.start + VPU_ENC_SEARCH_IRAM_OFFSET;
++		psecAxiIramInfo->searchRamSize = VPU_ENC_SEARCH_IRAM_SIZE;
++	}
++}
++
+ semaphore_t *vpu_semaphore_open(void)
+ {
+ 	semaphore_t *semap;
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 0d55b2d..4521623 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -42,6 +42,54 @@
+ #define ENC_ADDR_END_OF_RPT_BUF         ADDR_FRAME_BUF_STAT_BASE_OFFSET + SIZE_SLICE_INFO
+ #define DEC_ADDR_END_OF_RPT_BUF         ADDR_FRAME_BUF_STAT_BASE_OFFSET + SIZE_FRAME_BUF_STAT
+ 
++/* This is calculated by reserved iram size for vpu and requirement */
++#if defined(IMX51_3STACK) || defined(IMX51)
++/* 720P for decoder, D1 for encoder on i.MX51 */
++#define DEC_MAX_WIDTH_IRAM_SUPPORT      1280
++#define ENC_MAX_WIDTH_IRAM_SUPPORT      720
++#else
++/* Not used in any platform yet */
++#define DEC_MAX_WIDTH_IRAM_SUPPORT      1920
++#define ENC_MAX_WIDTH_IRAM_SUPPORT      1280
++#endif
++
++/* Following IRAM setting is for max size for Decoder */
++/* To save intermediate data such as MB prediction data */
++#define VPU_DEC_BIT_IRAM_OFFSET         0
++#define VPU_DEC_BIT_IRAM_SIZE           ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++/* To save intermediate data such as intra/ACDC prediction */
++#define VPU_DEC_IP_IRAM_OFFSET          (VPU_DEC_BIT_IRAM_OFFSET + VPU_DEC_BIT_IRAM_SIZE)
++#define VPU_DEC_IP_IRAM_SIZE            ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++/* To save intermediate data for deblocking filter */
++#define VPU_DEC_DBKY_IRAM_OFFSET        (VPU_DEC_IP_IRAM_OFFSET + VPU_DEC_IP_IRAM_SIZE)
++#define VPU_DEC_DBKY_IRAM_SIZE          ((256 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++#define VPU_DEC_DBKC_IRAM_OFFSET        (VPU_DEC_DBKY_IRAM_OFFSET + VPU_DEC_DBKY_IRAM_SIZE)
++#define VPU_DEC_DBKC_IRAM_SIZE          ((256 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++/* To save intermediate data for overlap filter */
++#define VPU_DEC_OVL_IRAM_OFFSET         (VPU_DEC_DBKC_IRAM_OFFSET + VPU_DEC_DBKC_IRAM_SIZE)
++#define VPU_DEC_OVL_IRAM_SIZE           ((80 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++#define VPU_DEC_TOTAL_IRAM_SIZE         (VPU_DEC_OVL_IRAM_OFFSET + VPU_DEC_OVL_IRAM_SIZE)
++
++/* Following IRAM setting is for max size for Encoder */
++#define VPU_ENC_SEARCH_IRAM_OFFSET      0
++#define VPU_ENC_SEARCH_IRAM_SIZE        ((ENC_MAX_WIDTH_IRAM_SUPPORT * 36 + 2048 + 1023) & ~1023)
++/* To save intermediate data such as MB prediction data */
++#define VPU_ENC_BIT_IRAM_OFFSET         (VPU_ENC_SEARCH_IRAM_OFFSET + VPU_ENC_SEARCH_IRAM_SIZE)
++#define VPU_ENC_BIT_IRAM_SIZE           ((128 * ENC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++/* To save intermediate data such as intra/ACDC prediction */
++#define VPU_ENC_IP_IRAM_OFFSET          (VPU_ENC_BIT_IRAM_OFFSET + VPU_ENC_BIT_IRAM_SIZE)
++#define VPU_ENC_IP_IRAM_SIZE            ((128 * ENC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++/* To save intermediate data for deblocking filter */
++/* Max size is calculated by H264/H263 encoder */
++#define VPU_ENC_DBKY_IRAM_OFFSET        (VPU_ENC_IP_IRAM_OFFSET + VPU_ENC_IP_IRAM_SIZE)
++#define VPU_ENC_DBKY_IRAM_SIZE          ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++#define VPU_ENC_DBKC_IRAM_OFFSET        (VPU_ENC_DBKY_IRAM_OFFSET + VPU_ENC_DBKY_IRAM_SIZE)
++#define VPU_ENC_DBKC_IRAM_SIZE          ((128 * DEC_MAX_WIDTH_IRAM_SUPPORT / 16 + 1023) & ~1023)
++/* No need for overlap filter for encoder */
++#define VPU_ENC_OVL_IRAM_OFFSET         (VPU_ENC_DBKC_IRAM_OFFSET + VPU_ENC_DBKC_IRAM_SIZE)
++#define VPU_ENC_OVL_IRAM_SIZE           0
++#define VPU_ENC_TOTAL_IRAM_SIZE         (VPU_ENC_OVL_IRAM_OFFSET + VPU_ENC_OVL_IRAM_SIZE)
++
+ #if defined(IMX37_3STACK)
+ enum {
+ 	AVC_DEC = 0,
+@@ -100,6 +148,30 @@ enum {
+ };
+ 
+ typedef struct {
++	int useBitEnable;
++	int useIpEnable;
++	int useDbkEnable;
++	int useOvlEnable;
++	int useMeEnable;
++
++	int useHostBitEnable;
++	int useHostIpEnable;
++	int useHostDbkEnable;
++	int useHostOvlEnable;
++	int useHostMeEnable;
++
++	PhysicalAddress bufBitUse;
++	PhysicalAddress bufIpAcDcUse;
++	PhysicalAddress bufDbkYUse;
++	PhysicalAddress bufDbkCUse;
++	PhysicalAddress bufOvlUse;
++
++	PhysicalAddress searchRamAddr;
++	int searchRamSize;
++
++} SecAxiUse;
++
++typedef struct {
+ 	EncOpenParam openParam;
+ 	EncInitialInfo initialInfo;
+ 
+@@ -123,6 +195,8 @@ typedef struct {
+ 	int dynamicAllocEnable;
+ 	int ringBufferEnable;
+ 
++	SecAxiUse secAxiUse;
++
+ 	EncReportInfo encReportMBInfo;
+ 	EncReportInfo encReportMVInfo;
+ 	EncReportInfo encReportSliceInfo;
+@@ -168,6 +242,8 @@ typedef struct {
+ 
+ 	DbkOffset dbkOffset;
+ 
++	SecAxiUse secAxiUse;
++
+ 	vpu_mem_desc picParaBaseMem;
+ 	vpu_mem_desc userDataBufMem;
+ 
+@@ -229,6 +305,9 @@ RetCode SetIntraRefreshNum(EncHandle handle, Uint32 *pIntraRefreshNum);
+ RetCode SetSliceMode(EncHandle handle, EncSliceMode *pSliceMode);
+ RetCode SetHecMode(EncHandle handle, int mode);
+ 
++void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width);
++void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width);
++
+ semaphore_t *vpu_semaphore_open(void);
+ void semaphore_post(semaphore_t *semap);
+ bool semaphore_wait(semaphore_t *semap);
+-- 
+1.8.0
+

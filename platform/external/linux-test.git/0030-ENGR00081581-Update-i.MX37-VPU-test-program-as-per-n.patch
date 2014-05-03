@@ -1,0 +1,1331 @@
+From 311f806cec8ae15c57a0785ae15d45ef52104869 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Wed, 2 Jul 2008 15:39:51 +0800
+Subject: [PATCH 030/435] ENGR00081581 Update i.MX37 VPU test program as per
+ new firmware 1.0.3
+
+Main change is display buffer mgmt schema -- display buffer control by Host
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/capture.c  |  26 ++++-----
+ test/mxc_vpu_test/dec.c      | 126 +++++++++++++++++++++++++++----------------
+ test/mxc_vpu_test/display.c  |  42 +++++++--------
+ test/mxc_vpu_test/enc.c      |  36 +++++++------
+ test/mxc_vpu_test/loopback.c |  48 ++++++++---------
+ test/mxc_vpu_test/main.c     |  25 ++++-----
+ test/mxc_vpu_test/utils.c    |  46 ++++++++--------
+ test/mxc_vpu_test/vpu_test.h |  17 +++++-
+ 8 files changed, 206 insertions(+), 160 deletions(-)
+
+diff --git a/test/mxc_vpu_test/capture.c b/test/mxc_vpu_test/capture.c
+index 92e7979..04fb208 100644
+--- a/test/mxc_vpu_test/capture.c
++++ b/test/mxc_vpu_test/capture.c
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -29,7 +29,7 @@
+ static int cap_fd = -1;
+ struct capture_testbuffer cap_buffers[TEST_BUFFER_NUM];
+ 
+-int 
++int
+ v4l_start_capturing(void)
+ {
+ 	unsigned int i;
+@@ -42,7 +42,7 @@ v4l_start_capturing(void)
+ 		buf.memory = V4L2_MEMORY_MMAP;
+ 		buf.index = i;
+ 		if (ioctl(cap_fd, VIDIOC_QUERYBUF, &buf) < 0) {
+-			printf("VIDIOC_QUERYBUF error\n");
++			err_msg("VIDIOC_QUERYBUF error\n");
+ 			return -1;
+ 		}
+ 
+@@ -57,21 +57,21 @@ v4l_start_capturing(void)
+ 		buf.index = i;
+ 		buf.m.offset = cap_buffers[i].offset;
+ 		if (ioctl(cap_fd, VIDIOC_QBUF, &buf) < 0) {
+-			printf("VIDIOC_QBUF error\n");
++			err_msg("VIDIOC_QBUF error\n");
+ 			return -1;
+ 		}
+ 	}
+ 
+ 	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	if (ioctl(cap_fd, VIDIOC_STREAMON, &type) < 0) {
+-		printf("VIDIOC_STREAMON error\n");
++		err_msg("VIDIOC_STREAMON error\n");
+ 		return -1;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-void 
++void
+ v4l_stop_capturing(void)
+ {
+ 	int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+@@ -80,7 +80,7 @@ v4l_stop_capturing(void)
+ 	cap_fd = -1;
+ }
+ 
+-int 
++int
+ v4l_capture_setup(int width, int height, int fps)
+ {
+ 	char v4l_device[32] = "/dev/video0";
+@@ -89,12 +89,12 @@ v4l_capture_setup(int width, int height, int fps)
+ 	struct v4l2_requestbuffers req = {0};
+ 
+ 	if (cap_fd > 0) {
+-		printf("capture device already opened\n");
++		warn_msg("capture device already opened\n");
+ 		return -1;
+ 	}
+ 
+ 	if ((cap_fd = open(v4l_device, O_RDWR, 0)) < 0) {
+-		printf("Unable to open %s\n", v4l_device);
++		err_msg("Unable to open %s\n", v4l_device);
+ 		return -1;
+ 	}
+ 
+@@ -107,7 +107,7 @@ v4l_capture_setup(int width, int height, int fps)
+ 	fmt.fmt.pix.sizeimage = 0;
+ 
+ 	if (ioctl(cap_fd, VIDIOC_S_FMT, &fmt) < 0) {
+-		printf("set format failed\n");
++		err_msg("set format failed\n");
+ 		close(cap_fd);
+ 		cap_fd = -1;
+ 		return -1;
+@@ -119,7 +119,7 @@ v4l_capture_setup(int width, int height, int fps)
+ 	parm.parm.capture.capturemode = 0;
+ 
+ 	if (ioctl(cap_fd, VIDIOC_S_PARM, &parm) < 0) {
+-		printf("set frame rate failed\n");
++		err_msg("set frame rate failed\n");
+ 		close(cap_fd);
+ 		cap_fd = -1;
+ 		return -1;
+@@ -131,7 +131,7 @@ v4l_capture_setup(int width, int height, int fps)
+ 	req.memory = V4L2_MEMORY_MMAP;
+ 
+ 	if (ioctl(cap_fd, VIDIOC_REQBUFS, &req) < 0) {
+-		printf("v4l_capture_setup: VIDIOC_REQBUFS failed\n");
++		err_msg("v4l_capture_setup: VIDIOC_REQBUFS failed\n");
+ 		close(cap_fd);
+ 		cap_fd = -1;
+ 		return -1;
+@@ -147,7 +147,7 @@ v4l_get_capture_data(struct v4l2_buffer *buf)
+ 	buf->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	buf->memory = V4L2_MEMORY_MMAP;
+ 	if (ioctl(cap_fd, VIDIOC_DQBUF, buf) < 0) {
+-		printf("VIDIOC_DQBUF failed\n");
++		err_msg("VIDIOC_DQBUF failed\n");
+ 		return -1;
+ 	}
+ 
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 3c84ef5..25a6b84 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -43,7 +43,7 @@ int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
+ 	ret = vpu_DecGetBitstreamBuffer(handle, &pa_read_ptr, &pa_write_ptr,
+ 					&space);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("vpu_DecGetBitstreamBuffer failed\n");
++		err_msg("vpu_DecGetBitstreamBuffer failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -120,7 +120,7 @@ update:
+ 	if (*eos == 0) {
+ 		ret = vpu_DecUpdateBitstreamBuffer(handle, nread);
+ 		if (ret != RETCODE_SUCCESS) {
+-			printf("vpu_DecUpdateBitstreamBuffer failed\n");
++			err_msg("vpu_DecUpdateBitstreamBuffer failed\n");
+ 			return -1;
+ 		}
+ 		*fill_end_bs = 0;
+@@ -129,7 +129,8 @@ update:
+ 			ret = vpu_DecUpdateBitstreamBuffer(handle,
+ 					STREAM_END_SIZE);
+ 			if (ret != RETCODE_SUCCESS) {
+-				printf("vpu_DecUpdateBitstreamBuffer failed\n");
++				err_msg("vpu_DecUpdateBitstreamBuffer failed"
++								"\n");
+ 				return -1;
+ 			}
+ 			*fill_end_bs = 1;
+@@ -212,8 +213,19 @@ decoder_start(struct decode *dec)
+ 	} else if (mp4dblk_en) {
+ 		dblkid = dec->fbcount;
+ 	}
+-	
++
++	decparam.dispReorderBuf = 0;
++
+ 	decparam.prescanEnable = 1;
++	decparam.prescanMode = 0;
++
++	decparam.skipframeMode = 0;
++	decparam.skipframeNum = 0;
++	/*
++	 * once iframeSearchEnable is enabled, prescanEnable, prescanMode
++	 * and skipframeMode options are ignored.
++	 */
++	decparam.iframeSearchEnable = 0;
+ 
+ 	fwidth = ((dec->picwidth + 15) & ~15);
+ 	fheight = ((dec->picheight + 15) & ~15);
+@@ -288,7 +300,7 @@ decoder_start(struct decode *dec)
+ 			ret = vpu_DecGiveCommand(handle, DEC_SET_DEBLOCK_OUTPUT,
+ 						(void *)mp4dblk_fb);
+ 			if (ret != RETCODE_SUCCESS) {
+-				printf("Failed to set deblocking output\n");
++				err_msg("Failed to set deblocking output\n");
+ 				unlock(dec->cmdl);
+ 				return -1;
+ 			}
+@@ -296,7 +308,7 @@ decoder_start(struct decode *dec)
+ 		
+ 		ret = vpu_DecStartOneFrame(handle, &decparam);
+ 		if (ret != RETCODE_SUCCESS) {
+-			printf("DecStartOneFrame failed\n");
++			err_msg("DecStartOneFrame failed\n");
+ 			unlock(dec->cmdl);
+ 			return -1;
+ 		}
+@@ -310,7 +322,7 @@ decoder_start(struct decode *dec)
+ 				      &eos, &fill_end_bs);
+ 			
+ 			if (err < 0) {
+-				printf("dec_fill_bsbuffer failed\n");
++				err_msg("dec_fill_bsbuffer failed\n");
+ 				unlock(dec->cmdl);
+ 				return -1;
+ 			}
+@@ -333,24 +345,29 @@ decoder_start(struct decode *dec)
+ 
+ 		ret = vpu_DecGetOutputInfo(handle, &outinfo);
+ 		unlock(dec->cmdl);
+-		if (ret == RETCODE_FAILURE) {
+-			frame_id++;
+-			continue;
+-		} else if (ret != RETCODE_SUCCESS) {
+-			printf("vpu_DecGetOutputInfo failed\n");
++		dprintf(4, "frame_id = %d\n", (int)frame_id);
++		if (ret != RETCODE_SUCCESS) {
++			err_msg("vpu_DecGetOutputInfo failed Err code is %d\n"
++				"\tframe_id = %d\n", ret, (int)frame_id);
+ 			return -1;
+ 		}
+-		
++
++		if (outinfo.decodingSuccess == 0) {
++			warn_msg("Incomplete finish of decoding process.\n"
++				"\tframe_id = %d\n", (int)frame_id);
++			continue;
++		}
++
+ 		if (outinfo.notSufficientPsBuffer) {
+-			printf("PS Buffer overflow\n");
++			err_msg("PS Buffer overflow\n");
+ 			return -1;
+ 		}
+-		
++
+ 		if (outinfo.notSufficientSliceBuffer) {
+-			printf("Slice Buffer overflow\n");
++			err_msg("Slice Buffer overflow\n");
+ 			return -1;
+ 		}
+-				
++
+ 		if (outinfo.indexFrameDisplay == -1)
+ 			decodefinish = 1;
+ 		else if ((outinfo.indexFrameDisplay > dec->fbcount) &&
+@@ -359,8 +376,9 @@ decoder_start(struct decode *dec)
+ 
+ 		if (decodefinish)
+ 			break;
+-		
+-		if (outinfo.prescanresult == 0) {
++
++		if ((outinfo.prescanresult == 0) &&
++					(decparam.prescanEnable == 1)) {
+ 			if (eos) {
+ 				break;
+ 			} else {
+@@ -369,7 +387,8 @@ decoder_start(struct decode *dec)
+ 				if (dec->cmdl->src_scheme == PATH_NET)
+ 					fillsize = 1000;
+ 				else
+-					printf("Prescan: not enough bs data\n");
++					warn_msg("Prescan: not enough bs data"
++									"\n");
+ 
+ 				dec->cmdl->complete = 1;
+ 				err = dec_fill_bsbuffer(handle,
+@@ -381,7 +400,7 @@ decoder_start(struct decode *dec)
+ 					        &eos, &fill_end_bs);
+ 				dec->cmdl->complete = 0;
+ 				if (err < 0) {
+-					printf("dec_fill_bsbuffer failed\n");
++					err_msg("dec_fill_bsbuffer failed\n");
+ 					return -1;
+ 				}
+ 
+@@ -397,8 +416,10 @@ decoder_start(struct decode *dec)
+ 
+ 		/* BIT don't have picture to be displayed */
+ 		if ((outinfo.indexFrameDisplay == -3) ||
+-				(outinfo.indexFrameDisplay == -2))
++				(outinfo.indexFrameDisplay == -2)) {
++			warn_msg("VPU doesn't have picture to be displayed.\n");
+ 			continue;
++		}
+ 
+ 		if (dec->cmdl->dst_scheme == PATH_V4L2) {
+ 			if (rot_en || dering_en) {
+@@ -414,38 +435,49 @@ decoder_start(struct decode *dec)
+ 				mp4dblk_fb->bufCr = mp4dblk_fb->bufCb +
+ 							(img_size >> 2);
+ 			}
+-			
++
+ 			err = v4l_put_data(disp);
+ 			if (err)
+ 				return -1;
+ 
++			err = vpu_DecClrDispFlag(handle, disp->buf.index);
++			if (err)
++				err_msg("vpu_DecClrDispFlag failed Error code"
++						" %d\n", err);
++
+ 		} else {
+ 			if (rot_en == 0 && mp4dblk_en == 0 && dering_en == 0) {
+ 				pfb = pfbpool[outinfo.indexFrameDisplay];
+ 			}
+-			
++
+ 			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr -
+ 					pfb->desc.phy_addr;
+-		
+-			
++
++
+ 			if (cpu_is_mxc30031()) {
+ 				write_to_file(dec, (u8 *)yuv_addr);
+ 			} else {
+ 				fwriten(dec->cmdl->dst_fd, (u8 *)yuv_addr,
+ 						img_size);
+ 			}
++
++			err = vpu_DecClrDispFlag(handle,
++						outinfo.indexFrameDisplay);
++			if (err)
++				err_msg("vpu_DecClrDispFlag failed Error code"
++						" %d\n", err);
+ 		}
+-		
++
+ 		if (outinfo.numOfErrMBs) {
+ 			totalNumofErrMbs += outinfo.numOfErrMBs;
+-			printf("Num of Error Mbs : %d, in Frame : %d \n",
++			info_msg("Num of Error Mbs : %d, in Frame : %d \n",
+ 					outinfo.numOfErrMBs, (int)frame_id);
+ 		}
+ 
+ 		frame_id++;
+ 		if ((count != 0) && (frame_id >= count))
+ 			break;
+-		
++
+ 		if (dec->cmdl->src_scheme == PATH_NET) {
+ 			err = dec_fill_bsbuffer(handle,	dec->cmdl,
+ 				      dec->virt_bsbuf_addr,
+@@ -453,19 +485,19 @@ decoder_start(struct decode *dec)
+ 				      dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
+ 				      &eos, &fill_end_bs);
+ 			if (err < 0) {
+-				printf("dec_fill_bsbuffer failed\n");
++				err_msg("dec_fill_bsbuffer failed\n");
+ 				return -1;
+ 			}
+ 		}
+ 	}
+ 
+ 	if (totalNumofErrMbs) {
+-		printf("Total Num of Error MBs : %d\n", totalNumofErrMbs);
++		info_msg("Total Num of Error MBs : %d\n", totalNumofErrMbs);
+ 	}
+ 
+-	printf("%d frames took %d microseconds\n", (int)frame_id,
++	info_msg("%d frames took %d microseconds\n", (int)frame_id,
+ 						(int)total_time);
+-	printf("fps = %.2f\n", (frame_id / (total_time / 1000000)));
++	info_msg("fps = %.2f\n", (frame_id / (total_time / 1000000)));
+ 	return 0;
+ }
+ 
+@@ -551,13 +583,13 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 
+ 	fb = dec->fb = calloc(totalfb, sizeof(FrameBuffer));
+ 	if (fb == NULL) {
+-		printf("Failed to allocate fb\n");
++		err_msg("Failed to allocate fb\n");
+ 		return -1;
+ 	}
+ 
+ 	pfbpool = dec->pfbpool = calloc(totalfb, sizeof(struct frame_buf *));
+ 	if (pfbpool == NULL) {
+-		printf("Failed to allocate pfbpool\n");
++		err_msg("Failed to allocate pfbpool\n");
+ 		free(fb);
+ 		return -1;
+ 	}
+@@ -618,7 +650,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 					mvcol_md[i].size = img_size >> 2;
+ 					ret = IOGetPhyMem(&mvcol_md[i]);
+ 					if (ret) {
+-						printf("buffer alloc failed\n");
++						err_msg("buf alloc failed\n");
+ 						goto err1;
+ 					}
+ 					fb[i].bufMvCol = mvcol_md[i].phy_addr;
+@@ -635,7 +667,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	ret = vpu_DecRegisterFrameBuffer(handle, fb, fbcount, stride, &bufinfo);
+ 	unlock(dec->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("Register frame buffer failed\n");
++		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+ 	}
+ 
+@@ -693,11 +725,11 @@ decoder_parse(struct decode *dec)
+ 	vpu_DecSetEscSeqInit(handle, 0);
+ 	unlock(dec->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("vpu_DecGetInitialInfo failed %d\n", ret);
++		err_msg("vpu_DecGetInitialInfo failed %d\n", ret);
+ 		return -1;
+ 	}
+ 
+-	printf("Decoder: width = %d, height = %d, fps = %lu, count = %u\n",
++	info_msg("Decoder: width = %d, height = %d, fps = %lu, count = %u\n",
+ 			initinfo.picWidth, initinfo.picHeight,
+ 			initinfo.frameRateInfo,
+ 			initinfo.minFrameBufferCount);
+@@ -730,7 +762,7 @@ decoder_open(struct decode *dec)
+ 
+ 	ret = vpu_DecOpen(&handle, &oparam);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("vpu_DecOpen failed\n");
++		err_msg("vpu_DecOpen failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -750,19 +782,19 @@ decode_test(void *arg)
+ 
+ 	dec = (struct decode *)calloc(1, sizeof(struct decode));
+ 	if (dec == NULL) {
+-		printf("Failed to allocate decode structure\n");
++		err_msg("Failed to allocate decode structure\n");
+ 		return -1;
+ 	}
+ 
+ 	mem_desc.size = STREAM_BUF_SIZE;
+ 	ret = IOGetPhyMem(&mem_desc);
+ 	if (ret) {
+-		printf("Unable to obtain physical mem\n");
++		err_msg("Unable to obtain physical mem\n");
+ 		return -1;
+ 	}
+ 
+ 	if (IOGetVirtMem(&mem_desc) <= 0) {
+-		printf("Unable to obtain virtual mem\n");
++		err_msg("Unable to obtain virtual mem\n");
+ 		IOFreePhyMem(&mem_desc);
+ 		free(dec);
+ 		return -1;
+@@ -776,14 +808,14 @@ decode_test(void *arg)
+ 		ps_mem_desc.size = PS_SAVE_SIZE;
+ 		ret = IOGetPhyMem(&ps_mem_desc);
+ 		if (ret) {
+-			printf("Unable to obtain physical ps save mem\n");
++			err_msg("Unable to obtain physical ps save mem\n");
+ 			goto err;
+ 		}
+ 
+ 		slice_mem_desc.size = SLICE_SAVE_SIZE;
+ 		ret = IOGetPhyMem(&slice_mem_desc);
+ 		if (ret) {
+-			printf("Unable to obtain physical slice save mem\n");
++			err_msg("Unable to obtain physical slice save mem\n");
+ 			IOFreePhyMem(&ps_mem_desc);
+ 			goto err;
+ 		}
+@@ -804,14 +836,14 @@ decode_test(void *arg)
+ 			dec->phy_bsbuf_addr, 0, &eos, &fill_end_bs);
+ 	cmdl->complete = 0;
+ 	if (ret < 0) {
+-		printf("dec_fill_bsbuffer failed\n");
++		err_msg("dec_fill_bsbuffer failed\n");
+ 		goto err1;
+ 	}
+ 
+ 	/* parse the bitstream */
+ 	ret = decoder_parse(dec);
+ 	if (ret) {
+-		printf("decoder parse failed\n");
++		err_msg("decoder parse failed\n");
+ 		goto err1;
+ 	}
+ 
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 40f353f..d52070e 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -104,7 +104,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ #ifdef	TVOUT_ENABLE
+ 	err = system("/bin/echo U:720x480i-60 > /sys/class/graphics/fb1/mode");
+ 	if (err == -1) {
+-		printf("set tv mode error\n");
++		warn_msg("set tv mode error\n");
+ 	}
+ 
+ 	out = 5;
+@@ -120,30 +120,30 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 
+ 	disp = (struct vpu_display *)calloc(1, sizeof(struct vpu_display));
+        	if (disp == NULL) {
+-		printf("falied to allocate vpu_display\n");
++		err_msg("falied to allocate vpu_display\n");
+ 		return NULL;
+ 	}
+ 
+ 	fd = open(v4l_device, O_RDWR, 0);
+ 	if (fd < 0) {
+-		printf("unable to open %s\n", v4l_device);
++		err_msg("unable to open %s\n", v4l_device);
+ 		return NULL;
+ 	}
+ 
+ 	err = ioctl(fd, VIDIOC_S_OUTPUT, &out);
+ 	if (err < 0) {
+-		printf("VIDIOC_S_OUTPUT failed\n");
++		err_msg("VIDIOC_S_OUTPUT failed\n");
+ 		goto err;
+ 	}
+ 
+ 	cropcap.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 	err = ioctl(fd, VIDIOC_CROPCAP, &cropcap);
+ 	if (err < 0) {
+-		printf("VIDIOC_CROPCAP failed\n");
++		err_msg("VIDIOC_CROPCAP failed\n");
+ 		goto err;
+ 	}
+-	dprintf(1, "cropcap.bounds.width = %d\ncropcap.bound.height = %d\n" \
+-		"cropcap.defrect.width = %d\ncropcap.defrect.height = %d\n",
++	dprintf(1, "cropcap.bounds.width = %d\n\tcropcap.bound.height = %d\n\t" \
++		"cropcap.defrect.width = %d\n\tcropcap.defrect.height = %d\n",
+ 		cropcap.bounds.width, cropcap.bounds.height,
+ 		cropcap.defrect.width, cropcap.defrect.height);
+ 
+@@ -166,7 +166,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 
+ 	err = ioctl(fd, VIDIOC_S_CROP, &crop);
+ 	if (err < 0) {
+-		printf("VIDIOC_S_CROP failed\n");
++		err_msg("VIDIOC_S_CROP failed\n");
+ 		goto err;
+ 	}
+ 
+@@ -182,7 +182,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 			ctrl.value = V4L2_MXC_ROTATE_90_LEFT;
+ 		err = ioctl(fd, VIDIOC_S_CTRL, &ctrl);
+ 		if (err < 0) {
+-			printf("VIDIOC_S_CTRL failed\n");
++			err_msg("VIDIOC_S_CTRL failed\n");
+ 			goto err;
+ 		}
+ 	} else {
+@@ -191,7 +191,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 		ctrl.value = 0;
+ 		err = ioctl(fd, VIDIOC_S_CTRL, &ctrl);
+ 		if (err < 0) {
+-			printf("VIDIOC_S_CTRL failed\n");
++			err_msg("VIDIOC_S_CTRL failed\n");
+ 			goto err;
+ 		}
+ 	}
+@@ -202,7 +202,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 	
+ 		err = ioctl(fd, VIDIOC_S_FBUF, &fb);
+ 		if (err < 0) {
+-			printf("VIDIOC_S_FBUF failed\n");
++			err_msg("VIDIOC_S_FBUF failed\n");
+ 			goto err;
+ 		}
+ 	}
+@@ -220,13 +220,13 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 
+ 	err = ioctl(fd, VIDIOC_S_FMT, &fmt);
+ 	if (err < 0) {
+-		printf("VIDIOC_S_FMT failed\n");
++		err_msg("VIDIOC_S_FMT failed\n");
+ 		goto err;
+ 	}
+ 
+ 	err = ioctl(fd, VIDIOC_G_FMT, &fmt);
+ 	if (err < 0) {
+-		printf("VIDIOC_G_FMT failed\n");
++		err_msg("VIDIOC_G_FMT failed\n");
+ 		goto err;
+ 	}
+ 
+@@ -236,12 +236,12 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 
+ 	err = ioctl(fd, VIDIOC_REQBUFS, &reqbuf);
+ 	if (err < 0) {
+-		printf("VIDIOC_REQBUFS failed\n");
++		err_msg("VIDIOC_REQBUFS failed\n");
+ 		goto err;
+ 	}
+ 
+ 	if (reqbuf.count < nframes) {
+-		printf("VIDIOC_REQBUFS: not enough buffers\n");
++		err_msg("VIDIOC_REQBUFS: not enough buffers\n");
+ 		goto err;
+ 	}
+ 
+@@ -263,7 +263,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 
+ 		err = ioctl(fd, VIDIOC_QUERYBUF, &buffer);
+ 		if (err < 0) {
+-			printf("VIDIOC_QUERYBUF: not enough buffers\n");
++			err_msg("VIDIOC_QUERYBUF: not enough buffers\n");
+ 			v4l_free_bufs(i, disp);
+ 			goto err;
+ 		}
+@@ -276,7 +276,7 @@ v4l_display_open(int width, int height, int nframes, struct rot rotation,
+ 				MAP_SHARED, fd, buffer.m.offset);
+ 		
+ 		if (buf->start == MAP_FAILED) {
+-			printf("mmap failed\n");
++			err_msg("mmap failed\n");
+ 			v4l_free_bufs(i, disp);
+ 			goto err;
+ 		}
+@@ -322,7 +322,7 @@ int v4l_put_data(struct vpu_display *disp)
+ 		disp->buf.index = disp->ncount;
+ 		err = ioctl(disp->fd, VIDIOC_QUERYBUF, &disp->buf);
+ 		if (err < 0) {
+-			printf("VIDIOC_QUERYBUF failed\n");
++			err_msg("VIDIOC_QUERYBUF failed\n");
+ 			goto err;
+ 		}
+ 	} else {
+@@ -330,7 +330,7 @@ int v4l_put_data(struct vpu_display *disp)
+ 		disp->buf.memory = V4L2_MEMORY_MMAP;
+ 		err = ioctl(disp->fd, VIDIOC_DQBUF, &disp->buf);
+ 		if (err < 0) {
+-			printf("VIDIOC_DQBUF failed\n");
++			err_msg("VIDIOC_DQBUF failed\n");
+ 			goto err;
+ 		}
+ 	}
+@@ -349,7 +349,7 @@ int v4l_put_data(struct vpu_display *disp)
+ 
+ 	err = ioctl(disp->fd, VIDIOC_QBUF, &disp->buf);
+ 	if (err < 0) {
+-		printf("VIDIOC_QBUF failed\n");
++		err_msg("VIDIOC_QBUF failed\n");
+ 		goto err;
+ 	}
+ 
+@@ -357,7 +357,7 @@ int v4l_put_data(struct vpu_display *disp)
+ 		type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 		err = ioctl(disp->fd, VIDIOC_STREAMON, &type);
+ 		if (err < 0) {
+-			printf("VIDIOC_STREAMON failed\n");
++			err_msg("VIDIOC_STREAMON failed\n");
+ 			goto err;
+ 		}
+ 	}
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 85488b8..6703751 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -44,7 +44,7 @@ enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd,
+ 	ret = vpu_EncGetBitstreamBuffer(handle, &pa_read_ptr, &pa_write_ptr,
+ 					&size);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("EncGetBitstreamBuffer failed\n");
++		err_msg("EncGetBitstreamBuffer failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -73,7 +73,7 @@ enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd,
+ 
+ 		ret = vpu_EncUpdateBitstreamBuffer(handle, space);
+ 		if (ret != RETCODE_SUCCESS) {
+-			printf("EncUpdateBitstreamBuffer failed\n");
++			err_msg("EncUpdateBitstreamBuffer failed\n");
+ 			return -1;
+ 		}
+ 	}
+@@ -184,14 +184,14 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 
+ 	fb = enc->fb = calloc(fbcount + 1, sizeof(FrameBuffer));
+ 	if (fb == NULL) {
+-		printf("Failed to allocate enc->fb\n");
++		err_msg("Failed to allocate enc->fb\n");
+ 		return -1;
+ 	}
+ 	
+ 	pfbpool = enc->pfbpool = calloc(fbcount + 1,
+ 					sizeof(struct frame_buf *));
+ 	if (pfbpool == NULL) {
+-		printf("Failed to allocate enc->pfbpool\n");
++		err_msg("Failed to allocate enc->pfbpool\n");
+ 		free(fb);
+ 		return -1;
+ 	}
+@@ -215,7 +215,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, stride);
+ 	unlock(enc->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("Register frame buffer failed\n");
++		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+ 	}
+ 	
+@@ -229,7 +229,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		pfbpool[src_fbid] = framebuf_alloc(enc->picwidth,
+ 						   enc->picheight);
+ 		if (pfbpool[src_fbid] == NULL) {
+-			printf("failed to allocate single framebuf\n");
++			err_msg("failed to allocate single framebuf\n");
+ 			goto err1;
+ 		}
+ 		
+@@ -279,7 +279,7 @@ encoder_start(struct encode *enc)
+ 	/* Must put encode header before encoding */
+ 	ret = encoder_fill_headers(enc);
+ 	if (ret) {
+-		printf("Encode fill headers failed\n");
++		err_msg("Encode fill headers failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -331,7 +331,8 @@ encoder_start(struct encode *enc)
+ 		lock(enc->cmdl);
+ 		ret = vpu_EncStartOneFrame(handle, &enc_param);
+ 		if (ret != RETCODE_SUCCESS) {
+-			printf("EncStartOneFrame failed\n");
++			err_msg("vpu_EncStartOneFrame failed Err code:%d\n",
++									ret);
+ 			unlock(enc->cmdl);
+ 			goto err2;
+ 		}
+@@ -352,7 +353,8 @@ encoder_start(struct encode *enc)
+ 		ret = vpu_EncGetOutputInfo(handle, &outinfo);
+ 		unlock(enc->cmdl);
+ 		if (ret != RETCODE_SUCCESS) {
+-			printf("EncGetOutputInfo failed\n");
++			err_msg("vpu_EncGetOutputInfo failed Err code: %d\n",
++									ret);
+ 			goto err2;
+ 		}
+ 
+@@ -368,7 +370,7 @@ encoder_start(struct encode *enc)
+ 					- enc->phy_bsbuf_addr);
+ 		ret = vpu_write(enc->cmdl, (void *)vbuf, outinfo.bitstreamSize);
+ 		if (ret < 0) {
+-			printf("writing bitstream buffer failed\n");
++			err_msg("writing bitstream buffer failed\n");
+ 			goto err2;
+ 		}
+ #endif
+@@ -382,7 +384,7 @@ encoder_start(struct encode *enc)
+ 			virt_bsbuf_end, phy_bsbuf_start, 0);
+ #endif
+ 
+-	printf("Finished encoding: %d frames\n", frame_id);
++	info_msg("Finished encoding: %d frames\n", frame_id);
+ err2:
+ 	if (src_scheme == PATH_V4L2) {
+ 		v4l_stop_capturing();
+@@ -420,7 +422,7 @@ encoder_configure(struct encode *enc)
+ 	lock(enc->cmdl);
+ 	ret = vpu_EncGiveCommand(handle, ENC_SET_SEARCHRAM_PARAM, &search_pa);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("Encoder SET_SEARCHRAM_PARAM failed\n");
++		err_msg("Encoder SET_SEARCHRAM_PARAM failed\n");
+ 		unlock(enc->cmdl);
+ 		return -1;
+ 	}
+@@ -437,7 +439,7 @@ encoder_configure(struct encode *enc)
+ 	ret = vpu_EncGetInitialInfo(handle, &initinfo);
+ 	unlock(enc->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("Encoder GetInitialInfo failed\n");
++		err_msg("Encoder GetInitialInfo failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -545,7 +547,7 @@ encoder_open(struct encode *enc)
+ 
+ 	ret = vpu_EncOpen(&handle, &encop);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("Encoder open failed %d\n", ret);
++		err_msg("Encoder open failed %d\n", ret);
+ 		return -1;
+ 	}
+ 
+@@ -569,7 +571,7 @@ encode_test(void *arg)
+ 	/* allocate memory for must remember stuff */
+ 	enc = (struct encode *)calloc(1, sizeof(struct encode));
+ 	if (enc == NULL) {
+-		printf("Failed to allocate encode structure\n");
++		err_msg("Failed to allocate encode structure\n");
+ 		return -1;
+ 	}
+ 
+@@ -577,7 +579,7 @@ encode_test(void *arg)
+ 	mem_desc.size = STREAM_BUF_SIZE;
+ 	ret = IOGetPhyMem(&mem_desc);
+ 	if (ret) {
+-		printf("Unable to obtain physical memory\n");
++		err_msg("Unable to obtain physical memory\n");
+ 		free(enc);
+ 		return -1;
+ 	}
+@@ -585,7 +587,7 @@ encode_test(void *arg)
+ 	/* mmap that physical buffer */
+ 	enc->virt_bsbuf_addr = IOGetVirtMem(&mem_desc);
+ 	if (enc->virt_bsbuf_addr <= 0) {
+-		printf("Unable to map physical memory\n");
++		err_msg("Unable to map physical memory\n");
+ 		IOFreePhyMem(&mem_desc);
+ 		free(enc);
+ 		return -1;
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index be2d68e..3098560 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -42,7 +42,7 @@ decode()
+ 
+ 	ret = vpu_DecStartOneFrame(handle, &decparam);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("DecStartOneFrame failed\n");
++		err_msg("DecStartOneFrame failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -54,17 +54,17 @@ decode()
+ 	if (ret == RETCODE_FAILURE) {
+ 		goto out;
+ 	} else if (ret != RETCODE_SUCCESS) {
+-		printf("vpu_DecGetOutputInfo failed %d\n", ret);
++		err_msg("vpu_DecGetOutputInfo failed %d\n", ret);
+ 		return -1;
+ 	}
+ 
+ 	if (outinfo.notSufficientPsBuffer) {
+-		printf("PS Buffer overflow\n");
++		err_msg("PS Buffer overflow\n");
+ 		return -1;
+ 	}
+ 	
+ 	if (outinfo.notSufficientSliceBuffer) {
+-		printf("Slice Buffer overflow\n");
++		err_msg("Slice Buffer overflow\n");
+ 		return -1;
+ 	}
+ 			
+@@ -73,7 +73,7 @@ decode()
+ 		return -1;
+ 
+ 	if ( (outinfo.prescanresult == 0) && (decparam.dispReorderBuf == 0)) {
+-		printf("Prescan Enable: not enough bs data\n");
++		warn_msg("Prescan Enable: not enough bs data\n");
+ 		goto out;
+ 	}
+ 
+@@ -100,7 +100,7 @@ dec_fill_bsbuffer(char *buf, int size)
+ 	ret = vpu_DecGetBitstreamBuffer(handle, &pa_read_ptr, &pa_write_ptr,
+ 					&space);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("vpu_DecGetBitstreamBuffer failed\n");
++		err_msg("vpu_DecGetBitstreamBuffer failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -123,7 +123,7 @@ dec_fill_bsbuffer(char *buf, int size)
+ 
+ 	ret = vpu_DecUpdateBitstreamBuffer(handle, size);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("vpu_DecUpdateBitstreamBuffer failed\n");
++		err_msg("vpu_DecUpdateBitstreamBuffer failed\n");
+ 		return -1;
+ 	}
+ 	
+@@ -215,7 +215,7 @@ encode()
+ 
+ 	ret = vpu_EncStartOneFrame(handle, &enc_param);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("EncStartOneFrame failed\n");
++		err_msg("EncStartOneFrame failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -225,7 +225,7 @@ encode()
+ 
+ 	ret = vpu_EncGetOutputInfo(handle, &outinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+-		printf("EncGetOutputInfo failed\n");
++		err_msg("EncGetOutputInfo failed\n");
+ 		return -1;
+ 	}
+ 
+@@ -234,12 +234,12 @@ encode()
+ 				- enc->phy_bsbuf_addr);
+ 	ret = dec_fill_bsbuffer((void *)vbuf, outinfo.bitstreamSize);
+ 	if (ret < 0) {
+-		printf("writing bitstream buffer failed\n");
++		err_msg("writing bitstream buffer failed\n");
+ 		return -1;
+ 	}
+ 
+ 	if (ret != outinfo.bitstreamSize) {
+-		printf("Oops...\n");
++		err_msg("Oops...\n");
+ 	}
+ 
+ 	return 0;
+@@ -262,7 +262,7 @@ encdec_test(void *arg)
+ 	/* allocate memory for must remember stuff */
+ 	enc = (struct encode *)calloc(1, sizeof(struct encode));
+ 	if (enc == NULL) {
+-		printf("Failed to allocate encode structure\n");
++		err_msg("Failed to allocate encode structure\n");
+ 		return -1;
+ 	}
+ 
+@@ -270,7 +270,7 @@ encdec_test(void *arg)
+ 	enc_mem_desc.size = STREAM_BUF_SIZE;
+ 	ret = IOGetPhyMem(&enc_mem_desc);
+ 	if (ret) {
+-		printf("Unable to obtain physical memory\n");
++		err_msg("Unable to obtain physical memory\n");
+ 		free(enc);
+ 		return -1;
+ 	}
+@@ -278,7 +278,7 @@ encdec_test(void *arg)
+ 	/* mmap that physical buffer */
+ 	enc->virt_bsbuf_addr = IOGetVirtMem(&enc_mem_desc);
+ 	if (enc->virt_bsbuf_addr <= 0) {
+-		printf("Unable to map physical memory\n");
++		err_msg("Unable to map physical memory\n");
+ 		IOFreePhyMem(&enc_mem_desc);
+ 		free(enc);
+ 		return -1;
+@@ -291,21 +291,21 @@ encdec_test(void *arg)
+ 
+ 	dec = (struct decode *)calloc(1, sizeof(struct decode));
+ 	if (dec == NULL) {
+-		printf("Failed to allocate decode structure\n");
++		err_msg("Failed to allocate decode structure\n");
+ 		goto err;
+ 	}
+ 
+ 	dec_mem_desc.size = STREAM_BUF_SIZE;
+ 	ret = IOGetPhyMem(&dec_mem_desc);
+ 	if (ret) {
+-		printf("Unable to obtain physical mem\n");
++		err_msg("Unable to obtain physical mem\n");
+ 		free(dec);
+ 		goto err;
+ 	}
+ 
+ 	dec->virt_bsbuf_addr = IOGetVirtMem(&dec_mem_desc);
+ 	if (dec->virt_bsbuf_addr <= 0) {
+-		printf("Unable to obtain virtual mem\n");
++		err_msg("Unable to obtain virtual mem\n");
+ 		IOFreePhyMem(&dec_mem_desc);
+ 		free(dec);
+ 		goto err;
+@@ -318,14 +318,14 @@ encdec_test(void *arg)
+ 		ps_mem_desc.size = PS_SAVE_SIZE;
+ 		ret = IOGetPhyMem(&ps_mem_desc);
+ 		if (ret) {
+-			printf("Unable to obtain physical ps save mem\n");
++			err_msg("Unable to obtain physical ps save mem\n");
+ 			goto err;
+ 		}
+ 
+ 		slice_mem_desc.size = SLICE_SAVE_SIZE;
+ 		ret = IOGetPhyMem(&slice_mem_desc);
+ 		if (ret) {
+-			printf("Unable to obtain physical slice save mem\n");
++			err_msg("Unable to obtain physical slice save mem\n");
+ 			IOFreePhyMem(&ps_mem_desc);
+ 			goto err;
+ 		}
+@@ -356,14 +356,14 @@ encdec_test(void *arg)
+ 
+ 	ret = encoder_fill_headers();
+ 	if (ret) {
+-		printf("fill headers failed\n");
++		err_msg("fill headers failed\n");
+ 		goto err4;
+ 	}
+ 
+ 	/* start capture */
+ 	ret = v4l_start_capturing();
+ 	if (ret < 0) {
+-		printf("v4l2 start failed\n");
++		err_msg("v4l2 start failed\n");
+ 		goto err4;
+ 	}
+ 
+@@ -377,7 +377,7 @@ encdec_test(void *arg)
+ 	/* parse the bitstream */
+ 	ret = decoder_parse(dec);
+ 	if (ret) {
+-		printf("decoder parse failed\n");
++		err_msg("decoder parse failed\n");
+ 		goto err5;
+ 	}
+ 
+@@ -390,13 +390,13 @@ encdec_test(void *arg)
+ 	while (1) {
+ 		ret = encode();
+ 		if (ret) {
+-			printf("Encode failed\n");
++			err_msg("Encode failed\n");
+ 			break;
+ 		}
+ 		
+ 		ret = decode();
+ 		if (ret) {
+-			printf("Decode failed\n");
++			err_msg("Decode failed\n");
+ 			break;
+ 		}
+ 
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index cfe271a..1411d5a 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -120,13 +120,13 @@ parse_config_file(char *file_name)
+ 
+ 	fp = fopen(file_name, "r");
+ 	if (fp == NULL) {
+-		printf("Failed to open config file\n");
++		err_msg("Failed to open config file\n");
+ 		return -1;
+ 	}
+ 
+ 	while (fgets(line, 64, fp) != NULL) {
+ 		if (instance > 3) {
+-			printf("No more instances!!\n");
++			err_msg("No more instances!!\n");
+ 			break;
+ 		}
+ 
+@@ -175,7 +175,8 @@ parse_main_args(int argc, char *argv[])
+ 			break;
+ 		case 'C':
+ 			if (instance > 0) {
+-			 	printf("-C option not selected because of other options\n");
++			 	warn_msg("-C option not selected because of"
++							"other options\n");
+ 				break;
+ 			}
+ 
+@@ -212,7 +213,7 @@ parse_args(int argc, char *argv[], int i)
+ 			break;
+ 		case 'o':
+ 			if (input_arg[i].cmd.dst_scheme == PATH_NET) {
+-				printf("warn: -o ignored because of -n\n");
++				warn_msg("-o ignored because of -n\n");
+ 				break;
+ 			}
+ 			strncpy(input_arg[i].cmd.output, optarg, 64);
+@@ -224,7 +225,7 @@ parse_args(int argc, char *argv[], int i)
+ 				strncpy(input_arg[i].cmd.output, optarg, 64);
+ 				input_arg[i].cmd.dst_scheme = PATH_NET;
+ 			} else {
+-				printf("Warn:-n option used only for encode\n");
++				warn_msg("-n option used only for encode\n");
+ 			}
+ 			break;
+ 		case 'p':
+@@ -283,9 +284,9 @@ signal_thread(void *arg)
+ 	while (1) {
+ 		err = sigwait(&sigset, &sig);
+ 		if (sig == SIGINT) {
+-			printf("Ctrl-C received\n");
++			warn_msg("Ctrl-C received\n");
+ 		} else {
+-			printf("Unknown signal. Still exiting\n");
++			warn_msg("Unknown signal. Still exiting\n");
+ 		}
+ 		quitflag = 1;
+ 		break;
+@@ -320,20 +321,20 @@ main(int argc, char *argv[])
+ 
+ 	err = IOSystemInit(NULL);
+ 	if (err) {
+-		printf("IOSystemInit failure\n");
++		err_msg("IOSystemInit failure\n");
+ 		return -1;
+ 	}
+ 
+ 	err = vpu_GetVersionInfo(&ver);
+ 	if (err) {
+-		printf("Cannot get version info\n");
++		err_msg("Cannot get version info\n");
+ 		IOSystemShutdown();
+ 		return -1;
+ 	}
+ 
+-	printf("VPU firmware version: %d.%d.%d\n", ver.fw_major, ver.fw_minor,
++	info_msg("VPU firmware version: %d.%d.%d\n", ver.fw_major, ver.fw_minor,
+ 						ver.fw_release);
+-	printf("VPU library version: %d.%d.%d\n", ver.lib_major, ver.lib_minor,
++	info_msg("VPU library version: %d.%d.%d\n", ver.lib_major, ver.lib_minor,
+ 						ver.lib_release);
+ 
+ 	if (instance > 1) {
+@@ -415,7 +416,7 @@ main(int argc, char *argv[])
+ 	return ret;
+ 
+ usage:
+-	printf("\n%s", usage);
++	info_msg("\n%s", usage);
+ 	return -1;
+ }
+ 
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index b91254a..b6cc264 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -171,7 +171,7 @@ udp_recv(struct cmd_line *cmd, int sd, char *buf, int n)
+ 
+ 		nactual = (nread - hdrlen);
+ 		if (net_h->len != nactual) {
+-			printf("warn: length mismatch\n");
++			warn_msg("length mismatch\n");
+ 		}
+ 		
+ 		if (cmd->seq_no++ != net_h->seqno) {
+@@ -213,7 +213,7 @@ udp_send(struct cmd_line *cmd, int sd, char *buf, int n)
+ 
+ 	hdrlen = sizeof(net_h);
+ 	if ((n + hdrlen) > DEFAULT_PKT_SIZE) {
+-		printf("panic: increase default udp pkt size! %d\n", n);
++		err_msg("panic: increase default udp pkt size! %d\n", n);
+ 		while (1);
+ 	}
+ 	
+@@ -237,7 +237,7 @@ udp_send(struct cmd_line *cmd, int sd, char *buf, int n)
+ 	nwrite = sendto(sd, cmd->nbuf, n, 0, (struct sockaddr *)&addr,
+ 				sizeof(addr));
+ 	if (nwrite != n) {
+-		printf("sendto: error\n");
++		err_msg("sendto: error\n");
+ 	}
+ 
+ 	return nwrite;
+@@ -330,13 +330,13 @@ udp_open(struct cmd_line *cmd)
+ 
+ 	cmd->nbuf = (char *)malloc(DEFAULT_PKT_SIZE);
+ 	if (cmd->nbuf == NULL) {
+-		printf("failed to malloc udp buffer\n");
++		err_msg("failed to malloc udp buffer\n");
+ 		return -1;
+ 	}
+ 	
+ 	sd = socket(PF_INET, SOCK_DGRAM, 0);
+ 	if (sd < 0) {
+-		printf("failed to open udp socket\n");
++		err_msg("failed to open udp socket\n");
+ 		free(cmd->nbuf);
+ 		cmd->nbuf = 0;
+ 		return -1;
+@@ -349,7 +349,7 @@ udp_open(struct cmd_line *cmd)
+ 		addr.sin_addr.s_addr = INADDR_ANY;
+ 
+ 		if (bind(sd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+-			printf("udp bind failed\n");
++			err_msg("udp bind failed\n");
+ 			close(sd);
+ 			free(cmd->nbuf);
+ 			cmd->nbuf = 0;
+@@ -377,7 +377,7 @@ open_files(struct cmd_line *cmd)
+ 			return -1;
+ 		}
+ 		
+-		printf("decoder listening on port %d\n", cmd->port);
++		info_msg("decoder listening on port %d\n", cmd->port);
+ 	}
+ 	
+ 	if (cmd->dst_scheme == PATH_FILE) {
+@@ -400,7 +400,7 @@ open_files(struct cmd_line *cmd)
+ 			return -1;
+ 		}
+ 		
+-		printf("encoder sending on port %d\n", cmd->port);
++		info_msg("encoder sending on port %d\n", cmd->port);
+ 	}
+ 
+ 	return 0;
+@@ -428,31 +428,29 @@ close_files(struct cmd_line *cmd)
+ int
+ check_params(struct cmd_line *cmd, int op)
+ {
+-	printf("Format: ");
+ 	switch (cmd->format) {
+ 	case STD_MPEG4:
+-		printf("STD_MPEG4");
++		info_msg("Format: STD_MPEG4\n");
+ 		break;
+ 	case STD_H263:
+-		printf("STD_H263");
++		info_msg("Format: STD_H263\n");
+ 		break;
+ 	case STD_AVC:
+-		printf("STD_AVC");
++		info_msg("Format: STD_AVC\n");
+ 		break;
+ 	case STD_VC1:
+-		printf("STD_VC1");
++		info_msg("Format: STD_VC1\n");
+ 		break;
+ 	case STD_MPEG2:
+-		printf("STD_MPEG2");
++		info_msg("Format: STD_MPEG2\n");
+ 		break;
+ 	case STD_DIV3:
+-		printf("STD_DIV3");
++		info_msg("Format: STD_DIV3\n");
+ 		break;
+ 	default:
+-		printf("Unsupported Format!");
++		err_msg("Unsupported Format!\n");
+ 		break;
+ 	}
+-	printf("\n");
+ 
+ 	if (cmd->port == 0) {
+ 		cmd->port = DEFAULT_PORT;
+@@ -465,7 +463,7 @@ check_params(struct cmd_line *cmd, int op)
+ 	if (cmd->src_scheme == PATH_FILE && op == ENCODE) {
+ 		if ((cmd->width == 0) || (cmd->width % 16 != 0) ||
+ 			(cmd->height == 0) || (cmd->height % 16 != 0)) {
+-			printf("Enter width and height for YUV file\n");
++			warn_msg("Enter width and height for YUV file\n");
+ 			return -1;
+ 		}
+ 	}
+@@ -479,20 +477,20 @@ check_params(struct cmd_line *cmd, int op)
+ 
+ 		if (cmd->width % 16 != 0) {
+ 			cmd->width -= cmd->width % 16;
+-			printf("Warn:width not divisible by 16, adjusted %d\n",
++			warn_msg("width not divisible by 16, adjusted %d\n",
+ 					cmd->width);
+ 		}
+ 	
+ 		if (cmd->height % 16 != 0) {
+ 			cmd->height -= cmd->height % 16;
+-			printf("Warn:height not divisible by 16, adjusted %d\n",
++			warn_msg("height not divisible by 16, adjusted %d\n",
+ 					cmd->height);
+ 		}
+ 	}
+ 
+ 	if (cmd->dst_scheme != PATH_FILE && op == ENCODE) {
+ 		if (cmd->dst_scheme != PATH_NET) {
+-			printf("Warn: No output file specified, using default\n");
++			warn_msg("No output file specified, using default\n");
+ 			cmd->dst_scheme = PATH_FILE;
+ 
+ 			if (cmd->format == STD_MPEG4) {
+@@ -508,21 +506,21 @@ check_params(struct cmd_line *cmd, int op)
+ 	if (cmd->rot_en) {
+ 		if (cmd->rot_angle != 0 && cmd->rot_angle != 90 &&
+ 			cmd->rot_angle != 180 && cmd->rot_angle != 270) {
+-			printf("Warn: Invalid rotation angle. No rotation!\n");
++			warn_msg("Invalid rotation angle. No rotation!\n");
+ 			cmd->rot_en = 0;
+ 			cmd->rot_angle = 0;
+ 		}
+ 	}
+ 
+ 	if (cmd->mirror < MIRDIR_NONE || cmd->mirror > MIRDIR_HOR_VER) {
+-		printf("Warn: Invalid mirror angle. Using 0\n");
++		warn_msg("Invalid mirror angle. Using 0\n");
+ 		cmd->mirror = 0;
+ 	}
+ 
+ 	if (!(cmd->format == STD_MPEG4 || cmd->format == STD_H263 ||
+ 	    cmd->format == STD_MPEG2 || cmd->format == STD_DIV3) &&
+ 	    cmd->mp4dblk_en) {
+-		printf("Warn: Deblocking only for MPEG4. Disabled!\n");
++		warn_msg("Deblocking only for MPEG4. Disabled!\n");
+ 		cmd->mp4dblk_en = 0;
+ 	}
+ 
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index d3a1419..a4bb322 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -23,8 +23,22 @@
+ #include "vpu_io.h"
+ 
+ #define	DEBUG_LEVEL	0
++
+ #define dprintf(level, fmt, arg...)     if (DEBUG_LEVEL >= level) \
+-        printf("<VPU-test> " fmt , ## arg)
++        printf("[DEBUG]\t%s:%d " fmt, __FILE__, __LINE__, ## arg)
++
++#define err_msg(fmt, arg...) do { if (DEBUG_LEVEL >= 1)		\
++	printf("[ERR]\t%s:%d " fmt,  __FILE__, __LINE__, ## arg); else \
++	printf("[ERR]\t" fmt, ## arg);	\
++	} while (0)
++#define info_msg(fmt, arg...) do { if (DEBUG_LEVEL >= 1)		\
++	printf("[INFO]\t%s:%d " fmt,  __FILE__, __LINE__, ## arg); else \
++	printf("[INFO]\t" fmt, ## arg);	\
++	} while (0)
++#define warn_msg(fmt, arg...) do { if (DEBUG_LEVEL >= 1)		\
++	printf("[WARN]\t%s:%d " fmt,  __FILE__, __LINE__, ## arg); else \
++	printf("[WARN]\t" fmt, ## arg);	\
++	} while (0)
+ 
+ /*#define TVOUT_ENABLE*/
+ /* Available on MX37. If not defined, then use VPU rotation.  */
+@@ -169,7 +183,6 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode);
+ 
+ struct vpu_display *v4l_display_open(int width, int height, int nframes,
+ 					struct rot rotation, int stride);
+-
+ int v4l_put_data(struct vpu_display *disp);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(int strideY, int height);
+-- 
+1.8.0
+

@@ -1,0 +1,363 @@
+From 5541756aa71253025aa57165a70f0b8d937ef7c6 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 6 Jul 2011 21:17:08 +0800
+Subject: [PATCH 227/435] ENGR00152371 vpu: Add mx6q vpu unit test.
+
+This is the initial version to add mx6q vpu test, only one instance
+of MPEG4/H264/VC1/MPEG2/AVS decoder can be tested currently,
+not support encoder and multiple instances yet.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/Makefile   |  2 +-
+ test/mxc_vpu_test/dec.c      | 43 +++++++++++++++++++++++++++++++------------
+ test/mxc_vpu_test/display.c  |  2 +-
+ test/mxc_vpu_test/enc.c      | 41 +++++++++++++++++++++++++++++++++++------
+ test/mxc_vpu_test/main.c     |  1 +
+ test/mxc_vpu_test/utils.c    | 11 ++++++++++-
+ test/mxc_vpu_test/vpu_test.h | 10 +++++++++-
+ 7 files changed, 88 insertions(+), 22 deletions(-)
+
+diff --git a/test/mxc_vpu_test/Makefile b/test/mxc_vpu_test/Makefile
+index ca4a451..9ab4f13 100644
+--- a/test/mxc_vpu_test/Makefile
++++ b/test/mxc_vpu_test/Makefile
+@@ -11,7 +11,7 @@ OBJ = main.o \
+       loopback.o
+ 
+ # list of platforms which want this test case
+-INCLUDE_LIST:=IMX27ADS IMX51 IMX53
++INCLUDE_LIST:=IMX27ADS IMX51 IMX53 IMX6Q
+ 
+ ifeq ($(PLATFORM),$(findstring $(PLATFORM),$(INCLUDE_LIST)))
+ TARGET = mxc_vpu_test.out
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index ea2d14d..2cc86cb 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -35,6 +35,7 @@ static FILE *fpMvLogfile = NULL;
+ static FILE *fpUserDataLogfile = NULL;
+ 
+ static int isInterlacedMPEG4 = 0;
++static JpegHeaderBufInfo jpgHeaderInfo;
+ 
+ #define FN_FRAME_BUFFER_STATUS "dec_frame_buf_status.log"
+ #define FN_ERR_MAP_DATA "dec_error_map.log"
+@@ -43,6 +44,8 @@ static int isInterlacedMPEG4 = 0;
+ #define FN_MV_DATA "dec_mv.log"
+ #define FN_USER_DATA "dec_user_data.log"
+ 
++#define JPG_HEADER_SIZE	     0x200
++
+ #ifdef COMBINED_VIDEO_SUPPORT
+ #define MAX_FRAME_WIDTH 720
+ #define MAX_FRAME_HEIGHT 576
+@@ -683,7 +686,7 @@ decoder_start(struct decode *dec)
+ 			&& (dec->cmdl->ipu_rot_en))
+ 		rot_en = 0;
+ 
+-	/* deblock_en is zero on mx5x since it is cleared in decode_open() function. */
++	/* deblock_en is zero on none mx27 since it is cleared in decode_open() function. */
+ 	if (rot_en || dering_en) {
+ 		rotid = dec->fbcount;
+ 		if (deblock_en) {
+@@ -1055,7 +1058,7 @@ decoder_start(struct decode *dec)
+ 							(img_size >> 2);
+ 			}
+ 
+-			if (cpu_is_mx5x())
++			if (!cpu_is_mx27())
+ 				if (dec->cmdl->dst_scheme == PATH_V4L2)
+ 					err = v4l_put_data(disp, actual_display_index, field, dec->cmdl->fps);
+ 				else
+@@ -1193,7 +1196,7 @@ decoder_free_framebuffer(struct decode *dec)
+ 		}
+ 	}
+ 
+-	/* deblock_en is zero on mx5x since it is cleared in decode_open() function. */
++	/* deblock_en is zero on none mx27 since it is cleared in decode_open() function. */
+ 	if (((dec->cmdl->dst_scheme != PATH_V4L2) && (dec->cmdl->dst_scheme != PATH_IPU)) ||
+ 			(((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU))
+ 			 && deblock_en)) {
+@@ -1324,10 +1327,11 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 				goto err;
+ 			}
+ 
++			fb[i].myIndex = i;
+ 			fb[i].bufY = pfbpool[i]->addrY;
+ 			fb[i].bufCb = pfbpool[i]->addrCb;
+ 			fb[i].bufCr = pfbpool[i]->addrCr;
+-			if (cpu_is_mx5x()) {
++			if (!cpu_is_mx27()) {
+ 				fb[i].bufMvCol = pfbpool[i]->mvColBuf;
+ 			}
+ 		}
+@@ -1363,7 +1367,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 		if (deblock_en == 0) {
+ 			img_size = dec->stride * dec->picheight;
+ 
+-			if (cpu_is_mx5x()) {
++			if (!cpu_is_mx27()) {
+ 				mvcol_md = dec->mvcol_memdesc =
+ 					calloc(totalfb, sizeof(vpu_mem_desc));
+ 			}
+@@ -1376,7 +1380,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 				fb[i].bufCb = fb[i].bufY + img_size;
+ 				fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
+ 				/* allocate MvCol buffer here */
+-				if (cpu_is_mx5x()) {
++				if (!cpu_is_mx27()) {
+ 					memset(&mvcol_md[i], 0,
+ 							sizeof(vpu_mem_desc));
+ 					mvcol_md[i].size = img_size / divX / divY;
+@@ -1392,8 +1396,14 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	}
+ 
+ 	stride = ((dec->stride + 15) & ~15);
+-	bufinfo.avcSliceBufInfo.sliceSaveBuffer = dec->phy_slice_buf;
+-	bufinfo.avcSliceBufInfo.sliceSaveBufferSize = dec->phy_slicebuf_size;
++
++	if (dec->cmdl->format == STD_AVC) {
++		bufinfo.avcSliceBufInfo.bufferBase = dec->phy_slice_buf;
++		bufinfo.avcSliceBufInfo.bufferSize = dec->phy_slicebuf_size;
++	} else if (dec->cmdl->format == STD_VP8) {
++		bufinfo.vp8MbDataBufInfo.bufferBase = dec->phy_slice_buf;
++		bufinfo.vp8MbDataBufInfo.bufferSize = dec->phy_slicebuf_size;
++	}
+ 
+ 	/* User needs to fill max suported macro block value of frame as following*/
+ 	bufinfo.maxDecFrmInfo.maxMbX = dec->stride / 16;
+@@ -1477,7 +1487,7 @@ decoder_parse(struct decode *dec)
+ 			err_msg("malloc_error\n");
+ 	}
+ 
+-	if(dec->cmdl->format == STD_MJPG) {
++	if(!cpu_is_mx6q() && dec->cmdl->format == STD_MJPG) {
+ 		ret = vpu_DecGiveCommand(handle,DEC_SET_REPORT_USERDATA, &dec->userData);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("Failed to set user data report, ret %d\n", ret);
+@@ -1485,7 +1495,6 @@ decoder_parse(struct decode *dec)
+ 		}
+ 	}
+ 
+-
+ 	/* Parse bitstream and get width/height/framerate etc */
+ 	vpu_DecSetEscSeqInit(handle, 1);
+ 	ret = vpu_DecGetInitialInfo(handle, &initinfo);
+@@ -1564,7 +1573,7 @@ decoder_parse(struct decode *dec)
+ 						profile = 1; /* advanced coding efficiency object */
+ 						break;
+ 					case 0xF:
+-						if (initinfo.level & 8 == 0)
++						if ((initinfo.level & 8) == 0)
+ 							profile = 2; /* advanced simple object */
+ 						else
+ 							profile = 5; /* reserved */
+@@ -1628,6 +1637,14 @@ decoder_parse(struct decode *dec)
+ 			info_msg("MJPG SourceFormat: %d\n", initinfo.mjpg_sourceFormat);
+ 			break;
+ 
++		case STD_AVS:
++			info_msg("AVS Profile: %d Level: %d\n", initinfo.profile, initinfo.level);
++			break;
++
++		case STD_VP8:
++			info_msg("VP8 Profile: %d Level: %d\n", initinfo.profile, initinfo.level);
++			break;
++
+ 		default:
+ 			break;
+ 		}
+@@ -1880,10 +1897,12 @@ decode_test(void *arg)
+ 	cmdl->complete = 1;
+ 	if (dec->cmdl->src_scheme == PATH_NET)
+ 		fillsize = 1024;
++
+ 	ret = dec_fill_bsbuffer(dec->handle, cmdl,
+ 			dec->virt_bsbuf_addr,
+ 		        (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
+ 			dec->phy_bsbuf_addr, fillsize, &eos, &fill_end_bs);
++
+ 	cmdl->complete = 0;
+ 	if (ret < 0) {
+ 		err_msg("dec_fill_bsbuffer failed\n");
+@@ -1898,7 +1917,7 @@ decode_test(void *arg)
+ 	}
+ 
+ 	/* allocate slice buf */
+-	if (cmdl->format == STD_AVC) {
++	if (cmdl->format == STD_AVC || cmdl->format == STD_VP8) {
+ 		slice_mem_desc.size = dec->phy_slicebuf_size;
+ 		ret = IOGetPhyMem(&slice_mem_desc);
+ 		if (ret) {
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index a47a0dd..14c9e49 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -617,7 +617,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	if ((disp_width != 0) && (disp_height!= 0 )) {
+ 		crop.c.width = disp_width;
+ 		crop.c.height = disp_height;
+-	} else if (cpu_is_mx5x()) {
++	} else if (!cpu_is_mx27()) {
+ 		crop.c.width = cropcap.bounds.width;
+ 		crop.c.height = cropcap.bounds.height;
+ 	}
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 952dfd1..96faabc 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -283,18 +283,25 @@ int
+ encoder_allocate_framebuffer(struct encode *enc)
+ {
+ 	EncHandle handle = enc->handle;
+-	int i, enc_stride, src_stride, src_fbid = enc->src_fbid, fbcount = enc->fbcount;
++	int i, enc_stride, src_stride, src_fbid = enc->src_fbid;
++	int needFrameBufCount, fbcount = enc->fbcount;
+ 	RetCode ret;
+ 	FrameBuffer *fb;
++	PhysicalAddress subSampBaseA = NULL, subSampBaseB = NULL;
+ 	struct frame_buf **pfbpool;
+ 
+-	fb = enc->fb = calloc(fbcount + 1, sizeof(FrameBuffer));
++	if (cpu_is_mx6q())
++		needFrameBufCount = fbcount + 3; // minFrameBufferCount + Subsamp buffer [2] + Src frame
++	else
++		needFrameBufCount = fbcount + 1;
++
++	fb = enc->fb = calloc(needFrameBufCount, sizeof(FrameBuffer));
+ 	if (fb == NULL) {
+ 		err_msg("Failed to allocate enc->fb\n");
+ 		return -1;
+ 	}
+ 
+-	pfbpool = enc->pfbpool = calloc(fbcount + 1,
++	pfbpool = enc->pfbpool = calloc(needFrameBufCount,
+ 					sizeof(struct frame_buf *));
+ 	if (pfbpool == NULL) {
+ 		err_msg("Failed to allocate enc->pfbpool\n");
+@@ -303,12 +310,14 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	for (i = 0; i < fbcount; i++) {
+-		pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420, (enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
++		pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420,
++				(enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
+ 		if (pfbpool[i] == NULL) {
+ 			fbcount = i;
+ 			goto err1;
+ 		}
+ 
++		fb[i].myIndex = i;
+ 		fb[i].bufY = pfbpool[i]->addrY;
+ 		fb[i].bufCb = pfbpool[i]->addrCb;
+ 		fb[i].bufCr = pfbpool[i]->addrCr;
+@@ -316,6 +325,25 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		fb[i].strideC = pfbpool[i]->strideC;
+ 	}
+ 
++	if (cpu_is_mx6q() &&  enc->cmdl->format != STD_MJPG) {
++		for (i = fbcount + 1; i < fbcount + 3; i++) {
++			pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420,
++					(enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
++			if (pfbpool[i] == NULL) {
++				fbcount = i;
++				goto err1;
++			}
++			fb[i].myIndex = i;
++			fb[i].bufY = pfbpool[i]->addrY;
++			fb[i].bufCb = pfbpool[i]->addrCb;
++			fb[i].bufCr = pfbpool[i]->addrCr;
++			fb[i].strideY = pfbpool[i]->strideY;
++			fb[i].strideC = pfbpool[i]->strideC;
++		}
++		subSampBaseA = fb[fbcount + 1].bufY;
++		subSampBaseB = fb[fbcount + 2].bufY;
++	}
++
+ 	/* Must be a multiple of 16 */
+ 	if (enc->cmdl->rot_angle == 90 || enc->cmdl->rot_angle == 270) {
+ 		enc_stride = (enc->enc_picheight + 15 ) & ~15;
+@@ -325,7 +353,8 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		src_stride = (enc->src_picwidth + 15 ) & ~15;
+ 	}
+ 
+-	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, enc_stride, src_stride);
++	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, enc_stride, src_stride,
++					    subSampBaseA, subSampBaseB);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index b14b1d8..9d6ae9e 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -38,6 +38,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "  -x <output method> V4l2(0) or IPU lib(1) \n "\
+ 	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, \n "\
+ 	       "	4 - MPEG2, 5 - DIV3, 6 - RV, 7 - MJPG, \n "\
++	       "        8 - AVS, 10 - VP6, 11 - VP8\n "\
+ 	       "	If no format specified, default is 0 (MPEG4) \n "\
+ 	       "  -l <mp4Class> 0 - MPEG4, 1 - DIVX 5.0 or higher, 2 - XVID, \n "\
+ 	       "        5 - DIVX4.0 \n "\
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index a8617b1..d9ca80f 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -473,6 +473,15 @@ check_params(struct cmd_line *cmd, int op)
+ 	case STD_MJPG:
+ 		info_msg("Format: STD_MJPG\n");
+ 		break;
++	case STD_AVS:
++		info_msg("Format: STD_AVS\n");
++		break;
++	case STD_VP6:
++		info_msg("Format: STD_VP6\n");
++		break;
++	case STD_VP8:
++		info_msg("Format: STD_VP8\n");
++		break;
+ 	default:
+ 		err_msg("Unsupported Format!\n");
+ 		break;
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 3fa8d6d..2fcd1d2 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc.
++ * Copyright 2004-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -279,4 +279,12 @@ void decoder_free_framebuffer(struct decode *dec);
+ 
+ void SaveQpReport(Uint32 *qpReportAddr, int picWidth, int picHeight,
+ 		  int frameIdx, char *fileName);
++
++static inline int is_mx6q_mjpg(int fmt)
++{
++        if (cpu_is_mx6q() && (fmt == STD_MJPG))
++                return true;
++        else
++                return false;
++}
+ #endif
+-- 
+1.8.0
+

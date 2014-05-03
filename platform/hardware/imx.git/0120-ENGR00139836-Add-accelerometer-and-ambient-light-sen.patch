@@ -1,0 +1,2789 @@
+From 42ab03ec8bae8f0486dff95bb925f42301b4d3a4 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 2 Mar 2011 14:06:02 +0800
+Subject: [PATCH 120/486] ENGR00139836 Add accelerometer and ambient light
+ sensor support
+
+Add MMA8451 accelerometer and isl29023 ambient light sensor HAL
+for mx53 smd board on gingerbread.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ libsensors/AccelSensor.cpp      | 283 ++++++++++++++++++++++++
+ libsensors/AccelSensor.h        |  78 +++++++
+ libsensors/Android.mk           |  34 +--
+ libsensors/InputEventReader.cpp |  88 ++++++++
+ libsensors/InputEventReader.h   |  48 +++++
+ libsensors/LightSensor.cpp      | 200 +++++++++++++++++
+ libsensors/LightSensor.h        |  60 ++++++
+ libsensors/SensorBase.cpp       | 131 +++++++++++
+ libsensors/SensorBase.h         |  66 ++++++
+ libsensors/fakesensor.cpp       | 468 ----------------------------------------
+ libsensors/mma7450.cpp          | 411 -----------------------------------
+ libsensors/mma8451.cpp          | 414 -----------------------------------
+ libsensors/sensors.cpp          | 289 +++++++++++++++++++++++++
+ libsensors/sensors.h            |  78 +++++++
+ 14 files changed, 1342 insertions(+), 1306 deletions(-)
+ create mode 100755 libsensors/AccelSensor.cpp
+ create mode 100755 libsensors/AccelSensor.h
+ create mode 100755 libsensors/InputEventReader.cpp
+ create mode 100755 libsensors/InputEventReader.h
+ create mode 100755 libsensors/LightSensor.cpp
+ create mode 100755 libsensors/LightSensor.h
+ create mode 100755 libsensors/SensorBase.cpp
+ create mode 100755 libsensors/SensorBase.h
+ delete mode 100755 libsensors/fakesensor.cpp
+ delete mode 100755 libsensors/mma7450.cpp
+ delete mode 100755 libsensors/mma8451.cpp
+ create mode 100755 libsensors/sensors.cpp
+ create mode 100755 libsensors/sensors.h
+
+diff --git a/libsensors/AccelSensor.cpp b/libsensors/AccelSensor.cpp
+new file mode 100755
+index 0000000..396f165
+--- /dev/null
++++ b/libsensors/AccelSensor.cpp
+@@ -0,0 +1,283 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <fcntl.h>
++#include <errno.h>
++#include <math.h>
++#include <stdlib.h>
++#include <poll.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <sys/select.h>
++#include <dlfcn.h>
++#include <cutils/log.h>
++
++#include "AccelSensor.h"
++
++/*****************************************************************************/
++AccelSensor::AccelSensor()
++: SensorBase(NULL, NULL),
++      mEnabled(0),
++      mPendingMask(0),
++      mInputReader(32),
++      mMinPollDelay(0),
++      mMaxPollDelay(0)
++{
++#if defined(ACCELEROMETER_SENSOR_MMA8451)
++    data_name = "mma8451";
++#elif defined(ACCELEROMETER_SENSOR_MMA8450)
++    data_name = "mma8450";
++#else
++#error you must define accelerometer properly
++    data_name = NULL;
++    data_fd = -1;
++#endif
++
++    if (data_name) {
++        data_fd = openInput(data_name);
++        getPollFile(data_name);
++    }
++    memset(mPendingEvents, 0, sizeof(mPendingEvents));
++
++    mPendingEvents[Accelerometer].version = sizeof(sensors_event_t);
++    mPendingEvents[Accelerometer].sensor = ID_A;
++    mPendingEvents[Accelerometer].type = SENSOR_TYPE_ACCELEROMETER;
++    mPendingEvents[Accelerometer].acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
++
++    // read the actual value of all sensors if they're enabled already
++    struct input_absinfo absinfo;
++    short flags = 0;
++
++    if (accel_is_sensor_enabled(SENSOR_TYPE_ACCELEROMETER))  {
++        mEnabled |= 1<<Accelerometer;
++        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_X), &absinfo)) {
++            mPendingEvents[Accelerometer].acceleration.x = absinfo.value * CONVERT_A_X;
++        }
++        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_Y), &absinfo)) {
++            mPendingEvents[Accelerometer].acceleration.y = absinfo.value * CONVERT_A_Y;
++        }
++        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_Z), &absinfo)) {
++            mPendingEvents[Accelerometer].acceleration.z = absinfo.value * CONVERT_A_Z;
++        }
++    }
++}
++
++AccelSensor::~AccelSensor()
++{
++}
++
++int AccelSensor::enable(int32_t handle, int en)
++{
++    int what = -1;
++
++    switch (handle) {
++        case ID_A: what = Accelerometer; break;
++    }
++
++    if (uint32_t(what) >= numSensors)
++        return -EINVAL;
++
++    int newState  = en ? 1 : 0;
++    int err = 0;
++
++    if ((uint32_t(newState)<<what) != (mEnabled & (1<<what))) {
++        uint32_t sensor_type;
++        switch (what) {
++            case Accelerometer: sensor_type = SENSOR_TYPE_ACCELEROMETER;  break;
++        }
++        short flags = newState;
++        if (en)
++            err = accel_enable_sensor(sensor_type);
++        else
++            err = accel_disable_sensor(sensor_type);
++
++        LOGE_IF(err, "Could not change sensor state (%s)", strerror(-err));
++        if (!err) {
++            mEnabled &= ~(1<<what);
++            mEnabled |= (uint32_t(flags)<<what);
++        }
++    }
++    return err;
++}
++
++int AccelSensor::getPollFile(const char* inputName)
++{
++    FILE *fd = NULL;
++    const char *dirname = "/sys/class/input/";
++    char sysfs_name[PATH_MAX], *endptr;
++    char *filename = NULL, buf[32];
++    DIR *dir;
++    struct dirent *de;
++    int n, path_len;
++
++    poll_sysfs_file_len = 0;
++    dir = opendir(dirname);
++    if(dir == NULL)
++        return -1;
++
++    strcpy(sysfs_name, dirname);
++    filename = sysfs_name + strlen(sysfs_name);
++    while ((de = readdir(dir))) {
++        if ((strlen(de->d_name) < 6) ||
++            strncmp(de->d_name, "input", 5))
++            continue;
++
++        strcpy(filename, de->d_name);
++        strcat(filename, "/");
++        path_len = strlen(sysfs_name);
++        strcat(filename, "name");
++        fd = fopen(sysfs_name, "r");
++        if (fd) {
++            memset(buf, 0, 32);
++            n = fread(buf, 1, 32, fd);
++            fclose(fd);
++            if ((strlen(buf) >= strlen(inputName)) &&
++                !strncmp(buf, inputName, strlen(inputName))) {
++                /* Try to open /sys/class/input/input?/poll */
++                filename = sysfs_name + path_len;
++                strcpy(filename, "poll");
++                fd = fopen(sysfs_name, "r+");
++                if (fd) {
++                    strcpy(poll_sysfs_file,sysfs_name);
++                    poll_sysfs_file_len = strlen(poll_sysfs_file);
++                    fclose(fd);
++                    LOGD("Found %s\n", poll_sysfs_file);
++
++                    /* Get max poll delay time */
++                    filename = sysfs_name + path_len;
++                    strcpy(filename, "max");
++                    fd = fopen(sysfs_name, "r");
++                    if (fd) {
++                        memset(buf, 0, 32);
++                        n = fread(buf, 1, 6, fd);
++                        if (n > 0)
++                            mMaxPollDelay = strtol(buf, &endptr, 10);
++                        fclose(fd);
++                    }
++
++                    /* Get min poll delay time */
++                    filename = sysfs_name + path_len;
++                    strcpy(filename, "min");
++                    fd = fopen(sysfs_name, "r");
++                    if (fd) {
++                        memset(buf, 0, 32);
++                        n = fread(buf, 1, 6, fd);
++                        if (n > 0)
++                            mMinPollDelay = strtol(buf, &endptr, 10);
++                        fclose(fd);
++                    }
++                    LOGD("mMinPollDelay %d, mMaxPollDelay %d\n",
++                           mMinPollDelay, mMaxPollDelay);
++
++                    return 0;
++                }
++            }
++        }
++   }
++
++   return -1;
++}
++
++int AccelSensor::setDelay(int32_t handle, int64_t ns)
++{
++    FILE *fd = NULL;
++    int n, len, ms, ret = -1;
++    char buf[6];
++
++    ms = ns / 1000 / 1000;
++    LOGD("AccelSensor....setDelay, ms=%d\n", ms);
++
++    if (poll_sysfs_file_len &&
++        (ms >= mMinPollDelay) &&
++        (ms <= mMaxPollDelay)) {
++       fd = fopen(poll_sysfs_file, "r+");
++       if (fd) {
++           len = 6;
++           memset(buf, 0, len);
++           snprintf(buf, len, "%d", ms);
++           n = fwrite(buf, 1, len, fd);
++           fclose(fd);
++           ret = 0;
++       }else
++           LOGE("file %s open failure\n", poll_sysfs_file);
++    }else
++        LOGE("Error in setDelay %d ms\n", ms);
++
++    return ret;
++}
++
++int AccelSensor::readEvents(sensors_event_t* data, int count)
++{
++
++    if (count < 1)
++        return -EINVAL;
++
++    ssize_t n = mInputReader.fill(data_fd);
++    if (n < 0)
++        return n;
++
++    int numEventReceived = 0;
++    input_event const* event;
++
++    while (count && mInputReader.readEvent(&event)) {
++        int type = event->type;
++        if (type == EV_ABS) {
++            processEvent(event->code, event->value);
++            mInputReader.next();
++        } else if (type == EV_SYN) {
++            int64_t time = timevalToNano(event->time);
++            for (int j=0 ; count && mPendingMask && j<numSensors ; j++) {
++                if (mPendingMask & (1<<j)) {
++                    mPendingMask &= ~(1<<j);
++                    mPendingEvents[j].timestamp = time;
++                    if (mEnabled & (1<<j)) {
++                        *data++ = mPendingEvents[j];
++                        count--;
++                        numEventReceived++;
++                    }
++                }
++            }
++            if (!mPendingMask) {
++                mInputReader.next();
++            }
++        } else {
++            LOGE("AccelSensor: unknown event (type=%d, code=%d)",
++                    type, event->code);
++            mInputReader.next();
++        }
++    }
++
++    return numEventReceived;
++}
++
++void AccelSensor::processEvent(int code, int value)
++{
++    switch (code) {
++        case EVENT_TYPE_ACCEL_X:
++            mPendingMask |= 1<<Accelerometer;
++            mPendingEvents[Accelerometer].acceleration.x = value * CONVERT_A_X;
++            break;
++        case EVENT_TYPE_ACCEL_Y:
++            mPendingMask |= 1<<Accelerometer;
++            mPendingEvents[Accelerometer].acceleration.y = value * CONVERT_A_Y;
++            break;
++        case EVENT_TYPE_ACCEL_Z:
++            mPendingMask |= 1<<Accelerometer;
++            mPendingEvents[Accelerometer].acceleration.z = value * CONVERT_A_Z;
++            break;
++    }
++}
+diff --git a/libsensors/AccelSensor.h b/libsensors/AccelSensor.h
+new file mode 100755
+index 0000000..4d2f338
+--- /dev/null
++++ b/libsensors/AccelSensor.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_ACCEL_SENSOR_H
++#define ANDROID_ACCEL_SENSOR_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++#include "sensors.h"
++#include "SensorBase.h"
++#include "InputEventReader.h"
++
++/*****************************************************************************/
++
++struct input_event;
++
++class AccelSensor : public SensorBase {
++public:
++            AccelSensor();
++    virtual ~AccelSensor();
++
++    enum {
++        Accelerometer   = 0,
++        numSensors
++    };
++
++    virtual int setDelay(int32_t handle, int64_t ns);
++    virtual int enable(int32_t handle, int enabled);
++    virtual int readEvents(sensors_event_t* data, int count);
++    void processEvent(int code, int value);
++
++private:
++    uint32_t mEnabled;
++    uint32_t mPendingMask;
++    InputEventCircularReader mInputReader;
++    sensors_event_t mPendingEvents[numSensors];
++    int mMinPollDelay;
++    int mMaxPollDelay;
++    char poll_sysfs_file[PATH_MAX];
++    int poll_sysfs_file_len;
++    int getPollFile(const char* inputName);
++    static inline int accel_is_sensor_enabled(uint32_t sensor_type)
++    {
++        //dummy now......
++        return 1;
++    }
++    static inline int accel_enable_sensor(uint32_t sensor_type)
++    {
++        //dummy now......
++        return 0;
++    }
++    static inline int accel_disable_sensor(uint32_t sensor_type)
++    {
++       //dummy now......
++       return 0;
++    }
++};
++
++/*****************************************************************************/
++
++#endif  // ANDROID_ACCEL_SENSOR_H
+diff --git a/libsensors/Android.mk b/libsensors/Android.mk
+index acbbb89..38b1395 100755
+--- a/libsensors/Android.mk
++++ b/libsensors/Android.mk
+@@ -15,28 +15,36 @@
+ ifeq ($(BOARD_HAS_SENSOR),true)
+ LOCAL_PATH := $(call my-dir)
+ 
+-# HAL module implemenation, not prelinked and stored in
+-# hw/<OVERLAY_HARDWARE_MODULE_ID>.<ro.product.board>.so
++ifneq ($(TARGET_SIMULATOR),true)
++
++# HAL module implemenation, not prelinked, and stored in
++# hw/<SENSORS_HARDWARE_MODULE_ID>.<ro.product.board>.so
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog
++LOCAL_MODULE := sensors.$(TARGET_BOARD_PLATFORM)
++LOCAL_MODULE_TAGS := eng
+ 
++LOCAL_CFLAGS := -DLOG_TAG=\"Sensors\"
+ ifeq ($(SENSOR_MMA8451),true)
+-LOCAL_SRC_FILES := mma8451.cpp
++LOCAL_CPPFLAGS += -DACCELEROMETER_SENSOR_MMA8451
+ else
+- ifeq ($(SENSOR_MMA7450),true)
+- LOCAL_SRC_FILES := mma7450.cpp
+- else
+- LOCAL_SRC_FILES := fakesensor.cpp
++ ifeq ($(SENSOR_MMA8450),true)
++ LOCAL_CPPFLAGS += -DACCELEROMETER_SENSOR_MMA8450
+  endif
+ endif
+ 
+-LOCAL_MODULE := sensors.$(TARGET_BOARD_PLATFORM)
++LOCAL_SRC_FILES := 						\
++				sensors.cpp 			\
++				SensorBase.cpp			\
++				LightSensor.cpp			\
++				AccelSensor.cpp                   \
++                                InputEventReader.cpp
+ 
+-LOCAL_SHARED_LIBRARIES += libutils libcutils
+-
+-LOCAL_MODULE_TAGS := eng
++LOCAL_SHARED_LIBRARIES := liblog libcutils libdl
+ 
+ include $(BUILD_SHARED_LIBRARY)
+-endif
++
++endif # !TARGET_SIMULATOR
++
++endif #
+diff --git a/libsensors/InputEventReader.cpp b/libsensors/InputEventReader.cpp
+new file mode 100755
+index 0000000..1014f29
+--- /dev/null
++++ b/libsensors/InputEventReader.cpp
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <stdint.h>
++#include <errno.h>
++#include <unistd.h>
++#include <poll.h>
++
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++#include <linux/input.h>
++
++#include <cutils/log.h>
++
++#include "InputEventReader.h"
++
++/*****************************************************************************/
++
++struct input_event;
++
++InputEventCircularReader::InputEventCircularReader(size_t numEvents)
++    : mBuffer(new input_event[numEvents * 2]),
++      mBufferEnd(mBuffer + numEvents),
++      mHead(mBuffer),
++      mCurr(mBuffer),
++      mFreeSpace(numEvents)
++{
++}
++
++InputEventCircularReader::~InputEventCircularReader()
++{
++    delete [] mBuffer;
++}
++
++ssize_t InputEventCircularReader::fill(int fd)
++{
++    size_t numEventsRead = 0;
++    if (mFreeSpace) {
++        const ssize_t nread = read(fd, mHead, mFreeSpace * sizeof(input_event));
++        if (nread<0 || nread % sizeof(input_event)) {
++            // we got a partial event!!
++            return nread<0 ? -errno : -EINVAL;
++        }
++
++        numEventsRead = nread / sizeof(input_event);
++        if (numEventsRead) {
++            mHead += numEventsRead;
++            mFreeSpace -= numEventsRead;
++            if (mHead > mBufferEnd) {
++                size_t s = mHead - mBufferEnd;
++                memcpy(mBuffer, mBufferEnd, s * sizeof(input_event));
++                mHead = mBuffer + s;
++            }
++        }
++    }
++
++    return numEventsRead;
++}
++
++ssize_t InputEventCircularReader::readEvent(input_event const** events)
++{
++    *events = mCurr;
++    ssize_t available = (mBufferEnd - mBuffer) - mFreeSpace;
++    return available ? 1 : 0;
++}
++
++void InputEventCircularReader::next()
++{
++    mCurr++;
++    mFreeSpace++;
++    if (mCurr >= mBufferEnd) {
++        mCurr = mBuffer;
++    }
++}
+diff --git a/libsensors/InputEventReader.h b/libsensors/InputEventReader.h
+new file mode 100755
+index 0000000..9b7dc58
+--- /dev/null
++++ b/libsensors/InputEventReader.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_INPUT_EVENT_READER_H
++#define ANDROID_INPUT_EVENT_READER_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++/*****************************************************************************/
++
++struct input_event;
++
++class InputEventCircularReader
++{
++    struct input_event* const mBuffer;
++    struct input_event* const mBufferEnd;
++    struct input_event* mHead;
++    struct input_event* mCurr;
++    ssize_t mFreeSpace;
++
++public:
++    InputEventCircularReader(size_t numEvents);
++    ~InputEventCircularReader();
++    ssize_t fill(int fd);
++    ssize_t readEvent(input_event const** events);
++    void next();
++};
++
++/*****************************************************************************/
++
++#endif  // ANDROID_INPUT_EVENT_READER_H
+diff --git a/libsensors/LightSensor.cpp b/libsensors/LightSensor.cpp
+new file mode 100755
+index 0000000..dabc40c
+--- /dev/null
++++ b/libsensors/LightSensor.cpp
+@@ -0,0 +1,200 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <fcntl.h>
++#include <errno.h>
++#include <math.h>
++#include <stdlib.h>
++#include <poll.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <sys/select.h>
++#include <cutils/log.h>
++#include <cutils/properties.h>
++
++#include "LightSensor.h"
++
++//#define SENSOR_DEBUG
++
++#ifdef SENSOR_DEBUG
++#define DEBUG(format, ...) LOGD((format), ## __VA_ARGS__)
++#else
++#define DEBUG(format, ...)
++#endif
++
++/*****************************************************************************/
++LightSensor::LightSensor()
++    : SensorBase(NULL, "isl29023 light sensor"),
++      mEnabled(0),
++      mInputReader(4),
++      mHasPendingEvent(false),
++      mThresholdLux(10)
++{
++    char  buffer[PROPERTY_VALUE_MAX];
++
++    mPendingEvent.version = sizeof(sensors_event_t);
++    mPendingEvent.sensor = ID_L;
++    mPendingEvent.type = SENSOR_TYPE_LIGHT;
++    memset(mPendingEvent.data, 0, sizeof(mPendingEvent.data));
++
++    if (data_fd >= 0) {
++        property_get("ro.hardware.lightsensor", buffer, "0");
++        strcpy(ls_sysfs_path, buffer);
++        ls_sysfs_path_len = strlen(ls_sysfs_path);
++        enable(0, 1);
++    }
++
++    /* Default threshold lux is 10 if ro.lightsensor.threshold
++       isn't set */
++    property_get("ro.lightsensor.threshold", buffer, "10");
++    mThresholdLux = atoi(buffer);
++}
++
++LightSensor::~LightSensor() {
++    if (mEnabled) {
++        enable(0, 0);
++    }
++}
++
++int LightSensor::setDelay(int32_t handle, int64_t ns)
++{
++    //dummy due to not support in driver....
++    return 0;
++}
++
++int LightSensor::enable(int32_t handle, int en)
++{
++    char buf[2];
++    int n;
++    int flags = en ? 1 : 0;
++
++    mPreviousLight = -1;
++    if (flags != mEnabled) {
++        FILE *fd = NULL;
++        strcpy(&ls_sysfs_path[ls_sysfs_path_len], "mode");
++        fd = fopen(ls_sysfs_path, "r+");
++        if (fd) {
++            memset(buf, 0, 2);
++            if (flags)
++                snprintf(buf, 2, "%d", ISL29023_ALS_CONT_MODE);
++            else
++                snprintf(buf, 2, "%d", 0);
++            n = fwrite(buf, 1, 1, fd);
++            fclose(fd);
++            mEnabled = flags;
++            if (flags)
++                setIntLux();
++            return 0;
++        }
++        return -1;
++    }
++    return 0;
++}
++
++int LightSensor::setIntLux()
++{
++    FILE *fd = NULL;
++    char buf[6];
++    int n, lux, int_ht_lux, int_lt_lux;
++
++    /* Read current lux value firstly, then change Delta value */
++    strcpy(&ls_sysfs_path[ls_sysfs_path_len], "lux");
++    if ((fd = fopen(ls_sysfs_path, "r")) == NULL) {
++        LOGE("Unable to open %s\n", ls_sysfs_path);
++        return -1;
++    }
++    memset(buf, 0, 6);
++    if ((n = fread(buf, 1, 6, fd)) < 0) {
++        LOGE("Unable to read %s\n", ls_sysfs_path);
++	return -1;
++    }
++    fclose(fd);
++
++    lux = atoi(buf);
++    int_ht_lux = lux + mThresholdLux;
++    int_lt_lux = lux - mThresholdLux;
++    DEBUG("Current light is %d lux\n", lux);
++
++    /* Set low lux and high interrupt lux for polling */
++    strcpy(&ls_sysfs_path[ls_sysfs_path_len], "int_lt_lux");
++    fd = fopen(ls_sysfs_path, "r+");
++    if (fd) {
++        memset(buf, 0, 6);
++        snprintf(buf, 6, "%d", int_lt_lux);
++        n = fwrite(buf, 1, 6, fd);
++        fclose(fd);
++    } else
++        LOGE("Couldn't open %s file\n", ls_sysfs_path);
++    strcpy(&ls_sysfs_path[ls_sysfs_path_len], "int_ht_lux");
++    fd = fopen(ls_sysfs_path, "r+");
++    if (fd) {
++        memset(buf, 0, 6);
++        snprintf(buf, 6, "%d", int_ht_lux);
++        n = fwrite(buf, 1, 6, fd);
++        fclose(fd);
++    } else
++        LOGE("Couldn't open %s file\n", ls_sysfs_path);
++
++    return 0;
++}
++bool LightSensor::hasPendingEvents() const {
++    return mHasPendingEvent;
++}
++
++int LightSensor::readEvents(sensors_event_t* data, int count)
++{
++    if (count < 1)
++        return -EINVAL;
++
++    if (mHasPendingEvent) {
++        mHasPendingEvent = false;
++        mPendingEvent.timestamp = getTimestamp();
++        *data = mPendingEvent;
++        return mEnabled ? 1 : 0;
++    }
++
++    ssize_t n = mInputReader.fill(data_fd);
++    if (n < 0)
++        return n;
++
++    int numEventReceived = 0;
++    input_event const* event;
++
++    while (count && mInputReader.readEvent(&event)) {
++        int type = event->type;
++        if (type == EV_ABS) {
++            if (event->code == EVENT_TYPE_LIGHT) {
++                mPendingEvent.light = event->value;
++                setIntLux();
++            }
++        } else if (type == EV_SYN) {
++            mPendingEvent.timestamp = timevalToNano(event->time);
++            if (mEnabled && (mPendingEvent.light != mPreviousLight)) {
++                *data++ = mPendingEvent;
++                count--;
++                numEventReceived++;
++                mPreviousLight = mPendingEvent.light;
++            }
++        } else {
++            LOGE("LightSensor: unknown event (type=%d, code=%d)",
++                    type, event->code);
++        }
++        mInputReader.next();
++    }
++
++    return numEventReceived;
++}
+diff --git a/libsensors/LightSensor.h b/libsensors/LightSensor.h
+new file mode 100755
+index 0000000..0edd171
+--- /dev/null
++++ b/libsensors/LightSensor.h
+@@ -0,0 +1,60 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_LIGHT_SENSOR_H
++#define ANDROID_LIGHT_SENSOR_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++#include "sensors.h"
++#include "SensorBase.h"
++#include "InputEventReader.h"
++
++#define ISL29023_ALS_CONT_MODE   5
++
++/*****************************************************************************/
++
++struct input_event;
++
++class LightSensor : public SensorBase {
++    int mEnabled;
++    InputEventCircularReader mInputReader;
++    sensors_event_t mPendingEvent;
++    bool mHasPendingEvent;
++    char ls_sysfs_path[PATH_MAX];
++    int ls_sysfs_path_len;
++    float mPreviousLight;
++
++public:
++            LightSensor();
++    virtual ~LightSensor();
++    virtual int readEvents(sensors_event_t* data, int count);
++    virtual bool hasPendingEvents() const;
++    virtual int setDelay(int32_t handle, int64_t ns);
++    virtual int enable(int32_t handle, int enabled);
++
++private:
++    int mThresholdLux;
++    int setIntLux();
++};
++
++/*****************************************************************************/
++
++#endif  // ANDROID_LIGHT_SENSOR_H
+diff --git a/libsensors/SensorBase.cpp b/libsensors/SensorBase.cpp
+new file mode 100755
+index 0000000..e04306c
+--- /dev/null
++++ b/libsensors/SensorBase.cpp
+@@ -0,0 +1,131 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <fcntl.h>
++#include <errno.h>
++#include <math.h>
++#include <poll.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <sys/select.h>
++
++#include <cutils/log.h>
++
++#include <linux/input.h>
++
++#include "SensorBase.h"
++
++/*****************************************************************************/
++
++SensorBase::SensorBase(
++        const char* dev_name,
++        const char* data_name)
++    : dev_name(dev_name), data_name(data_name),
++      dev_fd(-1), data_fd(-1)
++{
++    if (data_name) {
++        data_fd = openInput(data_name);
++    }
++}
++
++SensorBase::~SensorBase() {
++    if (data_fd >= 0) {
++        close(data_fd);
++    }
++    if (dev_fd >= 0) {
++        close(dev_fd);
++    }
++}
++
++int SensorBase::open_device() {
++    if (dev_fd<0 && dev_name) {
++        dev_fd = open(dev_name, O_RDONLY);
++        LOGE_IF(dev_fd<0, "Couldn't open %s (%s)", dev_name, strerror(errno));
++    }
++    return 0;
++}
++
++int SensorBase::close_device() {
++    if (dev_fd >= 0) {
++        close(dev_fd);
++        dev_fd = -1;
++    }
++    return 0;
++}
++
++int SensorBase::getFd() const {
++    if (!data_name) {
++        return dev_fd;
++    }
++    return data_fd;
++}
++
++int SensorBase::setDelay(int32_t handle, int64_t ns) {
++    return 0;
++}
++
++bool SensorBase::hasPendingEvents() const {
++    return false;
++}
++
++int64_t SensorBase::getTimestamp() {
++    struct timespec t;
++    t.tv_sec = t.tv_nsec = 0;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return int64_t(t.tv_sec)*1000000000LL + t.tv_nsec;
++}
++
++int SensorBase::openInput(const char* inputName) {
++    int fd = -1;
++    const char *dirname = "/dev/input";
++    char devname[PATH_MAX];
++    char *filename;
++    DIR *dir;
++    struct dirent *de;
++
++    dir = opendir(dirname);
++    if(dir == NULL)
++        return -1;
++    strcpy(devname, dirname);
++    filename = devname + strlen(devname);
++    *filename++ = '/';
++    while((de = readdir(dir))) {
++        if(de->d_name[0] == '.' &&
++                (de->d_name[1] == '\0' ||
++                        (de->d_name[1] == '.' && de->d_name[2] == '\0')))
++            continue;
++        strcpy(filename, de->d_name);
++        fd = open(devname, O_RDONLY);
++
++        if (fd>=0) {
++            char name[80];
++            if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), &name) < 1) {
++                name[0] = '\0';
++            }
++
++            if (!strcmp(name, inputName)) {
++                strcpy(input_name, filename);
++                break;
++            } else {
++                close(fd);
++                fd = -1;
++            }
++        }
++    }
++    closedir(dir);
++    LOGE_IF(fd<0, "couldn't find '%s' input device", inputName);
++    return fd;
++}
+diff --git a/libsensors/SensorBase.h b/libsensors/SensorBase.h
+new file mode 100755
+index 0000000..da66548
+--- /dev/null
++++ b/libsensors/SensorBase.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_SENSOR_BASE_H
++#define ANDROID_SENSOR_BASE_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++
++/*****************************************************************************/
++
++struct sensors_event_t;
++
++class SensorBase {
++protected:
++    const char* dev_name;
++    const char* data_name;
++    char        input_name[PATH_MAX];
++    int         dev_fd;
++    int         data_fd;
++
++    int openInput(const char* inputName);
++    static int64_t getTimestamp();
++
++
++    static int64_t timevalToNano(timeval const& t) {
++        return t.tv_sec*1000000000LL + t.tv_usec*1000;
++    }
++
++    int open_device();
++    int close_device();
++
++public:
++            SensorBase(
++                    const char* dev_name,
++                    const char* data_name);
++
++    virtual ~SensorBase();
++
++    virtual int readEvents(sensors_event_t* data, int count) = 0;
++    virtual bool hasPendingEvents() const;
++    virtual int getFd() const;
++    virtual int setDelay(int32_t handle, int64_t ns);
++    virtual int enable(int32_t handle, int enabled) = 0;
++};
++
++/*****************************************************************************/
++
++#endif  // ANDROID_SENSOR_BASE_H
+diff --git a/libsensors/fakesensor.cpp b/libsensors/fakesensor.cpp
+deleted file mode 100755
+index b6e4d02..0000000
+--- a/libsensors/fakesensor.cpp
++++ /dev/null
+@@ -1,468 +0,0 @@
+-/* Copyright (c) 2011 Freescale Semiconductor Inc. */
+-
+-#define LOG_TAG "Sensor"
+-
+-#include <hardware/hardware.h>
+-#include <hardware/sensors.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-#include <dirent.h>
+-#include <math.h>
+-#include <poll.h>
+-#include <linux/input.h>
+-#include <utils/Log.h>
+-#include <cutils/properties.h>
+-#include <cutils/atomic.h>
+-
+-// conversion of acceleration data to SI units (m/s^2)
+-#define CONVERT_A                   1
+-#define CONVERT_A_X                 (CONVERT_A)
+-#define CONVERT_A_Y                 (-CONVERT_A)
+-#define CONVERT_A_Z                 (CONVERT_A)
+-
+-/* sensor rate in me */
+-#define SENSORS_RATE_MS     20
+-/* timeout (constant value) in ms */
+-#define SENSORS_TIMEOUT_MS  100
+-/* # of samples to look at in the past for filtering */
+-#define COUNT               24
+-/* prediction ratio */
+-#define PREDICTION_RATIO    (1.0f/3.0f)
+-/* prediction time in seconds (>=0) */
+-#define PREDICTION_TIME     ((SENSORS_RATE_MS*COUNT/1000.0f)*PREDICTION_RATIO)
+-
+-static float mV[COUNT*2];
+-static float mT[COUNT*2];
+-static int mIndex;
+-static int gEventCount = 0;
+-static bool gRotation = 0;
+-
+-static inline
+-float normalize(float x)
+-{
+-    x *= (1.0f / 360.0f);
+-    if (fabsf(x) >= 0.5f)
+-        x = x - ceilf(x + 0.5f) + 1.0f;
+-    if (x < 0)
+-        x += 1.0f;
+-    x *= 360.0f;
+-    return x;
+-}
+-
+-static void LMSInit(void)
+-{
+-    memset(mV, 0, sizeof(mV));
+-    memset(mT, 0, sizeof(mT));
+-    mIndex = COUNT;
+-}
+-
+-static float LMSFilter(int64_t time, int v)
+-{
+-    const float ns = 1.0f / 1000000000.0f;
+-    const float t = time*ns;
+-    float v1 = mV[mIndex];
+-    if ((v-v1) > 180) {
+-        v -= 360;
+-    } else if ((v1-v) > 180) {
+-        v += 360;
+-    }
+-    /* Manage the circular buffer, we write the data twice spaced by COUNT
+-     * values, so that we don't have to memcpy() the array when it's full */
+-    mIndex++;
+-    if (mIndex >= COUNT*2)
+-        mIndex = COUNT;
+-    mV[mIndex] = v;
+-    mT[mIndex] = t;
+-    mV[mIndex-COUNT] = v;
+-    mT[mIndex-COUNT] = t;
+-
+-    float A, B, C, D, E;
+-    float a, b;
+-    int i;
+-
+-    A = B = C = D = E = 0;
+-    for (i=0 ; i<COUNT-1 ; i++) {
+-        const int j = mIndex - 1 - i;
+-        const float Z = mV[j];
+-        const float T = 0.5f*(mT[j] + mT[j+1]) - t;
+-        float dT = mT[j] - mT[j+1];
+-        dT *= dT;
+-        A += Z*dT;
+-        B += T*(T*dT);
+-        C +=   (T*dT);
+-        D += Z*(T*dT);
+-        E += dT;
+-    }
+-    b = (A*B + C*D) / (E*B + C*C);
+-    a = (E*b - A) / C;
+-    float f = b + PREDICTION_TIME*a;
+-
+-    //LOGD("A=%f, B=%f, C=%f, D=%f, E=%f", A,B,C,D,E);
+-    //LOGD("%lld  %d  %f  %f", time, v, f, a);
+-
+-    f = normalize(f);
+-    return f;
+-}
+-
+-/*****************************************************************************/
+-
+-struct sensors_control_context_t {
+-    struct sensors_control_device_t device;
+-    /* our private state goes below here */
+-};
+-
+-struct sensors_data_context_t {
+-    struct sensors_data_device_t device;
+-    /* our private state goes below here */
+-};
+-
+-static int sensors_device_open(const struct hw_module_t* module, const char* name,
+-        struct hw_device_t** device);
+-
+-static struct hw_module_methods_t sensors_module_methods = {
+-    open: sensors_device_open
+-};
+-
+-#define FAKE_SENSOR_FD (128)
+-static struct sensor_t const sensor_fake = {
+-	name: "FAKESENSOR",
+-	vendor: "FSL",
+-	version: 2,
+-	handle: SENSORS_HANDLE_BASE + 1,
+-	type: SENSOR_TYPE_ACCELEROMETER,
+-	maxRange: 1023,
+-	resolution: 2,
+-};
+-
+-struct sensor_handle_t : public native_handle {
+-    /* add the data fields we need here, for instance: */
+-    int ctl_fd;
+-};
+-
+-sensor_handle_t sensor_data_handle;
+-
+-static int get_sensors_list(struct sensors_module_t* module, struct sensor_t const** sensor)
+-{
+-    *sensor = &sensor_fake;
+-
+-    LOGD("sensor name %s, handle %d, type %d",
+-	    (*sensor)->name, (*sensor)->handle, (*sensor)->type);
+-
+-    return 1; //just one functions
+-}
+-
+-struct sensors_module_t HAL_MODULE_INFO_SYM = {
+-	common: {
+-		tag: HARDWARE_MODULE_TAG,
+-		version_major: 1,
+-		version_minor: 0,
+-		id: SENSORS_HARDWARE_MODULE_ID,
+-		name: "Sensor module",
+-		author: "Shen Yong at Freescale",
+-		methods: &sensors_module_methods,
+-	},
+-	get_sensors_list: get_sensors_list,
+-};
+-
+-static int open_input()
+-{
+-    /* scan all input drivers and look for "compass" */
+-    int fd = -1;
+-    const char *dirname = "/dev/input";
+-    char devname[PATH_MAX];
+-    char *filename;
+-    DIR *dir;
+-    struct dirent *de;
+-    dir = opendir(dirname);
+-    if(dir == NULL)
+-        return -1;
+-    strcpy(devname, dirname);
+-    filename = devname + strlen(devname);
+-    *filename++ = '/';
+-    while((de = readdir(dir))) {
+-        if(de->d_name[0] == '.' &&
+-           (de->d_name[1] == '\0' ||
+-            (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+-            continue;
+-        strcpy(filename, de->d_name);
+-        fd = open(devname, O_RDONLY);
+-        if (fd>=0) {
+-            char name[80];
+-            if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), &name) < 1) {
+-                name[0] = '\0';
+-            }
+-                LOGD("name %s", name);
+-            if (!strcmp(name, "mma7450")) {
+-                LOGD("using %s (name=%s)", devname, name);
+-                break;
+-            }
+-            close(fd);
+-            fd = -1;
+-        }
+-    }
+-    closedir(dir);
+-
+-    if (fd < 0) {
+-        LOGE("Couldn't find or open 'compass' driver (%s)", strerror(errno));
+-    }
+-    return fd;
+-}
+-
+-/**
+-* Returns a native_handle_t, which will be the parameter to
+-* sensors_data_device_t::open_data(). 
+-* The caller takes ownership of this handle. This is intended to be
+-* passed cross processes.
+-*
+-* @return a native_handle_t if successful, NULL on error
+-*/
+-static native_handle_t* open_data_source(struct sensors_control_device_t *dev)
+-{
+-    LOGD("open_data_source");
+-    memset(&sensor_data_handle, 0, sizeof(sensor_data_handle));
+-    sensor_data_handle.numFds      = 1;
+-    sensor_data_handle.numInts     = 0; // extra ints we have in our handle
+-    sensor_data_handle.ctl_fd = FAKE_SENSOR_FD;
+-    return &sensor_data_handle;
+-}
+-
+-static int activate(struct sensors_control_device_t *dev, int handle, int enabled)
+-{
+-    LOGI("active handle %d",handle);
+-    if (handle != sensor_fake.handle){
+-        LOGI("active handle %d is not the same as handle %d in sensor",
+-	        handle,sensor_fake.handle);
+-        return 0;
+-    }
+-
+-    return sensor_fake.handle;
+-}
+-
+-static int set_delay(struct sensors_control_device_t *dev, int32_t ms)
+-{
+-    LOGD("set delay %d ms",ms);
+-    return 0;
+-}
+-
+-static int wake(struct sensors_control_device_t *dev)
+-{
+-    LOGD("sensor wake");
+-    return 0;
+-}
+-
+-//data operation //////////////////////
+-static int sInputFD = -1;
+-static sensors_data_t sSensors;
+-
+-/**
+-* Prepare to read sensor data.
+-*
+-* This routine does NOT take ownership of the handle
+-* and must not close it. Typically this routine would
+-* use a duplicate of the nh parameter.
+-*
+-* @param nh from sensors_control_open.
+-*
+-* @return 0 if successful, < 0 on error
+-*/
+-static int data_open(struct sensors_data_device_t *dev, native_handle_t* nh)
+-{
+-    int i, fd;
+-    fd = ((sensor_handle_t *)nh)->ctl_fd;
+-    LOGI("sensor data open FD %d",fd);
+-    LMSInit();
+-    memset(&sSensors, 0, sizeof(sSensors));
+-    sSensors.vector.status = SENSOR_STATUS_ACCURACY_HIGH;
+-    sInputFD = fd;
+-
+-    LOGD("sensors_data_open: fd = %d", sInputFD);
+-    return 0;
+-}
+-
+-static int data_close(struct sensors_data_device_t *dev)
+-{
+-    LOGI("sensor data close");
+-    sInputFD = -1;
+-    return 0;
+-}
+-
+-static int sensor_poll(struct sensors_data_device_t *dev, sensors_data_t* data)
+-{
+-    LOGI("sensor_poll");
+-    struct input_event event;
+-    int64_t t;
+-    int nread;
+-
+-    int fd = sInputFD;
+-
+-    if (fd <= 0)
+-        return -1;
+-
+-    // wait until we get a complete event for an enabled sensor
+-    while (1) {
+-        char value[PROPERTY_VALUE_MAX];
+-        bool ratationRequest = 0;
+-
+-        do{
+-            if((gEventCount %4) == 0){
+-                sleep(5);//Raise sensor event every 10 seconds
+-            }
+-            else{
+-                break;
+-            }
+-            property_get("rw.SIMULATE_SENSOR_ROTATION", value, "0");
+-            if (strcmp(value, "1") != 0) {
+-                ratationRequest = false;
+-            }
+-            else
+-                ratationRequest = true;
+-            LOGI("Polling rotation request %d, older one %d",ratationRequest,ratationRequest);
+-        }while (ratationRequest == gRotation);
+-
+-        if((gEventCount %4) == 0){
+-            gRotation = ratationRequest;
+-        }
+-
+-        nread = sizeof(event);
+-        memset(&event, 0 , sizeof(event));
+-        if((gEventCount %4) == 0) {
+-            LOGI("sensor_poll simulate EV_ABS ABS_X");
+-            event.type = EV_ABS;//EV_ABS,EV_SYN
+-            event.code = ABS_X;//ABS_X,ABS_Y,ABS_Z
+-            if(!gRotation) {
+-                event.value = 0;
+-            }
+-            else{
+-                event.value = 128;
+-            }
+-        }
+-        if((gEventCount %4) == 1) {
+-            LOGI("sensor_poll simulate EV_ABS ABS_Y");
+-            event.type = EV_ABS;//EV_SYN
+-            event.code = ABS_Y;//ABS_X,ABS_Y,ABS_Z
+-            if(!gRotation) {
+-                event.value = -128;
+-            }
+-            else{
+-                event.value = 0;
+-            }
+-        }
+-        if((gEventCount %4) == 2) {
+-            LOGI("sensor_poll simulate EV_ABS ABS_Z");
+-            event.type = EV_ABS;//EV_SYN
+-            event.code = ABS_Z;//ABS_X,ABS_Y,ABS_Z
+-            event.value = 0;
+-        }
+-        if((gEventCount %4) == 3) {
+-            event.type = EV_SYN;
+-        }
+-        gEventCount++;
+-
+-        if (nread == sizeof(event)) {
+-            uint32_t v;
+-            if (event.type == EV_ABS) {
+-                LOGI("type: %d code: %d value: %-5d time: %ds",
+-                        event.type, event.code, event.value,
+-                      (int)event.time.tv_sec);
+-                switch (event.code) {
+-
+-                    case ABS_X:
+-                        sSensors.acceleration.x = event.value * CONVERT_A_X;
+-                        break;
+-                    case ABS_Y:
+-                        sSensors.acceleration.y = event.value * CONVERT_A_Y;
+-                        break;
+-                    case ABS_Z:
+-                        sSensors.acceleration.z = event.value * CONVERT_A_Z;
+-                        break;
+-                }
+-            } else if (event.type == EV_SYN) {
+-                int64_t t = event.time.tv_sec*1000000000LL + event.time.tv_usec*1000;
+-                *data = sSensors;
+-                return SENSORS_HANDLE_BASE + 1;
+-            }
+-        }
+-    }
+-}
+-
+-static int sensors_device_control_close(struct hw_device_t *dev)
+-{
+-    LOGI("sensors_device_control_close");
+-    struct sensors_control_context_t* ctx = (struct sensors_control_context_t*)dev;
+-    if (ctx) {
+-        /* free all resources associated with this device here
+-         * in particular the sensors_handle_t, outstanding sensors_t, etc...
+-         */
+-        free(ctx);
+-    }
+-    return 0;
+-}
+-
+-static int sensors_device_data_close(struct hw_device_t *dev)
+-{
+-    LOGI("sensors_device_data_close");
+-    struct sensors_data_context_t* ctx = (struct sensors_data_context_t*)dev;
+-    if (ctx) {
+-        /* free all resources associated with this device here
+-         * in particular all pending sensors_buffer_t if needed.
+-         *
+-         * NOTE: sensors_handle_t passed in initialize() is NOT freed and
+-         * its file descriptors are not closed (this is the responsibility
+-         * of the caller).
+-         */
+-        free(ctx);
+-    }
+-    return 0;
+-}
+-
+-/*****************************************************************************/
+-
+-static int sensors_device_open(const struct hw_module_t* module, const char* name,
+-        struct hw_device_t** device)
+-{
+-    int status = -EINVAL;
+-
+-	LOGI("sensor device open %s", name);
+-    if (!strcmp(name, SENSORS_HARDWARE_CONTROL)) {
+-        struct sensors_control_context_t *dev;
+-        dev = (struct sensors_control_context_t*)malloc(sizeof(*dev));
+-
+-        /* initialize our state here */
+-        memset(dev, 0, sizeof(*dev));
+-
+-        /* initialize the procs */
+-        dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        dev->device.common.version = 0;
+-        dev->device.common.module = const_cast<hw_module_t*>(module);
+-        dev->device.common.close = sensors_device_control_close;
+-
+-        dev->device.open_data_source = open_data_source;
+-        dev->device.activate = activate;
+-        dev->device.set_delay = set_delay;
+-        dev->device.wake = wake;
+-
+-        *device = &dev->device.common;
+-        status = 0;
+-    } else if (!strcmp(name, SENSORS_HARDWARE_DATA)) {
+-        struct sensors_data_context_t *dev;
+-        dev = (struct sensors_data_context_t*)malloc(sizeof(*dev));
+-
+-        /* initialize our state here */
+-        memset(dev, 0, sizeof(*dev));
+-
+-        /* initialize the procs */
+-        dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        dev->device.common.version = 0;
+-        dev->device.common.module = const_cast<hw_module_t*>(module);
+-        dev->device.common.close = sensors_device_data_close;
+-
+-        dev->device.data_open = data_open;
+-        dev->device.data_close = data_close;
+-        dev->device.poll = sensor_poll;
+-
+-        *device = &dev->device.common;
+-        status = 0;
+-    }
+-    return status;
+-}
+diff --git a/libsensors/mma7450.cpp b/libsensors/mma7450.cpp
+deleted file mode 100755
+index 7a2cce9..0000000
+--- a/libsensors/mma7450.cpp
++++ /dev/null
+@@ -1,411 +0,0 @@
+-/* Copyright (c) 2011 Freescale Semiconductor Inc. */
+-
+-#define LOG_TAG "Sensor"
+-
+-#include <hardware/hardware.h>
+-#include <hardware/sensors.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-#include <dirent.h>
+-#include <math.h>
+-#include <poll.h>
+-#include <linux/input.h>
+-#include <utils/Log.h>
+-#include <cutils/atomic.h>
+-
+-
+-// 720 LSG = 1G
+-#define LSG                         (720.0f)
+-
+-// conversion of acceleration data to SI units (m/s^2)
+-//#define CONVERT_A                   (GRAVITY_EARTH / LSG)
+-#define CONVERT_A                   1
+-#define CONVERT_A_X                 (CONVERT_A)
+-#define CONVERT_A_Y                 (-CONVERT_A)
+-#define CONVERT_A_Z                 (CONVERT_A)
+-
+-/* sensor rate in me */
+-#define SENSORS_RATE_MS     20
+-/* timeout (constant value) in ms */
+-#define SENSORS_TIMEOUT_MS  100
+-/* # of samples to look at in the past for filtering */
+-#define COUNT               24
+-/* prediction ratio */
+-#define PREDICTION_RATIO    (1.0f/3.0f)
+-/* prediction time in seconds (>=0) */
+-#define PREDICTION_TIME     ((SENSORS_RATE_MS*COUNT/1000.0f)*PREDICTION_RATIO)
+-
+-static float mV[COUNT*2];
+-static float mT[COUNT*2];
+-static int mIndex;
+-
+-static inline
+-float normalize(float x)
+-{
+-    x *= (1.0f / 360.0f);
+-    if (fabsf(x) >= 0.5f)
+-        x = x - ceilf(x + 0.5f) + 1.0f;
+-    if (x < 0)
+-        x += 1.0f;
+-    x *= 360.0f;
+-    return x;
+-}
+-
+-static void LMSInit(void)
+-{
+-    memset(mV, 0, sizeof(mV));
+-    memset(mT, 0, sizeof(mT));
+-    mIndex = COUNT;
+-}
+-
+-static float LMSFilter(int64_t time, int v)
+-{
+-    const float ns = 1.0f / 1000000000.0f;
+-    const float t = time*ns;
+-    float v1 = mV[mIndex];
+-    if ((v-v1) > 180) {
+-        v -= 360;
+-    } else if ((v1-v) > 180) {
+-        v += 360;
+-    }
+-    /* Manage the circular buffer, we write the data twice spaced by COUNT
+-     * values, so that we don't have to memcpy() the array when it's full */
+-    mIndex++;
+-    if (mIndex >= COUNT*2)
+-        mIndex = COUNT;
+-    mV[mIndex] = v;
+-    mT[mIndex] = t;
+-    mV[mIndex-COUNT] = v;
+-    mT[mIndex-COUNT] = t;
+-
+-    float A, B, C, D, E;
+-    float a, b;
+-    int i;
+-
+-    A = B = C = D = E = 0;
+-    for (i=0 ; i<COUNT-1 ; i++) {
+-        const int j = mIndex - 1 - i;
+-        const float Z = mV[j];
+-        const float T = 0.5f*(mT[j] + mT[j+1]) - t;
+-        float dT = mT[j] - mT[j+1];
+-        dT *= dT;
+-        A += Z*dT;
+-        B += T*(T*dT);
+-        C +=   (T*dT);
+-        D += Z*(T*dT);
+-        E += dT;
+-    }
+-    b = (A*B + C*D) / (E*B + C*C);
+-    a = (E*b - A) / C;
+-    float f = b + PREDICTION_TIME*a;
+-
+-    //LOGD("A=%f, B=%f, C=%f, D=%f, E=%f", A,B,C,D,E);
+-    //LOGD("%lld  %d  %f  %f", time, v, f, a);
+-
+-    f = normalize(f);
+-    return f;
+-}
+-
+-/*****************************************************************************/
+-
+-struct sensors_control_context_t {
+-    struct sensors_control_device_t device;
+-    /* our private state goes below here */
+-};
+-
+-struct sensors_data_context_t {
+-    struct sensors_data_device_t device;
+-    /* our private state goes below here */
+-};
+-
+-static int sensors_device_open(const struct hw_module_t* module, const char* name,
+-        struct hw_device_t** device);
+-
+-static struct hw_module_methods_t sensors_module_methods = {
+-    open: sensors_device_open
+-};
+-
+-static struct sensor_t const sensor_mma7450 = {
+-	name: "MMA7450L",
+-	vendor: "FSL",
+-	version: 2,
+-	handle: SENSORS_HANDLE_BASE + 1,
+-	type: SENSOR_TYPE_ACCELEROMETER,
+-	maxRange: 1023,
+-	resolution: 2,
+-};
+-
+-struct sensor_handle_t : public native_handle {
+-    /* add the data fields we need here, for instance: */
+-    int ctl_fd;
+-};
+-
+-sensor_handle_t sensor_data_handle;
+-
+-static int get_sensors_list(struct sensors_module_t* module, struct sensor_t const** sensor)
+-{
+-    *sensor = &sensor_mma7450;
+-
+-    LOGD("sensor name %s, handle %d, type %d",
+-	    (*sensor)->name, (*sensor)->handle, (*sensor)->type);
+-
+-    return 1; //just one functions
+-}
+-
+-struct sensors_module_t HAL_MODULE_INFO_SYM = {
+-	common: {
+-		tag: HARDWARE_MODULE_TAG,
+-		version_major: 1,
+-		version_minor: 0,
+-		id: SENSORS_HARDWARE_MODULE_ID,
+-		name: "Sonsor module",
+-		author: "Shen Yong at Freescale",
+-		methods: &sensors_module_methods,
+-	},
+-	get_sensors_list: get_sensors_list,
+-};
+-
+-static int open_input()
+-{
+-    /* scan all input drivers and look for "compass" */
+-    int fd = -1;
+-    const char *dirname = "/dev/input";
+-    char devname[PATH_MAX];
+-    char *filename;
+-    DIR *dir;
+-    struct dirent *de;
+-    dir = opendir(dirname);
+-    if(dir == NULL)
+-        return -1;
+-    strcpy(devname, dirname);
+-    filename = devname + strlen(devname);
+-    *filename++ = '/';
+-    while((de = readdir(dir))) {
+-        if(de->d_name[0] == '.' &&
+-           (de->d_name[1] == '\0' ||
+-            (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+-            continue;
+-        strcpy(filename, de->d_name);
+-        fd = open(devname, O_RDONLY);
+-        if (fd>=0) {
+-            char name[80];
+-            if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), &name) < 1) {
+-                name[0] = '\0';
+-            }
+-                LOGD("name %s", name);
+-            if (!strcmp(name, "mma7450")) {
+-                LOGD("using %s (name=%s)", devname, name);
+-                break;
+-            }
+-            close(fd);
+-            fd = -1;
+-        }
+-    }
+-    closedir(dir);
+-
+-    if (fd < 0) {
+-        LOGE("Couldn't find or open 'compass' driver (%s)", strerror(errno));
+-    }
+-    return fd;
+-}
+-
+-/**
+-* Returns a native_handle_t, which will be the parameter to
+-* sensors_data_device_t::open_data().
+-* The caller takes ownership of this handle. This is intended to be
+-* passed cross processes.
+-*
+-* @return a native_handle_t if successful, NULL on error
+-*/
+-static native_handle_t* open_data_source(struct sensors_control_device_t *dev)
+-{
+-    LOGD("open_data_source");
+-    memset(&sensor_data_handle, 0, sizeof(sensor_data_handle));
+-    sensor_data_handle.numFds      = 1;
+-    sensor_data_handle.numInts     = 0; // extra ints we have in our handle
+-    sensor_data_handle.ctl_fd = open_input();
+-    return &sensor_data_handle;
+-}
+-
+-static int activate(struct sensors_control_device_t *dev, int handle, int enabled)
+-{
+-    LOGI("active handle %d",handle);
+-
+-    if (handle != sensor_mma7450.handle)
+-	    return -1;
+-
+-    return sensor_mma7450.handle;
+-}
+-
+-static int set_delay(struct sensors_control_device_t *dev, int32_t ms)
+-{
+-    LOGD("set delay %d ms",ms);
+-    return 0;
+-}
+-
+-static int wake(struct sensors_control_device_t *dev)
+-{
+-    LOGD("sensor wake");
+-    return 0;
+-}
+-
+-//data operation //////////////////////
+-static int sInputFD = -1;
+-static sensors_data_t sSensors;
+-
+-/**
+-* Prepare to read sensor data.
+-*
+-* This routine does NOT take ownership of the handle
+-* and must not close it. Typically this routine would
+-* use a duplicate of the nh parameter.
+-*
+-* @param nh from sensors_control_open.
+-*
+-* @return 0 if successful, < 0 on error
+-*/
+-static int data_open(struct sensors_data_device_t *dev, native_handle_t* nh)
+-{
+-    int i, fd;
+-    fd = ((sensor_handle_t *)nh)->ctl_fd;
+-    LMSInit();
+-    memset(&sSensors, 0, sizeof(sSensors));
+-    sSensors.vector.status = SENSOR_STATUS_ACCURACY_HIGH;
+-    sInputFD = dup(fd);
+-
+-    LOGD("sensors_data_open: fd = %d", sInputFD);
+-    return 0;
+-}
+-
+-static int data_close(struct sensors_data_device_t *dev)
+-{
+-    LOGI("sensor data close");
+-    close(sInputFD);
+-    sInputFD = -1;
+-    return 0;
+-}
+-
+-static int sensor_poll(struct sensors_data_device_t *dev, sensors_data_t* data)
+-{
+-    LOGI("sensor_poll");
+-    struct input_event event;
+-    int64_t t;
+-    int nread;
+-
+-    int fd = sInputFD;
+-
+-    if (fd <= 0)
+-        return -1;
+-
+-    // wait until we get a complete event for an enabled sensor
+-    while (1) {
+-        nread = read(fd, &event, sizeof(event));
+-
+-        if (nread == sizeof(event)) {
+-            uint32_t v;
+-            if (event.type == EV_ABS) {
+-                LOGI("type: %d code: %d value: %-5d time: %ds",
+-                        event.type, event.code, event.value,
+-                      (int)event.time.tv_sec);
+-                switch (event.code) {
+-
+-                    case ABS_X:
+-                        sSensors.acceleration.x = event.value * CONVERT_A_X;
+-                        break;
+-                    case ABS_Y:
+-                        sSensors.acceleration.y = event.value * CONVERT_A_Y;
+-                        break;
+-                    case ABS_Z:
+-                        sSensors.acceleration.z = event.value * CONVERT_A_Z;
+-                        break;
+-                }
+-            } else if (event.type == EV_SYN) {
+-                int64_t t = event.time.tv_sec*1000000000LL + event.time.tv_usec*1000;
+-                *data = sSensors;
+-                return SENSORS_HANDLE_BASE + 1;
+-            }
+-        }
+-    }
+-}
+-
+-static int sensors_device_control_close(struct hw_device_t *dev)
+-{
+-    LOGI("sensors_device_control_close");
+-    struct sensors_control_context_t* ctx = (struct sensors_control_context_t*)dev;
+-    if (ctx) {
+-        /* free all resources associated with this device here
+-         * in particular the sensors_handle_t, outstanding sensors_t, etc...
+-         */
+-        free(ctx);
+-    }
+-    return 0;
+-}
+-
+-static int sensors_device_data_close(struct hw_device_t *dev)
+-{
+-    LOGI("sensors_device_data_close");
+-    struct sensors_data_context_t* ctx = (struct sensors_data_context_t*)dev;
+-    if (ctx) {
+-        /* free all resources associated with this device here
+-         * in particular all pending sensors_buffer_t if needed.
+-         *
+-         * NOTE: sensors_handle_t passed in initialize() is NOT freed and
+-         * its file descriptors are not closed (this is the responsibility
+-         * of the caller).
+-         */
+-        free(ctx);
+-    }
+-    return 0;
+-}
+-
+-/*****************************************************************************/
+-
+-static int sensors_device_open(const struct hw_module_t* module, const char* name,
+-        struct hw_device_t** device)
+-{
+-    int status = -EINVAL;
+-
+-	LOGI("sensor device open %s", name);
+-    if (!strcmp(name, SENSORS_HARDWARE_CONTROL)) {
+-        struct sensors_control_context_t *dev;
+-        dev = (struct sensors_control_context_t*)malloc(sizeof(*dev));
+-
+-        /* initialize our state here */
+-        memset(dev, 0, sizeof(*dev));
+-
+-        /* initialize the procs */
+-        dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        dev->device.common.version = 0;
+-        dev->device.common.module = const_cast<hw_module_t*>(module);
+-        dev->device.common.close = sensors_device_control_close;
+-
+-        dev->device.open_data_source = open_data_source;
+-        dev->device.activate = activate;
+-        dev->device.set_delay = set_delay;
+-        dev->device.wake = wake;
+-
+-        *device = &dev->device.common;
+-        status = 0;
+-    } else if (!strcmp(name, SENSORS_HARDWARE_DATA)) {
+-        struct sensors_data_context_t *dev;
+-        dev = (struct sensors_data_context_t*)malloc(sizeof(*dev));
+-
+-        /* initialize our state here */
+-        memset(dev, 0, sizeof(*dev));
+-
+-        /* initialize the procs */
+-        dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        dev->device.common.version = 0;
+-        dev->device.common.module = const_cast<hw_module_t*>(module);
+-        dev->device.common.close = sensors_device_data_close;
+-
+-        dev->device.data_open = data_open;
+-        dev->device.data_close = data_close;
+-        dev->device.poll = sensor_poll;
+-
+-        *device = &dev->device.common;
+-        status = 0;
+-    }
+-    return status;
+-}
+diff --git a/libsensors/mma8451.cpp b/libsensors/mma8451.cpp
+deleted file mode 100755
+index 3d42f65..0000000
+--- a/libsensors/mma8451.cpp
++++ /dev/null
+@@ -1,414 +0,0 @@
+-/* Copyright (c) 2011 Freescale Semiconductor Inc. */
+-
+-#define LOG_TAG "Sensor"
+-
+-#include <hardware/hardware.h>
+-#include <hardware/sensors.h>
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-#include <dirent.h>
+-#include <math.h>
+-#include <poll.h>
+-#include <linux/input.h>
+-#include <utils/Log.h>
+-#include <cutils/atomic.h>
+-
+-
+-// 4096 LSG = 1G for mma8451
+-#define LSG                         (4096.0f)
+-
+-// conversion of acceleration data to SI units (m/s^2)
+-#define CONVERT_A                   (GRAVITY_EARTH / LSG)
+-#define CONVERT_A_X                 (-CONVERT_A)
+-#define CONVERT_A_Y                 (CONVERT_A)
+-#define CONVERT_A_Z                 (-CONVERT_A)
+-
+-/* sensor rate in me */
+-#define SENSORS_RATE_MS     20
+-/* timeout (constant value) in ms */
+-#define SENSORS_TIMEOUT_MS  100
+-/* # of samples to look at in the past for filtering */
+-#define COUNT               24
+-/* prediction ratio */
+-#define PREDICTION_RATIO    (1.0f/3.0f)
+-/* prediction time in seconds (>=0) */
+-#define PREDICTION_TIME     ((SENSORS_RATE_MS*COUNT/1000.0f)*PREDICTION_RATIO)
+-
+-static float mV[COUNT*2];
+-static float mT[COUNT*2];
+-static int mIndex;
+-
+-static inline
+-float normalize(float x)
+-{
+-    x *= (1.0f / 360.0f);
+-    if (fabsf(x) >= 0.5f)
+-        x = x - ceilf(x + 0.5f) + 1.0f;
+-    if (x < 0)
+-        x += 1.0f;
+-    x *= 360.0f;
+-    return x;
+-}
+-
+-static void LMSInit(void)
+-{
+-    memset(mV, 0, sizeof(mV));
+-    memset(mT, 0, sizeof(mT));
+-    mIndex = COUNT;
+-}
+-
+-static float LMSFilter(int64_t time, int v)
+-{
+-    const float ns = 1.0f / 1000000000.0f;
+-    const float t = time*ns;
+-    float v1 = mV[mIndex];
+-    if ((v-v1) > 180) {
+-        v -= 360;
+-    } else if ((v1-v) > 180) {
+-        v += 360;
+-    }
+-    /* Manage the circular buffer, we write the data twice spaced by COUNT
+-     * values, so that we don't have to memcpy() the array when it's full */
+-    mIndex++;
+-    if (mIndex >= COUNT*2)
+-        mIndex = COUNT;
+-    mV[mIndex] = v;
+-    mT[mIndex] = t;
+-    mV[mIndex-COUNT] = v;
+-    mT[mIndex-COUNT] = t;
+-
+-    float A, B, C, D, E;
+-    float a, b;
+-    int i;
+-
+-    A = B = C = D = E = 0;
+-    for (i=0 ; i<COUNT-1 ; i++) {
+-        const int j = mIndex - 1 - i;
+-        const float Z = mV[j];
+-        const float T = 0.5f*(mT[j] + mT[j+1]) - t;
+-        float dT = mT[j] - mT[j+1];
+-        dT *= dT;
+-        A += Z*dT;
+-        B += T*(T*dT);
+-        C +=   (T*dT);
+-        D += Z*(T*dT);
+-        E += dT;
+-    }
+-    b = (A*B + C*D) / (E*B + C*C);
+-    a = (E*b - A) / C;
+-    float f = b + PREDICTION_TIME*a;
+-
+-    //LOGD("A=%f, B=%f, C=%f, D=%f, E=%f", A,B,C,D,E);
+-    //LOGD("%lld  %d  %f  %f", time, v, f, a);
+-
+-    f = normalize(f);
+-    return f;
+-}
+-
+-/*****************************************************************************/
+-
+-struct sensors_control_context_t {
+-    struct sensors_control_device_t device;
+-    /* our private state goes below here */
+-};
+-
+-struct sensors_data_context_t {
+-    struct sensors_data_device_t device;
+-    /* our private state goes below here */
+-};
+-
+-static int sensors_device_open(const struct hw_module_t* module, const char* name,
+-        struct hw_device_t** device);
+-
+-static struct hw_module_methods_t sensors_module_methods = {
+-    open: sensors_device_open
+-};
+-
+-static struct sensor_t const sensor_mma8451 = {
+-	name: "MMA8451",
+-	vendor: "FSL",
+-	version: 3,
+-	handle: SENSORS_HANDLE_BASE + 1,
+-	type: SENSOR_TYPE_ACCELEROMETER,
+-	maxRange: 8192,
+-	resolution: CONVERT_A,
+-};
+-
+-struct sensor_handle_t : public native_handle {
+-    /* add the data fields we need here, for instance: */
+-    int ctl_fd;
+-};
+-
+-sensor_handle_t sensor_data_handle;
+-
+-static int get_sensors_list(struct sensors_module_t* module, struct sensor_t const** sensor)
+-{
+-    *sensor = &sensor_mma8451;
+-
+-    LOGD("sensor name %s, handle %d, type %d",
+-	    (*sensor)->name, (*sensor)->handle, (*sensor)->type);
+-
+-    return 1; //just one functions
+-}
+-
+-struct sensors_module_t HAL_MODULE_INFO_SYM = {
+-	common: {
+-		tag: HARDWARE_MODULE_TAG,
+-		version_major: 1,
+-		version_minor: 0,
+-		id: SENSORS_HARDWARE_MODULE_ID,
+-		name: "Sensor module",
+-		author: "Shen Yong at Freescale",
+-		methods: &sensors_module_methods,
+-	},
+-	get_sensors_list: get_sensors_list,
+-};
+-
+-static int open_input()
+-{
+-    /* scan all input drivers and look for "compass" */
+-    int fd = -1;
+-    const char *dirname = "/dev/input";
+-    char devname[PATH_MAX];
+-    char *filename;
+-    DIR *dir;
+-    struct dirent *de;
+-    dir = opendir(dirname);
+-    if(dir == NULL)
+-        return -1;
+-    strcpy(devname, dirname);
+-    filename = devname + strlen(devname);
+-    *filename++ = '/';
+-    while((de = readdir(dir))) {
+-        if(de->d_name[0] == '.' &&
+-           (de->d_name[1] == '\0' ||
+-            (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+-            continue;
+-        strcpy(filename, de->d_name);
+-        fd = open(devname, O_RDONLY);
+-        if (fd>=0) {
+-            char name[80];
+-            if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), &name) < 1) {
+-                name[0] = '\0';
+-            }
+-                LOGD("name %s", name);
+-            if (!strcmp(name, "mma8451")) {
+-                LOGD("using %s (name=%s)", devname, name);
+-                break;
+-            }
+-            close(fd);
+-            fd = -1;
+-        }
+-    }
+-    closedir(dir);
+-
+-    if (fd < 0) {
+-        LOGE("Couldn't find or open 'mma8451' driver (%s)", strerror(errno));
+-    }
+-    return fd;
+-}
+-
+-/**
+-* Returns a native_handle_t, which will be the parameter to
+-* sensors_data_device_t::open_data().
+-* The caller takes ownership of this handle. This is intended to be
+-* passed cross processes.
+-*
+-* @return a native_handle_t if successful, NULL on error
+-*/
+-static native_handle_t* open_data_source(struct sensors_control_device_t *dev)
+-{
+-    LOGD("open_data_source");
+-    memset(&sensor_data_handle, 0, sizeof(sensor_data_handle));
+-    sensor_data_handle.numFds      = 1;
+-    sensor_data_handle.numInts     = 0; // extra ints we have in our handle
+-    sensor_data_handle.ctl_fd = open_input();
+-    return &sensor_data_handle;
+-}
+-
+-static int activate(struct sensors_control_device_t *dev, int handle, int enabled)
+-{
+-    LOGI("active handle %d",handle);
+-
+-    if (handle != sensor_mma8451.handle)
+-	    return -1;
+-
+-    return sensor_mma8451.handle;
+-}
+-
+-static int set_delay(struct sensors_control_device_t *dev, int32_t ms)
+-{
+-	LOGD("set delay %d ms",ms);
+-    return 0;
+-}
+-
+-static int wake(struct sensors_control_device_t *dev)
+-{
+-	LOGD("sensor wake");
+-	return 0;
+-}
+-
+-//data operation //////////////////////
+-static int sInputFD = -1;
+-static sensors_data_t sSensors;
+-
+-/**
+-* Prepare to read sensor data.
+-*
+-* This routine does NOT take ownership of the handle
+-* and must not close it. Typically this routine would
+-* use a duplicate of the nh parameter.
+-*
+-* @param nh from sensors_control_open.
+-*
+-* @return 0 if successful, < 0 on error
+-*/
+-static int data_open(struct sensors_data_device_t *dev, native_handle_t* nh)
+-{
+-    int i, fd;
+-
+-    fd = ((sensor_handle_t *)nh)->ctl_fd;
+-    LMSInit();
+-    memset(&sSensors, 0, sizeof(sSensors));
+-    sSensors.vector.status = SENSOR_STATUS_ACCURACY_HIGH;
+-    sInputFD = dup(fd);
+-
+-    LOGD("sensors_data_open: fd = %d", sInputFD);
+-    return 0;
+-}
+-    
+-static int data_close(struct sensors_data_device_t *dev)
+-{
+-    LOGI("sensor data close");
+-
+-    close(sInputFD);
+-    sInputFD = -1;
+-
+-    return 0;
+-}
+-
+-static int sensor_poll(struct sensors_data_device_t *dev, sensors_data_t* data)
+-{
+-    struct input_event event;
+-    int64_t t;
+-    int nread;
+-    int fd = sInputFD;
+-
+-    if (fd <= 0)
+-        return -1;
+-
+-    // wait until we get a complete event for an enabled sensor
+-    while (1) {
+-        nread = read(fd, &event, sizeof(event));
+-
+-        if (nread == sizeof(event)) {
+-            uint32_t v;
+-
+-            if (event.type == EV_ABS) {
+-                switch (event.code) {
+-
+-                    case ABS_X:
+-                        sSensors.acceleration.x = event.value * CONVERT_A_X;
+-                        break;
+-                    case ABS_Y:
+-                        sSensors.acceleration.y = event.value * CONVERT_A_Y;
+-                        break;
+-                    case ABS_Z:
+-                        sSensors.acceleration.z = event.value * CONVERT_A_Z;
+-                        break;
+-                }
+-            } else if (event.type == EV_SYN) {
+-		t = event.time.tv_sec * 1000000000LL + event.time.tv_usec * 1000;
+-		sSensors.time = t;
+-		*data = sSensors;
+-
+-		/* LOGD("x = %.2f, y = %.2f, z = %.2f\n", sSensors.acceleration.x,
+-			sSensors.acceleration.y, sSensors.acceleration.z); */
+-
+-		return SENSORS_HANDLE_BASE + 1;
+-            }
+-        }
+-    }
+-}
+-
+-static int sensors_device_control_close(struct hw_device_t *dev) 
+-{
+-    LOGI("sensors_device_control_close");
+-    struct sensors_control_context_t* ctx = (struct sensors_control_context_t*)dev;
+-    if (ctx) {
+-        /* free all resources associated with this device here
+-         * in particular the sensors_handle_t, outstanding sensors_t, etc...
+-         */
+-        free(ctx);
+-    }
+-    return 0;
+-}
+- 
+-static int sensors_device_data_close(struct hw_device_t *dev) 
+-{
+-    LOGI("sensors_device_data_close");
+-    struct sensors_data_context_t* ctx = (struct sensors_data_context_t*)dev;
+-    if (ctx) {
+-        /* free all resources associated with this device here
+-         * in particular all pending sensors_buffer_t if needed.
+-         * 
+-         * NOTE: sensors_handle_t passed in initialize() is NOT freed and
+-         * its file descriptors are not closed (this is the responsibility
+-         * of the caller).
+-         */
+-        free(ctx);
+-    }
+-    return 0;
+-}
+-
+-/*****************************************************************************/
+-
+-static int sensors_device_open(const struct hw_module_t* module, const char* name,
+-        struct hw_device_t** device)
+-{
+-    int status = -EINVAL;
+-
+-	LOGI("sensor device open %s", name);
+-    if (!strcmp(name, SENSORS_HARDWARE_CONTROL)) {
+-        struct sensors_control_context_t *dev;
+-        dev = (struct sensors_control_context_t*)malloc(sizeof(*dev));
+-
+-        /* initialize our state here */
+-        memset(dev, 0, sizeof(*dev));
+-
+-        /* initialize the procs */
+-        dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        dev->device.common.version = 0;
+-        dev->device.common.module = const_cast<hw_module_t*>(module);
+-        dev->device.common.close = sensors_device_control_close;
+-        
+-        dev->device.open_data_source = open_data_source;
+-        dev->device.activate = activate;
+-        dev->device.set_delay = set_delay;
+-        dev->device.wake = wake;
+-
+-        *device = &dev->device.common;
+-        status = 0;
+-    } else if (!strcmp(name, SENSORS_HARDWARE_DATA)) {
+-        struct sensors_data_context_t *dev;
+-        dev = (struct sensors_data_context_t*)malloc(sizeof(*dev));
+-
+-        /* initialize our state here */
+-        memset(dev, 0, sizeof(*dev));
+-
+-        /* initialize the procs */
+-        dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        dev->device.common.version = 0;
+-        dev->device.common.module = const_cast<hw_module_t*>(module);
+-        dev->device.common.close = sensors_device_data_close;
+-        
+-        dev->device.data_open = data_open;
+-        dev->device.data_close = data_close;
+-        dev->device.poll = sensor_poll;
+-        
+-        *device = &dev->device.common;
+-        status = 0;
+-    }
+-    return status;
+-}
+diff --git a/libsensors/sensors.cpp b/libsensors/sensors.cpp
+new file mode 100755
+index 0000000..20e72a6
+--- /dev/null
++++ b/libsensors/sensors.cpp
+@@ -0,0 +1,289 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "Sensors"
++
++#include <hardware/sensors.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <dirent.h>
++#include <math.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdlib.h>
++
++#include <linux/input.h>
++
++#include <utils/Atomic.h>
++#include <utils/Log.h>
++
++#include "sensors.h"
++
++#include "LightSensor.h"
++#include "AccelSensor.h"
++
++/*****************************************************************************/
++
++#define DELAY_OUT_TIME 0x7FFFFFFF
++
++#define LIGHT_SENSOR_POLLTIME    2000000000
++
++#define SENSORS_ACCELERATION     (1<<ID_A)
++#define SENSORS_MAGNETIC_FIELD   (1<<ID_M)
++#define SENSORS_ORIENTATION      (1<<ID_O)
++#define SENSORS_LIGHT            (1<<ID_L)
++#define SENSORS_PROXIMITY        (1<<ID_P)
++#define SENSORS_GYROSCOPE        (1<<ID_GY)
++
++#define SENSORS_ACCELERATION_HANDLE     0
++#define SENSORS_MAGNETIC_FIELD_HANDLE   1
++#define SENSORS_ORIENTATION_HANDLE      2
++#define SENSORS_LIGHT_HANDLE            3
++#define SENSORS_PROXIMITY_HANDLE        4
++#define SENSORS_GYROSCOPE_HANDLE        5
++
++
++/*****************************************************************************/
++
++/* The SENSORS Module */
++static const struct sensor_t sSensorList[] = {
++        { "MMA 3-axis Accelerometer",
++          "Freescale Semiconductor Inc.",
++          1, SENSORS_ACCELERATION_HANDLE,
++          SENSOR_TYPE_ACCELEROMETER, RANGE_A, CONVERT_A, 0.30f, 20000, { } },
++        { "ISL29023 Light sensor",
++          "Intersil",
++          1, SENSORS_LIGHT_HANDLE,
++          SENSOR_TYPE_LIGHT, 16000.0f, 1.0f, 0.35f, 0, { } },
++};
++
++
++static int open_sensors(const struct hw_module_t* module, const char* id,
++                        struct hw_device_t** device);
++
++
++static int sensors__get_sensors_list(struct sensors_module_t* module,
++                                     struct sensor_t const** list)
++{
++        *list = sSensorList;
++        return ARRAY_SIZE(sSensorList);
++}
++
++static struct hw_module_methods_t sensors_module_methods = {
++        open: open_sensors
++};
++
++struct sensors_module_t HAL_MODULE_INFO_SYM = {
++        common: {
++                tag: HARDWARE_MODULE_TAG,
++                version_major: 1,
++                version_minor: 0,
++                id: SENSORS_HARDWARE_MODULE_ID,
++                name: "Freescale Sensor module",
++                author: "Freescale Semiconductor Inc.",
++                methods: &sensors_module_methods,
++        },
++        get_sensors_list: sensors__get_sensors_list,
++};
++
++struct sensors_poll_context_t {
++    struct sensors_poll_device_t device; // must be first
++
++        sensors_poll_context_t();
++        ~sensors_poll_context_t();
++    int activate(int handle, int enabled);
++    int setDelay(int handle, int64_t ns);
++    int pollEvents(sensors_event_t* data, int count);
++
++private:
++    enum {
++        light           = 0,
++        accel             = 1,
++        numSensorDrivers,
++        numFds,
++    };
++
++    static const size_t wake = numFds - 1;
++    static const char WAKE_MESSAGE = 'W';
++    struct pollfd mPollFds[numFds];
++    int mWritePipeFd;
++    SensorBase* mSensors[numSensorDrivers];
++
++    int handleToDriver(int handle) const {
++        switch (handle) {
++            case ID_A:
++            case ID_M:
++            case ID_O:
++                return accel;
++            case ID_L:
++                return light;
++        }
++        return -EINVAL;
++    }
++};
++
++/*****************************************************************************/
++
++sensors_poll_context_t::sensors_poll_context_t()
++{
++    mSensors[light] = new LightSensor();
++    mPollFds[light].fd = mSensors[light]->getFd();
++    mPollFds[light].events = POLLIN;
++    mPollFds[light].revents = 0;
++
++    mSensors[accel] = new AccelSensor();
++    mPollFds[accel].fd = mSensors[accel]->getFd();
++    mPollFds[accel].events = POLLIN;
++    mPollFds[accel].revents = 0;
++
++    int wakeFds[2];
++    int result = pipe(wakeFds);
++    LOGE_IF(result<0, "error creating wake pipe (%s)", strerror(errno));
++    fcntl(wakeFds[0], F_SETFL, O_NONBLOCK);
++    fcntl(wakeFds[1], F_SETFL, O_NONBLOCK);
++    mWritePipeFd = wakeFds[1];
++
++    mPollFds[wake].fd = wakeFds[0];
++    mPollFds[wake].events = POLLIN;
++    mPollFds[wake].revents = 0;
++}
++
++sensors_poll_context_t::~sensors_poll_context_t() {
++    for (int i=0 ; i<numSensorDrivers ; i++) {
++        delete mSensors[i];
++    }
++    close(mPollFds[wake].fd);
++    close(mWritePipeFd);
++}
++
++int sensors_poll_context_t::activate(int handle, int enabled) {
++    int index = handleToDriver(handle);
++    if (index < 0) return index;
++    int err =  mSensors[index]->enable(handle, enabled);
++    if (enabled && !err) {
++        const char wakeMessage(WAKE_MESSAGE);
++        int result = write(mWritePipeFd, &wakeMessage, 1);
++        LOGE_IF(result<0, "error sending wake message (%s)", strerror(errno));
++    }
++    return err;
++}
++
++int sensors_poll_context_t::setDelay(int handle, int64_t ns) {
++
++    int index = handleToDriver(handle);
++    if (index < 0) return index;
++    return mSensors[index]->setDelay(handle, ns);
++}
++
++int sensors_poll_context_t::pollEvents(sensors_event_t* data, int count)
++{
++    int nbEvents = 0;
++    int n = 0;
++
++    do {
++        // see if we have some leftover from the last poll()
++        for (int i=0 ; count && i<numSensorDrivers ; i++) {
++            SensorBase* const sensor(mSensors[i]);
++
++	   if ((mPollFds[i].revents & POLLIN) || (sensor->hasPendingEvents())) {
++                int nb = sensor->readEvents(data, count);
++                if (nb < count) {
++                    // no more data for this sensor
++                    mPollFds[i].revents = 0;
++                }
++                count -= nb;
++                nbEvents += nb;
++                data += nb;
++            }
++        }
++
++        if (count) {
++            // we still have some room, so try to see if we can get
++            // some events immediately or just wait if we don't have
++            // anything to return
++            n = poll(mPollFds, numFds, nbEvents ? 0 : -1);
++            if (n<0) {
++                LOGE("poll() failed (%s)", strerror(errno));
++                return -errno;
++            }
++            if (mPollFds[wake].revents & POLLIN) {
++                char msg;
++                int result = read(mPollFds[wake].fd, &msg, 1);
++                LOGE_IF(result<0, "error reading from wake pipe (%s)", strerror(errno));
++                LOGE_IF(msg != WAKE_MESSAGE, "unknown message on wake queue (0x%02x)", int(msg));
++                mPollFds[wake].revents = 0;
++            }
++        }
++        // if we have events and space, go read them
++    } while (n && count);
++
++    return nbEvents;
++}
++
++/*****************************************************************************/
++
++static int poll__close(struct hw_device_t *dev)
++{
++    sensors_poll_context_t *ctx = (sensors_poll_context_t *)dev;
++    if (ctx) {
++        delete ctx;
++    }
++    return 0;
++}
++
++static int poll__activate(struct sensors_poll_device_t *dev,
++        int handle, int enabled) {
++    sensors_poll_context_t *ctx = (sensors_poll_context_t *)dev;
++    return ctx->activate(handle, enabled);
++}
++
++static int poll__setDelay(struct sensors_poll_device_t *dev,
++        int handle, int64_t ns) {
++    sensors_poll_context_t *ctx = (sensors_poll_context_t *)dev;
++    return ctx->setDelay(handle, ns);
++}
++
++static int poll__poll(struct sensors_poll_device_t *dev,
++        sensors_event_t* data, int count) {
++    sensors_poll_context_t *ctx = (sensors_poll_context_t *)dev;
++    return ctx->pollEvents(data, count);
++}
++
++/*****************************************************************************/
++
++/** Open a new instance of a sensor device using name */
++static int open_sensors(const struct hw_module_t* module, const char* id,
++                        struct hw_device_t** device)
++{
++        int status = -EINVAL;
++        sensors_poll_context_t *dev = new sensors_poll_context_t();
++
++        memset(&dev->device, 0, sizeof(sensors_poll_device_t));
++
++        dev->device.common.tag = HARDWARE_DEVICE_TAG;
++        dev->device.common.version  = 0;
++        dev->device.common.module   = const_cast<hw_module_t*>(module);
++        dev->device.common.close    = poll__close;
++        dev->device.activate        = poll__activate;
++        dev->device.setDelay        = poll__setDelay;
++        dev->device.poll            = poll__poll;
++
++        *device = &dev->device.common;
++        status = 0;
++
++        return status;
++}
+diff --git a/libsensors/sensors.h b/libsensors/sensors.h
+new file mode 100755
+index 0000000..1bf1728
+--- /dev/null
++++ b/libsensors/sensors.h
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_SENSORS_H
++#define ANDROID_SENSORS_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++#include <linux/input.h>
++
++#include <hardware/hardware.h>
++#include <hardware/sensors.h>
++
++__BEGIN_DECLS
++
++/*****************************************************************************/
++
++#define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
++
++#define ID_A  (0)
++#define ID_M  (1)
++#define ID_O  (2)
++#define ID_L  (3)
++#define ID_P  (4)
++#define ID_GY (5)
++
++/*****************************************************************************/
++
++/*
++ * The SENSORS Module
++ */
++
++/*****************************************************************************/
++
++#define EVENT_TYPE_ACCEL_X          ABS_X
++#define EVENT_TYPE_ACCEL_Y          ABS_Y
++#define EVENT_TYPE_ACCEL_Z          ABS_Z
++#define EVENT_TYPE_LIGHT            ABS_MISC
++
++#if defined(ACCELEROMETER_SENSOR_MMA8451)
++  #define LSG                         (4096.0f) // 4096 LSG = 1G for MMA8451
++#elif defined(ACCELEROMETER_SENSOR_MMA8450)
++  #define LSG                         (1024.0f) // 1024 LSG = 1G for MMA8450
++#else
++  #define LSG                         (720.0f)
++#endif
++
++// conversion of acceleration data to SI units (m/s^2)
++#define RANGE_A                     (2*GRAVITY_EARTH)
++#define CONVERT_A                   (GRAVITY_EARTH / LSG)
++#define CONVERT_A_X                 (-CONVERT_A)
++#define CONVERT_A_Y                 (CONVERT_A)
++#define CONVERT_A_Z                 (-CONVERT_A)
++
++#define SENSOR_STATE_MASK           (0x7FFF)
++
++/*****************************************************************************/
++
++__END_DECLS
++
++#endif  // ANDROID_SENSORS_H
+-- 
+1.8.0
+

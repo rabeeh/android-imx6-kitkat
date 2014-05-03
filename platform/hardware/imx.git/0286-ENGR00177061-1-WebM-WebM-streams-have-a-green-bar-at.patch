@@ -1,0 +1,77 @@
+From e456c65b324cdd8b6e75989a0b1eca268c1d20b9 Mon Sep 17 00:00:00 2001
+From: Oliver Brown <oliver.brown@freescale.com>
+Date: Thu, 7 Jun 2012 12:50:50 -0500
+Subject: [PATCH 286/486] ENGR00177061-1 [WebM] - WebM streams have a green
+ bar at the bottom.
+
+To support rendering using the AMD z430 GPU, buffer allocation sizes
+for YUV pixel formats must padded to align chroma buffers to 4K.
+
+Signed-off-by: Oliver Brown <oliver.brown@freescale.com>
+---
+ mx5x/libgralloc/gralloc.cpp    | 16 ++++++++++++----
+ mx5x/libgralloc/gralloc_priv.h |  6 +++++-
+ 2 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/mx5x/libgralloc/gralloc.cpp b/mx5x/libgralloc/gralloc.cpp
+index 64fbc78..dccbe28 100755
+--- a/mx5x/libgralloc/gralloc.cpp
++++ b/mx5x/libgralloc/gralloc.cpp
+@@ -372,22 +372,30 @@ static int gralloc_alloc(alloc_device_t* dev,
+             format == HAL_PIXEL_FORMAT_YCbCr_422_SP || format == HAL_PIXEL_FORMAT_YCbCr_420_I ||
+             format == HAL_PIXEL_FORMAT_YV12)
+     {
++        int luma_size;
++        int chroma_size;
++
+         // FIXME: there is no way to return the alignedh
+-        alignedw = ALIGN_PIXEL_16(w);
+-        alignedh = ALIGN_PIXEL_16(h);
++        // Aligning height and width to 64 forces 4096 alignment of chroma
++        // buffer assuming that the luma starts with 4096 alignment or higher.
++        // This is required for GPU rendering in ICS for iMX5.
++        alignedw = ALIGN_PIXEL_64(w);
++        alignedh = ALIGN_PIXEL_64(h);
++        luma_size = ALIGN_PIXEL_4096(alignedw * alignedh);
+         switch (format) {
+             case HAL_PIXEL_FORMAT_YCbCr_422_SP:
+             case HAL_PIXEL_FORMAT_YCbCr_422_I:
+-                size = alignedw * alignedh * 2;
++                chroma_size = ALIGN_PIXEL_4096( (alignedw * alignedh) / 2) * 2;
+                 break;
+             case HAL_PIXEL_FORMAT_YCbCr_420_SP:
+             case HAL_PIXEL_FORMAT_YCbCr_420_I:
+             case HAL_PIXEL_FORMAT_YV12:
+-                size = (alignedw * alignedh) + (w/2 * h/2) * 2;
++                chroma_size = ALIGN_PIXEL_4096(alignedw/2 * alignedh/2) * 2;
+                 break;
+             default:
+                 return -EINVAL;
+         }
++        size = luma_size + chroma_size;
+     } else {
+         alignedw = ALIGN_PIXEL(w);
+         alignedh = ALIGN_PIXEL(h);
+diff --git a/mx5x/libgralloc/gralloc_priv.h b/mx5x/libgralloc/gralloc_priv.h
+index 08a77d2..0aed8dd 100755
+--- a/mx5x/libgralloc/gralloc_priv.h
++++ b/mx5x/libgralloc/gralloc_priv.h
+@@ -32,10 +32,14 @@
+ #include <linux/fb.h>
+ 
+ #define  ALIGN_PIXEL(x)  ((x+ 31) & ~31)
+-#define  ALIGN_PIXEL_16(x)  ((x+ 15) & ~15)
++#define  ALIGN_PIXEL_64(x)  ((x+ 63) & ~63)
+ /** z430 core need 4k aligned memory, since xres has been 32 aligned, make yres
+     to 128 aligned will meet this request for all pixel format (RGB565,RGB888,etc.) */
+ #define  ALIGN_PIXEL_128(x)  ((x+ 127) & ~127)
++/** z430 core needs 4k aligned memory for all YUV pixel
++ *  formats */
++#define  ALIGN_PIXEL_4096(x)  ((x+ 4095) & ~4095)
++
+ /*****************************************************************************/
+ 
+ struct private_module_t;
+-- 
+1.8.0
+

@@ -1,0 +1,190 @@
+From 8096789d7597835c611216218f21d150265e3972 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 14 Nov 2008 08:42:06 +0800
+Subject: [PATCH 055/435] ENGR00098896 fix vpu protection isn't unclocked in
+ filling stream failed case
+
+GetOutputInfo may not be called in abnormal case, e.g,filling
+stream failed, then mutex is locked always. Make sure GetOutputInfo is
+called before DecClose/EncClose.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 44 +++++++++++++++++++++++++++++++++-----------
+ test/mxc_vpu_test/display.c  | 10 ++++++----
+ test/mxc_vpu_test/loopback.c | 10 ++++------
+ test/mxc_vpu_test/vpu_test.h |  1 +
+ 4 files changed, 44 insertions(+), 21 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index de92eca..92f9cf9 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -846,13 +846,18 @@ decoder_free_framebuffer(struct decode *dec)
+ 
+ 	if (dec->cmdl->dst_scheme == PATH_V4L2) {
+ 		v4l_display_close(dec->disp);
++		dec->disp = NULL;
+ 
+ 		if ((rot_en == 0) && (deblock_en == 0) && (dering_en == 0)) {
+ 			if (cpu_is_mx37() || cpu_is_mx51()) {
+ 				for (i = 0; i < dec->fbcount; i++) {
+-					IOFreePhyMem(&mvcol_md[i]);
++					if (mvcol_md[i].phy_addr)
++						IOFreePhyMem(&mvcol_md[i]);
++				}
++				if (dec->mvcol_memdesc) {
++					free(dec->mvcol_memdesc);
++					dec->mvcol_memdesc = NULL;
+ 				}
+-				free(mvcol_md);
+ 			}
+ 		}
+ 	}
+@@ -867,8 +872,14 @@ decoder_free_framebuffer(struct decode *dec)
+ 		}
+ 	}
+ 
+-	free(dec->fb);
+-	free(dec->pfbpool);
++	if (dec->fb) {
++		free(dec->fb);
++		dec->fb = NULL;
++	}
++	if (dec->pfbpool) {
++		free(dec->pfbpool);
++		dec->pfbpool = NULL;
++	}
+ 	return;
+ }
+ 
+@@ -996,6 +1007,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ err1:
+ 	if (dst_scheme == PATH_V4L2) {
+ 		v4l_display_close(disp);
++		dec->disp = NULL;
+ 	}
+ 
+ err:
+@@ -1103,6 +1115,20 @@ decoder_open(struct decode *dec)
+ 	return 0;
+ }
+ 
++void decoder_close(struct decode *dec)
++{
++	DecOutputInfo outinfo = {0};
++	RetCode ret;
++
++	ret = vpu_DecClose(dec->handle);
++	if (ret == RETCODE_FRAME_NOT_COMPLETE) {
++		vpu_DecGetOutputInfo(dec->handle, &outinfo);
++		ret = vpu_DecClose(dec->handle);
++		if (ret != RETCODE_SUCCESS)
++			err_msg("vpu_DecClose failed\n");
++	}
++}		
++
+ int
+ decode_test(void *arg)
+ {
+@@ -1152,7 +1178,6 @@ decode_test(void *arg)
+ 		ret = IOGetPhyMem(&slice_mem_desc);
+ 		if (ret) {
+ 			err_msg("Unable to obtain physical slice save mem\n");
+-			IOFreePhyMem(&ps_mem_desc);
+ 			goto err;
+ 		}
+ 
+@@ -1190,20 +1215,17 @@ decode_test(void *arg)
+ 
+ 	/* start decoding */
+ 	ret = decoder_start(dec);
++err1:
++	decoder_close(dec);
+ 
+ 	/* free the frame buffers */
+ 	decoder_free_framebuffer(dec);
+-
+-err1:
++err:
+ 	if (cmdl->format == STD_AVC) {
+-		IOFreeVirtMem(&slice_mem_desc);
+ 		IOFreePhyMem(&slice_mem_desc);
+-		IOFreeVirtMem(&ps_mem_desc);
+ 		IOFreePhyMem(&ps_mem_desc);
+ 	}
+ 
+-	vpu_DecClose(dec->handle);
+-err:
+ 	IOFreeVirtMem(&mem_desc);
+ 	IOFreePhyMem(&mem_desc);
+ 	free(dec);
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 6e6d2c1..d2952e4 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -337,10 +337,12 @@ err:
+ void v4l_display_close(struct vpu_display *disp)
+ {
+ 	int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-	ioctl(disp->fd, VIDIOC_STREAMOFF, &type);
+-	v4l_free_bufs(disp->nframes, disp);
+-	close(disp->fd);
+-	free(disp);
++	if (disp) {
++		ioctl(disp->fd, VIDIOC_STREAMOFF, &type);
++		v4l_free_bufs(disp->nframes, disp);
++		close(disp->fd);
++		free(disp);
++	}
+ }
+ 
+ int v4l_put_data(struct vpu_display *disp, int index)
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 667ba82..2d42085 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -441,12 +441,13 @@ encdec_test(void *arg)
+ 
+ 	}
+ 
+-	/* free the frame buffers */
+-	decoder_free_framebuffer(dec);
+ err5:
+ 	v4l_stop_capturing();
+ err4:
+-	vpu_DecClose(dec->handle);
++	decoder_close(dec);
++
++	/* free the frame buffers */
++	decoder_free_framebuffer(dec);
+ err3:
+ 	/* free the allocated framebuffers */
+ 	encoder_free_framebuffer(enc);
+@@ -455,11 +456,8 @@ err2:
+ 	encoder_close(enc);
+ err1:
+ 	if (cmdl->format == STD_AVC) {
+-		IOFreeVirtMem(&ps_mem_desc);
+ 		IOFreePhyMem(&ps_mem_desc);
+-		IOFreeVirtMem(&slice_mem_desc);
+ 		IOFreePhyMem(&slice_mem_desc);
+-		
+ 	}
+ 
+ 	IOFreeVirtMem(&dec_mem_desc);
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 87b436e..e0fa8ee 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -205,6 +205,7 @@ int encoder_allocate_framebuffer(struct encode *enc);
+ void encoder_free_framebuffer(struct encode *enc);
+ 
+ int decoder_open(struct decode *dec);
++void decoder_close(struct decode *dec);
+ int decoder_parse(struct decode *dec);
+ int decoder_allocate_framebuffer(struct decode *dec);
+ void decoder_free_framebuffer(struct decode *dec);
+-- 
+1.8.0
+

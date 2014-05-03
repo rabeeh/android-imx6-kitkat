@@ -1,0 +1,121 @@
+From 20ce09cbcf864203de93ab55f2bc768283a5e05b Mon Sep 17 00:00:00 2001
+From: Anish Trivedi <anish@freescale.com>
+Date: Tue, 19 Oct 2010 17:54:49 -0500
+Subject: [PATCH 186/435] ENGR00132800 SRTC Time set notification test fails
+ with SD fs
+
+The child process was preventing the parent from running
+initially to enter wait queue for notification. Therefore,
+subsequent time change by the child process was not being caught
+by the parent. Implemented the following changes to the test case:
+
+1) Decreased priority of the child (15) in comparison with parent (0).
+This ensures that parent can process the time change right after child
+sets the new time.
+
+2) The above priority change was not enough to yield to the parent at
+the beginning of the test for it to complete its ioctl call to enter
+wait queue. So child process needs to sleep for 1 second to allow
+parent to complete the wait queue enter call before time is changed.
+
+Signed-off-by: Anish Trivedi <anish@freescale.com>
+---
+ test/mxc_rtc/rtc_timesetnotification_test.c | 48 ++++++++++++++++-------------
+ 1 file changed, 27 insertions(+), 21 deletions(-)
+
+diff --git a/test/mxc_rtc/rtc_timesetnotification_test.c b/test/mxc_rtc/rtc_timesetnotification_test.c
+index 85542e0..ead13cd 100644
+--- a/test/mxc_rtc/rtc_timesetnotification_test.c
++++ b/test/mxc_rtc/rtc_timesetnotification_test.c
+@@ -35,14 +35,17 @@
+  * for rollover in the minute and hour fields. However, rollover into the day field
+  * is not checked. Therefore, if this test is run close to midnight, then it may fail.
+  *
+- * IMPORTANT: DRM process, like the parent process in this test, must be waiting
+- * to be notified before the time is changed, and it helps to have the highest
+- * priority. Otherwise, the process that sets the time will not yield to the DRM
+- * process immediately following the time set action, leading to a missed report
+- * of the time change. In this test, however, the parent and child processes have
+- * the same default priority, but the parent does call the RTC_WAIT_TIME_SET
+- * ioctl before the time is set. Therefore the child does yield to the parent
+- * (with same priority) after setting the time.
++ * IMPORTANT: The DRM process, like the parent process in this test, must be
++ * waiting to be notified before the time is changed, and it helps to have the
++ * highest priority. Otherwise, the process that sets the time will not yield to the
++ * DRM process immediately following the time set action, leading to a missed
++ * report of the time change. In this test, the child process priority is set to a
++ * much lower value than the parent's, whose "nice" value defaults to 0. Also,
++ * the child yields the CPU in the beginning by sleeping to ensure that parent
++ * can call the RTC_WAIT_TIME_SET ioctl before time is actually changed.
++ * In a real system, the developer must ensure somehow that DRM process calls
++ * the RTC_WAIT_TIME_SET ioctl to wait for notification before user has a
++ * chance to change the time.
+  *
+  */
+ 
+@@ -62,6 +65,9 @@
+ #include <linux/rtc.h>
+ #include <linux/mxc_srtc.h>
+ 
++/* Nice value (inverse of priority): between -20 and 19 */
++#define CHILD_PROC_NICE_VAL	15
++
+ int main(int argc, char **argv)
+ {
+ 	int fd_srtc;
+@@ -94,23 +100,23 @@ int main(int argc, char **argv)
+ 		exit(errno);
+ 	}
+ 
+-	fprintf(stderr, "Current RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
+-		rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+-		rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+-
+-
+-	fprintf(stderr, "47-bit Time counter on SRTC = 0x%llx\n", time_47bit);
+-
+ 	/* fork a child process that will call the ioctl that waits for time set */
+ 	pid_t pID = fork();
+ 
+ 	/* child process */
+ 	if (pID == 0) {
+ 
+-		/* Set the time to 16 sec ahead, and check for rollover of min & hr.
+-		 * Does not check for rollover of days, so this test may fail
+-		 * when run with RTC time = 11:59 PM */
+-		rtc_tm.tm_sec += 16;
++		/* set nice value to something higher than 0 (parent's nice value) */
++		setpriority(PRIO_PROCESS, 0, CHILD_PROC_NICE_VAL);
++		/* sleep for 1 second to ensure parent can run until it blocks waiting
++		  * for time to be changed */
++		sleep(1);
++
++		/* Set the time to 16 sec ahead (actually 17 since we have already slept
++		  * for 1 sec), and check for rollover of min & hr.
++		  * Does not check for rollover of days, so this test may fail
++		  * when run with RTC time = 11:59 PM */
++		rtc_tm.tm_sec += 17;
+ 		if (rtc_tm.tm_sec >= 60) {
+ 			rtc_tm.tm_sec %= 60;
+ 			rtc_tm.tm_min++;
+@@ -123,7 +129,7 @@ int main(int argc, char **argv)
+ 			rtc_tm.tm_hour = 0;
+ 
+ 
+-		fprintf(stderr, "Child process: Trying to set RTC date/time to %d-%d-%d, %02d:%02d:%02d.\n",
++		fprintf(stderr, "Child process: Trying to set RTC date/time ahead to %d-%d-%d, %02d:%02d:%02d.\n",
+ 			rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+ 			rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+@@ -165,7 +171,7 @@ int main(int argc, char **argv)
+ 				rtc_tm.tm_hour = 23;
+ 		}
+ 
+-		fprintf(stderr, "Child process: Trying to set RTC date/time to %d-%d-%d, %02d:%02d:%02d.\n",
++		fprintf(stderr, "Child process: Trying to set RTC date/time back to %d-%d-%d, %02d:%02d:%02d.\n",
+ 			rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+ 			rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+-- 
+1.8.0
+

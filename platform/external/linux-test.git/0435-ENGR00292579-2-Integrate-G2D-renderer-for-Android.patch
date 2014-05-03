@@ -1,0 +1,1017 @@
+From e4db3e666623862067054d137d4ce6939ac6f20f Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 18 Dec 2013 13:43:14 +0800
+Subject: [PATCH 435/435] ENGR00292579-2 Integrate G2D renderer for Android
+
+- G2D renderer coexists with V4L2 renderer on Android,
+  using -x 2 to select G2D
+- GPU rotation coexists with VPU rotation,
+  using -u 1 to select GPU rotation
+- Reuse variables and functions
+- Unify control flow of
+  . V4L2
+  . V4L2 performance mode
+  . GPU
+  under the use cases of non-MJPEG/MJPEG/Post processing (Using VPU or IPU/GPU).
+  Clear display flags in decoder thread. In post processing case, display flag
+  of some frame buffers released from renderer must not be cleared.
+- Fix GPU rotation bug of not setting src/dst width/height
+- Verified on Android JB4.2.2
+- G2D renderer can be refered to as a model to integrate new renderers
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/Android.mk          |   3 +-
+ test/mxc_vpu_test/android_display.cpp | 194 ++++++++++++++--------------------
+ test/mxc_vpu_test/dec.c               | 170 ++++++++++++++++-------------
+ test/mxc_vpu_test/display.c           |  46 ++------
+ test/mxc_vpu_test/main.c              |  16 ++-
+ test/mxc_vpu_test/transcode.c         |   3 -
+ test/mxc_vpu_test/utils.c             |   6 +-
+ test/mxc_vpu_test/vpu_test.h          |  57 ++++++++--
+ 8 files changed, 246 insertions(+), 249 deletions(-)
+
+diff --git a/test/mxc_vpu_test/Android.mk b/test/mxc_vpu_test/Android.mk
+index 56c330f..4e09deb 100644
+--- a/test/mxc_vpu_test/Android.mk
++++ b/test/mxc_vpu_test/Android.mk
+@@ -19,7 +19,8 @@ LOCAL_CFLAGS += -DBUILD_FOR_ANDROID
+ LOCAL_C_INCLUDES += $(LOCAL_PATH) \
+ 	external/linux-lib/ipu \
+ 	external/linux-lib/vpu \
+-	device/fsl-proprietary/include
++	device/fsl-proprietary/include \
++	hardware/imx/mx6/libgralloc_wrapper
+ 
+ LOCAL_SHARED_LIBRARIES := libutils libc libvpu libipu libg2d libgui libui libhardware
+ 
+diff --git a/test/mxc_vpu_test/android_display.cpp b/test/mxc_vpu_test/android_display.cpp
+index 2841dfa..e2e00b7 100644
+--- a/test/mxc_vpu_test/android_display.cpp
++++ b/test/mxc_vpu_test/android_display.cpp
+@@ -1,19 +1,17 @@
+ /*
+- *  Copyright (C) 2013 Freescale Semiconductor, Inc.
+- *  All Rights Reserved.
+- *
+- *  The following programs are the sole property of Freescale Semiconductor Inc.,
+- *  and contain its proprietary and confidential information.
+- *
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ * All rights reserved.
+  */
+ 
+ /*
+- *	android_display.cpp
+- *	implement video display based on g2d renderer
+- *	History :
+- *	Date(y.m.d)        Author            Version        Description
+- *	2013-04-10         Li Xianzhong      0.1            Created
+-*/
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/stat.h>
+@@ -23,11 +21,10 @@
+ #include <unistd.h>
+ #include <sys/types.h>
+ #include <ui/FramebufferNativeWindow.h>
+-#include <hardware/gralloc.h>
+-
+ #include <utils/Log.h>
+ #include <gui/Surface.h>
+ #include <gui/SurfaceComposerClient.h>
++#include "gralloc_priv.h"
+ 
+ #ifndef LOGE
+ #define LOGE ALOGE
+@@ -35,86 +32,15 @@
+ 
+ extern "C" {
+ #include "vpu_test.h"
+-    extern int vpu_v4l_performance_test;
+     struct vpu_display *android_display_open(struct decode *dec, int nframes, struct rot rotation, Rect cropRect);
++    int android_get_buf(struct decode *dec);
+     int android_put_data(struct vpu_display *disp, int index, int field, int fps);
+     void android_display_close(struct vpu_display *disp);
+ }
+-
+-struct private_handle_t {
+-
+-    native_handle_t nativeHandle;
+-
+-    /* file-descriptors */
+-    int     fd;
+-    /* ints */
+-    int     magic;
+-    int     flags;
+-    int     size;
+-    int     offset;
+-
+-    int     base;
+-
+-    int     phys;
+-    int     width;
+-    int     height;
+-    int     format;
+-
+-    int     pid;
+-};
+-
+-static __inline int queue_size(struct buf_queue * q)
+-{
+-    if (q->tail >= q->head)
+-        return (q->tail - q->head);
+-    else
+-        return ((q->tail + QUEUE_SIZE) - q->head);
+-}
+-
+-static __inline int queue_buf(struct buf_queue * q, int idx)
+-{
+-    if (((q->tail + 1) % QUEUE_SIZE) == q->head)
+-        return -1;      /* queue full */
+-    q->list[q->tail] = idx;
+-    q->tail = (q->tail + 1) % QUEUE_SIZE;
+-    return 0;
+-}
+-
+-static __inline int dequeue_buf(struct buf_queue * q)
+-{
+-    int ret;
+-    if (q->tail == q->head)
+-         return -1;      /* queue empty */
+-    ret = q->list[q->head];
+-    q->head = (q->head + 1) % QUEUE_SIZE;
+-    return ret;
+-}
+-
+-static __inline int peek_next_buf(struct buf_queue * q)
+-{
+-    if (q->tail == q->head)
+-        return -1;      /* queue empty */
+-    return q->list[q->head];
+-}
+-
+ extern int quitflag;
+ static int g2d_waiting = 0;
+ static int g2d_running = 0;
+-static pthread_cond_t g2d_cond;
+ static pthread_mutex_t g2d_mutex;
+-static inline void wait_queue()
+-{
+-    pthread_mutex_lock(&g2d_mutex);
+-    g2d_waiting = 1;
+-    pthread_cond_wait(&g2d_cond, &g2d_mutex);
+-    g2d_waiting = 0;
+-    pthread_mutex_unlock(&g2d_mutex);
+-}
+-
+-static inline void wakeup_queue()
+-{
+-    pthread_cond_signal(&g2d_cond);
+-}
+ 
+ struct android_display_context {
+     android::sp<android::SurfaceComposerClient> g2d_client;
+@@ -137,6 +63,7 @@ void *android_disp_loop_thread(void *arg)
+     struct decode *dec = (struct decode *)arg;
+     DecHandle handle = dec->handle;
+     struct vpu_display *disp = dec->disp;
++    struct g2d_specific_data *g2d_rsd = (struct g2d_specific_data *)disp->render_specific_data;
+     int width = dec->picwidth;
+     int height = dec->picheight;
+     int left = dec->picCropRect.left;
+@@ -157,7 +84,8 @@ void *android_disp_loop_thread(void *arg)
+     }
+     else
+     {
+-         if(dec->cmdl->rot_en && (dec->cmdl->rot_angle == 90 || dec->cmdl->rot_angle == 270))
++         if((dec->cmdl->ext_rot_en || dec->cmdl->rot_en)
++			 && (dec->cmdl->rot_angle == 90 || dec->cmdl->rot_angle == 270))
+          {
+             int temp    = disp_width;
+             disp_width  = disp_height;
+@@ -167,6 +95,15 @@ void *android_disp_loop_thread(void *arg)
+          native_win = android_get_display_surface(&dispctx, disp_left, disp_top, disp_width, disp_height);
+     }
+ 
++    if (dec->cmdl->rot_en) {
++	    if (dec->cmdl->rot_angle == 90 || dec->cmdl->rot_angle == 270) {
++		    int temp = width;
++		    width = height;
++		    height = temp;
++	    }
++	    dprintf(3, "VPU rot: width = %d; height = %d\n", width, height);
++    }
++
+     if (native_win == NULL) {
+         err_msg("failed to create display surface window \n");
+         return NULL;
+@@ -201,7 +138,7 @@ void *android_disp_loop_thread(void *arg)
+ 
+         if(quitflag) break;
+ 
+-        index = dequeue_buf(&(disp->g2d_buf_q));
++        index = dequeue_buf(&(disp->display_q));
+         if (index < 0) {
+             info_msg("thread is going to finish\n");
+             break;
+@@ -223,14 +160,14 @@ void *android_disp_loop_thread(void *arg)
+ 
+         if (dec->cmdl->chromaInterleave == 0) {
+             src.format = G2D_I420;
+-            src.planes[0] = disp->g2d_bufs[index]->buf_paddr;
+-            src.planes[1] = disp->g2d_bufs[index]->buf_paddr + width * height;
++            src.planes[0] = g2d_rsd->g2d_bufs[index]->buf_paddr;
++            src.planes[1] = g2d_rsd->g2d_bufs[index]->buf_paddr + width * height;
+             src.planes[2] = src.planes[1] + width * height / 4;
+         }
+         else {
+             src.format = G2D_NV12;
+-            src.planes[0] = disp->g2d_bufs[index]->buf_paddr;
+-            src.planes[1] = disp->g2d_bufs[index]->buf_paddr + width * height;
++            src.planes[0] = g2d_rsd->g2d_bufs[index]->buf_paddr;
++            src.planes[1] = g2d_rsd->g2d_bufs[index]->buf_paddr + width * height;
+             src.planes[2] = 0;
+         }
+         src.left = 0;
+@@ -238,6 +175,8 @@ void *android_disp_loop_thread(void *arg)
+         src.right = width;
+         src.bottom = height;
+         src.stride = width;
++        src.width = width;
++        src.height = height;
+         src.rot    = G2D_ROTATION_0;
+ 
+         switch(disp_format)
+@@ -262,8 +201,11 @@ void *android_disp_loop_thread(void *arg)
+         dst.right = disp_width;
+         dst.bottom = disp_height;
+         dst.stride = native_buf->width;
++        dst.width = disp_width;
++        dst.height = disp_height;
+         dst.rot    = G2D_ROTATION_0;
+-        if(dec->cmdl->rot_en)
++
++        if(dec->cmdl->ext_rot_en)
+         {
+          switch(dec->cmdl->rot_angle)
+          {
+@@ -296,15 +238,12 @@ void *android_disp_loop_thread(void *arg)
+ 
+         if(quitflag == 0)
+         {
+-            /* Clear the flag after showing */
+-            err = vpu_DecClrDispFlag(dec->handle, index);
+-            if (err) {
+-                err_msg("vpu_DecClrDispFlag failed Error code %d\n", err);
+-                quitflag = 1;
+-                break;
+-            }
++	    queue_buf(&(disp->released_q), index);
++	    pthread_mutex_lock(&g2d_mutex);
++	    disp->dequeued_count++;
++	    pthread_mutex_unlock(&g2d_mutex);
++	    sem_post(&disp->avaiable_decoding_frame);
+         }
+-        sem_post(&disp->avaiable_decoding_frame);
+     }
+ 
+     g2d_close(g2d_handle);
+@@ -320,44 +259,67 @@ android_display_open(struct decode *dec, int nframes, struct rot rotation, Rect
+     int width = dec->picwidth;
+     int height = dec->picheight;
+     struct vpu_display *disp = NULL;
+-
+-    vpu_v4l_performance_test = 1;
++    struct g2d_specific_data *g2d_rsd;
+ 
+     disp = (struct vpu_display *)calloc(1, sizeof(struct vpu_display));
+     if (disp == NULL) {
+-        err_msg("falied to allocate vpu_display\n");
++        err_msg("failed to allocate vpu_display\n");
+         return NULL;
+     }
+ 
++    g2d_rsd = (struct g2d_specific_data *) calloc(1, sizeof(struct g2d_specific_data));
++    if (g2d_rsd == NULL) {
++        err_msg("failed to allocate g2d_specific_data\n");
++        return NULL;
++    }
++    disp->render_specific_data = (void *)g2d_rsd;
++
+     disp->nframes = nframes;
+     disp->frame_size = width*height*3/2;
+ 
+     for (i=0;i<nframes;i++) {
+-        disp->g2d_bufs[i] = g2d_alloc(disp->frame_size, 0);
+-        if (disp->g2d_bufs[i] == NULL) {
++        g2d_rsd->g2d_bufs[i] = g2d_alloc(disp->frame_size, 0);
++        if (g2d_rsd->g2d_bufs[i] == NULL) {
+             err_msg("g2d memory alloc failed\n");
+             free(disp);
+             return NULL;
+         }
+     }
+ 
+-    disp->g2d_buf_q.tail = disp->g2d_buf_q.head = 0;
++    disp->display_q.tail = disp->display_q.head = 0;
++    disp->released_q.tail = disp->released_q.head = 0;
+     disp->stopping = 0;
+ 
+     dec->disp = disp;
+     pthread_mutex_init(&g2d_mutex, NULL);
+-    pthread_cond_init(&g2d_cond, NULL);
+     sem_init(&disp->avaiable_decoding_frame, 0,
+ 			    dec->regfbcount - dec->minfbcount);
+     sem_init(&disp->avaiable_dequeue_frame, 0, 0);
+ 
+  //   info_msg("%s %d, sem_init avaiable_decoding_frame count %d  \n", __FUNCTION__, __LINE__, dec->regfbcount - dec->minfbcount);
+     /* start disp loop thread */
+-    pthread_create(&(disp->g2d_disp_loop_thread), NULL, android_disp_loop_thread, (void *)dec);
++    pthread_create(&(disp->disp_loop_thread), NULL, android_disp_loop_thread, (void *)dec);
+ 
+     return disp;
+ }
+ 
++int android_get_buf(struct decode *dec)
++{
++	int index = -1;
++	struct vpu_display *disp;
++
++	disp = dec->disp;
++
++	while((sem_trywait(&disp->avaiable_decoding_frame) != 0) && !quitflag) usleep(1000);
++	if (disp->dequeued_count > 0) {
++		index = dequeue_buf(&(disp->released_q));
++		pthread_mutex_lock(&g2d_mutex);
++		disp->dequeued_count--;
++		pthread_mutex_unlock(&g2d_mutex);
++	}
++	return index;
++}
++
+ int android_put_data(struct vpu_display *disp, int index, int field, int fps)
+ {
+     if (field == V4L2_FIELD_TOP || field == V4L2_FIELD_BOTTOM ||
+@@ -366,32 +328,29 @@ int android_put_data(struct vpu_display *disp, int index, int field, int fps)
+         disp->deinterlaced = 1;
+     }
+ 
+-    queue_buf(&(disp->g2d_buf_q), index);
++    queue_buf(&(disp->display_q), index);
+     sem_post(&disp->avaiable_dequeue_frame);
+ 
+-    while(sem_trywait(&disp->avaiable_decoding_frame) != 0) usleep(1000);
+-
+     return 0;
+ }
+ 
+ void android_display_close(struct vpu_display *disp)
+ {
+     int i, err=0;
++    struct g2d_specific_data *g2d_rsd = (struct g2d_specific_data *)disp->render_specific_data;
+ 
+     quitflag = 1;
+     disp->stopping = 1;
+     disp->deinterlaced = 0;
+-    while(g2d_running && ((queue_size(&(disp->g2d_buf_q)) > 0) || !g2d_waiting)) usleep(10000);
++    while(g2d_running && ((queue_size(&(disp->display_q)) > 0) || !g2d_waiting)) usleep(10000);
+     if (g2d_running) {
+-	wakeup_queue();
+ 	info_msg("Join disp loop thread\n");
+-        pthread_join(disp->g2d_disp_loop_thread, NULL);
++        pthread_join(disp->disp_loop_thread, NULL);
+     }
+     pthread_mutex_destroy(&g2d_mutex);
+-    pthread_cond_destroy(&g2d_cond);
+ 
+     for (i=0;i<disp->nframes;i++) {
+-        err = g2d_free(disp->g2d_bufs[i]);
++        err = g2d_free(g2d_rsd->g2d_bufs[i]);
+         if (err != 0) {
+             err_msg("%s: g2d memory free failed\n", __FUNCTION__);
+             free(disp);
+@@ -399,6 +358,7 @@ void android_display_close(struct vpu_display *disp)
+         }
+     }
+ 
++    free(g2d_rsd);
+     free(disp);
+     return;
+ }
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 12a1bae..00b38cf 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -971,11 +971,7 @@ decoder_start(struct decode *dec)
+ 	int tiled2LinearEnable = dec->tiled2LinearEnable;
+ 	char *delay_ms, *endptr;
+ 	int mjpgReadChunk = 0;
+-	int index;
+-
+-	if (((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU))
+-			&& (dec->cmdl->ipu_rot_en))
+-		rot_en = 0;
++	int index = -1;
+ 
+ 	/* deblock_en is zero on none mx27 since it is cleared in decode_open() function. */
+ 	if (rot_en || dering_en || tiled2LinearEnable) {
+@@ -1479,7 +1475,11 @@ decoder_start(struct decode *dec)
+ 		else
+ 			actual_display_index = outinfo.indexFrameDisplay;
+ 
+-		if ((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU)) {
++		if ((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU)
++#ifdef BUILD_FOR_ANDROID
++				|| (dec->cmdl->dst_scheme == PATH_G2D)
++#endif
++		   ) {
+ 			v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
+ 			if (deblock_en) {
+ 				deblock_fb->bufY =
+@@ -1490,43 +1490,51 @@ decoder_start(struct decode *dec)
+ 			}
+ 
+ 			if (!cpu_is_mx27())
+-#ifdef BUILD_FOR_ANDROID
+-				err = android_put_data(disp, actual_display_index, dec->decoded_field[actual_display_index], dec->cmdl->fps);
+-#else
++			{
+ 				if (dec->cmdl->dst_scheme == PATH_V4L2)
+ 					err = v4l_put_data(dec, actual_display_index, dec->decoded_field[actual_display_index], dec->cmdl->fps);
+-				else
++				else if (dec->cmdl->dst_scheme == PATH_IPU)
+ 					err = ipu_put_data(disp, actual_display_index, dec->decoded_field[actual_display_index], dec->cmdl->fps);
+-#endif
+-			else
+ #ifdef BUILD_FOR_ANDROID
+-				err = android_put_data(disp, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
+-#else
++				else if (dec->cmdl->dst_scheme == PATH_G2D)
++					err = android_put_data(disp, actual_display_index, dec->decoded_field[actual_display_index], dec->cmdl->fps);
++#endif
++			}
++			else {
+ 				if (dec->cmdl->dst_scheme == PATH_V4L2)
+ 					err = v4l_put_data(dec, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
+-				else
++				else if (dec->cmdl->dst_scheme == PATH_IPU)
+ 					err = ipu_put_data(disp, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
++#ifdef BUILD_FOR_ANDROID
++				else if (dec->cmdl->dst_scheme == PATH_G2D)
++					err = android_put_data(disp, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
+ #endif
++			}
+ 
+ 			if (err)
+ 				return -1;
+ 
+-			if (dec->cmdl->dst_scheme == PATH_V4L2) {
+-				if (!vpu_v4l_performance_test) {
+-					if (dec->cmdl->format != STD_MJPG && disp_clr_index >= 0) {
+-						err = vpu_DecClrDispFlag(handle, disp_clr_index);
+-						if (err)
+-							err_msg("vpu_DecClrDispFlag failed Error code"
++			if (dec->cmdl->dst_scheme == PATH_V4L2
++#ifdef BUILD_FOR_ANDROID
++					|| dec->cmdl->dst_scheme == PATH_G2D
++#endif
++			   ) {
++				if (dec->cmdl->dst_scheme == PATH_V4L2) {
++					if (!vpu_v4l_performance_test)
++						index = v4l_rsd->buf.index;
++					else
++						index = v4l_get_buf(dec);
++				}
++#ifdef BUILD_FOR_ANDROID
++				else if (dec->cmdl->dst_scheme == PATH_G2D)
++					index = android_get_buf(dec);
++#endif
++
++				if (dec->cmdl->format != STD_MJPG && disp_clr_index >= 0) {
++					err = vpu_DecClrDispFlag(handle, disp_clr_index);
++					if (err)
++						err_msg("vpu_DecClrDispFlag failed Error code"
+ 								" %d\n", err);
+-					}
+-				} else {
+-					index = v4l_get_buf(dec);
+-					if (index >= 0) {
+-						err = vpu_DecClrDispFlag(handle, index);
+-						if (err)
+-							err_msg("vpu_DecClrDispFlag failed Error code"
+-									" %d\n", err);
+-					}
+ 				}
+ 
+ 				if (dec->cmdl->format == STD_MJPG) {
+@@ -1534,16 +1542,15 @@ decoder_start(struct decode *dec)
+ 					rotid %= dec->regfbcount;
+ 				} else if (rot_en || dering_en || tiled2LinearEnable) {
+ 					disp_clr_index = outinfo.indexFrameDisplay;
+-					if (v4l_rsd->buf.index != -1)
+-						rotid = v4l_rsd->buf.index; /* de-queued buffer as next rotation buffer */
++					if (index != -1)
++						rotid = index; /* de-queued buffer as next rotation buffer */
+ 					else {
+ 						rotid++;
+ 						rotid = (rotid - dec->regfbcount) % dec->extrafb;
+ 						rotid += dec->regfbcount;
+ 					}
+-				}
+-				else
+-					disp_clr_index = v4l_rsd->buf.index;
++				} else
++					disp_clr_index = index;
+ 			}
+ 		} else {
+ 			if (rot_en) {
+@@ -1616,15 +1623,19 @@ decoder_free_framebuffer(struct decode *dec)
+ 
+ 	totalfb = dec->regfbcount + dec->extrafb;
+ 
+-	if ((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU)) {
+-		if (dec->disp) {
++	if ((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU)
+ #ifdef BUILD_FOR_ANDROID
+-			android_display_close(dec->disp);
+-#else
++			|| (dec->cmdl->dst_scheme == PATH_G2D)
++#endif
++	   ) {
++		if (dec->disp) {
+ 			if (dec->cmdl->dst_scheme == PATH_V4L2)
+ 				v4l_display_close(dec->disp);
+-			else
++			else if (dec->cmdl->dst_scheme == PATH_IPU)
+ 				ipu_display_close(dec->disp);
++#ifdef BUILD_FOR_ANDROID
++			else if (dec->cmdl->dst_scheme == PATH_G2D)
++				android_display_close(dec->disp);
+ #endif
+ 			dec->disp = NULL;
+ 		}
+@@ -1719,16 +1730,15 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	FrameBuffer *fb;
+ 	struct frame_buf **pfbpool;
+ 	struct vpu_display *disp = NULL;
+-	struct v4l_specific_data *v4l_rsd;
++	struct v4l_specific_data *v4l_rsd = NULL;
++#ifdef BUILD_FOR_ANDROID
++	struct g2d_specific_data *g2d_rsd = NULL;
++#endif
+ 	int stride, divX, divY;
+ 	vpu_mem_desc *mvcol_md = NULL;
+ 	Rect rotCrop;
+ 	int delay = -1;
+ 
+-	if (((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU))
+-			&& (dec->cmdl->ipu_rot_en))
+-		rot_en = 0;
+-
+ 	if (rot_en || dering_en || tiled2LinearEnable) {
+ 		/*
+ 		 * At least 1 extra fb for rotation(or dering) is needed, two extrafb
+@@ -1737,6 +1747,11 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 		 */
+ 		dec->rot_buf_count = ((dec->cmdl->dst_scheme == PATH_V4L2) ||
+ 				(dec->cmdl->dst_scheme == PATH_IPU)) ? 2 : 1;
++		/*
++		 * Need more buffers for V4L2 performance mode
++		 * otherwise, buffer will be queued twice
++		 */
++		dec->rot_buf_count = dec->regfbcount - dec->minfbcount + 1;
+ 		dec->extrafb += dec->rot_buf_count;
+ 		dec->post_processing = 1;
+ 	}
+@@ -1816,32 +1831,36 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 		}
+ 	}
+ 
+-	if ((dst_scheme == PATH_V4L2) || (dst_scheme == PATH_IPU)) {
++	if ((dst_scheme == PATH_V4L2) || (dst_scheme == PATH_IPU)
++#ifdef BUILD_FOR_ANDROID
++			|| (dst_scheme == PATH_G2D)
++#endif
++	   ) {
+ 		rotation.rot_en = dec->cmdl->rot_en;
+ 		rotation.rot_angle = dec->cmdl->rot_angle;
+ 
+-		if (dec->cmdl->ipu_rot_en) {
++		if (dec->cmdl->ext_rot_en) {
+ 			rotation.rot_en = 0;
+-			rotation.ipu_rot_en = 1;
++			rotation.ext_rot_en = 1;
+ 		}
+ 		if (rotation.rot_en) {
+ 			swapCropRect(dec, &rotCrop);
+-#ifdef BUILD_FOR_ANDROID
+-			disp = android_display_open(dec, totalfb, rotation, rotCrop);
+-#else
+ 			if (dst_scheme == PATH_V4L2)
+ 				disp = v4l_display_open(dec, totalfb, rotation, rotCrop);
+-			else
++			else if (dst_scheme == PATH_IPU)
+ 				disp = ipu_display_open(dec, totalfb, rotation, rotCrop);
++#ifdef BUILD_FOR_ANDROID
++			else if (dst_scheme == PATH_G2D)
++				disp = android_display_open(dec, totalfb, rotation, rotCrop);
+ #endif
+ 		} else
+-#ifdef BUILD_FOR_ANDROID
+-			disp = android_display_open(dec, totalfb, rotation, dec->picCropRect);
+-#else
+ 			if (dst_scheme == PATH_V4L2)
+ 				disp = v4l_display_open(dec, totalfb, rotation, dec->picCropRect);
+-			else
++			else if (dst_scheme == PATH_IPU)
+ 				disp = ipu_display_open(dec, totalfb, rotation, dec->picCropRect);
++#ifdef BUILD_FOR_ANDROID
++			else if (dst_scheme == PATH_G2D)
++				disp = android_display_open(dec, totalfb, rotation, dec->picCropRect);
+ #endif
+ 
+ 		if (disp == NULL) {
+@@ -1850,13 +1869,18 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 
+ #ifndef _FSL_VTS_
+ 		/* Not set fps when doing performance test default */
+-		if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test)
++		if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test && (dst_scheme == PATH_V4L2))
+ 			dec->cmdl->fps = 30;
+ #endif
+ 
+ 		info_msg("Display fps will be %d\n", dec->cmdl->fps);
+ 
+-		v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
++		if (dst_scheme == PATH_V4L2)
++			v4l_rsd = (struct v4l_specific_data *)disp->render_specific_data;
++#ifdef BUILD_FOR_ANDROID
++		else if (dst_scheme == PATH_G2D)
++			g2d_rsd = (struct g2d_specific_data *)disp->render_specific_data;
++#endif
+ 
+ 		divX = (dec->mjpg_fmt == MODE420 || dec->mjpg_fmt == MODE422) ? 2 : 1;
+ 		divY = (dec->mjpg_fmt == MODE420 || dec->mjpg_fmt == MODE224) ? 2 : 1;
+@@ -1873,32 +1897,33 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 				fb[i].myIndex = i;
+ 
+ 				if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
+-#ifdef BUILD_FOR_ANDROID
+-					fb[i].bufY = disp->g2d_bufs[i]->buf_paddr;
+-#else
+ 					if (dst_scheme == PATH_V4L2)
+ 						fb[i].bufY = v4l_rsd->buffers[i]->offset;
+-					else
++					else if (dst_scheme == PATH_IPU)
+ 						fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
++#ifdef BUILD_FOR_ANDROID
++					else if (dst_scheme == PATH_G2D)
++						fb[i].bufY = g2d_rsd->g2d_bufs[i]->buf_paddr;
+ #endif
+ 					fb[i].bufCb = fb[i].bufY + img_size;
+ 					fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
+ 				}
+ 				else if ((dec->cmdl->mapType == TILED_FRAME_MB_RASTER_MAP)
+ 						||(dec->cmdl->mapType == TILED_FIELD_MB_RASTER_MAP)){
+-#ifdef BUILD_FOR_ANDROID
+-					fb[i].bufY = disp->g2d_bufs[i]->buf_paddr;
+-					fb[i].bufCb = fb[i].bufY + img_size;
+-					fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
+-#else
+ 					if (dst_scheme == PATH_V4L2)
+ 						tiled_framebuf_base(&fb[i], v4l_rsd->buffers[i]->offset,
+ 							dec->stride, dec->picheight, dec->cmdl->mapType);
+-					else {
++					else if (dst_scheme == PATH_IPU) {
+ 						fb[i].bufY = disp->ipu_bufs[i].ipu_paddr;
+ 						fb[i].bufCb = fb[i].bufY + img_size;
+ 						fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
+ 					}
++#ifdef BUILD_FOR_ANDROID
++					else if (dst_scheme == PATH_G2D) {
++						fb[i].bufY = g2d_rsd->g2d_bufs[i]->buf_paddr;
++						fb[i].bufCb = fb[i].bufY + img_size;
++						fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
++					}
+ #endif
+ 				} else {
+ 					err_msg("undefined mapType = %d\n", dec->cmdl->mapType);
+@@ -1953,10 +1978,6 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	return 0;
+ 
+ err1:
+-#ifdef BUILD_FOR_ANDROID
+-	android_display_close(disp);
+-	dec->disp = NULL;
+-#else
+ 	if (dst_scheme == PATH_V4L2) {
+ 		v4l_display_close(disp);
+ 		dec->disp = NULL;
+@@ -1964,6 +1985,11 @@ err1:
+ 		ipu_display_close(disp);
+ 		dec->disp = NULL;
+ 	}
++#ifdef BUILD_FOR_ANDROID
++	else if (dst_scheme == PATH_G2D) {
++		android_display_close(disp);
++		dec->disp = NULL;
++	}
+ #endif
+ err:
+ 	if (((dst_scheme != PATH_V4L2) && (dst_scheme != PATH_IPU))||
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 1362272..6b72404 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -38,40 +38,6 @@
+ #define V4L2_MXC_ROTATE_90_RIGHT_HFLIP          6
+ #define V4L2_MXC_ROTATE_90_LEFT                 7
+ 
+-static __inline int queue_size(struct buf_queue * q)
+-{
+-        if (q->tail >= q->head)
+-                return (q->tail - q->head);
+-        else
+-                return ((q->tail + QUEUE_SIZE) - q->head);
+-}
+-
+-static __inline int queue_buf(struct buf_queue * q, int idx)
+-{
+-        if (((q->tail + 1) % QUEUE_SIZE) == q->head)
+-                return -1;      /* queue full */
+-        q->list[q->tail] = idx;
+-        q->tail = (q->tail + 1) % QUEUE_SIZE;
+-        return 0;
+-}
+-
+-static __inline int dequeue_buf(struct buf_queue * q)
+-{
+-        int ret;
+-        if (q->tail == q->head)
+-                return -1;      /* queue empty */
+-        ret = q->list[q->head];
+-        q->head = (q->head + 1) % QUEUE_SIZE;
+-        return ret;
+-}
+-
+-static __inline int peek_next_buf(struct buf_queue * q)
+-{
+-        if (q->tail == q->head)
+-                return -1;      /* queue empty */
+-        return q->list[q->head];
+-}
+-
+ int ipu_memory_alloc(int size, int cnt, dma_addr_t paddr[], void * vaddr[], int fd_fb_alloc)
+ {
+ 	int i, ret = 0;
+@@ -381,7 +347,7 @@ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	disp->output.width = disp_width;
+ 	disp->output.height = disp_height;
+ 	disp->output.fmt = V4L2_PIX_FMT_UYVY;
+-	if (rotation.ipu_rot_en && (rotation.rot_angle != 0)) {
++	if (rotation.ext_rot_en && (rotation.rot_angle != 0)) {
+ 		if (rotation.rot_angle == 90)
+ 			disp->output.rot = IPU_ROTATE_90_RIGHT;
+ 		else if (rotation.rot_angle == 180)
+@@ -544,8 +510,8 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		}
+ 		close(fd_fb);
+ 	}
+-	dprintf(3, "rot_en:%d; rot_angle:%d; ipu_rot_en:%d\n", rotation.rot_en,
+-			rotation.rot_angle, rotation.ipu_rot_en);
++	dprintf(3, "rot_en:%d; rot_angle:%d; ext_rot_en:%d\n", rotation.rot_en,
++			rotation.rot_angle, rotation.ext_rot_en);
+ 
+ 	tv_mode = getenv("VPU_TV_MODE");
+ 
+@@ -626,7 +592,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		cropcap.bounds.width, cropcap.bounds.height,
+ 		cropcap.defrect.width, cropcap.defrect.height);
+ 
+-	if (rotation.ipu_rot_en == 0) {
++	if (rotation.ext_rot_en == 0) {
+ 		ratio = calculate_ratio(width, height, cropcap.bounds.width,
+ 				cropcap.bounds.height);
+ 		dprintf(3, "VPU rot: ratio = %d\n", ratio);
+@@ -683,7 +649,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		struct v4l2_control ctrl;
+ 
+ 		ctrl.id = V4L2_CID_ROTATE;
+-		if (rotation.ipu_rot_en)
++		if (rotation.ext_rot_en)
+ 			ctrl.value = rotation.rot_angle;
+ 		else
+ 			ctrl.value = 0;
+@@ -692,7 +658,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 			err_msg("VIDIOC_S_CTRL failed\n");
+ 			goto err;
+ 		}
+-	} else if (rotation.ipu_rot_en && (rotation.rot_angle != 0)) {
++	} else if (rotation.ext_rot_en && (rotation.rot_angle != 0)) {
+ 		/* Set rotation via V4L2 i/f */
+ 		struct v4l2_control ctrl;
+ 		ctrl.id = V4L2_CID_PRIVATE_BASE;
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index c3017ef..e727588 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -40,6 +40,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	If no output is specified, default is LCD \n "\
+ 	       "  -x <output method> output mode V4l2(0) or IPU lib(1) \n "\
+ 	       "        0 - V4L2 of FG device, 1 - IPU lib path \n "\
++	       "        2 - G2D (available for Android only) \n "\
+ 	       "        Other value means V4L2 with other video node\n "\
+ 	       "        16 - /dev/video16, 17 - /dev/video17, and so on \n "\
+ 	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, \n "\
+@@ -62,7 +63,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	default rotation is disabled (0) \n "\
+ 	       "  -m <mirror direction> 0, 1, 2, 3 \n "\
+ 	       "	default no mirroring (0) \n "\
+-	       "  -u <ipu rotation> Using IPU rotation for display - 1. IPU rotation \n "\
++	       "  -u <ipu/gpu rotation> Using IPU/GPU rotation for display - 1. IPU/GPU rotation \n "\
+ 	       "        default is VPU rotation(0).\n "\
+ 	       "        This flag is effective when 'r' flag is specified.\n "\
+ 	       "  -v <vdi motion> set IPU VDI motion algorithm l, m, h.\n "\
+@@ -343,6 +344,13 @@ parse_args(int argc, char *argv[], int i)
+ 				if (val == 1) {
+ 					input_arg[i].cmd.dst_scheme = PATH_IPU;
+ 					info_msg("Display through IPU LIB\n");
++					if (cpu_is_mx6x())
++						warn_msg("IPU lib is OBSOLETE, please try other renderer\n");
++#ifdef BUILD_FOR_ANDROID
++				} else if (val == 2) {
++					input_arg[i].cmd.dst_scheme = PATH_G2D;
++					info_msg("Display through G2D\n");
++#endif
+ 				} else {
+ 					input_arg[i].cmd.dst_scheme = PATH_V4L2;
+ 					info_msg("Display through V4L2\n");
+@@ -373,9 +381,9 @@ parse_args(int argc, char *argv[], int i)
+ 				input_arg[i].cmd.rot_en = 1;
+ 			break;
+ 		case 'u':
+-			input_arg[i].cmd.ipu_rot_en = atoi(optarg);
+-			/* ipu rotation will override vpu rotation */
+-			if (input_arg[i].cmd.ipu_rot_en)
++			input_arg[i].cmd.ext_rot_en = atoi(optarg);
++			/* ipu/gpu rotation will override vpu rotation */
++			if (input_arg[i].cmd.ext_rot_en)
+ 				input_arg[i].cmd.rot_en = 0;
+ 			break;
+ 		case 'f':
+diff --git a/test/mxc_vpu_test/transcode.c b/test/mxc_vpu_test/transcode.c
+index 5413aef..55d9354 100644
+--- a/test/mxc_vpu_test/transcode.c
++++ b/test/mxc_vpu_test/transcode.c
+@@ -624,9 +624,6 @@ transcode_start(struct decode *dec, struct encode *enc)
+ 		return -1;
+ 	}
+ 
+-	if ((dec->cmdl->dst_scheme == PATH_V4L2) && (dec->cmdl->ipu_rot_en))
+-		rot_en = 0;
+-
+ 	if (rot_en || dering_en || tiled2LinearEnable) {
+ 		rotid = dec->regfbcount;
+ 	}
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index a59cf44..d9ed06a 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -732,14 +732,14 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode)
+ 		return 0;
+ 	}
+ 
+-	str = strstr(buf, "ipu_rot");
++	str = strstr(buf, "ext_rot");
+ 	if (str != NULL) {
+ 		str = index(buf, '=');
+ 		if (str != NULL) {
+ 			str++;
+ 			if (*str != '\0') {
+-				cmd->ipu_rot_en = strtol(str, NULL, 10);
+-				if (cmd->ipu_rot_en == 1)
++				cmd->ext_rot_en = strtol(str, NULL, 10);
++				if (cmd->ext_rot_en == 1)
+ 					cmd->rot_en = 0;
+ 			}
+ 		}
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 123bca5..da23be7 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -79,6 +79,9 @@ typedef char s8;
+ #define PATH_FILE	1
+ #define PATH_NET	2
+ #define PATH_IPU	3
++#ifdef BUILD_FOR_ANDROID
++#define PATH_G2D	4
++#endif
+ 
+ /* Test operations */
+ #define ENCODE		1
+@@ -123,6 +126,12 @@ struct v4l_specific_data {
+ 	struct v4l_buf *buffers[MAX_BUF_NUM];
+ };
+ 
++#ifdef BUILD_FOR_ANDROID
++struct g2d_specific_data {
++	struct g2d_buf *g2d_bufs[MAX_BUF_NUM];
++};
++#endif
++
+ struct buf_queue {
+ 	int list[MAX_BUF_NUM + 1];
+ 	int head;
+@@ -163,12 +172,6 @@ struct vpu_display {
+ 	pthread_t ipu_disp_loop_thread;
+ 	struct buf_queue ipu_q;
+ 	struct ipu_buf ipu_bufs[MAX_BUF_NUM];
+-
+-#ifdef BUILD_FOR_ANDROID
+-	struct buf_queue g2d_buf_q;
+-	struct g2d_buf *g2d_bufs[MAX_BUF_NUM];
+-	pthread_t g2d_disp_loop_thread;
+-#endif
+ };
+ 
+ struct capture_testbuffer {
+@@ -178,7 +181,7 @@ struct capture_testbuffer {
+ 
+ struct rot {
+ 	int rot_en;
+-	int ipu_rot_en;
++	int ext_rot_en;
+ 	int rot_angle;
+ };
+ 
+@@ -201,8 +204,8 @@ struct cmd_line {
+ 	int format;
+ 	int deblock_en;
+ 	int dering_en;
+-	int rot_en;
+-	int ipu_rot_en;
++	int rot_en; /* Use VPU to do rotation */
++	int ext_rot_en; /* Use IPU/GPU to do rotation */
+ 	int rot_angle;
+ 	int mirror;
+ 	int chromaInterleave;
+@@ -338,6 +341,7 @@ int ipu_put_data(struct vpu_display *disp, int index, int field, int fps);
+ struct vpu_display *
+ android_display_open(struct decode *dec, int nframes, struct rot rotation, Rect cropRect);
+ void android_display_close(struct vpu_display *disp);
++int android_get_buf(struct decode *dec);
+ int android_put_data(struct vpu_display *disp, int index, int field, int fps);
+ #endif
+ 
+@@ -370,4 +374,39 @@ static inline int is_mx6x_mjpg(int fmt)
+         else
+                 return false;
+ }
++
++static __inline int queue_size(struct buf_queue * q)
++{
++        if (q->tail >= q->head)
++                return (q->tail - q->head);
++        else
++                return ((q->tail + QUEUE_SIZE) - q->head);
++}
++
++static __inline int queue_buf(struct buf_queue * q, int idx)
++{
++        if (((q->tail + 1) % QUEUE_SIZE) == q->head)
++                return -1;      /* queue full */
++        q->list[q->tail] = idx;
++        q->tail = (q->tail + 1) % QUEUE_SIZE;
++        return 0;
++}
++
++static __inline int dequeue_buf(struct buf_queue * q)
++{
++        int ret;
++        if (q->tail == q->head)
++                return -1;      /* queue empty */
++        ret = q->list[q->head];
++        q->head = (q->head + 1) % QUEUE_SIZE;
++        return ret;
++}
++
++static __inline int peek_next_buf(struct buf_queue * q)
++{
++        if (q->tail == q->head)
++                return -1;      /* queue empty */
++        return q->list[q->head];
++}
++
+ #endif
+-- 
+1.8.0
+

@@ -1,0 +1,200 @@
+From 1165bdc95cdaa420c78eae298ff181fe312a6825 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Thu, 13 Dec 2012 17:59:56 +0800
+Subject: [PATCH 01/10] ENGR00236857: revert libion back to jb4.1.x version
+
+The libion in JB4.2 has updated to use 3.4 kernel driver.
+But in our kernel 3.0.35, the DMA_SHARED_BUFFER
+feature is not supported, so new ion cannot be used.
+
+Change-Id: Ib2cad9712f435bacdcdc213d72e7efd02e084140
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ include/ion/ion.h |  8 +++-----
+ libion/ion.c      | 41 +++++++++++++++++------------------------
+ libion/ion_test.c | 24 ++++++++++++++----------
+ 3 files changed, 34 insertions(+), 39 deletions(-)
+
+diff --git a/include/ion/ion.h b/include/ion/ion.h
+index 018c0a1..ee40eb4 100644
+--- a/include/ion/ion.h
++++ b/include/ion/ion.h
+@@ -27,16 +27,14 @@ __BEGIN_DECLS
+ 
+ int ion_open();
+ int ion_close(int fd);
+-int ion_alloc(int fd, size_t len, size_t align, unsigned int heap_mask,
+-	      unsigned int flags, struct ion_handle **handle);
+-int ion_alloc_fd(int fd, size_t len, size_t align, unsigned int heap_mask,
+-		 unsigned int flags, int *handle_fd);
+-int ion_sync_fd(int fd, int handle_fd);
++int ion_alloc(int fd, size_t len, size_t align, unsigned int flags,
++              struct ion_handle **handle);
+ int ion_free(int fd, struct ion_handle *handle);
+ int ion_map(int fd, struct ion_handle *handle, size_t length, int prot,
+             int flags, off_t offset, unsigned char **ptr, int *map_fd);
+ int ion_share(int fd, struct ion_handle *handle, int *share_fd);
+ int ion_import(int fd, int share_fd, struct ion_handle **handle);
++unsigned long ion_phys(int fd, struct ion_handle *handle);
+ 
+ __END_DECLS
+ 
+diff --git a/libion/ion.c b/libion/ion.c
+index 020c35b..5057886 100644
+--- a/libion/ion.c
++++ b/libion/ion.c
+@@ -4,6 +4,7 @@
+  * Memory Allocator functions for ion
+  *
+  *   Copyright 2011 Google, Inc
++ *   Copyright (C) 2012 Freescale Semiconductor, Inc.
+  *
+  *  Licensed under the Apache License, Version 2.0 (the "License");
+  *  you may not use this file except in compliance with the License.
+@@ -54,14 +55,13 @@ static int ion_ioctl(int fd, int req, void *arg)
+         return ret;
+ }
+ 
+-int ion_alloc(int fd, size_t len, size_t align, unsigned int heap_mask,
+-	      unsigned int flags, struct ion_handle **handle)
++int ion_alloc(int fd, size_t len, size_t align, unsigned int flags,
++              struct ion_handle **handle)
+ {
+         int ret;
+         struct ion_allocation_data data = {
+                 .len = len,
+                 .align = align,
+-		.heap_mask = heap_mask,
+                 .flags = flags,
+         };
+ 
+@@ -103,6 +103,20 @@ int ion_map(int fd, struct ion_handle *handle, size_t length, int prot,
+         return ret;
+ }
+ 
++unsigned long ion_phys(int fd, struct ion_handle *handle)
++{
++        int ret;
++        struct ion_phys_data data = {
++                .handle = handle,
++		.phys = 0,
++        };
++
++        ret = ion_ioctl(fd, ION_IOC_PHYS, &data);
++        if (ret == 0)
++            return data.phys;
++        return 0;
++}
++
+ int ion_share(int fd, struct ion_handle *handle, int *share_fd)
+ {
+         int map_fd;
+@@ -121,19 +135,6 @@ int ion_share(int fd, struct ion_handle *handle, int *share_fd)
+         return ret;
+ }
+ 
+-int ion_alloc_fd(int fd, size_t len, size_t align, unsigned int heap_mask,
+-		 unsigned int flags, int *handle_fd) {
+-	struct ion_handle *handle;
+-	int ret;
+-
+-	ret = ion_alloc(fd, len, align, heap_mask, flags, &handle);
+-	if (ret < 0)
+-		return ret;
+-	ret = ion_share(fd, handle, handle_fd);
+-	ion_free(fd, handle);
+-	return ret;
+-}
+-
+ int ion_import(int fd, int share_fd, struct ion_handle **handle)
+ {
+         struct ion_fd_data data = {
+@@ -146,11 +147,3 @@ int ion_import(int fd, int share_fd, struct ion_handle **handle)
+         *handle = data.handle;
+         return ret;
+ }
+-
+-int ion_sync_fd(int fd, int handle_fd)
+-{
+-    struct ion_fd_data data = {
+-        .fd = handle_fd,
+-    };
+-    return ion_ioctl(fd, ION_IOC_SYNC, &data);
+-}
+diff --git a/libion/ion_test.c b/libion/ion_test.c
+index 0caaa2a..3f2d7cc 100644
+--- a/libion/ion_test.c
++++ b/libion/ion_test.c
+@@ -19,8 +19,8 @@ size_t len = 1024*1024, align = 0;
+ int prot = PROT_READ | PROT_WRITE;
+ int map_flags = MAP_SHARED;
+ int alloc_flags = 0;
+-int heap_mask = 1;
+ int test = -1;
++size_t width = 1024*1024, height = 1024*1024;
+ size_t stride;
+ 
+ int _ion_alloc_test(int *fd, struct ion_handle **handle)
+@@ -31,7 +31,7 @@ int _ion_alloc_test(int *fd, struct ion_handle **handle)
+ 	if (*fd < 0)
+ 		return *fd;
+ 
+-	ret = ion_alloc(*fd, len, align, heap_mask, alloc_flags, handle);
++	ret = ion_alloc(*fd, len, align, alloc_flags, handle);
+ 
+ 	if (ret)
+ 		printf("%s failed: %s\n", __func__, strerror(ret));
+@@ -203,16 +203,17 @@ int main(int argc, char* argv[]) {
+ 		static struct option opts[] = {
+ 			{"alloc", no_argument, 0, 'a'},
+ 			{"alloc_flags", required_argument, 0, 'f'},
+-			{"heap_mask", required_argument, 0, 'h'},
+ 			{"map", no_argument, 0, 'm'},
+ 			{"share", no_argument, 0, 's'},
+ 			{"len", required_argument, 0, 'l'},
+ 			{"align", required_argument, 0, 'g'},
+ 			{"map_flags", required_argument, 0, 'z'},
+ 			{"prot", required_argument, 0, 'p'},
++			{"width", required_argument, 0, 'w'},
++			{"height", required_argument, 0, 'h'},
+ 		};
+ 		int i = 0;
+-		c = getopt_long(argc, argv, "af:h:l:mr:st", opts, &i);
++		c = getopt_long(argc, argv, "af:h:l:mr:stw:", opts, &i);
+ 		if (c == -1)
+ 			break;
+ 
+@@ -244,9 +245,6 @@ int main(int argc, char* argv[]) {
+ 		case 'f':
+ 			alloc_flags = atol(optarg);
+ 			break;
+-		case 'h':
+-			heap_mask = atol(optarg);
+-			break;
+ 		case 'a':
+ 			test = ALLOC_TEST;
+ 			break;
+@@ -256,11 +254,17 @@ int main(int argc, char* argv[]) {
+ 		case 's':
+ 			test = SHARE_TEST;
+ 			break;
++		case 'w':
++			width = atol(optarg);
++			break;
++		case 'h':
++			height = atol(optarg);
++			break;
+ 		}
+ 	}
+-	printf("test %d, len %u, align %u, map_flags %d, prot %d, heap_mask %d,"
+-	       " alloc_flags %d\n", test, len, align, map_flags, prot,
+-	       heap_mask, alloc_flags);
++	printf("test %d, len %u, width %u, height %u align %u, "
++		   "map_flags %d, prot %d, alloc_flags %d\n", test, len, width,
++		   height, align, map_flags, prot, alloc_flags);
+ 	switch (test) {
+ 		case ALLOC_TEST:
+ 			ion_alloc_test();
+-- 
+1.8.0
+

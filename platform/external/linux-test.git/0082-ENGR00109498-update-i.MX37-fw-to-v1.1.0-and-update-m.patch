@@ -1,0 +1,287 @@
+From 8330a0624eb2209e24449ddf9e73ed381aa0aa31 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Thu, 19 Mar 2009 15:44:47 +0800
+Subject: [PATCH 082/435] ENGR00109498 update i.MX37 fw to v1.1.0 and update
+ mv mb userdata info reporting
+
+Most bug fixed are done via FW.
+New features include framebuffer status, Mv/Mb/UserData information reporting
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/dec.c | 148 +++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 102 insertions(+), 46 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index cb801a9..f6c3299 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -25,54 +25,73 @@
+ 
+ extern int quitflag;
+ 
+-static FILE *fpFrmStatusLogfile = 0;
+-static FILE *fpMbLogfile = 0;
+-static FILE *fpMvLogfile = 0;
+-static FILE *fpUserDataLogfile = 0;
+-
+-#define FN_FRAME_BUFFER_STATUS "log_FrameBufStatus.log"
+-#define FN_MB_DATA "log_MB_Para.log"
+-#define FN_MV_DATA "log_Mv_Para.log"
+-#define FN_USER_DATA "log_User_Data.log"
+-
+-void SaveFrameBufStat(u8 *frmStatusBuf, int size) {
++static FILE *fpFrmStatusLogfile = NULL;
++static FILE *fpErrMapLogfile = NULL;
++static FILE *fpQpLogfile = NULL;
++static FILE *fpSliceBndLogfile = NULL;
++static FILE *fpMvLogfile = NULL;
++static FILE *fpUserDataLogfile = NULL;
++
++#define FN_FRAME_BUFFER_STATUS "dec_frame_buf_status.log"
++#define FN_ERR_MAP_DATA "dec_error_map.log"
++#define FN_QP_DATA "dec_qp.log"
++#define FN_SB_DATA "dec_slice_bnd.log"
++#define FN_MV_DATA "dec_mv.log"
++#define FN_USER_DATA "dec_user_data.log"
++
++void SaveFrameBufStat(u8 *frmStatusBuf, int size, int DecNum)
++{
+ 
+ 	int i;
+ 
+-	if (fpFrmStatusLogfile == 0) {
++	if (fpFrmStatusLogfile == NULL) {
+ 		fpFrmStatusLogfile = fopen(FN_FRAME_BUFFER_STATUS, "w+");
+ 	}
+ 
++	fprintf(fpFrmStatusLogfile, "FRAME [%1d]\n", DecNum);
++
+ 	for (i = 0; i < size; i++) {
+-		fprintf(fpFrmStatusLogfile, "%X %X ",
+-				((frmStatusBuf[i] >> 4) & 0x0F),
+-						(frmStatusBuf[i] & 0x0F));
++		fprintf(fpFrmStatusLogfile, "[%d] %d ", i*2, ((frmStatusBuf[i]>>4)&0x0F));
++		fprintf(fpFrmStatusLogfile, "[%d] %d ", (i*2)+1, (frmStatusBuf[i]&0x0F));
+ 	}
+ 	fprintf(fpFrmStatusLogfile, "\n");
+ 	fflush(fpFrmStatusLogfile);
+ }
+ 
+ 
+-void SaveMB_Para(u8 *mbParaBuf, int size, int mbNumX, int DecNum) {
++void SaveMB_Para(u8 *mbParaBuf, int size, int DecNum)
++{
+ 
+ 	int i;
+ 
+-	if (fpMbLogfile == 0) {
+-		fpMbLogfile = fopen(FN_MB_DATA, "w+");
+-	}
++	if (DecNum == 1)
++		DecNum = DecNum;
++
++	if (fpErrMapLogfile == NULL)
++		fpErrMapLogfile = fopen(FN_ERR_MAP_DATA, "w+");
++	if (fpQpLogfile == NULL)
++		fpQpLogfile = fopen(FN_QP_DATA, "w+");
++	if (fpSliceBndLogfile == NULL)
++		fpSliceBndLogfile = fopen(FN_SB_DATA, "w+");
++
++	fprintf(fpQpLogfile, "FRAME [%1d]\n", DecNum);
++	fprintf(fpSliceBndLogfile, "FRAME [%1d]\n", DecNum);
++	fprintf(fpErrMapLogfile, "FRAME [%1d]\n", DecNum);
+ 
+-	fprintf(fpMbLogfile, "Dec Frame Num : %d\n", DecNum);
+ 
+ 	for (i = 0; i < size; i++) {
+-		fprintf(fpMbLogfile, "%02X ", mbParaBuf[i]);
+-		if(mbNumX == ((i % mbNumX) + 1))
+-			fprintf(fpMbLogfile, "%%\n");
++		fprintf(fpQpLogfile, "MbAddr[%4d]: MbQs[%2d]\n", i, mbParaBuf[i]&0x3F);
++		fprintf(fpSliceBndLogfile, "MbAddr[%4d]: Slice Boundary Flag[%1d]\n", i, (mbParaBuf[i]>>6)&1);
++		fprintf(fpErrMapLogfile, "MbAddr[%4d]: ErrMap[%1d]\n", i, (mbParaBuf[i]>>7)&1);
+ 	}
+ 
+-	fflush(fpMbLogfile);
++	fflush(fpQpLogfile);
++	fflush(fpSliceBndLogfile);
++	fflush(fpErrMapLogfile);
+ }
+ 
+-void SaveMvPara(u8 *mvParaBuf, int size, int mvNumPerMb, int mbNumX, int DecNum) {
++void SaveMvPara(u8 *mvParaBuf, int size, int mvNumPerMb, int mbNumX, int DecNum)
++{
+ 
+ 	int i, j;
+ 	short mvX, mvY;
+@@ -82,7 +101,7 @@ void SaveMvPara(u8 *mvParaBuf, int size, int mvNumPerMb, int mbNumX, int DecNum)
+ 		fpMvLogfile = fopen(FN_MV_DATA, "w+");
+ 	}
+ 
+-	fprintf(fpMvLogfile, "Dec Frame Num : %d\n", DecNum);
++	fprintf(fpMvLogfile, "FRAME [%1d]\n", DecNum);
+ 
+ 	for (i = 0; i < size; i++) {
+ 		for (j = 0; j < mvNumPerMb; j++) {
+@@ -96,9 +115,9 @@ void SaveMvPara(u8 *mvParaBuf, int size, int mvNumPerMb, int mbNumX, int DecNum)
+ 				mvY = 0;
+ 
+ 				if (j == 0 )
+-					fprintf(fpMvLogfile, "[ No FW  ]");
++					fprintf(fpMvLogfile, "MbAddr[%4d:For ]: Avail[0] Mv[%5d:%5d]\n", i, mvX, mvY);
+ 				if (j == 1)
+-					fprintf(fpMvLogfile, "[ No BW  ]");
++					fprintf(fpMvLogfile, "MbAddr[%4d:Back]: Avail[0] Mv[%5d:%5d]\n", i, mvX, mvY);
+ 
+ 			} else {
+ 
+@@ -115,13 +134,11 @@ void SaveMvPara(u8 *mvParaBuf, int size, int mvNumPerMb, int mbNumX, int DecNum)
+ 				}
+ 
+ 				if (j == 0 )
+-					fprintf(fpMvLogfile, "[%4d%4d]", mvX, mvY);
++					fprintf(fpMvLogfile, "MbAddr[%4d:For ]: Avail[1] Mv[%5d:%5d]\n", i, mvX, mvY);
+ 				if (j == 1)
+-					fprintf(fpMvLogfile, "[%4d%4d]", mvX, mvY);
++					fprintf(fpMvLogfile, "MbAddr[%4d:Back]: Avail[1] Mv[%5d:%5d]\n", i, mvX, mvY);
+ 			}
+ 		}
+-		if(mvNumPerMb && mbNumX == ((i%mbNumX) + 1))
+-			fprintf(fpMvLogfile, "%%\n");
+ 	}
+ 	fflush(fpMvLogfile);
+ }
+@@ -748,7 +765,7 @@ decoder_start(struct decode *dec)
+ 		}
+ 
+ 		if (dec->mbInfo.enable == 1) {
+-			ret = vpu_DecGiveCommand(handle,DEC_SET_REPORT_MBINFO, &dec->mbInfo);
++			ret = vpu_DecGiveCommand(handle, DEC_SET_REPORT_MBINFO, &dec->mbInfo);
+ 			if (ret != RETCODE_SUCCESS) {
+ 				err_msg("Failed to set MbInfo report, ret %d\n", ret);
+ 				return -1;
+@@ -836,17 +853,21 @@ decoder_start(struct decode *dec)
+ 		}
+ 
+ 		/* Frame Buffer Status */
+-		if (outinfo.frameBufStat.enable && outinfo.frameBufStat.size) {
++		if (outinfo.indexFrameDecoded >= 0 &&
++			outinfo.frameBufStat.enable &&
++			outinfo.frameBufStat.size) {
+ 			SaveFrameBufStat(outinfo.frameBufStat.addr,
+-				   outinfo.frameBufStat.size);
++				   outinfo.frameBufStat.size, decIndex);
+ 		}
+ 
+ 		/* Mb Param */
+ 		if (outinfo.indexFrameDecoded >= 0 && outinfo.mbInfo.enable &&
+ 			outinfo.mbInfo.size) {
+-			int mbNumX = dec->picwidth / 16;
+-			SaveMB_Para(outinfo.mbInfo.addr,
+-			        outinfo.mbInfo.size, mbNumX, decIndex);
++			/* skip picture */
++			if (!(dec->cmdl->format == STD_VC1 &&
++				(outinfo.picType >>3 == 4)))
++				SaveMB_Para(outinfo.mbInfo.addr,
++				        outinfo.mbInfo.size, decIndex);
+ 		}
+ 
+ 		/* Motion Vector */
+@@ -858,8 +879,8 @@ decoder_start(struct decode *dec)
+ 		}
+ 
+ 		/* User Data */
+-		if (outinfo.indexFrameDecoded >= 0 &&  (dec->cmdl->format == STD_VC1) &&
+-		    outinfo.userData.enable && outinfo.userData.size) {
++		if (outinfo.indexFrameDecoded >= 0 &&
++			outinfo.userData.enable && outinfo.userData.size) {
+ 			if (outinfo.userData.userDataBufFull)
+ 				warn_msg("User Data Buffer is Full\n");
+ 			SaveUserData(dec->userData.addr);
+@@ -875,7 +896,7 @@ decoder_start(struct decode *dec)
+ 					info_msg("dec_idx %d : VC1 RPTFRM [%1d]\n", decIndex, outinfo.vc1_repeatFrame);
+ 			} else if (dec->cmdl->format == STD_AVC) {
+ 				if (outinfo.interlacedFrame)
+-					info_msg("Top Field First flag: %d, dec_idx %d\n",
++					dprintf(3, "Top Field First flag: %d, dec_idx %d\n",
+ 						  outinfo.topFieldFirst, decIndex);
+ 			} else if ((dec->cmdl->format != STD_MPEG4) && (dec->cmdl->format != STD_RV)){
+ 				if (outinfo.interlacedFrame || !outinfo.progressiveFrame) {
+@@ -891,7 +912,8 @@ decoder_start(struct decode *dec)
+ 			}
+ 		}
+ 
+-		decIndex++;
++		if(outinfo.indexFrameDecoded >= 0)
++			decIndex++;
+ 
+ 		if (outinfo.indexFrameDisplay == -1)
+ 			decodefinish = 1;
+@@ -1091,6 +1113,31 @@ decoder_free_framebuffer(struct decode *dec)
+ 		}
+ 	}
+ 
++	if (fpFrmStatusLogfile) {
++		fclose(fpFrmStatusLogfile);
++		fpFrmStatusLogfile = NULL;
++	}
++	if (fpErrMapLogfile) {
++		fclose(fpErrMapLogfile);
++		fpErrMapLogfile = NULL;
++	}
++	if (fpQpLogfile) {
++		fclose(fpQpLogfile);
++		fpQpLogfile = NULL;
++	}
++	if (fpSliceBndLogfile) {
++		fclose(fpSliceBndLogfile);
++		fpSliceBndLogfile = NULL;
++	}
++	if (fpMvLogfile) {
++		fclose(fpMvLogfile);
++		fpMvLogfile = NULL;
++	}
++	if (fpUserDataLogfile) {
++		fclose(fpUserDataLogfile);
++		fpUserDataLogfile = NULL;
++	}
++
+ 	if (dec->fb) {
+ 		free(dec->fb);
+ 		dec->fb = NULL;
+@@ -1271,18 +1318,27 @@ err:
+ 		fclose(fpFrmStatusLogfile);
+ 		fpFrmStatusLogfile = NULL;
+ 	}
++	if (fpErrMapLogfile) {
++		fclose(fpErrMapLogfile);
++		fpErrMapLogfile = NULL;
++	}
++	if (fpQpLogfile) {
++		fclose(fpQpLogfile);
++		fpQpLogfile = NULL;
++	}
++	if (fpSliceBndLogfile) {
++		fclose(fpSliceBndLogfile);
++		fpSliceBndLogfile = NULL;
++	}
+ 	if (fpMvLogfile) {
+ 		fclose(fpMvLogfile);
+ 		fpMvLogfile = NULL;
+ 	}
+-	if (fpMbLogfile) {
+-		fclose(fpMbLogfile);
+-		fpMbLogfile = NULL;
+-	}
+ 	if (fpUserDataLogfile) {
+ 		fclose(fpUserDataLogfile);
+ 		fpUserDataLogfile = NULL;
+ 	}
++
+ 	free(dec->fb);
+ 	free(dec->pfbpool);
+ 	dec->fb = NULL;
+-- 
+1.8.0
+

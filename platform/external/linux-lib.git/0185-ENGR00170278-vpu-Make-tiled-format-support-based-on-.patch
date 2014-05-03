@@ -1,0 +1,518 @@
+From 1a433f26dc31fda3bb080a4a9b86b76ff2545282 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Sat, 17 Dec 2011 00:24:10 +0800
+Subject: [PATCH 185/249] ENGR00170278 vpu: Make tiled format support based on
+ frame on mx6
+
+Re-work tiled format support to frame based, and also enable tiled
+format support in encoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_gdi.c  | 228 +++++++++++++++++++++++++++++----------------------------
+ vpu/vpu_gdi.h  |   3 +-
+ vpu/vpu_lib.c  |  39 ++++++++--
+ vpu/vpu_lib.h  |   2 +-
+ vpu/vpu_util.h |   5 ++
+ 5 files changed, 157 insertions(+), 120 deletions(-)
+
+diff --git a/vpu/vpu_gdi.c b/vpu/vpu_gdi.c
+index e1e96b5..722e507 100644
+--- a/vpu/vpu_gdi.c
++++ b/vpu/vpu_gdi.c
+@@ -21,48 +21,47 @@
+ #include "vpu_util.h"
+ #include "vpu_debug.h"
+ 
+-static GdiTiledMap sTiledInfo;
+-
+ static int GetXY2RBCLogic(int map_val, int xpos, int ypos, int tb);
+ static int rbc2axi_logic(int map_val, int ra_in, int ba_in, int ca_in);
+ 
+-int SetTiledMapType(GDI_TILED_MAP_TYPE TiledMapType)
++int SetTiledMapTypeInfo(GDI_TILED_MAP_TYPE TiledMapType, GdiTiledMap *pTiledInfo)
+ {
+-	int luma_map;
+-	int chro_map;
+-	int i;
++	int luma_map, chro_map, i;
++
++	if (!cpu_is_mx6q())
++		return 0;
+ 
+-	memset(&sTiledInfo, 0, sizeof(GdiTiledMap));
++	memset(pTiledInfo, 0, sizeof(GdiTiledMap));
+ 
+ 	luma_map = 64;
+ 	chro_map = 64;
+-	sTiledInfo.MapType = TiledMapType;
++	pTiledInfo->MapType = TiledMapType;
+ 	for (i = 0; i < 16; i++)
+-		sTiledInfo.xy2ca_map[i] = luma_map << 8 | chro_map;
++		pTiledInfo->xy2ca_map[i] = luma_map << 8 | chro_map;
+ 	for (i = 0; i < 4; i++)
+-		sTiledInfo.xy2ba_map[i] = luma_map << 8 | chro_map;
++		pTiledInfo->xy2ba_map[i] = luma_map << 8 | chro_map;
+ 	for (i = 0; i < 16; i++)
+-		sTiledInfo.xy2ra_map[i] = luma_map << 8 | chro_map;
++		pTiledInfo->xy2ra_map[i] = luma_map << 8 | chro_map;
+ 
+ 	if (TiledMapType == LINEAR_FRAME_MAP) {
+-		sTiledInfo.xy2rbc_config = 0;
++		pTiledInfo->xy2rbc_config = 0;
+ 	} else if (TiledMapType == TILED_FRAME_MB_RASTER_MAP) {
+-		sTiledInfo.xy2ca_map[0] = XY2(Y_SEL, 0, Y_SEL, 0);
+-		sTiledInfo.xy2ca_map[1] = XY2(Y_SEL, 1, Y_SEL, 1);
+-		sTiledInfo.xy2ca_map[2] = XY2(Y_SEL, 2, Y_SEL, 2);
+-		sTiledInfo.xy2ca_map[3] = XY2(Y_SEL, 3, X_SEL, 3);
+-		sTiledInfo.xy2ca_map[4] = XY2(X_SEL, 3, 4, 0);
++		pTiledInfo->xy2ca_map[0] = XY2(Y_SEL, 0, Y_SEL, 0);
++		pTiledInfo->xy2ca_map[1] = XY2(Y_SEL, 1, Y_SEL, 1);
++		pTiledInfo->xy2ca_map[2] = XY2(Y_SEL, 2, Y_SEL, 2);
++		pTiledInfo->xy2ca_map[3] = XY2(Y_SEL, 3, X_SEL, 3);
++		pTiledInfo->xy2ca_map[4] = XY2(X_SEL, 3, 4, 0);
+ 
+-		sTiledInfo.xy2rbc_config =
++		pTiledInfo->xy2rbc_config =
+ 		    XY2CONFIG(0, 0, 0, 1, 1, 15, 0, 7, 0);
+ 
+ 	} else if (TiledMapType == TILED_FIELD_MB_RASTER_MAP) {
+-		sTiledInfo.xy2ca_map[0] = XY2(Y_SEL, 0, Y_SEL, 0);
+-		sTiledInfo.xy2ca_map[1] = XY2(Y_SEL, 1, Y_SEL, 1);
+-		sTiledInfo.xy2ca_map[2] = XY2(Y_SEL, 2, X_SEL, 3);
+-		sTiledInfo.xy2ca_map[3] = XY2(X_SEL, 3, 4, 0);
++		pTiledInfo->xy2ca_map[0] = XY2(Y_SEL, 0, Y_SEL, 0);
++		pTiledInfo->xy2ca_map[1] = XY2(Y_SEL, 1, Y_SEL, 1);
++		pTiledInfo->xy2ca_map[2] = XY2(Y_SEL, 2, X_SEL, 3);
++		pTiledInfo->xy2ca_map[3] = XY2(X_SEL, 3, 4, 0);
+ 
+-		sTiledInfo.xy2rbc_config = XY2CONFIG(0, 1, 1, 1, 1, 7, 7, 3, 3);
++		pTiledInfo->xy2rbc_config = XY2CONFIG(0, 1, 1, 1, 1, 7, 7, 3, 3);
+ 
+ 	} else {
+ 		err_msg("TiledMapType is %d >-- Error\n", TiledMapType);
+@@ -70,103 +69,109 @@ int SetTiledMapType(GDI_TILED_MAP_TYPE TiledMapType)
+ 	}
+ 
+ 	if (TiledMapType == TILED_FRAME_MB_RASTER_MAP) {
+-		sTiledInfo.rbc2axi_map[0] = RBC(Z_SEL, 0, Z_SEL, 0);
+-		sTiledInfo.rbc2axi_map[1] = RBC(Z_SEL, 0, Z_SEL, 0);
+-		sTiledInfo.rbc2axi_map[2] = RBC(Z_SEL, 0, Z_SEL, 0);
+-		sTiledInfo.rbc2axi_map[3] = RBC(CA_SEL, 0, CA_SEL, 0);
+-		sTiledInfo.rbc2axi_map[4] = RBC(CA_SEL, 1, CA_SEL, 1);
+-		sTiledInfo.rbc2axi_map[5] = RBC(CA_SEL, 2, CA_SEL, 2);
+-		sTiledInfo.rbc2axi_map[6] = RBC(CA_SEL, 3, CA_SEL, 3);
+-		sTiledInfo.rbc2axi_map[7] = RBC(CA_SEL, 4, CA_SEL, 8);
+-		sTiledInfo.rbc2axi_map[8] = RBC(CA_SEL, 8, CA_SEL, 9);
+-		sTiledInfo.rbc2axi_map[9] = RBC(CA_SEL, 9, CA_SEL, 10);
+-		sTiledInfo.rbc2axi_map[10] = RBC(CA_SEL, 10, CA_SEL, 11);
+-		sTiledInfo.rbc2axi_map[11] = RBC(CA_SEL, 11, CA_SEL, 12);
+-		sTiledInfo.rbc2axi_map[12] = RBC(CA_SEL, 12, CA_SEL, 13);
+-		sTiledInfo.rbc2axi_map[13] = RBC(CA_SEL, 13, CA_SEL, 14);
+-		sTiledInfo.rbc2axi_map[14] = RBC(CA_SEL, 14, CA_SEL, 15);
+-		sTiledInfo.rbc2axi_map[15] = RBC(CA_SEL, 15, RA_SEL, 0);
+-		sTiledInfo.rbc2axi_map[16] = RBC(RA_SEL, 0, RA_SEL, 1);
+-		sTiledInfo.rbc2axi_map[17] = RBC(RA_SEL, 1, RA_SEL, 2);
+-		sTiledInfo.rbc2axi_map[18] = RBC(RA_SEL, 2, RA_SEL, 3);
+-		sTiledInfo.rbc2axi_map[19] = RBC(RA_SEL, 3, RA_SEL, 4);
+-		sTiledInfo.rbc2axi_map[20] = RBC(RA_SEL, 4, RA_SEL, 5);
+-		sTiledInfo.rbc2axi_map[21] = RBC(RA_SEL, 5, RA_SEL, 6);
+-		sTiledInfo.rbc2axi_map[22] = RBC(RA_SEL, 6, RA_SEL, 7);
+-		sTiledInfo.rbc2axi_map[23] = RBC(RA_SEL, 7, RA_SEL, 8);
+-		sTiledInfo.rbc2axi_map[24] = RBC(RA_SEL, 8, RA_SEL, 9);
+-		sTiledInfo.rbc2axi_map[25] = RBC(RA_SEL, 9, RA_SEL, 10);
+-		sTiledInfo.rbc2axi_map[26] = RBC(RA_SEL, 10, RA_SEL, 11);
+-		sTiledInfo.rbc2axi_map[27] = RBC(RA_SEL, 11, RA_SEL, 12);
+-		sTiledInfo.rbc2axi_map[28] = RBC(RA_SEL, 12, RA_SEL, 13);
+-		sTiledInfo.rbc2axi_map[29] = RBC(RA_SEL, 13, RA_SEL, 14);
+-		sTiledInfo.rbc2axi_map[30] = RBC(RA_SEL, 14, RA_SEL, 15);
+-		sTiledInfo.rbc2axi_map[31] = RBC(RA_SEL, 15, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[0] = RBC(Z_SEL, 0, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[1] = RBC(Z_SEL, 0, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[2] = RBC(Z_SEL, 0, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[3] = RBC(CA_SEL, 0, CA_SEL, 0);
++		pTiledInfo->rbc2axi_map[4] = RBC(CA_SEL, 1, CA_SEL, 1);
++		pTiledInfo->rbc2axi_map[5] = RBC(CA_SEL, 2, CA_SEL, 2);
++		pTiledInfo->rbc2axi_map[6] = RBC(CA_SEL, 3, CA_SEL, 3);
++		pTiledInfo->rbc2axi_map[7] = RBC(CA_SEL, 4, CA_SEL, 8);
++		pTiledInfo->rbc2axi_map[8] = RBC(CA_SEL, 8, CA_SEL, 9);
++		pTiledInfo->rbc2axi_map[9] = RBC(CA_SEL, 9, CA_SEL, 10);
++		pTiledInfo->rbc2axi_map[10] = RBC(CA_SEL, 10, CA_SEL, 11);
++		pTiledInfo->rbc2axi_map[11] = RBC(CA_SEL, 11, CA_SEL, 12);
++		pTiledInfo->rbc2axi_map[12] = RBC(CA_SEL, 12, CA_SEL, 13);
++		pTiledInfo->rbc2axi_map[13] = RBC(CA_SEL, 13, CA_SEL, 14);
++		pTiledInfo->rbc2axi_map[14] = RBC(CA_SEL, 14, CA_SEL, 15);
++		pTiledInfo->rbc2axi_map[15] = RBC(CA_SEL, 15, RA_SEL, 0);
++		pTiledInfo->rbc2axi_map[16] = RBC(RA_SEL, 0, RA_SEL, 1);
++		pTiledInfo->rbc2axi_map[17] = RBC(RA_SEL, 1, RA_SEL, 2);
++		pTiledInfo->rbc2axi_map[18] = RBC(RA_SEL, 2, RA_SEL, 3);
++		pTiledInfo->rbc2axi_map[19] = RBC(RA_SEL, 3, RA_SEL, 4);
++		pTiledInfo->rbc2axi_map[20] = RBC(RA_SEL, 4, RA_SEL, 5);
++		pTiledInfo->rbc2axi_map[21] = RBC(RA_SEL, 5, RA_SEL, 6);
++		pTiledInfo->rbc2axi_map[22] = RBC(RA_SEL, 6, RA_SEL, 7);
++		pTiledInfo->rbc2axi_map[23] = RBC(RA_SEL, 7, RA_SEL, 8);
++		pTiledInfo->rbc2axi_map[24] = RBC(RA_SEL, 8, RA_SEL, 9);
++		pTiledInfo->rbc2axi_map[25] = RBC(RA_SEL, 9, RA_SEL, 10);
++		pTiledInfo->rbc2axi_map[26] = RBC(RA_SEL, 10, RA_SEL, 11);
++		pTiledInfo->rbc2axi_map[27] = RBC(RA_SEL, 11, RA_SEL, 12);
++		pTiledInfo->rbc2axi_map[28] = RBC(RA_SEL, 12, RA_SEL, 13);
++		pTiledInfo->rbc2axi_map[29] = RBC(RA_SEL, 13, RA_SEL, 14);
++		pTiledInfo->rbc2axi_map[30] = RBC(RA_SEL, 14, RA_SEL, 15);
++		pTiledInfo->rbc2axi_map[31] = RBC(RA_SEL, 15, Z_SEL, 0);
+ 	} else if (TiledMapType == TILED_FIELD_MB_RASTER_MAP) {
+-		sTiledInfo.rbc2axi_map[0] = RBC(Z_SEL, 0, Z_SEL, 0);
+-		sTiledInfo.rbc2axi_map[1] = RBC(Z_SEL, 0, Z_SEL, 0);
+-		sTiledInfo.rbc2axi_map[2] = RBC(Z_SEL, 0, Z_SEL, 0);
+-		sTiledInfo.rbc2axi_map[3] = RBC(CA_SEL, 0, CA_SEL, 0);
+-		sTiledInfo.rbc2axi_map[4] = RBC(CA_SEL, 1, CA_SEL, 1);
+-		sTiledInfo.rbc2axi_map[5] = RBC(CA_SEL, 2, CA_SEL, 2);
+-		sTiledInfo.rbc2axi_map[6] = RBC(CA_SEL, 3, CA_SEL, 8);
+-		sTiledInfo.rbc2axi_map[7] = RBC(CA_SEL, 8, CA_SEL, 9);
+-		sTiledInfo.rbc2axi_map[8] = RBC(CA_SEL, 9, CA_SEL, 10);
+-		sTiledInfo.rbc2axi_map[9] = RBC(CA_SEL, 10, CA_SEL, 11);
+-		sTiledInfo.rbc2axi_map[10] = RBC(CA_SEL, 11, CA_SEL, 12);
+-		sTiledInfo.rbc2axi_map[11] = RBC(CA_SEL, 12, CA_SEL, 13);
+-		sTiledInfo.rbc2axi_map[12] = RBC(CA_SEL, 13, CA_SEL, 14);
+-		sTiledInfo.rbc2axi_map[13] = RBC(CA_SEL, 14, CA_SEL, 15);
+-		sTiledInfo.rbc2axi_map[14] = RBC(CA_SEL, 15, RA_SEL, 0);
+-
+-		sTiledInfo.rbc2axi_map[15] = RBC(RA_SEL, 0, RA_SEL, 1);
+-		sTiledInfo.rbc2axi_map[16] = RBC(RA_SEL, 1, RA_SEL, 2);
+-		sTiledInfo.rbc2axi_map[17] = RBC(RA_SEL, 2, RA_SEL, 3);
+-		sTiledInfo.rbc2axi_map[18] = RBC(RA_SEL, 3, RA_SEL, 4);
+-		sTiledInfo.rbc2axi_map[19] = RBC(RA_SEL, 4, RA_SEL, 5);
+-		sTiledInfo.rbc2axi_map[20] = RBC(RA_SEL, 5, RA_SEL, 6);
+-		sTiledInfo.rbc2axi_map[21] = RBC(RA_SEL, 6, RA_SEL, 7);
+-		sTiledInfo.rbc2axi_map[22] = RBC(RA_SEL, 7, RA_SEL, 8);
+-		sTiledInfo.rbc2axi_map[23] = RBC(RA_SEL, 8, RA_SEL, 9);
+-		sTiledInfo.rbc2axi_map[24] = RBC(RA_SEL, 9, RA_SEL, 10);
+-		sTiledInfo.rbc2axi_map[25] = RBC(RA_SEL, 10, RA_SEL, 11);
+-		sTiledInfo.rbc2axi_map[26] = RBC(RA_SEL, 11, RA_SEL, 12);
+-		sTiledInfo.rbc2axi_map[27] = RBC(RA_SEL, 12, RA_SEL, 13);
+-		sTiledInfo.rbc2axi_map[28] = RBC(RA_SEL, 13, RA_SEL, 14);
+-		sTiledInfo.rbc2axi_map[29] = RBC(RA_SEL, 14, RA_SEL, 15);
+-		sTiledInfo.rbc2axi_map[30] = RBC(RA_SEL, 15, Z_SEL, 0);
+-		sTiledInfo.rbc2axi_map[31] = RBC(Z_SEL, 0, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[0] = RBC(Z_SEL, 0, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[1] = RBC(Z_SEL, 0, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[2] = RBC(Z_SEL, 0, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[3] = RBC(CA_SEL, 0, CA_SEL, 0);
++		pTiledInfo->rbc2axi_map[4] = RBC(CA_SEL, 1, CA_SEL, 1);
++		pTiledInfo->rbc2axi_map[5] = RBC(CA_SEL, 2, CA_SEL, 2);
++		pTiledInfo->rbc2axi_map[6] = RBC(CA_SEL, 3, CA_SEL, 8);
++		pTiledInfo->rbc2axi_map[7] = RBC(CA_SEL, 8, CA_SEL, 9);
++		pTiledInfo->rbc2axi_map[8] = RBC(CA_SEL, 9, CA_SEL, 10);
++		pTiledInfo->rbc2axi_map[9] = RBC(CA_SEL, 10, CA_SEL, 11);
++		pTiledInfo->rbc2axi_map[10] = RBC(CA_SEL, 11, CA_SEL, 12);
++		pTiledInfo->rbc2axi_map[11] = RBC(CA_SEL, 12, CA_SEL, 13);
++		pTiledInfo->rbc2axi_map[12] = RBC(CA_SEL, 13, CA_SEL, 14);
++		pTiledInfo->rbc2axi_map[13] = RBC(CA_SEL, 14, CA_SEL, 15);
++		pTiledInfo->rbc2axi_map[14] = RBC(CA_SEL, 15, RA_SEL, 0);
++		pTiledInfo->rbc2axi_map[15] = RBC(RA_SEL, 0, RA_SEL, 1);
++		pTiledInfo->rbc2axi_map[16] = RBC(RA_SEL, 1, RA_SEL, 2);
++		pTiledInfo->rbc2axi_map[17] = RBC(RA_SEL, 2, RA_SEL, 3);
++		pTiledInfo->rbc2axi_map[18] = RBC(RA_SEL, 3, RA_SEL, 4);
++		pTiledInfo->rbc2axi_map[19] = RBC(RA_SEL, 4, RA_SEL, 5);
++		pTiledInfo->rbc2axi_map[20] = RBC(RA_SEL, 5, RA_SEL, 6);
++		pTiledInfo->rbc2axi_map[21] = RBC(RA_SEL, 6, RA_SEL, 7);
++		pTiledInfo->rbc2axi_map[22] = RBC(RA_SEL, 7, RA_SEL, 8);
++		pTiledInfo->rbc2axi_map[23] = RBC(RA_SEL, 8, RA_SEL, 9);
++		pTiledInfo->rbc2axi_map[24] = RBC(RA_SEL, 9, RA_SEL, 10);
++		pTiledInfo->rbc2axi_map[25] = RBC(RA_SEL, 10, RA_SEL, 11);
++		pTiledInfo->rbc2axi_map[26] = RBC(RA_SEL, 11, RA_SEL, 12);
++		pTiledInfo->rbc2axi_map[27] = RBC(RA_SEL, 12, RA_SEL, 13);
++		pTiledInfo->rbc2axi_map[28] = RBC(RA_SEL, 13, RA_SEL, 14);
++		pTiledInfo->rbc2axi_map[29] = RBC(RA_SEL, 14, RA_SEL, 15);
++		pTiledInfo->rbc2axi_map[30] = RBC(RA_SEL, 15, Z_SEL, 0);
++		pTiledInfo->rbc2axi_map[31] = RBC(Z_SEL, 0, Z_SEL, 0);
+ 	}
+ 
++	pTiledInfo->tb_separate_map = (pTiledInfo->xy2rbc_config >> 19) & 0x1;
++	pTiledInfo->top_bot_split = (pTiledInfo->xy2rbc_config >> 18) & 0x1;
++	pTiledInfo->tiledMap = (pTiledInfo->xy2rbc_config >> 17) & 0x1;
++	pTiledInfo->ca_inc_hor = (pTiledInfo->xy2rbc_config >> 16) & 0x1;
++
++	return 0;
++}
++
++
++void SetGDIRegs(GdiTiledMap *pTiledInfo)
++{
++	int i;
++
+ 	IOClkGateSet(true);
+ 	for (i = 0; i < 16; i++)
+-		VpuWriteReg(GDI_XY2_CAS_0 + 4 * i, sTiledInfo.xy2ca_map[i]);
++		VpuWriteReg(GDI_XY2_CAS_0 + 4 * i, pTiledInfo->xy2ca_map[i]);
+ 
+ 	for (i = 0; i < 4; i++)
+-		VpuWriteReg(GDI_XY2_BA_0 + 4 * i, sTiledInfo.xy2ba_map[i]);
++		VpuWriteReg(GDI_XY2_BA_0 + 4 * i, pTiledInfo->xy2ba_map[i]);
+ 
+ 	for (i = 0; i < 16; i++)
+-		VpuWriteReg(GDI_XY2_RAS_0 + 4 * i, sTiledInfo.xy2ra_map[i]);
+-
+-	VpuWriteReg(GDI_XY2_RBC_CONFIG, sTiledInfo.xy2rbc_config);
++		VpuWriteReg(GDI_XY2_RAS_0 + 4 * i, pTiledInfo->xy2ra_map[i]);
+ 
+-	sTiledInfo.tb_separate_map = (sTiledInfo.xy2rbc_config >> 19) & 0x1;
+-	sTiledInfo.top_bot_split = (sTiledInfo.xy2rbc_config >> 18) & 0x1;
+-	sTiledInfo.tiledMap = (sTiledInfo.xy2rbc_config >> 17) & 0x1;
+-	sTiledInfo.ca_inc_hor = (sTiledInfo.xy2rbc_config >> 16) & 0x1;
++	VpuWriteReg(GDI_XY2_RBC_CONFIG, pTiledInfo->xy2rbc_config);
+ 
+ 	for (i = 0; i < 32; i++)
+-		VpuWriteReg(GDI_RBC2_AXI_0 + 4 * i, sTiledInfo.rbc2axi_map[i]);
++		VpuWriteReg(GDI_RBC2_AXI_0 + 4 * i, pTiledInfo->rbc2axi_map[i]);
+ 	IOClkGateSet(false);
+-
+-	return 1;
+-
+ }
+ 
+-int vpu_GetXY2AXIAddr(int ycbcr, int posY, int posX, int stride,
++int vpu_GetXY2AXIAddr(DecHandle handle, int ycbcr, int posY, int posX, int stride,
+ 		      unsigned int addrY, unsigned int addrCb,
+ 		      unsigned int addrCr)
+ {
++	CodecInst *pCodecInst;
++	GdiTiledMap *pTiledInfo;
+ 	int ypos_mod, temp, temp_bit;
+ 	int i, tb, pix_addr = 0;
+ 	int ra_conv = 0, ba_conv = 0, ca_conv = 0;
+@@ -175,8 +180,11 @@ int vpu_GetXY2AXIAddr(int ycbcr, int posY, int posX, int stride,
+ 	int temp_val12bit, temp_val6bit;
+ 	int mb_raster_base = 0;
+ 
++	pCodecInst = handle;
++	pTiledInfo = &pCodecInst->CodecInfo.decInfo.sTiledInfo;
++
+ 	tb = posY & 0x1;
+-	ypos_mod = sTiledInfo.tb_separate_map ? posY >> 1 : posY;
++	ypos_mod = pTiledInfo->tb_separate_map ? posY >> 1 : posY;
+ 	addr = ycbcr == 0 ? addrY : ycbcr == 2 ? addrCb : addrCr;
+ 
+ 	/* 20bit = AddrY [31:12] */
+@@ -188,11 +196,11 @@ int vpu_GetXY2AXIAddr(int ycbcr, int posY, int posX, int stride,
+ 	/* 20bit = AddrCb[ 3: 0], AddrCr[31:16] */
+ 	chr_bot_base = ((addrCb & 0xf) << 16) | ((addrCr >> 16) & 0xffff);
+ 
+-	if (sTiledInfo.MapType == 0)
++	if (pTiledInfo->MapType == 0)
+ 		return ((posY * stride) + posX) + addr;
+ 
+-	if (sTiledInfo.MapType == TILED_FRAME_MB_RASTER_MAP
+-	    || sTiledInfo.MapType == TILED_FIELD_MB_RASTER_MAP) {
++	if (pTiledInfo->MapType == TILED_FRAME_MB_RASTER_MAP
++	    || pTiledInfo->MapType == TILED_FIELD_MB_RASTER_MAP) {
+ 		if (ycbcr == 0) {
+ 			mbx = posX / 16;
+ 			mby = posY / 16;
+@@ -205,9 +213,9 @@ int vpu_GetXY2AXIAddr(int ycbcr, int posY, int posX, int stride,
+ 
+ 		for (i = 0; i < 8; i++) {
+ 			if (ycbcr == 2 || ycbcr == 3)
+-				temp = sTiledInfo.xy2ca_map[i] & 0xff;
++				temp = pTiledInfo->xy2ca_map[i] & 0xff;
+ 			else
+-				temp = sTiledInfo.xy2ca_map[i] >> 8;
++				temp = pTiledInfo->xy2ca_map[i] >> 8;
+ 			temp_bit = GetXY2RBCLogic(temp, posX, ypos_mod, tb);
+ 			ca_conv = ca_conv + (temp_bit << i);
+ 		}
+@@ -217,7 +225,7 @@ int vpu_GetXY2AXIAddr(int ycbcr, int posY, int posX, int stride,
+ 
+ 		for (i = 0; i < 32; i++) {
+ 
+-			temp_val12bit = sTiledInfo.rbc2axi_map[i];
++			temp_val12bit = pTiledInfo->rbc2axi_map[i];
+ 			temp_val6bit =
+ 			    (ycbcr ==
+ 			     0) ? (temp_val12bit >> 6) : (temp_val12bit & 0x3f);
+@@ -229,7 +237,7 @@ int vpu_GetXY2AXIAddr(int ycbcr, int posY, int posX, int stride,
+ 			pix_addr = pix_addr + (temp_bit << i);
+ 		}
+ 
+-		if (sTiledInfo.tb_separate_map == 1 && tb == 1)
++		if (pTiledInfo->tb_separate_map == 1 && tb == 1)
+ 			mb_raster_base =
+ 			    ycbcr == 0 ? lum_bot_base : chr_bot_base;
+ 		else
+diff --git a/vpu/vpu_gdi.h b/vpu/vpu_gdi.h
+index f0707e0..b3fc0c2 100644
+--- a/vpu/vpu_gdi.h
++++ b/vpu/vpu_gdi.h
+@@ -51,6 +51,7 @@ typedef struct {
+ 	int value;
+ } GdiTiledMap;
+ 
+-int SetTiledMapType(GDI_TILED_MAP_TYPE TiledMapType);
++int SetTiledMapTypeInfo(GDI_TILED_MAP_TYPE TiledMapType, GdiTiledMap *pTiledInfo);
++void SetGDIRegs(GdiTiledMap *pTiledInfo);
+ 
+ #endif				// end of GDI_H_INCLUDED
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index c65c7dd..b8cd0d3 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -577,6 +577,8 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	pEncInfo->ringBufferEnable = pop->ringBufferEnable;
+ 	pEncInfo->cacheConfig.Bypass = 1;		    /* By default, turn off MC cache */
+ 	pEncInfo->subFrameSyncConfig.subFrameSyncOn = 0;    /* By default, turn off SubFrameSync */
++	pEncInfo->linear2TiledEnable = pop->linear2TiledEnable;
++	pEncInfo->mapType = pop->mapType;
+ 
+ 	/* MB Aligned source resolution */
+ 	pEncInfo->srcFrameWidth = (pop->picWidth + 15) & ~15;
+@@ -647,6 +649,9 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 
+ 	val = VpuReadReg(BIT_FRAME_MEM_CTRL);
+ 	val &= ~(1 << 2 | 0x7 << 9);  /* clear the bit firstly */
++	if (pEncInfo->mapType)
++		val |= pEncInfo->linear2TiledEnable << 11 | 0x03 << 9;
++
+ 	pCodecInst->ctxRegs[CTX_BIT_FRAME_MEM_CTRL] =
+ 	    val | (pEncInfo->openParam.chromaInterleave << 2);
+ 
+@@ -1037,10 +1042,12 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	pEncInfo->initialInfo = *info;
+ 	pEncInfo->initialInfoObtained = 1;
+ 
+-        /* Enable 2-D cache */
+-	if (cpu_is_mx6q())
++	if (cpu_is_mx6q()) {
++		SetTiledMapTypeInfo(pEncInfo->mapType, &pEncInfo->sTiledInfo);
++		/* Enable 2-D cache */
+ 		SetMaverickCache(&pEncInfo->cacheConfig, 0,
+ 				 pEncInfo->openParam.chromaInterleave);
++	}
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -1469,6 +1476,10 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 		}
+ 	}
+ 
++	/* Set GDI related registers per tiled map info for mx6q */
++	if (cpu_is_mx6q())
++		SetGDIRegs(&pEncInfo->sTiledInfo);
++
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
+ 		VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG, pEncInfo->streamBufStartAddr);
+ 		VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pEncInfo->streamBufEndAddr);
+@@ -1551,9 +1562,13 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 		VpuWriteReg(GDI_CONTROL, 1);
+ 		while(!val)
+ 			val = VpuReadReg(GDI_STATUS);
++		if (pEncInfo->mapType)
++			val = 3 << 20;
++		else
++			val = 0;
+ 		VpuWriteReg(GDI_INFO_CONTROL, ((pEncInfo->jpgInfo.format & 0x07) << 17) |
+ 					       (pEncInfo->openParam.chromaInterleave << 16) |
+-					       pSrcFrame->strideY);
++					       val | pSrcFrame->strideY);
+ 		VpuWriteReg(GDI_INFO_PIC_SIZE, (pEncInfo->jpgInfo.alignedWidth << 16) |
+ 						pEncInfo->jpgInfo.alignedHeight);
+ 		VpuWriteReg(GDI_INFO_BASE_Y,  pSrcFrame->bufY);
+@@ -2531,8 +2546,6 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 		pDecInfo->cacheConfig.Bypass = 1;
+ 		for (i = 0; i < 6; i++)
+ 			pDecInfo->writeMemProtectCfg.region[i].enable = 0;
+-
+-		SetTiledMapType(pDecInfo->mapType);
+ 	}
+ 
+ 	if (!LockVpu(vpu_semap))
+@@ -3002,10 +3015,12 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		SetDecSecondAXIIRAM(&pDecInfo->secAxiUse, &iramParam);
+ 	}
+ 
+-	/* Enable 2-D cache */
+-	if (cpu_is_mx6q())
++	if (cpu_is_mx6q()) {
++		SetTiledMapTypeInfo(pDecInfo->mapType, &pDecInfo->sTiledInfo);
++		/* Enable 2-D cache */
+ 		SetMaverickCache(&pDecInfo->cacheConfig, pDecInfo->mapType,
+ 			    pDecInfo->openParam.chromaInterleave);
++	}
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -3476,6 +3491,10 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
++	/* Set GDI related registers per tiled map info for mx6q */
++	if (cpu_is_mx6q())
++		SetGDIRegs(&pDecInfo->sTiledInfo);
++
+ 	if (is_mx6q_mjpg_codec(pCodecInst->codecMode)) {
+ 		if (pDecInfo->jpgInfo.lineBufferMode) {
+ 			if (param->chunkSize <= 0) {
+@@ -3607,9 +3626,13 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 		while (!val)
+ 			val = VpuReadReg(GDI_STATUS);
+ 
++		if (pDecInfo->mapType)
++			val = 3 << 20;
++		else
++			val = 0;
+ 		VpuWriteReg(GDI_INFO_CONTROL, ((pDecInfo->jpgInfo.format & 0x07) << 17) |
+ 					       (pDecInfo->openParam.chromaInterleave << 16) |
+-						pDecInfo->rotatorStride);
++					       val | pDecInfo->rotatorStride);
+ 		VpuWriteReg(GDI_INFO_PIC_SIZE, (pDecInfo->jpgInfo.alignedWidth << 16) |
+ 						pDecInfo->jpgInfo.alignedHeight);
+ 		VpuWriteReg(GDI_INFO_BASE_Y,  pDecInfo->rotatorOutput.bufY);
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 3575267..2061960 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -732,7 +732,7 @@ int vpu_IsBusy(void);
+ int jpu_IsBusy(void);
+ int vpu_WaitForInt(int timeout_in_ms);
+ RetCode vpu_SWReset(DecHandle handle, int index);
+-int vpu_GetXY2AXIAddr(int ycbcr, int posY, int posX, int stride,
++int vpu_GetXY2AXIAddr(DecHandle handle, int ycbcr, int posY, int posX, int stride,
+                    unsigned int addrY, unsigned int addrCb, unsigned int addrCr);
+ 
+ void SaveGetEncodeHeader(EncHandle handle, int encHeaderType, char *filename);
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index da06401..a2e71be 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -23,6 +23,7 @@
+ #include "vpu_reg.h"
+ #include "vpu_lib.h"
+ #include "vpu_io.h"
++#include "vpu_gdi.h"
+ #include "sw_gbu.h"
+ 
+ #define MAX_FW_BINARY_LEN		200 * 1024
+@@ -317,11 +318,14 @@ typedef struct {
+ 	int dynamicAllocEnable;
+ 	int ringBufferEnable;
+ 	int mp4_dataPartitionEnable;
++	int linear2TiledEnable;
++	int mapType;
+ 
+ 	SecAxiUse secAxiUse;
+ 	MaverickCacheConfig cacheConfig;
+ 	EncSubFrameSyncConfig subFrameSyncConfig;
+ 	JpgEncInfo jpgInfo;
++	GdiTiledMap sTiledInfo;
+ 
+ 	EncReportInfo encReportMBInfo;
+ 	EncReportInfo encReportMVInfo;
+@@ -427,6 +431,7 @@ typedef struct {
+ 	vpu_mem_desc userDataBufMem;
+ 
+ 	WriteMemProtectCfg writeMemProtectCfg;
++	GdiTiledMap sTiledInfo;
+ 
+ 	DecReportInfo decReportFrameBufStat; /* Frame Buffer Status */
+ 	DecReportInfo decReportMBInfo;      /* Mb Param for Error Concealment */
+-- 
+1.8.0
+

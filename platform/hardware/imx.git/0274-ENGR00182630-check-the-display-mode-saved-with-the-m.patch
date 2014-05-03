@@ -1,0 +1,403 @@
+From d5ba3950865cda4b91ba6a704019c78a3a321d4a Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Thu, 10 May 2012 15:52:19 +0800
+Subject: [PATCH 274/486] ENGR00182630 check the display mode saved with the
+ mode list supported.
+
+check the display mode saved with the mode list supported.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libgralloc_wrapper/Android.mk       |   3 +-
+ mx6/libgralloc_wrapper/display_mode.cpp | 220 ++++++++++++++++++++++++++++++++
+ mx6/libgralloc_wrapper/display_mode.h   |  61 +++++++++
+ mx6/libgralloc_wrapper/framebuffer.cpp  |  43 +++++++
+ 4 files changed, 326 insertions(+), 1 deletion(-)
+ create mode 100644 mx6/libgralloc_wrapper/display_mode.cpp
+ create mode 100644 mx6/libgralloc_wrapper/display_mode.h
+
+diff --git a/mx6/libgralloc_wrapper/Android.mk b/mx6/libgralloc_wrapper/Android.mk
+index bcbcabb..47a558f 100755
+--- a/mx6/libgralloc_wrapper/Android.mk
++++ b/mx6/libgralloc_wrapper/Android.mk
+@@ -24,7 +24,8 @@ LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu libhardware libut
+ LOCAL_SRC_FILES := 	\
+ 	gralloc.cpp 	\
+ 	framebuffer.cpp \
+-	mapper.cpp
++	mapper.cpp      \
++        display_mode.cpp
+ 	
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX
+diff --git a/mx6/libgralloc_wrapper/display_mode.cpp b/mx6/libgralloc_wrapper/display_mode.cpp
+new file mode 100644
+index 0000000..91896e0
+--- /dev/null
++++ b/mx6/libgralloc_wrapper/display_mode.cpp
+@@ -0,0 +1,220 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* Copyright 2010-2012 Freescale Semiconductor, Inc. */
++
++#include <fcntl.h>
++#include <errno.h>
++#include <cutils/properties.h>
++#include <stdlib.h>
++#include "display_mode.h"
++#include "cutils/log.h"
++
++static int str2int(char *p, int *len)
++{
++        int val = 0;
++        int length =0;
++        if(!p) return -1;
++
++        while(p[0] >= '0' && p[0] <= '9')
++        {
++                val = val * 10 + p[0] - '0';
++                p++;
++                length ++;
++        }
++    *len = length;
++        return val;
++}
++
++static int disp_mode_compare( const void *arg1, const void *arg2)
++{
++        disp_mode *dm1 = (disp_mode *)arg1;
++        disp_mode *dm2 = (disp_mode *)arg2;
++
++    if(dm1->width  > dm2->width)  return -1;
++    else if (dm1->width  < dm2->width) return 1;
++    else {
++        if(dm1->height > dm2->height) return -1;
++        else if (dm1->height < dm2->height )  return 1;
++        else {
++            if (dm1->freq > dm2->freq ) return -1;
++            else if (dm1->freq < dm2->freq ) return 1;
++            else return 0;
++        }
++    }
++
++        return 0;
++}
++
++static int get_available_mode(int fbid, const char *mode_list)
++{
++        int disp_threshold = 0;
++        int i,disp_mode_count = 0;
++        read_state state = CHECK_NEXT_STATE;
++        char *p = (char *)mode_list;
++        char *start = p;
++        char *end   = p;
++    int len = 0;
++    if(!p) return 0;
++
++
++        while(p[0])
++        {
++                switch(state)
++                {
++                case CHECK_NEXT_STATE:
++                        if(!strncmp(p, "D:", 2)
++                                || !strncmp(p, "S:", 2)
++                                || !strncmp(p, "U:", 2)
++                                || !strncmp(p, "V:", 2))
++                        {
++                                start = p;
++                                state = FIND_WIDTH_STATE;
++                                p+=2;
++                        }
++                        else p++;
++                        break;
++                case FIND_WIDTH_STATE:
++                        if(p[0]>='0' && p[0]<='9')
++                        {
++                            len = 0;
++                                disp_class_list[fbid].disp_mode_list[disp_mode_count].width = str2int(p, &len);
++                                state = FIND_JOINT_STATE;
++                                p =  p +len;
++                        }
++                        else p++;
++                        break;
++                case FIND_JOINT_STATE:
++                        if(p[0] == 'x' || p[0] == 'X')
++                        {
++                            p++;
++                                state = FIND_HEIGHT_STATE;
++                        }
++                        else p++;
++                        break;
++                case FIND_HEIGHT_STATE:
++                        if(p[0]>='0' && p[0]<='9')
++                        {
++                            len = 0;
++                                disp_class_list[fbid].disp_mode_list[disp_mode_count].height = str2int(p,&len);
++                                state = PREFIX_FREQ_STATE;
++                                p =  p +len;
++                        }
++                        else p++;
++                        break;
++                case PREFIX_FREQ_STATE:
++                        if(!strncmp(p, "p-", 2) || !strncmp(p, "i-", 2))
++                        {
++                                state = FREQUENCY_STATE;
++                                p+=2;
++                        }
++                        else p++;
++                        break;
++                case  FREQUENCY_STATE:
++                        if(p[0]>='0' && p[0]<='9')
++                        {
++                            len = 0;
++                                disp_class_list[fbid].disp_mode_list[disp_mode_count].freq = str2int(p,&len);
++                                state = FIND_NEWLINE_STATE;
++                                p =  p +len;
++                        }
++                        else p++;
++                        break;
++                case FIND_NEWLINE_STATE:
++                        if(p[0] == '\n')
++                        {
++                                end = p+1;
++                                strncpy(disp_class_list[fbid].disp_mode_list[disp_mode_count].mode, start, (size_t)end -(size_t)start);
++                                disp_mode_count ++;
++                                state = CHECK_NEXT_STATE;
++                                p++;
++                if(disp_mode_count >= sizeof(disp_class_list[fbid].disp_mode_list)/sizeof(disp_class_list[fbid].disp_mode_list[0])) goto check_mode_end;
++                        }
++                        else p++;
++                        break;
++                default:
++                        p++;
++                        break;
++                }
++        }
++
++check_mode_end:
++
++        qsort(&disp_class_list[fbid].disp_mode_list[0], disp_mode_count, sizeof(disp_mode), disp_mode_compare);
++
++    disp_class_list[fbid].disp_mode_length = disp_mode_count;
++
++    return 0;
++}
++
++static int read_graphics_fb_mode(int fb)
++{
++    int size=0;
++    int fp_modes=0;
++    char fb_modes[1024];
++    char temp_name[256];
++
++    sprintf(temp_name, "/sys/class/graphics/fb%d/modes", fb);
++    fp_modes = open(temp_name,O_RDONLY, 0);
++    if(fp_modes < 0) {
++        LOGI("Error %d! Cannot open %s", fp_modes, temp_name);
++        goto set_graphics_fb_mode_error;
++    }
++
++    memset(fb_modes, 0, sizeof(fb_modes));
++    size = read(fp_modes, fb_modes, sizeof(fb_modes));
++    if(size <= 0)
++    {
++        LOGI("Error! Cannot read %s", temp_name);
++        goto set_graphics_fb_mode_error;
++    }
++
++    close(fp_modes); fp_modes = 0;
++
++    if(size == sizeof(fb_modes)) fb_modes[size -1] = 0;
++
++    get_available_mode(fb, fb_modes);
++
++    return 0;
++
++set_graphics_fb_mode_error:
++
++    if(fp_modes > 0) close(fp_modes);
++
++    return -1;
++}
++
++int isModeValid(int fb, char* pMode, int len)
++{
++    int err = 0;
++    int i;
++
++        LOGW("----------isModeValid:pMode=%s, len=%d", pMode, len);
++    err = read_graphics_fb_mode(fb);
++    if(err)
++        return 0;
++
++    for(i=0; i<disp_class_list[fb].disp_mode_length; i++) {
++        LOGW("----------isModeValid:disp_mode_list[%d].mode=%s", i, disp_class_list[fb].disp_mode_list[i].mode);
++        if(!strncmp(disp_class_list[fb].disp_mode_list[i].mode, pMode, len)) {
++            return 1;
++        }
++    }
++
++    return 0;
++}
++
++
+diff --git a/mx6/libgralloc_wrapper/display_mode.h b/mx6/libgralloc_wrapper/display_mode.h
+new file mode 100644
+index 0000000..9558b65
+--- /dev/null
++++ b/mx6/libgralloc_wrapper/display_mode.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* Copyright 2010-2012 Freescale Semiconductor, Inc. */
++
++#ifndef _DISPLAY_MODE_H_
++#define _DISPLAY_MODE_H_
++
++#define MAX_DISP_DEVICE                  4
++#define MAX_DISP_DEVICE_MODE                  128
++
++typedef int boolean;
++typedef struct
++{
++        char mode[20];
++        int width;
++        int height;
++        int freq;
++} disp_mode;
++
++typedef enum {
++    CHECK_NEXT_STATE,
++    FIND_WIDTH_STATE,
++    FIND_JOINT_STATE,
++    FIND_HEIGHT_STATE,
++    PREFIX_FREQ_STATE,
++    FREQUENCY_STATE,
++    FIND_NEWLINE_STATE
++} read_state;
++
++typedef struct
++{
++    boolean disp_connected;
++    boolean disp_enabled;
++    disp_mode disp_mode_list[MAX_DISP_DEVICE_MODE];
++    int disp_mode_length;
++} disp_class;
++
++//most support 4 pluggable display device;
++static  disp_class disp_class_list[MAX_DISP_DEVICE];
++
++static int   str2int(char *p, int *len);
++static int   disp_mode_compare( const void *arg1, const void *arg2);
++
++static int     get_available_mode(int fbid, const char *mode_list);
++static int     read_graphics_fb_mode(int fbid);
++
++#endif
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 65eb14f..f4c044a 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -220,6 +220,8 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev)
+ }
+ 
+ /*****************************************************************************/
++extern int isModeValid(int fb, char* pMode, int len);
++
+ static int set_graphics_fb_mode(int fb, struct configParam* param)
+ {
+     char temp_name[256];
+@@ -248,6 +250,45 @@ static int set_graphics_fb_mode(int fb, struct configParam* param)
+                         disp_mode++;
+                         n = disp_mode - start_index;
+                         *(char*)disp_mode = '\0';
++
++                        if(!isModeValid(fb, start_index + 1, n-1)) {
++                            LOGI("Warning: display %d does not support len:%d, %s", fb, n-1, start_index + 1);
++                            memset(fb_mode, 0, sizeof(fb_mode));
++                            memset(temp_name, 0, sizeof(temp_name));
++                            sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
++                            fd_mode = open(temp_name,O_RDWR, 0);
++                            if(fd_mode < 0) {
++                                LOGI("Error %d! Cannot open %s", fd_mode, temp_name);
++                                return -1;
++                            }
++                            strncpy(fb_mode, "mode=", 5);
++                            size = 5;
++                            size += read(fd_mode, fb_mode+size, sizeof(fb_mode)-size);
++                            LOGW("fb_mode is %s", fb_mode);
++                            close(fd_mode);
++
++                            memset(temp_name, 0, sizeof(temp_name));
++                            sprintf(temp_name, "/sys/class/graphics/fb%d/bits_per_pixel", fb);
++                            fd_mode = open(temp_name, O_RDONLY, 0);
++                            if(fd_mode < 0) {
++                                LOGI("Error %d! Cannot open %s", fd_mode, temp_name);
++                                return -1;
++                            }
++                            strncpy(fb_mode+size, "colordepth=", 11);
++                            size += 11;
++                            size += read(fd_mode, fb_mode+size, sizeof(fb_mode)-size);
++                            LOGW("fb_mode is size=%d, %s", size, fb_mode);
++                            close(fd_mode);
++
++                            close(fb_misc);
++                            fb_misc = open("/data/misc/display.conf", O_RDWR | O_TRUNC, 0);
++                            if(fb_misc < 0)
++                                return -1;
++                            write(fb_misc, fb_mode, size);
++                            close(fb_misc);
++                            return -1;
++                        }//end !isModeValid
++
+                         memset(temp_name, 0, sizeof(temp_name));
+ 			sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+ 			fd_mode = open(temp_name,O_RDWR, 0);
+@@ -256,6 +297,7 @@ static int set_graphics_fb_mode(int fb, struct configParam* param)
+ 			    return -1;
+ 			}
+                         write(fd_mode, start_index + 1, n);
++                        close(fd_mode);
+                         break;
+                     }
+                     if(*disp_mode == '=') start_index = (char*)disp_mode;
+@@ -263,6 +305,7 @@ static int set_graphics_fb_mode(int fb, struct configParam* param)
+                 }
+             }
+         }
++        close(fb_misc);
+         return 0;
+     }
+ 
+-- 
+1.8.0
+

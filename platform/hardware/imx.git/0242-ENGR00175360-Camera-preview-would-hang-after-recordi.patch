@@ -1,0 +1,129 @@
+From 39dd054a866db254ea183c264edd7c98dfd76e06 Mon Sep 17 00:00:00 2001
+From: YangYonggang <b31664@freescale.com>
+Date: Fri, 24 Feb 2012 18:13:33 +0800
+Subject: [PATCH 242/486] ENGR00175360 Camera preview would hang after
+ recording for many times.
+
+The root cause was in the process of stopping recording, there was more
+frame sent to VPU. In this condition, CameraService would drop this frame.
+But camera HAL thought it already sent to VPU and would not release it anymore.
+The way to fix it, after stopping record, release the frame sent to VPU in
+camera HAL.
+
+Signed-off-by: YangYonggang <b31664@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp | 44 ++++++++++++++++++++++++++------------------
+ 1 file changed, 26 insertions(+), 18 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 570c20b..d8754f9 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -956,13 +956,14 @@ namespace android {
+         }
+         
+            
+-	if (bDerectInput == true) {
+-		for(i = 0; i < mVideoBufNume; i++) {
+-			mVideoBufferUsing[i] = 0;
+-		}
+-	}
+-	mEncodeLock.unlock();
++        if (bDerectInput == true) {
++            for(i = 0; i < mVideoBufNume; i++) {
++                mVideoBufferUsing[i] = 0;
++            }
++        }
++
+         mRecordRunning = true;
++        mEncodeLock.unlock();
+ 
+         return NO_ERROR;
+     }
+@@ -972,17 +973,14 @@ namespace android {
+         CAMERA_HAL_LOG_FUNC;
+         
+         mEncodeLock.lock();        
+-
+         if(mRecordRunning) {
+             mRecordRunning = false;
+             mEncodeThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_STOP, 0));
+             sem_wait(&mEncodeStoppedCondition);
+             CAMERA_HAL_LOG_RUNTIME("---%s, after wait--", __FUNCTION__);
+         }
+-		//if(bDerectInput == true) 
+-		//	bDerectInput = false;		                
+         mEncodeLock.unlock();
+-	}
++    }
+ 
+     void CameraHal::releaseRecordingFrame(const void* mem)
+     {
+@@ -1879,13 +1877,22 @@ Pic_out:
+     {
+         if(pBuf == NULL)
+             return INVALID_OPERATION;
+-            
++
++        unsigned int buf_index = pBuf - &mCaptureBuffers[0];
++
+         Mutex::Autolock _l(pBuf->mBufferLock);
++
++        mEncodeLock.lock();
++        if(!mRecordRunning &&  (mVideoBufferUsing[buf_index] == 1)
++                && (pBuf->refCount == 2)) {
++            pBuf->refCount --;
++            mVideoBufferUsing[buf_index] = 0;
++        }
++        mEncodeLock.unlock();
++
+         pBuf->refCount --;
+         if(pBuf->refCount == 0) {
+             if(!mPPDeviceNeed && mCaptureRunning) {
+-                unsigned int buf_index = pBuf - &mCaptureBuffers[0];
+-
+                 if(buf_index < mCaptureBufNum) {
+                     if(mCaptureDevice->DevQueue(buf_index) <0){
+                         CAMERA_HAL_ERR("The Capture device queue buf error !!!!");
+@@ -1958,7 +1965,6 @@ Pic_out:
+                     mPreviewThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, bufIndex));
+                     
+                     if(mRecordRunning) {
+-                        getBufferCount(&mCaptureBuffers[bufIndex]);
+                         mEncodeThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, bufIndex));
+                     }
+                 }else {
+@@ -2259,6 +2265,7 @@ Pic_out:
+                     EncBuf = &mPPbuf[enc_index];
+                 }
+ 
++                mEncodeLock.lock();
+                 if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+                     nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+                     if (bDerectInput == true) {
+@@ -2270,17 +2277,18 @@ Pic_out:
+                         ret = putBufferCount(EncBuf);
+                     }
+ 
++                    getBufferCount(&mCaptureBuffers[enc_index]);
+                     mVideoBufferUsing[enc_index] = 1;
+                     mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoMemory, enc_index, mCallbackCookie);
+-                break;
+-                }else {
+-                    ret = putBufferCount(EncBuf);
++                    mEncodeLock.unlock();
++                    break;
+                 }
++                mEncodeLock.unlock();
+                 break;
+ 
+             case CMESSAGE_TYPE_STOP:
+                 CAMERA_HAL_LOG_INFO("%s: encode thread stop", __FUNCTION__);
+-                //mEncodeThreadQueue.clearMessage();
++                mEncodeThreadQueue.clearMessage();
+                 sem_post(&mEncodeStoppedCondition);
+                 break;
+             case CMESSAGE_TYPE_QUITE:
+-- 
+1.8.0
+

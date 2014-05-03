@@ -1,0 +1,643 @@
+From 2bd5ffd2f66b5a99c21a7b97508b2a40db87f2b8 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Wed, 25 Jul 2012 11:37:33 +0800
+Subject: [PATCH 316/486] ENGR00215174 add camera sensor support CSC format to
+ make sensor consistent.
+
+add camera sensor support CSC format to make different sensor
+behave consistently. so, camera hal handle different kind sensor
+with the same method.
+camera sensor handle CSC function internally.
+when open camera failed, make app quit normally.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp            |  78 +++++---------
+ mx6/libcamera/CameraHal.h              |   3 +-
+ mx6/libcamera/CameraModule.cpp         |  13 ++-
+ mx6/libcamera/CaptureDeviceInterface.h |   1 -
+ mx6/libcamera/V4l2CapDeviceBase.cpp    |  10 --
+ mx6/libcamera/V4l2CapDeviceBase.h      |   2 -
+ mx6/libcamera/V4l2UVCDevice.cpp        | 182 +++++++++++++++++++++++++++++----
+ mx6/libcamera/V4l2UVCDevice.h          |  35 ++++++-
+ 8 files changed, 229 insertions(+), 95 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index dd7d565..dab2d65 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -116,7 +116,6 @@ namespace android {
+         CAMERA_LOG_FUNC;
+         mVpuSupportFmt[0] = v4l2_fourcc('N','V','1','2');
+         mVpuSupportFmt[1] = v4l2_fourcc('Y','U','1','2');
+-        mIsFormatMatch = false;
+     }
+     void CameraHal :: postDestroy()
+     {
+@@ -150,9 +149,7 @@ namespace android {
+         CAMERA_LOG_FUNC;
+         CAMERA_HAL_RET ret = CAMERA_HAL_ERR_NONE;
+         mCameraReady == true;
+-
+-        CAMERA_TYPE cType;
+-        mCaptureDevice->GetDevType(&cType);
++        mCaptureDevice->GetDevType(&mSensorType);
+ 
+         if ((ret = AllocInterBuf())<0)
+             return ret;
+@@ -249,15 +246,19 @@ namespace android {
+         mCaptureThreadQueue.postQuitMessage();
+         //Make sure all thread been exit, in case they still
+         //access the message queue
+-        mCaptureFrameThread->requestExitAndWait();
++        if(mCaptureFrameThread != NULL)
++            mCaptureFrameThread->requestExitAndWait();
+ 
+         //Post Quite message to make sure the thread can be exited
+         //In case mCaptureFrameThread not been started yet in CTS test
+         mPreviewThreadQueue.postQuitMessage();
+-        mPreviewShowFrameThread->requestExitAndWait();
++        if(mPreviewShowFrameThread != NULL)
++            mPreviewShowFrameThread->requestExitAndWait();
+         mEncodeThreadQueue.postQuitMessage();
+-        mEncodeFrameThread->requestExitAndWait();
+-        mTakePicThread->requestExitAndWait();
++        if(mEncodeFrameThread != NULL)
++            mEncodeFrameThread->requestExitAndWait();
++        if(mTakePicThread != NULL)
++            mTakePicThread->requestExitAndWait();
+         return ret;
+     }
+ 
+@@ -278,11 +279,6 @@ namespace android {
+             uFormat[n] = mSensorSupportFmt[n];
+         }
+ 
+-        //if the sensor format and preview not match,
+-        //then should count the preview format.
+-        if(!mIsFormatMatch && n < MAX_QUERY_FMT_TIMES)
+-            uFormat[n++] = mPreviewCapturedFormat;
+-
+         memset(fmtStr, 0, 40);
+         for(i = 0; i < n; i++) {
+             for (int j = 0; j < MAX_VPU_SUPPORT_FORMAT; j++) {
+@@ -1220,7 +1216,9 @@ Pic_out:
+ 
+         mCaptureDevice->DevStop();
+         mCaptureDevice->DevDeAllocate();
+-        CloseCaptureDevice();
++        if(mSensorType == CAMERA_TYPE_UVC) {
++            CloseCaptureDevice();
++        }
+ 
+         if(JpegMemBase) {
+             JpegMemBase->release(JpegMemBase);
+@@ -1272,23 +1270,12 @@ Pic_out:
+                     break;
+             }
+             if (nPickFormat == 0) {
+-                //mPictureEncodeFormat stores format report to app.
+-                //mCaptureDeviceCfg.fmt stores format related to dirver.
+-                mPictureEncodeFormat = mJpegEncoderSupportFmt[0];
+-                mCaptureDeviceCfg.fmt = mSensorSupportFmt[0];//mUvcSpecialCaptureFormat; //For uvc now, IPU only can support yuyv.
+-                CAMERA_LOG_INFO("Need to do the CSC for Jpeg encoder");
+-                CAMERA_LOG_INFO("Get the sensor format is :%c%c%c%c\n",
+-                        mCaptureDeviceCfg.fmt & 0xFF, (mCaptureDeviceCfg.fmt >> 8) & 0xFF,
+-                        (mCaptureDeviceCfg.fmt >> 16) & 0xFF, (mCaptureDeviceCfg.fmt >> 24) & 0xFF);
+-                CAMERA_LOG_INFO("Get the Picture Encode Format :%c%c%c%c\n",
+-                        mPictureEncodeFormat & 0xFF, (mPictureEncodeFormat >> 8) & 0xFF,
+-                        (mPictureEncodeFormat >> 16) & 0xFF, (mPictureEncodeFormat >> 24) & 0xFF);
+-                mCaptureDevice->setColorConvert(true);
++                CAMERA_LOG_ERR("NegotiateCaptureFmt failed");
++                return UNKNOWN_ERROR;
+             }
+             else {
+                 mPictureEncodeFormat = nPickFormat;
+                 mCaptureDeviceCfg.fmt = nPickFormat;
+-                mCaptureDevice->setColorConvert(false);
+             }
+             //should make mPictureEncodeFormat equal to mPreviewCapturedFormat.
+             //because allocate buffer should use it.
+@@ -1312,25 +1299,12 @@ Pic_out:
+                     break;
+             }
+             if (nPickFormat == 0) {
+-                //mPreviewCapturedFormat stores format report to app.
+-                //mCaptureDeviceCfg.fmt stores format related to dirver.
+-                mPreviewCapturedFormat = mVpuSupportFmt[0];
+-                mCaptureDeviceCfg.fmt = mSensorSupportFmt[1];//mUvcSpecialCaptureFormat; //For uvc now, IPU only can support yuyv.
+-                CAMERA_LOG_INFO("Need to do the CSC for preview");
+-                CAMERA_LOG_INFO("Get the sensor format is :%c%c%c%c\n",
+-                        mCaptureDeviceCfg.fmt & 0xFF, (mCaptureDeviceCfg.fmt >> 8) & 0xFF,
+-                        (mCaptureDeviceCfg.fmt >> 16) & 0xFF, (mCaptureDeviceCfg.fmt >> 24) & 0xFF);
+-                CAMERA_LOG_INFO("Get the preview format :%c%c%c%c\n",
+-                        mPreviewCapturedFormat & 0xFF, (mPreviewCapturedFormat >> 8) & 0xFF,
+-                        (mPreviewCapturedFormat >> 16) & 0xFF, (mPreviewCapturedFormat >> 24) & 0xFF);
+-                mCaptureDevice->setColorConvert(true);
+-                mIsFormatMatch = false;
++                CAMERA_LOG_ERR("NegotiateCaptureFmt2 failed");
++                return UNKNOWN_ERROR;
+             }
+             else {
+                 mPreviewCapturedFormat = nPickFormat;
+                 mCaptureDeviceCfg.fmt = nPickFormat;
+-                mCaptureDevice->setColorConvert(false);
+-                mIsFormatMatch = true;
+             }
+         }//end else
+ 
+@@ -1585,13 +1559,7 @@ Pic_out:
+             return ret;
+         }
+ 
+-        if(mIsFormatMatch) {
+-            mCaptureDeviceCfg.fmt = mPreviewCapturedFormat;
+-            mCaptureDevice->setColorConvert(false);
+-        }
+-        else {
+-            mCaptureDevice->setColorConvert(true);
+-        }
++        mCaptureDeviceCfg.fmt = mPreviewCapturedFormat;
+ 
+         CAMERA_LOG_RUNTIME("*********%s,mCaptureDeviceCfg.fmt=%x************", __FUNCTION__, mCaptureDeviceCfg.fmt);
+         mCaptureDeviceCfg.rotate = (SENSOR_PREVIEW_ROTATE)mPreviewRotate;
+@@ -1706,7 +1674,9 @@ Pic_out:
+         mCaptureDevice->DevStop();
+         mCaptureDevice->DevDeAllocate();
+         freeBuffersToNativeWindow();
+-        CloseCaptureDevice();
++        if(mSensorType == CAMERA_TYPE_UVC) {
++            CloseCaptureDevice();
++        }
+     }
+ 
+     status_t CameraHal :: PrepareCaptureBufs()
+@@ -1810,9 +1780,11 @@ Pic_out:
+ 
+         unsigned int bufIndex = 0;
+         //skip 10 frames when doing preview
+-        for (int k = 0; k < 10; k++) {
+-            mCaptureDevice->DevDequeue(&bufIndex);
+-            mCaptureDevice->DevQueue(bufIndex);
++        if(mSensorType != CAMERA_TYPE_UVC) {
++            for (int k = 0; k < 10; k++) {
++                mCaptureDevice->DevDequeue(&bufIndex);
++                mCaptureDevice->DevQueue(bufIndex);
++            }
+         }
+ 
+         for(unsigned int i=0; i < mCaptureBufNum; i++) {
+diff --git a/mx6/libcamera/CameraHal.h b/mx6/libcamera/CameraHal.h
+index 70d0e2e..d0d8972 100755
+--- a/mx6/libcamera/CameraHal.h
++++ b/mx6/libcamera/CameraHal.h
+@@ -395,8 +395,7 @@ namespace android {
+         CAMERA_PREVIEW_ROTATE mPreviewRotate;
+ 
+         unsigned int mVpuSupportFmt[MAX_VPU_SUPPORT_FORMAT];
+-        bool mIsFormatMatch;//between hal and driver.
+-        //bool mIsEncoderMatch;
++        CAMERA_TYPE mSensorType;
+     };
+ 
+ }; // namespace android
+diff --git a/mx6/libcamera/CameraModule.cpp b/mx6/libcamera/CameraModule.cpp
+index eb0f61d..a049622 100755
+--- a/mx6/libcamera/CameraModule.cpp
++++ b/mx6/libcamera/CameraModule.cpp
+@@ -591,12 +591,15 @@ int camera_device_open(const hw_module_t* module, const char* name,
+         }
+ 
+         if (camera->setCaptureDevice(pCaptureDevice) < 0 ||
+-                camera->setJpegEncoder(pJpegEncoder) < 0)
+-            return NULL;
+-
+-        if (camera->Init() < 0)
+-            return NULL;
++                camera->setJpegEncoder(pJpegEncoder) < 0) {
++            rv = -EINVAL;
++            goto fail;
++        }
+ 
++        if (camera->Init() < 0) {
++            rv = -EINVAL;
++            goto fail;
++        }
+ 
+         gCameraHals[cameraid] = camera;
+         gCamerasOpen++;
+diff --git a/mx6/libcamera/CaptureDeviceInterface.h b/mx6/libcamera/CaptureDeviceInterface.h
+index b41fa41..38163e1 100755
+--- a/mx6/libcamera/CaptureDeviceInterface.h
++++ b/mx6/libcamera/CaptureDeviceInterface.h
+@@ -93,7 +93,6 @@ namespace android {
+ 
+         virtual CAPTURE_DEVICE_RET SetDevName(char * deviceName)=0;
+         virtual CAPTURE_DEVICE_RET GetDevName(char * deviceName)=0;
+-        virtual CAPTURE_DEVICE_RET setColorConvert(bool enable)=0;
+         virtual CAPTURE_DEVICE_RET DevOpen(int cameraId)=0;
+         virtual CAPTURE_DEVICE_RET EnumDevParam(DevParamType devParamType, void *retParam)=0;
+         virtual CAPTURE_DEVICE_RET DevSetConfig(struct capture_config_t *pCapcfg)=0;
+diff --git a/mx6/libcamera/V4l2CapDeviceBase.cpp b/mx6/libcamera/V4l2CapDeviceBase.cpp
+index a1fc3a4..26e509e 100755
+--- a/mx6/libcamera/V4l2CapDeviceBase.cpp
++++ b/mx6/libcamera/V4l2CapDeviceBase.cpp
+@@ -75,12 +75,6 @@ namespace android{
+         return ret;
+     }
+ 
+-    CAPTURE_DEVICE_RET V4l2CapDeviceBase::setColorConvert(bool enable){
+-        CAMERA_LOG_FUNC;
+-
+-        return V4l2setColorConvert(enable);
+-    }
+-
+     CAPTURE_DEVICE_RET V4l2CapDeviceBase::DevOpen(int cameraId){
+         CAMERA_LOG_FUNC;
+ 
+@@ -718,8 +712,4 @@ namespace android{
+         return CAPTURE_DEVICE_ERR_NONE;
+     }
+ 
+-    CAPTURE_DEVICE_RET V4l2CapDeviceBase :: V4l2setColorConvert(bool enable){
+-        return CAPTURE_DEVICE_ERR_NONE;
+-    }
+-
+ };
+diff --git a/mx6/libcamera/V4l2CapDeviceBase.h b/mx6/libcamera/V4l2CapDeviceBase.h
+index 557192f..6bc3e0b 100755
+--- a/mx6/libcamera/V4l2CapDeviceBase.h
++++ b/mx6/libcamera/V4l2CapDeviceBase.h
+@@ -31,7 +31,6 @@ namespace android{
+         virtual CAPTURE_DEVICE_RET SetDevName(char * deviceName);
+         virtual CAPTURE_DEVICE_RET GetDevName(char * deviceName);
+         virtual CAPTURE_DEVICE_RET GetDevType(CAMERA_TYPE *pType);
+-        virtual CAPTURE_DEVICE_RET setColorConvert(bool enable);
+         virtual CAPTURE_DEVICE_RET DevOpen(int cameraId);
+         virtual CAPTURE_DEVICE_RET EnumDevParam(DevParamType devParamType, void *retParam);
+         virtual CAPTURE_DEVICE_RET DevSetConfig(struct capture_config_t *pCapcfg);
+@@ -66,7 +65,6 @@ namespace android{
+         virtual CAPTURE_DEVICE_RET V4l2ConfigInput(struct capture_config_t *pCapcfg);
+         virtual CAPTURE_DEVICE_RET V4l2GetCaptureMode(struct capture_config_t *pCapcfg, unsigned int *pMode);
+         virtual CAPTURE_DEVICE_RET V4l2SetRot(struct capture_config_t *pCapcfg);
+-        virtual CAPTURE_DEVICE_RET V4l2setColorConvert(bool enable);
+ 
+         char         mCaptureDeviceName[CAMAERA_FILENAME_LENGTH];
+         char         mInitalDeviceName[CAMAERA_SENSOR_LENGTH];
+diff --git a/mx6/libcamera/V4l2UVCDevice.cpp b/mx6/libcamera/V4l2UVCDevice.cpp
+index d34b1dd..097915c 100755
+--- a/mx6/libcamera/V4l2UVCDevice.cpp
++++ b/mx6/libcamera/V4l2UVCDevice.cpp
+@@ -50,7 +50,23 @@ V4l2UVCDevice::V4l2UVCDevice()
+     mCaptureConfigNum = 0;
+     mCurrentConfig = NULL;
+     memset(mCaptureConfig, 0, sizeof(mCaptureConfig));
++
+     mEnableCSC = false;
++    memset(mCscSupportFmt, 0, sizeof(mCscSupportFmt));
++    //the format support in CSC.
++    mCscSupportFmt[0] = v4l2_fourcc('N','V','1','2');
++    mSensorFmtCnt = 0;
++    mCscFmtCnt = 0;
++    mActualCscFmtCnt = 0;
++    memset(mSensorSupportFmt, 0, sizeof(mSensorSupportFmt));
++    memset(mActualCscFmt, 0 , sizeof(mActualCscFmt));
++
++    memset(mCscGroup, 0, sizeof(mCscGroup));
++    //related to format support in CSC.
++    mCscGroup[0].srcFormat = v4l2_fourcc('Y','U','Y','V');
++    mCscGroup[0].dstFormat = v4l2_fourcc('N','V','1','2');
++    mCscGroup[0].cscConvert = convertYUYUToNV12;
++    mDoCsc = NULL;
+ }
+ 
+ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2Open(int cameraId)
+@@ -101,6 +117,10 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2Open(int cameraId)
+                             strcpy(mCaptureDeviceName, dev_node);
+                             break;
+                         }
++                        else {
++                            close(fd);
++                            fd = 0;
++                        }
+                     } else {
+                         close(fd);
+                         fd = 0;
+@@ -240,9 +260,17 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2Dequeue(unsigned int *pBufQueIdx)
+         *pBufQueIdx = cfilledbuffer.index;
+ 
+         //should do hardware accelerate.
+-        if(mEnableCSC)
+-            convertYUYUToNV12(mUvcBuffers[*pBufQueIdx].virt_start, mCaptureBuffers[*pBufQueIdx].virt_start,
+-                           mCurrentConfig->width, mCurrentConfig->height);
++        if(mEnableCSC && mDoCsc) {
++            mDoCsc->width = mCurrentConfig->width;
++            mDoCsc->height = mCurrentConfig->height;
++            mDoCsc->srcStride = mDoCsc->width;
++            mDoCsc->dstStride = mDoCsc->width;
++            mDoCsc->srcVirt = mUvcBuffers[*pBufQueIdx].virt_start;
++            mDoCsc->dstVirt = mCaptureBuffers[*pBufQueIdx].virt_start;
++            mDoCsc->srcPhy = mUvcBuffers[*pBufQueIdx].phy_offset;
++            mDoCsc->dstPhy = mCaptureBuffers[*pBufQueIdx].phy_offset;
++            mDoCsc->cscConvert(mDoCsc);
++        }
+         else
+             memcpy(mCaptureBuffers[*pBufQueIdx].virt_start, mUvcBuffers[*pBufQueIdx].virt_start, mCaptureBuffers[*pBufQueIdx].length);
+ 
+@@ -299,6 +327,68 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2DeAlloc()
+     return CAPTURE_DEVICE_ERR_NONE;
+ }
+ 
++void V4l2UVCDevice::selectCscFunction(unsigned int format)
++{
++    CAMERA_LOG_FUNC;
++    mDoCsc = NULL;
++    for(int i=0; i<MAX_CSC_SUPPORT_FMT; i++) {
++        if(mCscGroup[i].dstFormat == format) {
++            mDoCsc = &mCscGroup[i];
++            CAMERA_LOG_RUNTIME("find the match mCscGroup[%d]", i);
++        }
++    }
++}
++
++unsigned int V4l2UVCDevice::queryCscSourceFormat(unsigned int format)
++{
++    CAMERA_LOG_FUNC;
++    for(int i=0; i<MAX_CSC_SUPPORT_FMT; i++) {
++        if(mCscGroup[i].dstFormat == format) {
++            CAMERA_LOG_RUNTIME("find the CSC source format=0x%x convert to dest format=0x%x",
++                         mCscGroup[i].srcFormat, mCscGroup[i].dstFormat);
++            return mCscGroup[i].srcFormat;
++        }
++    }
++
++    CAMERA_LOG_ERR("invalidate format 0x%x in query", format);
++    return 0;
++}
++
++bool V4l2UVCDevice::needDoCsc(unsigned int format)
++{
++    CAMERA_LOG_FUNC;
++    unsigned int i;
++    for(i=0; i < mActualCscFmtCnt; i++) {
++        if(mActualCscFmt[i] == format)
++            return true;
++    }
++
++    return false;
++}
++
++unsigned int V4l2UVCDevice::countActualCscFmt()
++{
++    CAMERA_LOG_FUNC;
++    if(mSensorFmtCnt <= 0) {
++        return 0;
++    }
++
++    unsigned int i, k;
++    unsigned int n = 0;
++    for(i=0; i < MAX_CSC_SUPPORT_FMT; i++) {
++        for(k=0; k < mSensorFmtCnt; k++) {
++            if(mCscSupportFmt[i] == mSensorSupportFmt[k]) {
++                break;
++            }
++        }
++        if(k == mSensorFmtCnt) {
++            mActualCscFmt[n++] = mCscSupportFmt[i];
++        }
++    }
++
++    return n;
++}
++
+ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2EnumFmt(void *retParam)
+ {
+     CAMERA_LOG_FUNC;
+@@ -310,11 +400,26 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2EnumFmt(void *retParam)
+     vid_fmtdesc.index = mFmtParamIdx;
+     vid_fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+     if (ioctl(mCameraDevice, VIDIOC_ENUM_FMT, &vid_fmtdesc ) != 0){
++        if(mSensorFmtCnt > 0) {
++            mCscFmtCnt = countActualCscFmt();
++            mActualCscFmtCnt = mCscFmtCnt;
++            mSensorFmtCnt = 0;
++        }
++        if(mCscFmtCnt > 0) {
++            *pParamVal = mActualCscFmt[mCscFmtCnt-1];
++            mFmtParamIdx ++;
++            mCscFmtCnt --;
++            return CAPTURE_DEVICE_ERR_ENUM_CONTINUE;
++        }
+         mFmtParamIdx = 0;
+         ret = CAPTURE_DEVICE_ERR_GET_PARAM;
+     }else{
+         CAMERA_LOG_RUNTIME("vid_fmtdesc.pixelformat is %x", vid_fmtdesc.pixelformat);
+         *pParamVal = vid_fmtdesc.pixelformat;
++        if(mFmtParamIdx < MAX_SUPPORTED_FMT) {
++            mSensorSupportFmt[mFmtParamIdx] = vid_fmtdesc.pixelformat;
++            mSensorFmtCnt ++;
++        }
+         mFmtParamIdx ++;
+         ret = CAPTURE_DEVICE_ERR_ENUM_CONTINUE;
+     }
+@@ -334,15 +439,40 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2EnumSizeFps(void *retParam)
+     vid_frmsize.index = mSizeFPSParamIdx;
+     CAMERA_LOG_RUNTIME("the query for size fps fmt is %x",pCapCfg->fmt);
+ 
+-    vid_frmsize.pixel_format = pCapCfg->fmt;
++    if(needDoCsc(pCapCfg->fmt)) {
++        vid_frmsize.pixel_format = queryCscSourceFormat(pCapCfg->fmt);
++        if(vid_frmsize.pixel_format == 0) {
++            CAMERA_LOG_ERR("EnumSizeFps: queryCscSourceFormat return failed");
++            return CAPTURE_DEVICE_ERR_BAD_PARAM;
++        }
++    }
++    else {
++        vid_frmsize.pixel_format = pCapCfg->fmt;
++    }
+     if (ioctl(mCameraDevice, VIDIOC_ENUM_FRAMESIZES, &vid_frmsize) != 0){
+         mSizeFPSParamIdx = 0;
+         ret = CAPTURE_DEVICE_ERR_SET_PARAM;
+     }else{
++        //uvc handle 1600x1200 may have some problem. so, skip it.
++        if(vid_frmsize.discrete.width == 1600 && vid_frmsize.discrete.height == 1200) {
++            CAMERA_LOG_ERR("EnumSizeFps: now skip %d x %d resolution", vid_frmsize.discrete.width, vid_frmsize.discrete.height);
++            mSizeFPSParamIdx = 0;
++            return CAPTURE_DEVICE_ERR_SET_PARAM;
++        }
++
+         memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
+         CAMERA_LOG_RUNTIME("in %s the w %d, h %d", __FUNCTION__,vid_frmsize.discrete.width, vid_frmsize.discrete.height);
+         vid_frmval.index = 0; //get the first, that is the min frame interval, but the biggest fps
+-        vid_frmval.pixel_format = pCapCfg->fmt;
++        if(needDoCsc(pCapCfg->fmt)) {
++            vid_frmval.pixel_format = queryCscSourceFormat(pCapCfg->fmt);
++            if(vid_frmsize.pixel_format == 0) {
++                CAMERA_LOG_ERR("EnumSizeFps2: queryCscSourceFormat return failed");
++                return CAPTURE_DEVICE_ERR_BAD_PARAM;
++            }
++        }
++        else {
++            vid_frmval.pixel_format = pCapCfg->fmt;
++        }
+         vid_frmval.width = vid_frmsize.discrete.width;
+         vid_frmval.height= vid_frmsize.discrete.height;
+         if (ioctl(mCameraDevice, VIDIOC_ENUM_FRAMEINTERVALS, &vid_frmval) != 0){
+@@ -357,7 +487,7 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2EnumSizeFps(void *retParam)
+             mSizeFPSParamIdx ++;
+ 
+             //store all configuration here.
+-            mCaptureConfig[mCaptureConfigNum].fmt = pCapCfg->fmt;
++            mCaptureConfig[mCaptureConfigNum].fmt = vid_frmsize.pixel_format;//pCapCfg->fmt;
+             mCaptureConfig[mCaptureConfigNum].width = pCapCfg->width;
+             mCaptureConfig[mCaptureConfigNum].height = pCapCfg->height;
+             mCaptureConfig[mCaptureConfigNum].picture_waite_number = 0;
+@@ -369,12 +499,6 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2EnumSizeFps(void *retParam)
+     return ret;
+ }
+ 
+-CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2setColorConvert(bool enable)
+-{
+-    mEnableCSC = enable;
+-    return CAPTURE_DEVICE_ERR_NONE;
+-}
+-
+ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2SetConfig(struct capture_config_t *pCapcfg)
+ {
+     CAMERA_LOG_FUNC;
+@@ -392,7 +516,7 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2SetConfig(struct capture_config_t *pCapcfg
+ 
+     //find the best match configuration.
+     for(unsigned int i=0; i < mCaptureConfigNum; i++) {
+-        if(mCaptureConfig[i].fmt == pCapcfg->fmt &&
++        if(/*mCaptureConfig[i].fmt == pCapcfg->fmt &&*/
+                  mCaptureConfig[i].width == pCapcfg->width &&
+                  mCaptureConfig[i].height == pCapcfg->height) {
+             matchConfig = &mCaptureConfig[i];
+@@ -419,14 +543,28 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2SetConfig(struct capture_config_t *pCapcfg
+                        pCapcfg->fmt, pCapcfg->width, pCapcfg->height);
+         return CAPTURE_DEVICE_ERR_BAD_PARAM;
+     }
++
+     mCurrentConfig = matchConfig;
+ 
+     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    fmt.fmt.pix.pixelformat = matchConfig->fmt;
++    if(needDoCsc(pCapcfg->fmt)) {
++        mEnableCSC = true;
++        //set mDoCsc 
++        selectCscFunction(pCapcfg->fmt);
++        fmt.fmt.pix.pixelformat = queryCscSourceFormat(pCapcfg->fmt);
++        if(fmt.fmt.pix.pixelformat == 0) {
++            CAMERA_LOG_ERR("SetConfig: queryCscSourceFormat return failed");
++            return CAPTURE_DEVICE_ERR_BAD_PARAM;
++        }
++    }
++    else {
++        mEnableCSC = false;
++        fmt.fmt.pix.pixelformat = matchConfig->fmt;
++    }
+ 
+-    fmt.fmt.pix.width = matchConfig->width&0xFFFFFFF8;
+-    fmt.fmt.pix.height = matchConfig->height&0xFFFFFFF8;
+-    if (matchConfig->fmt == V4L2_PIX_FMT_YUYV)
++    fmt.fmt.pix.width = matchConfig->width;
++    fmt.fmt.pix.height = matchConfig->height;
++    if (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)
+         fmt.fmt.pix.bytesperline = fmt.fmt.pix.width * 2;
+     else
+         fmt.fmt.pix.bytesperline = fmt.fmt.pix.width;
+@@ -446,7 +584,8 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2SetConfig(struct capture_config_t *pCapcfg
+     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+     parm.parm.capture.timeperframe.numerator = matchConfig->tv.numerator;
+     parm.parm.capture.timeperframe.denominator = matchConfig->tv.denominator;
+-
++    CAMERA_LOG_RUNTIME("frame timeval is numerator %d, denominator %d",parm.parm.capture.timeperframe.numerator,
++                parm.parm.capture.timeperframe.denominator);
+     if ( (err = ioctl(mCameraDevice, VIDIOC_S_PARM, &parm)) < 0) {
+         CAMERA_LOG_ERR("%s:%d  VIDIOC_S_PARM failed err=%d\n", __FUNCTION__,__LINE__, err);
+         CAMERA_LOG_ERR("frame timeval is numerator %d, denominator %d",parm.parm.capture.timeperframe.numerator,
+@@ -473,8 +612,13 @@ CAPTURE_DEVICE_RET V4l2UVCDevice::V4l2SetConfig(struct capture_config_t *pCapcfg
+     return CAPTURE_DEVICE_ERR_NONE;
+ }
+ 
+-void V4l2UVCDevice::convertYUYUToNV12(unsigned char *pSrcBufs, unsigned char *pDstBufs, unsigned int bufWidth, unsigned int bufHeight)
++void V4l2UVCDevice::convertYUYUToNV12(struct CscConversion* param)
+ {
++    unsigned char *pSrcBufs = param->srcVirt;
++    unsigned char *pDstBufs = param->dstVirt;
++    unsigned int bufWidth = param->width;
++    unsigned int bufHeight = param->height;
++
+     unsigned char *pSrcY1Offset = pSrcBufs;
+     unsigned char *pSrcY2Offset = pSrcBufs + (bufWidth << 1);
+     unsigned char *pSrcY3Offset = pSrcBufs + (bufWidth << 1) * 2;
+diff --git a/mx6/libcamera/V4l2UVCDevice.h b/mx6/libcamera/V4l2UVCDevice.h
+index baa3bcf..2f95c89 100755
+--- a/mx6/libcamera/V4l2UVCDevice.h
++++ b/mx6/libcamera/V4l2UVCDevice.h
+@@ -26,9 +26,25 @@
+ #define MAX_DEV_NAME_LENGTH 10
+ #define MAX_CAPTURE_CONFIG  20
+ #define MAX_SUPPORTED_FMT  10
++#define MAX_CSC_SUPPORT_FMT 1
+ 
+ namespace android{
+ 
++struct CscConversion {
++    int width;
++    int height;
++    int srcStride;
++    int dstStride;
++    unsigned int srcFormat;
++    unsigned int dstFormat;
++    unsigned char* srcVirt;
++    unsigned char* dstVirt;
++    int srcPhy;
++    int dstPhy;
++
++    void(*cscConvert)(struct CscConversion* param);
++};
++
+ class V4l2UVCDevice : public V4l2CapDeviceBase{
+ public:
+     V4l2UVCDevice();//{mCameraType = CAMERA_TYPE_UVC;}
+@@ -44,10 +60,13 @@ protected:
+     CAPTURE_DEVICE_RET V4l2EnumFmt(void *retParam);
+     CAPTURE_DEVICE_RET V4l2EnumSizeFps(void *retParam);
+     CAPTURE_DEVICE_RET V4l2SetConfig(struct capture_config_t *pCapcfg);
+-    CAPTURE_DEVICE_RET V4l2setColorConvert(bool enable);
+ 
+ private:
+-    void convertYUYUToNV12(unsigned char *pSrcBufs, unsigned char *pDstBufs, unsigned int bufWidth, unsigned int bufHeight);
++    static void convertYUYUToNV12(struct CscConversion* param);
++    unsigned int countActualCscFmt();
++    bool needDoCsc(unsigned int);
++    void selectCscFunction(unsigned int format);
++    unsigned int queryCscSourceFormat(unsigned int format);
+     //DMA_BUFFER mCameraBuffer[MAX_CAPTURE_BUF_QUE_NUM];
+     //mCaptureBuffers defined in parent class store buffers allocated from user space.
+     //mUvcBuffers store the buffers allocated from uvc driver.
+@@ -59,8 +78,18 @@ private:
+     struct capture_config_t* mCurrentConfig;
+ 
+     //for jpeg encoder support yuyv. this case, should not covert.
+-    int mNeedConvert;
+     bool mEnableCSC;
++    //stores csc support format.
++    unsigned int mCscSupportFmt[MAX_CSC_SUPPORT_FMT];
++    //stores nedd csc format. 
++    struct CscConversion mCscGroup[MAX_CSC_SUPPORT_FMT];
++    struct CscConversion* mDoCsc;
++    unsigned int mActualCscFmt[MAX_CSC_SUPPORT_FMT];
++    unsigned int mActualCscFmtCnt;
++    //stores sensor support format.
++    unsigned int mSensorSupportFmt[MAX_SUPPORTED_FMT];
++    unsigned int mSensorFmtCnt;
++    unsigned int mCscFmtCnt;
+ };
+ 
+ };
+-- 
+1.8.0
+

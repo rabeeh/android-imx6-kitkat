@@ -1,0 +1,88 @@
+From 117c3300e34ca8cd348dfb2928f10b0b873f24bd Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Tue, 23 Oct 2012 10:08:57 +0800
+Subject: [PATCH 358/486] ENGR00225708 HDMI will mute sometimes
+
+1.Clear the pointer when close the stream
+2.elarge the start threshold for the hdmi.
+
+Change-Id: Ib548589742cb94478fa98e91aa943a47ebd152e7
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/tinyalsa_hal.c | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index 8cc37a4..353bd55 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -107,8 +107,8 @@ struct pcm_config pcm_config_mm_out = {
+ struct pcm_config pcm_config_hdmi_multi = {
+     .channels = 8, /* changed when the stream is opened */
+     .rate = MM_FULL_POWER_SAMPLING_RATE, /* changed when the stream is opened */
+-    .period_size = LONG_PERIOD_SIZE,
+-    .period_count = PLAYBACK_LONG_PERIOD_COUNT,
++    .period_size = HDMI_PERIOD_SIZE,
++    .period_count = PLAYBACK_HDMI_PERIOD_COUNT,
+     .format = PCM_FORMAT_S16_LE,
+     .start_threshold = 0,
+     .avail_min = 0,
+@@ -418,7 +418,7 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+     int pcm_device;
+     bool success = true;
+ 
+-    ALOGW("start_output_stream... %d",(int)out);
++    ALOGW("start_output_stream... %d, device %d",(int)out, out->device);
+ 
+     if (adev->mode != AUDIO_MODE_IN_CALL) {
+         /* FIXME: only works if only one output can be active at a time */
+@@ -444,7 +444,7 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+         out->write_flags[PCM_HDMI]            = PCM_OUT;
+         out->write_threshold[PCM_HDMI]        = HDMI_PERIOD_SIZE * PLAYBACK_HDMI_PERIOD_COUNT;
+         out->config[PCM_HDMI] = pcm_config_mm_out;
+-        out->config[PCM_HDMI].start_threshold = HDMI_PERIOD_SIZE;
++        out->config[PCM_HDMI].start_threshold = HDMI_PERIOD_SIZE * PLAYBACK_HDMI_PERIOD_COUNT;
+         out->config[PCM_HDMI].avail_min       = HDMI_PERIOD_SIZE;
+         card = get_card_for_device(adev, pcm_device);
+         out->pcm[PCM_HDMI] = pcm_open(card, port,out->write_flags[PCM_HDMI], &out->config[PCM_HDMI]);
+@@ -720,7 +720,7 @@ static int do_output_standby(struct imx_stream_out *out)
+             }
+         }
+ 
+-        ALOGW("do_out_standby...");
++        ALOGW("do_out_standby... %d",(int)out);
+ 
+         /* if in call, don't turn off the output stage. This will
+         be done when the call is ended */
+@@ -809,7 +809,7 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+     }
+     ALOGW("out_set_parameters %s, ret %d, out %d",kvpairs, ret, (int)out);
+     str_parms_destroy(parms);
+-    return 0;
++    return ret;
+ }
+ 
+ static char * out_get_parameters(const struct audio_stream *stream, const char *keys)
+@@ -1842,9 +1842,18 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
+ {
+     struct imx_stream_out *out = (struct imx_stream_out *)stream;
+     struct imx_audio_device *ladev = (struct imx_audio_device *)dev;
+-    ALOGW("adev_close_output_stream...");
++    int i;
++    ALOGW("adev_close_output_stream...%d",(int)out);
+ 
+     out_standby(&stream->common);
++
++    for (i = 0; i < OUTPUT_TOTAL; i++) {
++        if (ladev->active_output[i] == out) {
++            ladev->active_output[i] = NULL;
++            break;
++        }
++    }
++
+     if (out->buffer)
+         free(out->buffer);
+     if (out->resampler)
+-- 
+1.8.0
+

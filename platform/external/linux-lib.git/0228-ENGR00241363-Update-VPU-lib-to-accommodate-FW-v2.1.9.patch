@@ -1,0 +1,208 @@
+From 0cef165d805074acaae2847b210aa0937fb7a222 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 23 Jan 2013 10:26:14 +0800
+Subject: [PATCH 228/249] ENGR00241363 Update VPU lib to accommodate FW
+ v2.1.9, bug fix
+
+VPU lib v5.4.12
+
+1) Update VPU lib to accommodate FW v2.1.9
+
+- Support forced initial delay for H.264 decoder
+User can call vpu_DecGiveCommand(handle, DEC_SET_FRAME_DELAY, &delay)
+before vpu_DecRegisterFrameBuffer to overwrite initial delay.
+Take care not to set initial delay lower than reorder depth of the clip,
+otherwise, display will be out of order.
+
+- Increase BIT_WORK_SIZE and SIZE_PIC_PARA_BASE_BUF
+
+2) Bug fix
+
+- Bug
+vpu_DecGetInitialInfo got out of BIT_BUSY_FLAG check loop, but VPU was
+still busy.
+
+- Root cause
+In roll back mode, if roll back happens, FW will reset BPU. If negedge
+of the reset signal falls in some core cycles of an APB read transfer,
+the value read will be 0 (instead of the value in register).
+BIT_BUSY_FLAG=0 may be caused by the reset but VPU is not idle.
+
+- Solution
+Given the fact that APB doesn't allow pipelined request, the negedge of
+reset signal can impact at most one APB read. If BIT_BUSY_FLAG read is
+wrong, subsequent read to any BPU register is correct. So we will check
+BIT_BUSY_FLAG once more.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c  | 17 +++++++++++++++++
+ vpu/vpu_lib.h  |  6 ++++--
+ vpu/vpu_reg.h  |  3 ++-
+ vpu/vpu_util.c |  3 +++
+ vpu/vpu_util.h |  7 ++++---
+ 5 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 53f2945..29e1647 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -324,6 +324,7 @@ RetCode vpu_Init(void *cb)
+ 		}
+ 
+ 		VpuWriteReg(BIT_BUSY_FLAG, 1);
++		dump_regs(0, 128);
+ 		VpuWriteReg(BIT_CODE_RUN, 1);
+ 		while (VpuReadReg(BIT_BUSY_FLAG));
+ 
+@@ -2579,6 +2580,8 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	pDecInfo->decReportUserData.enable = 0;
+ 	pDecInfo->decReportUserData.size = 0;
+ 
++	pDecInfo->frame_delay = -1;
++
+ 	if (cpu_is_mx6x()) {
+ 		pDecInfo->mapType = pop->mapType;
+ 		pDecInfo->tiledLinearEnable = pop->tiled2LinearEnable;
+@@ -2931,6 +2934,11 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 
+ 	BitIssueCommand(pCodecInst, SEQ_INIT);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
++	if (cpu_is_mx6x() && pDecInfo->openParam.bitstreamMode) {
++		/* check once more in roll back mode, in case
++		 * BIT_BUSY_FLAG=0 is caused by reset */
++		while (VpuReadReg(BIT_BUSY_FLAG)) ;
++	}
+ 
+ 	val = VpuReadReg(RET_DEC_SEQ_SUCCESS);
+ 
+@@ -3315,6 +3323,9 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 	} else
+ 		VpuWriteReg(BIT_AXI_SRAM_USE, 0);       /* not use SRAM */
+ 
++	if (cpu_is_mx6x())
++		VpuWriteReg(CMD_SET_FRAME_DELAY, pDecInfo->frame_delay);
++
+ 	if (cpu_is_mx6x()) {
+ 		/* Maverick Cache Configuration */
+ 		val = (pDecInfo->cacheConfig.luma.cfg.PageSizeX << 28) |
+@@ -4868,6 +4879,12 @@ RetCode vpu_DecGiveCommand(DecHandle handle, CodecCommand cmd, void *param)
+ 			break;
+ 		}
+ 
++	case DEC_SET_FRAME_DELAY:
++		{
++			pDecInfo->frame_delay = *(int *)param;
++			break;
++		}
++
+ 	default:
+ 		return RETCODE_INVALID_COMMAND;
+ 	}
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 89bad6b..abdc60d 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -138,7 +138,9 @@ typedef enum {
+ 
+ 	ENC_SET_SUB_FRAME_SYNC,
+ 	ENC_ENABLE_SUB_FRAME_SYNC,
+-	ENC_DISABLE_SUB_FRAME_SYNC
++	ENC_DISABLE_SUB_FRAME_SYNC,
++
++	DEC_SET_FRAME_DELAY
+ } CodecCommand;
+ 
+ typedef struct {
+@@ -661,7 +663,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 11)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 12)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 2c8ca6f..2957d09 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -1,7 +1,7 @@
+ /*
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  *
+- * Copyright (C) 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2004-2013 Freescale Semiconductor, Inc.
+  */
+ 
+ /* The following programs are the sole property of Freescale Semiconductor Inc.,
+@@ -332,6 +332,7 @@
+ /* MX5X used, others dummy */
+ #if defined(IMX6Q)
+ #define CMD_SET_FRAME_MAX_DEC_SIZE      0x1B8
++#define CMD_SET_FRAME_DELAY		0x1BC
+ #else
+ #define CMD_SET_FRAME_MAX_DEC_SIZE      0x1A4
+ #endif
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 7c05722..d43d5ec 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -325,6 +325,8 @@ void BitIssueCommand(CodecInst *pCodecInst, int cmd)
+ 
+ 	LockVpuReg(vpu_semap);
+ 
++	dprintf(4, "BitIssueCommand %d\n", cmd);
++
+ 	if (pCodecInst != NULL) {
+ 		/* Save context related registers to vpu */
+ 		VpuWriteReg(BIT_BIT_STREAM_PARAM,
+@@ -355,6 +357,7 @@ void BitIssueCommand(CodecInst *pCodecInst, int cmd)
+ 	VpuWriteReg(BIT_RUN_INDEX, instIdx);
+ 	VpuWriteReg(BIT_RUN_COD_STD, cdcMode);
+ 	VpuWriteReg(BIT_RUN_AUX_STD, auxMode);
++	dump_regs(0, 128);
+ 	VpuWriteReg(BIT_RUN_COMMAND, cmd);
+ 	UnlockVpuReg(vpu_semap);
+ }
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 7e2c41c..4838360 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -1,7 +1,7 @@
+ /*
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  *
+- * Copyright (C) 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2004-2013 Freescale Semiconductor, Inc.
+  */
+ 
+ /* The following programs are the sole property of Freescale Semiconductor Inc.,
+@@ -37,14 +37,14 @@ typedef enum {
+ 
+ 
+ #if defined(IMX6Q)
+-#define BIT_WORK_SIZE			48 * 1024
++#define BIT_WORK_SIZE			80 * 1024
+ #else
+ #define BIT_WORK_SIZE			128 * 1024
+ #endif
+ #define SIZE_CONTEXT_BUF		BIT_WORK_SIZE
+ #define PS_SAVE_SIZE			0x080000
+ 
+-#define SIZE_PIC_PARA_BASE_BUF          0x100
++#define SIZE_PIC_PARA_BASE_BUF          0x10000
+ #define SIZE_MV_DATA                    0x20000
+ #define SIZE_MB_DATA                    0x4000
+ #define SIZE_FRAME_BUF_STAT             0x100
+@@ -517,6 +517,7 @@ typedef struct {
+ 	DecReportInfo decReportMBInfo;      /* Mb Param for Error Concealment */
+ 	DecReportInfo decReportMVInfo;     /* Motion vector */
+ 	DecReportInfo decReportUserData;
++	int frame_delay;
+ } DecInfo;
+ 
+ typedef struct CodecInst {
+-- 
+1.8.0
+

@@ -1,0 +1,630 @@
+From a6614bc703f7545f28432dea88d1c9193b9a751b Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Mon, 4 Feb 2013 15:53:41 +0800
+Subject: [PATCH 415/486] ENGR00243105 imx6: hwcomposer: refine vsync
+ structure.
+
+This patch is change the hwcomposer 's vsync to IOCTL implement
+to archive less overhead.
+
+Our old way is:
+
+[UserSpace]
+Vsync Enable
+[Kernel]
+VSYNC IRQ -> VSYNC Workqueue -> send Uevent
+[Userspace]
+VSync Thread->wait for Uevent -> Got uevent -> Got Vsync timestamp
+-> call android vsync
+
+After this change, it become simpler:
+[UserSpace]
+Vsync_enable -> Vsync Thread call ioctl of FB
+ [Kernel]
+IOCTl Handler of FB -> Enable VSYNC IRQ -> Got IRQ -> return IOCTL
+[Userspace]
+Got vsync timestamp -> call android VSYNC
+
+The workqueue schedule and uevent will affect the average vsync
+overhead and stability.
+
+About 10x over head and 2x standard deviation of two implement.
+
+So change to the IOCTL version implement.
+
+Also this patch separate the Uevent Handle in HWC to a
+different thread, and some code refine.
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ mx6/hwcomposer/Android.mk      |  18 +++++-
+ mx6/hwcomposer/hwc_context.h   |   9 ++-
+ mx6/hwcomposer/hwc_display.cpp |  16 ++---
+ mx6/hwcomposer/hwc_display.h   |  24 ++++++++
+ mx6/hwcomposer/hwc_uevent.cpp  |  98 ++++++++++++++++++++++++++++++
+ mx6/hwcomposer/hwc_uevent.h    |  40 +++++++++++++
+ mx6/hwcomposer/hwc_vsync.cpp   | 131 ++++++++++++++---------------------------
+ mx6/hwcomposer/hwc_vsync.h     |   9 ++-
+ mx6/hwcomposer/hwcomposer.cpp  |  25 ++++----
+ 9 files changed, 254 insertions(+), 116 deletions(-)
+ create mode 100644 mx6/hwcomposer/hwc_display.h
+ create mode 100644 mx6/hwcomposer/hwc_uevent.cpp
+ create mode 100644 mx6/hwcomposer/hwc_uevent.h
+
+diff --git a/mx6/hwcomposer/Android.mk b/mx6/hwcomposer/Android.mk
+index ad5f279..6cee365 100755
+--- a/mx6/hwcomposer/Android.mk
++++ b/mx6/hwcomposer/Android.mk
+@@ -21,8 +21,22 @@ ifeq ($(TARGET_HAVE_IMX_HWCOMPOSER),true)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libEGL libcutils libutils libui libhardware libhardware_legacy libbinder
+-LOCAL_SRC_FILES := hwcomposer.cpp hwc_vsync.cpp hwc_display.cpp
++LOCAL_SHARED_LIBRARIES :=			\
++	liblog					\
++	libEGL					\
++	libcutils				\
++	libutils				\
++	libui					\
++	libhardware				\
++	libhardware_legacy			\
++	libbinder
++
++LOCAL_SRC_FILES :=				\
++	hwcomposer.cpp				\
++	hwc_vsync.cpp				\
++	hwc_display.cpp				\
++	hwc_uevent.cpp
++
+ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+ LOCAL_C_INCLUDES += hardware/imx/mx6/libgralloc_wrapper
+ LOCAL_CFLAGS:= -DLOG_TAG=\"hwcomposer\"
+diff --git a/mx6/hwcomposer/hwc_context.h b/mx6/hwcomposer/hwc_context.h
+index ea76717..986b536 100644
+--- a/mx6/hwcomposer/hwc_context.h
++++ b/mx6/hwcomposer/hwc_context.h
+@@ -36,6 +36,7 @@
+ #include <EGL/egl.h>
+ #include "gralloc_priv.h"
+ #include "hwc_vsync.h"
++#include "hwc_uevent.h"
+ /*****************************************************************************/
+ #define HWC_VIV_HARDWARE_MODULE_ID "hwcomposer_viv"
+ #define HWC_MAIN_FB "/dev/graphics/fb0"
+@@ -46,6 +47,7 @@
+ #define HWC_FB_SYS "/sys/class/graphics/fb"
+ 
+ class VSyncThread;
++class UeventThread;
+ 
+ enum {
+     HWC_DISPLAY_LDB = 1,
+@@ -72,11 +74,16 @@ struct hwc_context_t {
+     //hwc_layer_list_t* mDispList[HWC_NUM_DISPLAY_TYPES];
+     //size_t mListCapacity[HWC_NUM_DISPLAY_TYPES];
+ 
+-    hwc_procs_t* m_callback;
+     bool m_vsync_enable;
++
++    hwc_procs_t* m_callback;
++
+     sp<VSyncThread> m_vsync_thread;
++    sp<UeventThread> m_uevent_thread;
++
+     hwc_composer_device_1* m_viv_hwc;
+     hw_module_t const *m_gralloc_module;
++
+     framebuffer_device_t* mFbDev[HWC_NUM_DISPLAY_TYPES];
+     unsigned long mFbPhysAddrs[HWC_NUM_DISPLAY_TYPES];
+ };
+diff --git a/mx6/hwcomposer/hwc_display.cpp b/mx6/hwcomposer/hwc_display.cpp
+index fccce34..58c17b7 100644
+--- a/mx6/hwcomposer/hwc_display.cpp
++++ b/mx6/hwcomposer/hwc_display.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2009-2013 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -43,7 +43,7 @@ static int hwc_judge_display_state(struct hwc_context_t* ctx)
+     FILE *fp;
+     int dispid = 0;
+ 
+-    for (int i=0; i<HWC_MAX_FB; i++) {
++    for (int i = 0; i < HWC_MAX_FB; i++) {
+         if(dispid >= HWC_NUM_DISPLAY_TYPES) {
+             ALOGW("system can't support more than %d devices", dispid);
+             break;
+@@ -60,9 +60,7 @@ static int hwc_judge_display_state(struct hwc_context_t* ctx)
+         fclose(fp);
+ 
+         //check if it is a real device
+-        memset(tmp, 0, sizeof(tmp));
+-        strcpy(tmp, fb_path);
+-        strcat(tmp, "/name");
++        snprintf(tmp, sizeof(tmp), "%s/name", fb_path);
+         if (!(fp = fopen(tmp, "r"))) {
+             ALOGW("open %s failed", tmp);
+             continue;
+@@ -81,9 +79,7 @@ static int hwc_judge_display_state(struct hwc_context_t* ctx)
+         fclose(fp);
+ 
+         //read fb device name
+-        memset(tmp, 0, sizeof(tmp));
+-        strcpy(tmp, fb_path);
+-        strcat(tmp, "/fsl_disp_dev_property");
++        snprintf(tmp, sizeof(tmp), "%s/fsl_disp_dev_property", fb_path);
+         if (!(fp = fopen(tmp, "r"))) {
+             ALOGI("open %s failed", tmp);
+             continue;
+@@ -119,9 +115,7 @@ static int hwc_judge_display_state(struct hwc_context_t* ctx)
+         pInfo->fb_num = i;
+         if(pInfo->type != HWC_DISPLAY_LDB) {
+             //judge connected device state
+-            memset(tmp, 0, sizeof(tmp));
+-            strcpy(tmp, fb_path);
+-            strcat(tmp, "/disp_dev/cable_state");
++            snprintf(tmp, sizeof(tmp), "%s/disp_dev/cable_state", fb_path);
+             if (!(fp = fopen(tmp, "r"))) {
+                 ALOGI("open %s failed", tmp);
+                 //make default to false.
+diff --git a/mx6/hwcomposer/hwc_display.h b/mx6/hwcomposer/hwc_display.h
+new file mode 100644
+index 0000000..82662f8
+--- /dev/null
++++ b/mx6/hwcomposer/hwc_display.h
+@@ -0,0 +1,24 @@
++/*
++ * Copyright (C) 2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HWC_DISPLAY_H
++#define HWC_DISPLAY_H
++
++int hwc_get_display_fbid(struct hwc_context_t* ctx, int disp_type);
++int hwc_get_framebuffer_info(displayInfo *pInfo);
++int hwc_get_display_info(struct hwc_context_t* ctx);
++
++#endif
+diff --git a/mx6/hwcomposer/hwc_uevent.cpp b/mx6/hwcomposer/hwc_uevent.cpp
+new file mode 100644
+index 0000000..22f371f
+--- /dev/null
++++ b/mx6/hwcomposer/hwc_uevent.cpp
+@@ -0,0 +1,98 @@
++/*
++ * Copyright (C) 2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "hwc_context.h"
++#include "hwc_uevent.h"
++#include "hwc_display.h"
++
++#define HDMI_PLUG_EVENT "change@/devices/platform/mxc_hdmi"
++
++using namespace android;
++
++
++
++void UeventThread::onFirstRef() {
++    run("HWC-UEvent-Thread", PRIORITY_URGENT_DISPLAY);
++}
++
++status_t UeventThread::readyToRun() {
++    uevent_init();
++    return NO_ERROR;
++}
++
++void UeventThread::handleHdmiUevent(const char *buff, int len) {
++    struct private_module_t *priv_m = NULL;
++    int fbid = -1;
++    const char *s = buff;
++
++    if (!mCtx || !mCtx->m_callback || !mCtx->m_callback->hotplug)
++        return;
++
++    s += strlen(s) + 1;
++
++    while (*s) {
++        if (!strncmp(s, "EVENT=plugin", strlen("EVENT=plugin"))) {
++            mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = true;
++            fbid = hwc_get_display_fbid(mCtx, HWC_DISPLAY_HDMI);
++            if (fbid < 0) {
++                ALOGE("unrecognized fb num for hdmi");
++            } else {
++                ALOGI("HDMI Plugin detected");
++                if (mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].xres == 0) {
++                    hwc_get_framebuffer_info(&mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL]);
++                }
++            }
++        } else if (!strncmp(s, "EVENT=plugout", strlen("EVENT=plugout"))) {
++            mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = false;
++            ALOGI("HDMI Plugout detected");
++        }
++
++        s += strlen(s) + 1;
++        if (s - buff >= len)
++            break;
++    }
++
++    if (fbid >= 0 && mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] == NULL && mCtx->m_gralloc_module != NULL) {
++        ALOGI("HDMI Gralloc Framebuffer opening. ");
++        mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] = reinterpret_cast<framebuffer_device_t*>(fbid);
++        char fbname[HWC_STRING_LENGTH];
++        memset(fbname, 0, sizeof(fbname));
++        sprintf(fbname, "fb%d", fbid);
++        mCtx->m_gralloc_module->methods->open(mCtx->m_gralloc_module, fbname,
++                                              (struct hw_device_t**)&mCtx->mFbDev[HWC_DISPLAY_EXTERNAL]);
++        priv_m = (struct private_module_t *)mCtx->m_gralloc_module;
++
++        mCtx->mFbPhysAddrs[HWC_DISPLAY_EXTERNAL] = priv_m->external_module->framebuffer->phys;
++    }
++
++    mCtx->m_callback->hotplug(mCtx->m_callback, HWC_DISPLAY_EXTERNAL,
++                              mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected);
++}
++
++bool UeventThread::threadLoop() {
++    char uevent_desc[4096];
++    const char *pHdmiEvent = HDMI_PLUG_EVENT;
++
++    memset(uevent_desc, 0, sizeof(uevent_desc));
++    int len = uevent_next_event(uevent_desc, sizeof(uevent_desc) - 2);
++    bool hdmi = !strncmp(uevent_desc, pHdmiEvent, strlen(pHdmiEvent));
++
++    if (hdmi && mCtx->mDispInfo[HWC_DISPLAY_PRIMARY].type != HWC_DISPLAY_HDMI)
++        handleHdmiUevent(uevent_desc, len);
++
++    return true;
++}
++
+diff --git a/mx6/hwcomposer/hwc_uevent.h b/mx6/hwcomposer/hwc_uevent.h
+new file mode 100644
+index 0000000..cae2be9
+--- /dev/null
++++ b/mx6/hwcomposer/hwc_uevent.h
+@@ -0,0 +1,40 @@
++/*
++ * Copyright (C) 2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef HWC_UEVENT_H
++#define HWC_UEVENT_H
++
++#include <utils/threads.h>
++#include <utils/StrongPointer.h>
++
++/* This class mainly handle all uevent in hwc, currently only hdmi
++ * hotplugin event needs to be care. */
++class UeventThread : public Thread
++{
++public:
++    UeventThread(hwc_context_t *ctx) : Thread(false), mCtx(ctx) {}
++
++private:
++    virtual void onFirstRef();
++    virtual status_t readyToRun();
++    virtual bool threadLoop();
++    void handleHdmiUevent(const char *buff, int len);
++
++    hwc_context_t *mCtx;
++};
++
++
++#endif
+diff --git a/mx6/hwcomposer/hwc_vsync.cpp b/mx6/hwcomposer/hwc_vsync.cpp
+index c83cd7d..6e0c37e 100644
+--- a/mx6/hwcomposer/hwc_vsync.cpp
++++ b/mx6/hwcomposer/hwc_vsync.cpp
+@@ -15,120 +15,77 @@
+  */
+ #include "hwc_context.h"
+ #include "hwc_vsync.h"
++#include "hwc_display.h"
+ 
+ /*****************************************************************************/
+ 
+-using namespace android;
++#undef DEBUG_HWC_VSYNC_TIMING
+ 
+-extern int hwc_get_display_fbid(struct hwc_context_t* ctx, int disp_type);
+-extern int hwc_get_framebuffer_info(displayInfo *pInfo);
++using namespace android;
+ 
+ VSyncThread::VSyncThread(hwc_context_t *ctx)
+-    : Thread(false), mCtx(ctx)
++    : Thread(false), mCtx(ctx), mEnabled(false)
+ {
+ }
+ 
+ void VSyncThread::onFirstRef()
+ {
+-    run("vsyncThread", PRIORITY_URGENT_DISPLAY);
++    run("HWC-VSYNC-Thread", PRIORITY_URGENT_DISPLAY);
+ }
+ 
+ status_t VSyncThread::readyToRun()
+ {
+-    uevent_init();
+     return NO_ERROR;
+ }
+ 
+-void VSyncThread::handleVsyncUevent(const char *buff, int len)
+-{
+-    uint64_t timestamp = 0;
+-    const char *s = buff;
+-
+-    if (!mCtx || !mCtx->m_callback || !mCtx->m_callback->vsync)
+-       return;
+-
+-    s += strlen(s) + 1;
+-
+-    while (*s) {
+-        if (!strncmp(s, "VSYNC=", strlen("VSYNC=")))
+-            timestamp = strtoull(s + strlen("VSYNC="), NULL, 0);
+-
+-        s += strlen(s) + 1;
+-        if (s - buff >= len)
+-            break;
+-    }
+-
+-    mCtx->m_callback->vsync(mCtx->m_callback, 0, timestamp);
++void VSyncThread::setEnabled(bool enabled) {
++    Mutex::Autolock _l(mLock);
++    mEnabled = enabled;
++    mCondition.signal();
+ }
+ 
+-void VSyncThread::handleHdmiUevent(const char *buff, int len)
++bool VSyncThread::threadLoop()
+ {
+-    struct private_module_t *priv_m = NULL;
+-
+-    if (!mCtx || !mCtx->m_callback || !mCtx->m_callback->hotplug)
+-        return;
+-
+-    int fbid = -1;
+-    const char *s = buff;
+-    s += strlen(s) + 1;
+-
+-    while (*s) {
+-        if (!strncmp(s, "EVENT=plugin", strlen("EVENT=plugin"))) {
+-            mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = true;
+-            fbid = hwc_get_display_fbid(mCtx, HWC_DISPLAY_HDMI);
+-            if (fbid < 0) {
+-                ALOGE("unrecognized fb num for hdmi");
+-            }
+-            else {
+-                ALOGI("-----------hdmi---plug--in----");
+-                if (mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].xres == 0) {
+-                    hwc_get_framebuffer_info(&mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL]);
+-                }
+-            }
+-        }
+-        else if (!strncmp(s, "EVENT=plugout", strlen("EVENT=plugout"))) {
+-            mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = false;
+-            ALOGI("-----------hdmi---plug--out----");
++    { // scope for lock
++        Mutex::Autolock _l(mLock);
++        while (!mEnabled) {
++            mCondition.wait(mLock);
+         }
+-
+-        s += strlen(s) + 1;
+-        if (s - buff >= len)
+-            break;
+     }
+ 
+-    if (fbid >= 0 && mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] == NULL && mCtx->m_gralloc_module != NULL) {
+-        ALOGI("-----------hdmi---open framebuffer----");
+-        mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] = (framebuffer_device_t*)fbid;
+-        char fbname[HWC_STRING_LENGTH];
+-        memset(fbname, 0, sizeof(fbname));
+-        sprintf(fbname, "fb%d", fbid);
+-        mCtx->m_gralloc_module->methods->open(mCtx->m_gralloc_module, fbname,
+-                     (struct hw_device_t**)&mCtx->mFbDev[HWC_DISPLAY_EXTERNAL]);
+-        priv_m = (struct private_module_t *)mCtx->m_gralloc_module;
+-
+-        mCtx->mFbPhysAddrs[HWC_DISPLAY_EXTERNAL] = priv_m->external_module->framebuffer->phys;
++    uint64_t timestamp = 0;
++    uint32_t crt = (uint32_t)&timestamp;
++
++    int err = ioctl(mCtx->mDispInfo[HWC_DISPLAY_PRIMARY].fd,
++                    MXCFB_WAIT_FOR_VSYNC, crt);
++    if ( err < 0 ) {
++        ALOGE("FBIO_WAITFORVSYNC error: %s\n", strerror(errno));
++        return true;
+     }
+ 
+-    mCtx->m_callback->hotplug(mCtx->m_callback, HWC_DISPLAY_EXTERNAL, 
+-                      mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected);
+-}
++#ifdef DEBUG_HWC_VSYNC_TIMING
++    static nsecs_t last_time_ns;
++    nsecs_t cur_time_ns;
+ 
+-bool VSyncThread::threadLoop()
+-{
+-    char uevent_desc[4096];
+-    memset(uevent_desc, 0, sizeof(uevent_desc));
+-    int len = uevent_next_event(uevent_desc, sizeof(uevent_desc) - 2);
+-    const char *pVsyncEvent = FB_VSYNC_EVENT_PREFIX;
+-    const char *pHdmiEvent = HDMI_PLUG_EVENT;
+-    bool vsync = !strncmp(uevent_desc, pVsyncEvent, strlen(pVsyncEvent));
+-    bool hdmi = !strncmp(uevent_desc, pHdmiEvent, strlen(pHdmiEvent));
+-    if(vsync) {
+-        handleVsyncUevent(uevent_desc, len);
+-    }
+-    else if (hdmi &&
+-            mCtx->mDispInfo[HWC_DISPLAY_PRIMARY].type != HWC_DISPLAY_HDMI) {
+-        handleHdmiUevent(uevent_desc, len);
+-    }
++    cur_time_ns  = systemTime(SYSTEM_TIME_MONOTONIC);
++    mCtx->m_callback->vsync(mCtx->m_callback, 0, timestamp);
++    ALOGE("Vsync %llu, %llu\n", cur_time_ns - last_time_ns,
++          cur_time_ns - timestamp);
++    last_time_ns = cur_time_ns;
++#else
++    mCtx->m_callback->vsync(mCtx->m_callback, 0, timestamp);
++#endif
++
++    struct timespec tm;
++    struct timespec ts;
++    const nsecs_t wake_up = 400000;
++
++    double m_frame_period_ns = mCtx->mDispInfo[HWC_DISPLAY_PRIMARY].vsync_period;
++
++    ts.tv_nsec =  (timestamp + m_frame_period_ns)
++        - (systemTime(SYSTEM_TIME_MONOTONIC) + wake_up );
++    ts.tv_sec = 0;
++    nanosleep( &ts, &tm);
+ 
+     return true;
+ }
+diff --git a/mx6/hwcomposer/hwc_vsync.h b/mx6/hwcomposer/hwc_vsync.h
+index f3cd62c..2b78867 100644
+--- a/mx6/hwcomposer/hwc_vsync.h
++++ b/mx6/hwcomposer/hwc_vsync.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -37,7 +37,6 @@
+ /*****************************************************************************/
+ #define FB_VSYNC_EVENT "change@/devices/platform/mxc_sdc_fb.0/graphics/fb0"
+ #define FB_VSYNC_EVENT_PREFIX "change@/devices/platform/mxc_sdc_fb"
+-#define HDMI_PLUG_EVENT "change@/devices/platform/mxc_hdmi"
+ 
+ using namespace android;
+ 
+@@ -46,7 +45,8 @@ struct hwc_context_t;
+ class VSyncThread : public Thread
+ {
+ public:
+-    VSyncThread(hwc_context_t *ctx);
++    explicit VSyncThread(hwc_context_t *ctx);
++    void setEnabled(bool enabled);
+ 
+ private:
+     virtual void onFirstRef();
+@@ -56,6 +56,9 @@ private:
+     void handleHdmiUevent(const char *buff, int len);
+ 
+     hwc_context_t *mCtx;
++    mutable Mutex mLock;
++    Condition mCondition;
++    bool mEnabled;
+ };
+ 
+ #endif
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index 50ed2f1..78896ed 100755
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -35,11 +35,13 @@
+ #include "gralloc_priv.h"
+ #include "hwc_context.h"
+ #include "hwc_vsync.h"
++#include "hwc_uevent.h"
++#include "hwc_display.h"
+ 
+ /*****************************************************************************/
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+         struct hw_device_t** device);
+-extern int hwc_get_display_info(struct hwc_context_t* ctx);
++
+ 
+ static struct hw_module_methods_t hwc_module_methods = {
+     open: hwc_device_open
+@@ -81,7 +83,14 @@ static int hwc_device_close(struct hw_device_t *dev)
+     if (ctx) {
+         if (ctx->m_vsync_thread != NULL) {
+             ctx->m_vsync_thread->requestExitAndWait();
++            ctx->m_uevent_thread.clear();
++        }
++
++        if (ctx->m_uevent_thread.get() != NULL) {
++            ctx->m_uevent_thread->requestExitAndWait();
++            ctx->m_uevent_thread.clear();
+         }
++
+         for (int i=0; i<HWC_NUM_DISPLAY_TYPES; i++) {
+             if(ctx->mDispInfo[i].connected)
+                 close(ctx->mDispInfo[i].fd);
+@@ -190,21 +199,12 @@ static void hwc_registerProcs(struct hwc_composer_device_1* dev,
+ 
+ static int hwc_eventControl(struct hwc_composer_device_1* dev, int dpy, int event, int enabled)
+ {
+-    int ret = -EINVAL;
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+     if(ctx && event == HWC_EVENT_VSYNC) {
+-        int val = !!enabled;
+-        ctx->m_vsync_enable = val;
+-        ret = ioctl(ctx->mDispInfo[0].fd, MXCFB_ENABLE_VSYNC_EVENT, &val);
+-        if(ret < 0) {
+-            ALOGE("ioctl FB_ENABLE_VSYNC_IOCTL failed: %d, %s", ret, strerror(errno));
+-        }
+-        else {
+-            ret = 0;
+-        }
++        ctx->m_vsync_thread->setEnabled(enabled);
+     }
+ 
+-    return ret;
++    return 0;
+ }
+ 
+ static int hwc_query(struct hwc_composer_device_1* dev,
+@@ -348,6 +348,7 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+ 
+         /* our private state goes below here */
+         dev->m_vsync_thread = new VSyncThread(dev);
++        dev->m_uevent_thread = new UeventThread(dev);
+         hwc_get_display_info(dev);
+ 
+         hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &dev->m_gralloc_module);
+-- 
+1.8.0
+

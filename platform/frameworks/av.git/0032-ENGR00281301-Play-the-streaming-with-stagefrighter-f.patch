@@ -1,0 +1,88 @@
+From 6547a719590f225390ae13cd5452ffaa9fa6ebbd Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Wed, 25 Sep 2013 23:19:51 +0800
+Subject: [PATCH 32/50] ENGR00281301 Play the streaming with stagefrighter for
+ widevine content
+
+Using widevine API to check the streaming type
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ media/libmediaplayerservice/MediaPlayerFactory.cpp | 40 +++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/media/libmediaplayerservice/MediaPlayerFactory.cpp b/media/libmediaplayerservice/MediaPlayerFactory.cpp
+index 48115bc..aad1ad6 100644
+--- a/media/libmediaplayerservice/MediaPlayerFactory.cpp
++++ b/media/libmediaplayerservice/MediaPlayerFactory.cpp
+@@ -15,7 +15,7 @@
+ ** limitations under the License.
+ */
+ 
+-/* Copyright 2013 Freescale Semiconductor Inc. */
++/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
+ 
+ #define LOG_TAG "MediaPlayerFactory"
+ #include <utils/Log.h>
+@@ -39,6 +39,7 @@
+ #include "../libstagefright/include/NuCachedSource2.h"
+ #include "../libstagefright/include/WVMExtractor.h"
+ #include <media/stagefright/DataSource.h>
++#include <media/stagefright/FileSource.h>
+ #include <media/OMXPlayer.h>
+ #endif
+ 
+@@ -279,6 +280,40 @@ bool isWVM(const char* url,
+     return false;
+ }
+ 
++bool isWVM(int fd,
++           int64_t offset,
++           int64_t length) {
++    sp<DataSource> dataSource;
++
++    void *VendorLibHandle = NULL;
++    if (VendorLibHandle == NULL) {
++        VendorLibHandle = dlopen("libwvm.so", RTLD_NOW);
++    }
++
++    if (!VendorLibHandle) {
++        return false;
++    }
++
++    dataSource = new FileSource(dup(fd), offset, length);
++
++    if (dataSource == NULL) {
++        return false;
++    }
++
++    typedef WVMLoadableExtractor *(*SnifferFunc)(const sp<DataSource>&);
++    SnifferFunc snifferFunc =
++        (SnifferFunc) dlsym(VendorLibHandle,
++                "_ZN7android15IsWidevineMediaERKNS_2spINS_10DataSourceEEE");
++
++    if (snifferFunc) {
++        if ((*snifferFunc)(dataSource)) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ class OMXPlayerFactory : public MediaPlayerFactory::IFactory {
+     public:
+         virtual float scoreFactory(const sp<IMediaPlayer>& client,
+@@ -374,6 +409,9 @@ class OMXPlayerFactory : public MediaPlayerFactory::IFactory {
+             if (kOurScore <= curScore)
+                 return 0.0;
+ 
++            if (isWVM(fd, offset, length))
++                return 0.0;
++
+             char url[128];
+             int ret = 0;
+ 
+-- 
+1.8.0
+

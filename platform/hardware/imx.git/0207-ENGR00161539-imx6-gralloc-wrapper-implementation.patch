@@ -1,0 +1,432 @@
+From 113060cf9db5f0a73a0913a7e43fde9aea3d5a7b Mon Sep 17 00:00:00 2001
+From: b07117 <b07117@freescale.com>
+Date: Mon, 14 Nov 2011 15:36:10 +0800
+Subject: [PATCH 207/486] ENGR00161539 imx6 gralloc wrapper implementation
+
+new FB flow: open/map(FSL)->alloc/register/render(VIV)->flip(FSL)
+all normal surface buffer operation go to gpu gralloc
+
+Signed-off-by: xianzhong <b07117@freescale.com>
+---
+ mx6/libgralloc/Android.mk      | 51 ++++++++++++++++++++++
+ mx6/libgralloc/framebuffer.cpp |  5 ++-
+ mx6/libgralloc/gralloc.cpp     | 47 +++++++++++++++++++--
+ mx6/libgralloc/gralloc_priv.h  | 96 +++++++++++-------------------------------
+ mx6/libgralloc/mapper.cpp      | 43 +++++++++++++++++++
+ 5 files changed, 165 insertions(+), 77 deletions(-)
+ create mode 100755 mx6/libgralloc/Android.mk
+
+diff --git a/mx6/libgralloc/Android.mk b/mx6/libgralloc/Android.mk
+new file mode 100755
+index 0000000..cd788ff
+--- /dev/null
++++ b/mx6/libgralloc/Android.mk
+@@ -0,0 +1,51 @@
++# Copyright (C) 2008 The Android Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++LOCAL_PATH := $(call my-dir)
++
++# HAL module implemenation, not prelinked and stored in
++# hw/<OVERLAY_HARDWARE_MODULE_ID>.<ro.product.board>.so
++include $(CLEAR_VARS)
++LOCAL_PRELINK_MODULE := false
++LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
++LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu libhardware
++#ifeq ($(BOARD_SOC_TYPE),IMX50)
++#LOCAL_SHARED_LIBRARIES += libc2d_z160
++#else
++#LOCAL_SHARED_LIBRARIES += libc2d_z430
++#endif
++LOCAL_C_INCLUDES += external/linux-lib/ipu
++LOCAL_C_INCLUDES += hardware/imx/mx5x/libcopybit
++
++LOCAL_SRC_FILES := 	\
++	allocator.cpp 	\
++	gralloc.cpp 	\
++	framebuffer.cpp \
++	mapper.cpp
++	
++LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
++LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX
++
++
++#ifeq ($(HAVE_FSL_EPDC_FB),true)
++#LOCAL_CFLAGS += -DFSL_EPDC_FB
++#endif
++
++#ifeq ($(HAVE_FSL_IMX_IPU),true)
++#LOCAL_CFLAGS += -DSECOND_DISPLAY_SUPPORT
++#endif
++
++LOCAL_MODULE_TAGS := eng
++
++include $(BUILD_SHARED_LIBRARY)
+diff --git a/mx6/libgralloc/framebuffer.cpp b/mx6/libgralloc/framebuffer.cpp
+index 723b628..9507cbc 100755
+--- a/mx6/libgralloc/framebuffer.cpp
++++ b/mx6/libgralloc/framebuffer.cpp
+@@ -367,7 +367,7 @@ static int fb_setSecRotation(struct framebuffer_device_t* dev,int secRotation)
+ 
+ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ {
+-    if (private_handle_t::validate(buffer) < 0)
++    if (!buffer)
+         return -EINVAL;
+ 
+     fb_context_t* ctx = (fb_context_t*)dev;
+@@ -382,9 +382,10 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ 
+     if (hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER) {
+ 
++        void *vaddr = NULL;
+         m->base.lock(&m->base, buffer, 
+                 private_module_t::PRIV_USAGE_LOCKED_FOR_POST, 
+-                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL_128(m->info.yres), NULL);
++                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL_128(m->info.yres), &vaddr);
+ 
+         const size_t offset = hnd->base - m->framebuffer->base;
+         m->info.activate = FB_ACTIVATE_VBL;
+diff --git a/mx6/libgralloc/gralloc.cpp b/mx6/libgralloc/gralloc.cpp
+index f65099e..cb87a56 100755
+--- a/mx6/libgralloc/gralloc.cpp
++++ b/mx6/libgralloc/gralloc.cpp
+@@ -100,14 +100,10 @@ struct private_module_t HAL_MODULE_INFO_SYM = {
+         unlock: gralloc_unlock,
+     },
+     framebuffer: 0,
+-    flags: 0,
+     numBuffers: 0,
+     bufferMask: 0,
+     lock: PTHREAD_MUTEX_INITIALIZER,
+     currentBuffer: 0,
+-    pmem_master: -1,
+-    pmem_master_base: 0,
+-    master_phys: 0
+ };
+ 
+ /*****************************************************************************/
+@@ -365,6 +361,14 @@ static int gralloc_alloc(alloc_device_t* dev,
+     if (!pHandle || !pStride)
+         return -EINVAL;
+ 
++    private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
++    if(!m)
++        return -EINVAL;
++
++    if (m->gpu_device) {
++       return m->gpu_device->alloc(dev, w, h, format, usage, pHandle, pStride);
++    }
++
+     size_t size, alignedw, alignedh;
+     if (format == HAL_PIXEL_FORMAT_YCbCr_420_SP || 
+             format == HAL_PIXEL_FORMAT_YCbCr_422_SP) 
+@@ -424,6 +428,14 @@ static int gralloc_alloc(alloc_device_t* dev,
+ static int gralloc_free(alloc_device_t* dev,
+         buffer_handle_t handle)
+ {
++    private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
++    if(!m)
++       return -EINVAL;
++
++    if(m->gpu_device && ((private_handle_t*)handle)->magic != private_handle_t::sMagic) {
++       return m->gpu_device->free(dev, handle);
++    }
++
+     if (private_handle_t::validate(handle) < 0)
+         return -EINVAL;
+ 
+@@ -472,6 +484,11 @@ static int gralloc_close(struct hw_device_t *dev)
+         /* TODO: keep a list of all buffer_handle_t created, and free them
+          * all here.
+          */
++        private_module_t* m = reinterpret_cast<private_module_t*>(dev);
++        if(m && m->gpu_device){
++           gralloc_close((struct hw_device_t *)m->gpu_device);
++        }
++
+         free(ctx);
+     }
+     return 0;
+@@ -481,6 +498,9 @@ int gralloc_device_open(const hw_module_t* module, const char* name,
+         hw_device_t** device)
+ {
+     int status = -EINVAL;
++    hw_module_t *hw = const_cast<hw_module_t *>(module);
++    private_module_t* m = reinterpret_cast<private_module_t*>(hw);
++
+     if (!strcmp(name, GRALLOC_HARDWARE_GPU0)) {
+         gralloc_context_t *dev;
+         dev = (gralloc_context_t*)malloc(sizeof(*dev));
+@@ -499,7 +519,26 @@ int gralloc_device_open(const hw_module_t* module, const char* name,
+ 
+         *device = &dev->device.common;
+         status = 0;
++
++        if(!m->gpu_device)
++        {
++           hw_module_t const* gpu_module;;
++           if (hw_get_module(GRALLOC_VIV_HARDWARE_MODULE_ID, &gpu_module) == 0) {
++              status = gralloc_open(gpu_module, &m->gpu_device);
++              if(status || m->gpu_device){
++                 LOGE("gralloc_device_open: gpu gralloc device open failed!");
++              }
++           }
++        }
+     } else {
++
++        m->flags = 0;
++        m->pmem_master = -1;
++        m->pmem_master_base=0;
++        m->master_phys = 0;
++        m->gpu_device = 0;
++        m->gralloc_viv= 0;
++
+         status = fb_device_open(module, name, device);
+     }
+     return status;
+diff --git a/mx6/libgralloc/gralloc_priv.h b/mx6/libgralloc/gralloc_priv.h
+index 39be9fd..9c49fe6 100755
+--- a/mx6/libgralloc/gralloc_priv.h
++++ b/mx6/libgralloc/gralloc_priv.h
+@@ -30,6 +30,7 @@
+ #include <linux/fb.h>
+ 
+ #define  ALIGN_PIXEL(x)  ((x+ 31) & ~31)
++#define  ALIGN_PIXEL_16(x)  ((x+ 15) & ~15)
+ /** z430 core need 4k aligned memory, since xres has been 32 aligned, make yres
+     to 128 aligned will meet this request for all pixel format (RGB565,RGB888,etc.) */
+ #define  ALIGN_PIXEL_128(x)  ((x+ 127) & ~127)
+@@ -39,24 +40,27 @@ struct private_module_t;
+ struct private_handle_t;
+ 
+ struct private_module_t {
++/** do NOT change the elements below **/
+     gralloc_module_t base;
+-
+     private_handle_t* framebuffer;
+-    uint32_t flags;
+     uint32_t numBuffers;
+     uint32_t bufferMask;
+     pthread_mutex_t lock;
+     buffer_handle_t currentBuffer;
+-    int pmem_master;
+-    void* pmem_master_base;
+-    unsigned long master_phys;
+-
+     struct fb_var_screeninfo info;
+     struct fb_fix_screeninfo finfo;
++/** do NOT change the elements above **/
++
+     float xdpi;
+     float ydpi;
+     float fps;
+ 
++    uint32_t flags;
++    int pmem_master;
++    void* pmem_master_base;
++    unsigned long master_phys;
++    alloc_device_t *gpu_device;
++    gralloc_module_t* gralloc_viv;
+     enum {
+         // flag to indicate we'll post this buffer
+         PRIV_USAGE_LOCKED_FOR_POST = 0x80000000
+@@ -82,79 +86,32 @@ struct private_handle_t {
+         LOCK_STATE_MAPPED    =   1<<30,
+         LOCK_STATE_READ_MASK =   0x3FFFFFFF
+     };
+-
+-    // file-descriptors
++/** do NOT change any element below **/
++    int     fd;
+     int     magic;
+     int     flags;
+     int     size;
+     int     offset;
+     int     base;
+-
+-    int     pid;
+-
+-    int     vidNode;
+-    int     adjustedSize;
+-    int     pool;
+-    int     surface;
++    int     phys;
++    int     format;
+     int     width;
+     int     height;
+-    int     format;
+-#if !defined(gcdHARDWARE_2D_COMPOSITION)
+-    /* 3D composition. */
+-    int     resolveVidNode;
+-    int     resolveAdjustedSize;
+-    int     resolvePool;
+-    int     resolveSurface;
+-    int     resolveDoneSignal;
+-    int     resolveOutstanding;
+-    int     usage;
+-    int     private0; /* Padding */
+-#endif
+-    /* Out of band */
+-    int     phys;
+-    int     fd;
++    int     pid;
++/** do NOT change any element above **/
+ 
++    int     usage;
++    int     lockState;
++    int     writeOwner;
+ #ifdef __cplusplus
+-
+-#if !defined(gcdHARDWARE_2D_COMPOSITION)
+-    /* 3D composition. */
+-    static const int sNumInts = 23;
+-    static const int sNumFds  = 0;
+-#else
+-    /* 2D hardware composition. */
+     static const int sNumInts = 13;
+-    static const int sNumFds  = 0;
+-#endif
+-    static const int sMagic   = 0x3141592;
++    static const int sNumFds = 1;
++    static const int sMagic = 'pgpu';
+ 
+     private_handle_t(int fd, int size, int flags) :
+-        magic(sMagic),
+-        flags(flags),
+-        size(size),
+-        offset(0),
+-        base(0),
+-        pid(getpid()),
+-        vidNode(0),
+-        adjustedSize(0),
+-        pool(0),
+-        surface(0),
+-        width(0),
+-        height(0),
+-        format(0),
+-#if !defined(gcdHARDWARE_2D_COMPOSITION)
+-        /* 3D composition. */
+-        resolveVidNode(0),
+-        resolveAdjustedSize(0),
+-        resolvePool(0),
+-        resolveSurface(0),
+-        resolveDoneSignal(0),
+-        resolveOutstanding(0),
+-        usage(0),
+-#endif
+-        /* Out of band */
+-        phys(0),
+-        fd(fd)
+-
++        fd(fd), magic(sMagic), flags(flags), size(size), offset(0),
++        base(0), lockState(0), writeOwner(0), phys(0),pid(getpid()),
++        format(0), width(0), height(0)
+     {
+         version = sizeof(native_handle);
+         numInts = sNumInts;
+@@ -174,10 +131,7 @@ struct private_handle_t {
+                 h->numInts != sNumInts || h->numFds != sNumFds ||
+                 hnd->magic != sMagic)
+         {
+-            //LOGE("invalid gralloc handle (at %p)", h);
+-            //LOGE("------------------h=%x", (int)h);
+-	    //if(h != NULL)
+-	        //LOGE("h->version=%d, h->numInts=%d, h->numFds=%d, hnd->magic=%x", h->version, h->numInts, h->numFds, hnd->magic);
++            LOGE("invalid gralloc handle (at %p)", h);
+             return -EINVAL;
+         }
+         return 0;
+diff --git a/mx6/libgralloc/mapper.cpp b/mx6/libgralloc/mapper.cpp
+index e2caf79..634308c 100755
+--- a/mx6/libgralloc/mapper.cpp
++++ b/mx6/libgralloc/mapper.cpp
+@@ -95,10 +95,38 @@ static int gralloc_unmap(gralloc_module_t const* module,
+ static pthread_mutex_t sMapLock = PTHREAD_MUTEX_INITIALIZER; 
+ 
+ /*****************************************************************************/
++static gralloc_module_t const*gralloc_get(gralloc_module_t const* module, buffer_handle_t handle)
++{
++    hw_module_t const* pModule;
++
++    if(!handle)
++       return NULL;
++
++    if (((private_handle_t*)handle)->magic == private_handle_t::sMagic)
++       return NULL;
++
++    gralloc_module_t *gr = const_cast<gralloc_module_t *>(module);
++    private_module_t* m = reinterpret_cast<private_module_t*>(gr);
+ 
++    if(m->gralloc_viv)
++        return m->gralloc_viv;
++
++    if(hw_get_module(GRALLOC_VIV_HARDWARE_MODULE_ID, &pModule))
++       return NULL;
++
++    gralloc_module_t const* gralloc_viv = reinterpret_cast<gralloc_module_t const*>(pModule);
++    m->gralloc_viv = (gralloc_module_t*)gralloc_viv;
++
++    return gralloc_viv;
++}
+ int gralloc_register_buffer(gralloc_module_t const* module,
+         buffer_handle_t handle)
+ {
++    gralloc_module_t const* gralloc_viv = gralloc_get(module, handle);
++    if(gralloc_viv){
++        return gralloc_viv->registerBuffer(gralloc_viv, handle);
++    }
++
+     if (private_handle_t::validate(handle) < 0)
+         return -EINVAL;
+ 
+@@ -124,6 +152,11 @@ int gralloc_register_buffer(gralloc_module_t const* module,
+ int gralloc_unregister_buffer(gralloc_module_t const* module,
+         buffer_handle_t handle)
+ {
++    gralloc_module_t const* gralloc_viv = gralloc_get(module, handle);
++    if(gralloc_viv){
++        return gralloc_viv->unregisterBuffer(gralloc_viv, handle);
++    }
++
+     if (private_handle_t::validate(handle) < 0)
+         return -EINVAL;
+ 
+@@ -183,6 +216,11 @@ int gralloc_lock(gralloc_module_t const* module,
+         int l, int t, int w, int h,
+         void** vaddr)
+ {
++    gralloc_module_t const* gralloc_viv = gralloc_get(module, handle);
++    if(gralloc_viv){
++        return gralloc_viv->lock(gralloc_viv, handle, usage, l, t, w, h, vaddr);
++    }
++
+     if (private_handle_t::validate(handle) < 0)
+         return -EINVAL;
+ 
+@@ -250,6 +288,11 @@ int gralloc_lock(gralloc_module_t const* module,
+ int gralloc_unlock(gralloc_module_t const* module, 
+         buffer_handle_t handle)
+ {
++    gralloc_module_t const* gralloc_viv = gralloc_get(module, handle);
++    if(gralloc_viv){
++        return gralloc_viv->unlock(gralloc_viv, handle);
++    }
++
+     if (private_handle_t::validate(handle) < 0)
+         return -EINVAL;
+ 
+-- 
+1.8.0
+

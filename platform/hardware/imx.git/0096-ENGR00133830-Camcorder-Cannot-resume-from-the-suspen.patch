@@ -1,0 +1,200 @@
+From f7397c90aabe3649c1433428a0903ae9e5717672 Mon Sep 17 00:00:00 2001
+From: Yaoming Qin <b10945@freescale.com>
+Date: Wed, 8 Dec 2010 07:14:46 +0800
+Subject: [PATCH 096/486] ENGR00133830 Camcorder: Cannot resume from the
+ suspend status. 100%
+
+Remove the dead lock which appears during destroy the overlay.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ liboverlay/overlay.cpp      | 23 +++++++++++--
+ liboverlay/overlay_thread.h | 82 ++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 101 insertions(+), 4 deletions(-)
+
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+index 6575be4..77ffa73 100755
+--- a/liboverlay/overlay.cpp
++++ b/liboverlay/overlay.cpp
+@@ -996,6 +996,8 @@ static overlay_t* overlay_createOverlay(struct overlay_control_device_t *dev,
+ static void overlay_destroyOverlay(struct overlay_control_device_t *dev,
+          overlay_t* overlay) 
+ {
++    struct timespec timeout;
++    struct timeval tv;
+     OVERLAY_LOG_INFO("overlay_destroyOverlay()");
+     overlay_control_context_t *ctx = (overlay_control_context_t *)dev;
+     int instance = 0;
+@@ -1015,6 +1017,8 @@ static void overlay_destroyOverlay(struct overlay_control_device_t *dev,
+         //Flush the buffer in queue
+         overlay_data_shared_t *data_shared = ctx->overlay_intances[instance]->mDataShared;
+         if(data_shared != NULL) {
++            //Unlock the control lock incase the dead lock between overlay thread
++            pthread_mutex_unlock(&ctx->control_lock);
+             pthread_mutex_lock(&data_shared->obj_lock);
+             data_shared->in_destroy = true;
+             while(data_shared->queued_count > 0) {
+@@ -1026,7 +1030,12 @@ static void overlay_destroyOverlay(struct overlay_control_device_t *dev,
+                 if(ctx->control_shared) {
+                     sem_post(&ctx->control_shared->overlay_sem);
+                 }
+-                pthread_cond_wait(&data_shared->free_cond, &data_shared->obj_lock);
++                gettimeofday(&tv, (struct timezone *) NULL);
++                timeout.tv_sec = tv.tv_sec;
++                timeout.tv_nsec = (tv.tv_usec + 200000) * 1000L;//200ms
++                //Overlay data close or Overlay destroy may both block in this, so only one can get the condition
++                //Make a time out here.
++                pthread_cond_timedwait(&data_shared->free_cond, &data_shared->obj_lock,&timeout);
+                 if(data_shared->wait_buf_flag != 0) {
+                     OVERLAY_LOG_ERR("Error!cannot make a buffer flushed for destory overlay");
+                }
+@@ -1049,6 +1058,8 @@ static void overlay_destroyOverlay(struct overlay_control_device_t *dev,
+             else{
+                 pthread_mutex_unlock(&data_shared->obj_lock);
+             }
++
++            pthread_mutex_lock(&ctx->control_lock);
+         }
+ 
+         ctx->overlay_number--;
+@@ -1891,6 +1902,9 @@ static int overlay_data_close(struct hw_device_t *dev)
+ {
+     struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
+     overlay_data_shared_t  *data_shared;
++    struct timespec timeout;
++    struct timeval  tv;
++
+     OVERLAY_LOG_INFO("overlay_data_close()");
+     if (ctx) {
+         /* free all resources associated with this device here
+@@ -1907,7 +1921,7 @@ static int overlay_data_close(struct hw_device_t *dev)
+             pthread_mutex_lock(&data_shared->obj_lock);
+             data_shared->in_destroy = true;
+             while(data_shared->queued_count > 0) {
+-                OVERLAY_LOG_WARN("Warning!destroyOverlay Still %d buffer in queue",
++                OVERLAY_LOG_WARN("Warning!data close Still %d buffer in queue",
+                                 data_shared->queued_count);
+                 //Wait a buffer be mixered
+                 data_shared->wait_buf_flag = 1;
+@@ -1915,7 +1929,10 @@ static int overlay_data_close(struct hw_device_t *dev)
+                 if(ctx->control_shared) {
+                     sem_post(&ctx->control_shared->overlay_sem);
+                 }
+-                pthread_cond_wait(&data_shared->free_cond, &data_shared->obj_lock);
++                gettimeofday(&tv, (struct timezone *) NULL);
++                timeout.tv_sec = tv.tv_sec;
++                timeout.tv_nsec = (tv.tv_usec + 200000) * 1000L;//200ms
++                pthread_cond_timedwait(&data_shared->free_cond, &data_shared->obj_lock,&timeout);
+                 if(data_shared->wait_buf_flag != 0) {
+                     OVERLAY_LOG_ERR("Error!cannot make a buffer flushed");
+                }
+diff --git a/liboverlay/overlay_thread.h b/liboverlay/overlay_thread.h
+index 4bf5796..9ccab14 100755
+--- a/liboverlay/overlay_thread.h
++++ b/liboverlay/overlay_thread.h
+@@ -105,6 +105,45 @@ class OverlayThread: public Thread {
+                 //Fetch one buffer from each overlay instance buffer queue
+                 OVERLAY_LOG_RUNTIME("queued_count %d,queued_head %d",
+                      dataShared0->queued_count,dataShared0->queued_head);
++
++                //If this overlay is under destroy, just return all buffers in queue
++                //The user should guarantee the buffer all to be flushed before destroy it.
++                if(dataShared0->in_destroy) {
++                     OVERLAY_LOG_INFO("Overlay in destroy,flush queue as queued_count %d,queued_head %d",
++                     dataShared0->queued_count,dataShared0->queued_head);
++                     while(dataShared0->queued_count > 0) {
++                        //fetch the head buffer in queued buffers
++                        overlay_buf0 = dataShared0->queued_bufs[dataShared0->queued_head];
++                        OVERLAY_LOG_RUNTIME("id %d Get queue buffer for Overlay Instance 0: 0x%x queued_count %d",
++                             dataShared0->instance_id,overlay_buf0,dataShared0->queued_count);
++                        dataShared0->queued_bufs[dataShared0->queued_head] = 0;
++                        dataShared0->queued_head ++;
++                        dataShared0->queued_head = dataShared0->queued_head%MAX_OVERLAY_BUFFER_NUM;
++                        dataShared0->queued_count --;
++
++                        //For push mode, no need to return the buffer back
++                        if(dataShared0->overlay_mode == OVERLAY_NORAML_MODE) {
++                            dataShared0->free_bufs[dataShared0->free_tail] = overlay_buf0;
++                            OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x at %d free_count %d",
++                                 dataShared0->instance_id,overlay_buf0,dataShared0->free_tail,dataShared0->free_count+1);
++                            dataShared0->free_tail++;
++                            dataShared0->free_tail = dataShared0->free_tail%MAX_OVERLAY_BUFFER_NUM;
++                            dataShared0->free_count++;
++                            if(dataShared0->free_count > dataShared0->num_buffer) {
++                                OVERLAY_LOG_ERR("Error!free_count %d is greater the total number %d",
++                                                dataShared0->free_count,dataShared0->num_buffer);
++                            }
++                        }
++
++                        if(dataShared0->wait_buf_flag) {
++                            dataShared0->wait_buf_flag = 0;
++                            OVERLAY_LOG_RUNTIME("Id %d Condition signal for Overlay Instance 0",dataShared0->instance_id);
++                            pthread_cond_signal(&dataShared0->free_cond);
++                        }
++                     }
++                     overlay_buf0 = NULL;
++                }
++
+                 if(dataShared0->queued_count > 0) 
+                 {
+                     //fetch the head buffer in queued buffers
+@@ -142,6 +181,47 @@ class OverlayThread: public Thread {
+                 OVERLAY_LOG_RUNTIME("Process obj 0 instance_id %d dataShared0 0x%x",
+                                     dataShared0->instance_id,dataShared0);
+                 pthread_mutex_lock(&dataShared1->obj_lock);
++
++                //If this overlay is under destroy, just return all buffers in queue
++                //The user should guarantee the buffer all to be flushed before destroy it.
++                if(dataShared1->in_destroy) {
++                     OVERLAY_LOG_INFO("Overlay in destroy,flush queue as queued_count %d,queued_head %d",
++                     dataShared1->queued_count,dataShared1->queued_head);
++                     while(dataShared1->queued_count > 0) {
++                        //fetch the head buffer in queued buffers
++                        overlay_buf1 = dataShared1->queued_bufs[dataShared1->queued_head];
++                        OVERLAY_LOG_RUNTIME("id %d Get queue buffer for Overlay Instance 0: 0x%x queued_count %d",
++                             dataShared1->instance_id,overlay_buf1,dataShared1->queued_count);
++                        dataShared1->queued_bufs[dataShared1->queued_head] = 0;
++                        dataShared1->queued_head ++;
++                        dataShared1->queued_head = dataShared1->queued_head%MAX_OVERLAY_BUFFER_NUM;
++                        dataShared1->queued_count --;
++
++                        //For push mode, no need to return the buffer back
++                        if(dataShared1->overlay_mode == OVERLAY_NORAML_MODE) {
++                            dataShared1->free_bufs[dataShared1->free_tail] = overlay_buf1;
++                            OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x at %d free_count %d",
++                                 dataShared1->instance_id,overlay_buf1,dataShared1->free_tail,dataShared1->free_count+1);
++                            dataShared1->free_tail++;
++                            dataShared1->free_tail = dataShared1->free_tail%MAX_OVERLAY_BUFFER_NUM;
++                            dataShared1->free_count++;
++                            if(dataShared1->free_count > dataShared1->num_buffer) {
++                                OVERLAY_LOG_ERR("Error!free_count %d is greater the total number %d",
++                                                dataShared1->free_count,dataShared1->num_buffer);
++                            }
++                        }
++
++                        if(dataShared1->wait_buf_flag) {
++                            dataShared1->wait_buf_flag = 0;
++                            OVERLAY_LOG_RUNTIME("Id %d Condition signal for Overlay Instance 0",dataShared1->instance_id);
++                            pthread_cond_signal(&dataShared1->free_cond);
++                        }
++
++                     }
++                     overlay_buf1 = NULL;
++                }
++
++
+                 //Fetch one buffer from each overlay instance buffer queue
+                 if(dataShared1->queued_count > 0) 
+                 {
+@@ -246,7 +326,7 @@ class OverlayThread: public Thread {
+                     mIPUInputParam.input_crop_win.win_h = overlay0_outregion.bottom - overlay0_outregion.top;
+                     mIPUInputParam.fmt = m_dev->outpixelformat;
+                     mIPUInputParam.user_def_paddr[0] = mLatestQueuedBuf.m.offset;
+-    
++
+                     //Setting output format
+                     //Should align with v4l
+                     mIPUOutputParam.fmt = m_dev->outpixelformat;
+-- 
+1.8.0
+

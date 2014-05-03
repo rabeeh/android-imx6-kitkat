@@ -1,0 +1,256 @@
+From 04dbeda3a66f87216c301a9622951b41a53c3c91 Mon Sep 17 00:00:00 2001
+From: "Yaoming.Qin" <B10945@freescale.com>
+Date: Mon, 16 May 2011 20:50:34 +0800
+Subject: [PATCH 147/486] ENGR00142255 UVC  Camera Fix bug
+
+1. The uvc camera can work only for preview&capture fps both on 15 fps.
+2. in set config, the fmt configure should be before param configure.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ libcamera/CameraHal.cpp            | 31 +++++++++++++++++++++++-------
+ libcamera/CameraHal.h              |  2 ++
+ libcamera/CaptureDeviceInterface.h |  1 +
+ libcamera/JpegEncoderSoftware.cpp  |  2 +-
+ libcamera/V4l2CapDeviceBase.cpp    | 39 +++++++++++++++++++++++---------------
+ libcamera/V4l2CapDeviceBase.h      |  4 +++-
+ 6 files changed, 55 insertions(+), 24 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index 4936939..842d5ca 100755
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -722,13 +722,20 @@ namespace android {
+         }
+         mParameters.getPictureSize((int *)&(mCaptureDeviceCfg.width),(int *)&(mCaptureDeviceCfg.height));
+         mCaptureDeviceCfg.tv.numerator = 1;
++        mCaptureDevice->GetDevName(mCameraSensorName);
++        if (strstr(mCameraSensorName, "uvc") == NULL){
++        //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
++        // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
+         if (mParameters.getPreviewFrameRate() >= 15)
+             mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
+         else{
+             mParameters.getPreviewFpsRange(&min_fps, &max_fps);
+-            CAMERA_HAL_LOG_INFO("###the fps is %d###", max_fps);
++            CAMERA_HAL_LOG_INFO("###start the preview the fps is %d###", max_fps);
+             mCaptureDeviceCfg.tv.denominator = max_fps/1000;
+         }
++        }else{
++                mCaptureDeviceCfg.tv.denominator = 15;
++        }
+         mCaptureBufNum = PICTURE_CAPTURE_BUFFER_NUM;
+         mPPbufNum = 1;
+         mTakePicFlag = true;
+@@ -743,13 +750,16 @@ namespace android {
+                 CAMERA_HAL_ERR("PreparePostProssDevice error");
+                 return ret;
+             }
++        }
++        if ((ret = PrepareCaptureDevices()) < 0)
++            return ret;
++
++        if (mPPDeviceNeedForPic){
+             if ((ret = PreparePreviwBuf()) < 0){
+                 CAMERA_HAL_ERR("PreparePreviwBuf error");
+                 return ret;
+             }
+         }
+-        if ((ret = PrepareCaptureDevices()) < 0)
+-            return ret;
+         if ((ret = PrepareJpegEncoder()) < 0)
+             return ret;
+ 
+@@ -980,9 +990,9 @@ Pic_out:
+             mJpegEncCfg.RotationInfo = ORIENTATION_NORMAL; //the android and the jpeg has the same define
+         else if (rotate_angle == 90)
+             mJpegEncCfg.RotationInfo = ORIENTATION_ROTATE_90;
+-        else if (rotate_angle = 180)
++        else if (rotate_angle == 180)
+             mJpegEncCfg.RotationInfo = ORIENTATION_ROTATE_180;
+-        else if (rotate_angle = 270)
++        else if (rotate_angle == 270)
+             mJpegEncCfg.RotationInfo = ORIENTATION_ROTATE_270;
+         else
+             mJpegEncCfg.RotationInfo = ORIENTATION_NORMAL;
+@@ -1011,6 +1021,9 @@ Pic_out:
+         else if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_TORCH) == 0){
+             flash_info = FLASH_FIRED_COMPULOSORY;
+         }
++        else{
++            flash_info = FLASH_NOT_FIRE;
++        }
+         mJpegEncCfg.FlashInfo = flash_info;
+ 
+         cLatitude   = (char *)mParameters.get(CameraParameters::KEY_GPS_LATITUDE);
+@@ -1116,15 +1129,20 @@ Pic_out:
+         mParameters.getPreviewSize((int *)&(mCaptureDeviceCfg.width),(int *)&(mCaptureDeviceCfg.height));
+         mCaptureDeviceCfg.fmt = mPreviewCapturedFormat;
+         mCaptureDeviceCfg.tv.numerator = 1;
++        mCaptureDevice->GetDevName(mCameraSensorName);
++        if (strstr(mCameraSensorName, "uvc") == NULL){
+         //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
+         // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
+         if (mParameters.getPreviewFrameRate() >= 15)
+             mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
+         else{
+             mParameters.getPreviewFpsRange(&min_fps, &max_fps);
+-            CAMERA_HAL_LOG_INFO("###start the preview the fps is %d###", max_fps);
++            CAMERA_HAL_LOG_INFO("###start the capture the fps is %d###", max_fps);
+             mCaptureDeviceCfg.tv.denominator = max_fps/1000;
+         }
++        }else{
++                mCaptureDeviceCfg.tv.denominator = 15;
++        }
+         mCaptureBufNum = PREVIEW_CAPTURE_BUFFER_NUM;
+         mPPbufNum = POST_PROCESS_BUFFER_NUM;
+         mTakePicFlag = false;
+@@ -1697,7 +1715,6 @@ show_out:
+ #define DEFAULT_ERROR_NAME '#'
+ #define DEFAULT_ERROR_NAME_str "#"
+ #define UVC_NAME "uvc"
+-#define MAX_SENSOR_NAME 10
+     static CameraInfo sCameraInfo[2];
+     static char Camera_name[2][MAX_SENSOR_NAME];
+ 
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index de94ff3..7df6a1d 100755
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -53,6 +53,7 @@
+ #define MAX_QUERY_FMT_TIMES 20
+ #define PARAMS_DELIMITER ","
+ #define V4LSTREAM_WAKE_LOCK "V4LCapture"
++#define MAX_SENSOR_NAME 32
+ 
+ #define PREVIEW_HEAP_BUF_NUM    5
+ #define VIDEO_OUTPUT_BUFFER_NUM 5
+@@ -326,6 +327,7 @@ namespace android {
+         unsigned int        mPreviewHeapBufNum;
+         unsigned int        mTakePicBufQueNum;
+ 
++        char                mCameraSensorName[MAX_SENSOR_NAME];
+         bool mCameraReady;
+         bool mCaptureDeviceOpen;
+         bool mPPDeviceNeed;
+diff --git a/libcamera/CaptureDeviceInterface.h b/libcamera/CaptureDeviceInterface.h
+index 6cb6567..2f9a87c 100755
+--- a/libcamera/CaptureDeviceInterface.h
++++ b/libcamera/CaptureDeviceInterface.h
+@@ -71,6 +71,7 @@ namespace android {
+     public:
+ 
+         virtual CAPTURE_DEVICE_ERR_RET SetDevName(char * deviceName)=0;
++        virtual CAPTURE_DEVICE_ERR_RET GetDevName(char * deviceName)=0;
+         virtual CAPTURE_DEVICE_ERR_RET DevOpen()=0;
+         virtual CAPTURE_DEVICE_ERR_RET EnumDevParam(DevParamType devParamType, void *retParam)=0;
+         virtual CAPTURE_DEVICE_ERR_RET DevSetConfig(struct capture_config_t *pCapcfg)=0;
+diff --git a/libcamera/JpegEncoderSoftware.cpp b/libcamera/JpegEncoderSoftware.cpp
+index 47670d5..14adb6a 100755
+--- a/libcamera/JpegEncoderSoftware.cpp
++++ b/libcamera/JpegEncoderSoftware.cpp
+@@ -296,7 +296,7 @@ INT_ERR_RET:
+         thumbnail_height = pEncCfgLocal->ThumbHeight;
+ 
+ 
+-        if (thumbnail_width <= 0 || thumbnail_width <= 0)
++        if (thumbnail_width <= 0 || thumbnail_height<= 0)
+             mEncodeThumbnailFlag = false;
+ 
+         g_JpegDataSize = 0;//Total size of g_JpegData
+diff --git a/libcamera/V4l2CapDeviceBase.cpp b/libcamera/V4l2CapDeviceBase.cpp
+index 3280b16..8976b9e 100755
+--- a/libcamera/V4l2CapDeviceBase.cpp
++++ b/libcamera/V4l2CapDeviceBase.cpp
+@@ -65,6 +65,14 @@ namespace android{
+         return ret;
+     }
+ 
++    CAPTURE_DEVICE_ERR_RET V4l2CapDeviceBase::GetDevName(char * deviceName){
++        CAMERA_HAL_LOG_FUNC;
++        CAPTURE_DEVICE_ERR_RET ret = CAPTURE_DEVICE_ERR_NONE;
++        if(NULL == deviceName)
++            return CAPTURE_DEVICE_ERR_BAD_PARAM;
++        strcpy(deviceName, mInitalDeviceName);
++        return ret;
++    }
+ 
+     CAPTURE_DEVICE_ERR_RET V4l2CapDeviceBase::DevOpen(){
+         CAMERA_HAL_LOG_FUNC;
+@@ -363,21 +371,6 @@ namespace android{
+ 
+         V4l2ConfigInput(pCapcfg);
+ 
+-        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        parm.parm.capture.timeperframe.numerator = pCapcfg->tv.numerator;
+-        parm.parm.capture.timeperframe.denominator = pCapcfg->tv.denominator;
+-        ret = V4l2GetCaptureMode(pCapcfg, &(parm.parm.capture.capturemode));
+-        if (ret != CAPTURE_DEVICE_ERR_NONE)
+-            return ret;
+-
+-        if (ioctl(mCameraDevice, VIDIOC_S_PARM, &parm) < 0) {
+-            CAMERA_HAL_ERR("%s:%d  VIDIOC_S_PARM failed\n", __FUNCTION__,__LINE__);
+-            CAMERA_HAL_ERR("frame timeval is numerator %d, denominator %d",parm.parm.capture.timeperframe.numerator, 
+-                    parm.parm.capture.timeperframe.denominator);
+-            return CAPTURE_DEVICE_ERR_SYS_CALL;
+-        }
+-
+-
+         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+         fmt.fmt.pix.pixelformat = pCapcfg->fmt;
+ 
+@@ -399,6 +392,22 @@ namespace android{
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+         }
+ 
++        parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        parm.parm.capture.timeperframe.numerator = pCapcfg->tv.numerator;
++        parm.parm.capture.timeperframe.denominator = pCapcfg->tv.denominator;
++        ret = V4l2GetCaptureMode(pCapcfg, &(parm.parm.capture.capturemode));
++        if (ret != CAPTURE_DEVICE_ERR_NONE)
++            return ret;
++
++        if (ioctl(mCameraDevice, VIDIOC_S_PARM, &parm) < 0) {
++            CAMERA_HAL_ERR("%s:%d  VIDIOC_S_PARM failed\n", __FUNCTION__,__LINE__);
++            CAMERA_HAL_ERR("frame timeval is numerator %d, denominator %d",parm.parm.capture.timeperframe.numerator,
++                    parm.parm.capture.timeperframe.denominator);
++            return CAPTURE_DEVICE_ERR_SYS_CALL;
++        }
++
++
++
+         if(V4l2SetRot(pCapcfg) < 0)
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+ 
+diff --git a/libcamera/V4l2CapDeviceBase.h b/libcamera/V4l2CapDeviceBase.h
+index e43daaf..636b062 100755
+--- a/libcamera/V4l2CapDeviceBase.h
++++ b/libcamera/V4l2CapDeviceBase.h
+@@ -25,6 +25,7 @@
+ 
+ #define CAMAERA_FILENAME_LENGTH     256
+ #define MAX_CAPTURE_BUF_QUE_NUM     6
++#define CAMAERA_SENSOR_LENGTH       32
+ 
+ namespace android{
+ 
+@@ -32,6 +33,7 @@ namespace android{
+     public:
+ 
+         virtual CAPTURE_DEVICE_ERR_RET SetDevName(char * deviceName);
++        virtual CAPTURE_DEVICE_ERR_RET GetDevName(char * deviceName);
+         virtual CAPTURE_DEVICE_ERR_RET DevOpen();
+         virtual CAPTURE_DEVICE_ERR_RET EnumDevParam(DevParamType devParamType, void *retParam);
+         virtual CAPTURE_DEVICE_ERR_RET DevSetConfig(struct capture_config_t *pCapcfg);
+@@ -66,7 +68,7 @@ namespace android{
+         virtual CAPTURE_DEVICE_ERR_RET V4l2SetRot(struct capture_config_t *pCapcfg);
+ 
+         char         mCaptureDeviceName[CAMAERA_FILENAME_LENGTH];
+-        char         mInitalDeviceName[CAMAERA_FILENAME_LENGTH];
++        char         mInitalDeviceName[CAMAERA_SENSOR_LENGTH];
+         int          mCameraDevice;
+         unsigned int mFmtParamIdx;
+         unsigned int mSizeFPSParamIdx;
+-- 
+1.8.0
+

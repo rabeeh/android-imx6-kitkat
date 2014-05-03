@@ -1,0 +1,95 @@
+From 94bef1511ab9068a78763351036ff6cf0f6ca7f2 Mon Sep 17 00:00:00 2001
+From: b07117 <b07117@freescale.com>
+Date: Mon, 11 Apr 2011 15:22:36 +0800
+Subject: [PATCH 134/486] ENGR00141720, Disable UI output in second display
+ during video playback
+
+Popup UI in Video caused screen flicker and system freeze in eben's device,
+disable UI output in second display once video player is started, and enable
+
+Signed-off-by: xianzhong <b07117@freescale.com>
+---
+ libgralloc/framebuffer.cpp | 48 ++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 38 insertions(+), 10 deletions(-)
+
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index d27a485..b9977e8 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -98,6 +98,7 @@ struct fb_context_t {
+     pthread_t thread_id;
+     C2D_CONTEXT c2dctx;
+     int sec_rotation;
++    int cleancount;
+     int mRotate;
+ #endif
+ };
+@@ -1198,7 +1199,8 @@ static int resizeToSecFrameBuffer_c2d(int base,int phys,fb_context_t* ctx)
+     c2dSetSrcSurface(ctx->c2dctx, srcSurface);
+     c2dSetDstSurface(ctx->c2dctx, dstSurface); 
+     c2dSetSrcRotate(ctx->c2dctx, ctx->mRotate);
+-    
++
++    c2dSetStretchMode(ctx->c2dctx, C2D_STRETCH_BILINEAR_SAMPLING);
+     c2dSetBlendMode(ctx->c2dctx, C2D_ALPHA_BLEND_NONE);         
+     c2dSetDither(ctx->c2dctx, 0); 
+  
+@@ -1228,20 +1230,46 @@ void * secDispShowFrames(void * arg)
+             break;
+         }
+ 
+-        hnd = reinterpret_cast<private_handle_t const*>(ctx->buffer);
+-        m = reinterpret_cast<private_module_t*>(ctx->dev->common.module);
++        char value[PROPERTY_VALUE_MAX];
++        property_get("ro.secfb.disable-overlay", value, "0");
++        if (!strcmp(value, "1"))
++        {
++            property_get("media.VIDEO_PLAYING", value, "0");
++        }
+ 
+-        if(ctx->c2dctx != NULL)
++        if (strcmp(value, "1") == 0)
+         {
+-            resizeToSecFrameBuffer_c2d(hnd->base,
+-                       m->framebuffer->phys + hnd->base - m->framebuffer->base,
+-                       ctx);
++            if(ctx->cleancount)
++            {
++                sem_post(&ctx->sec_display_end);
++                continue;
++            }
++
++            ctx->cleancount++;
++            memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*NUM_BUFFERS);
+         }
+         else
+         {
+-            resizeToSecFrameBuffer(hnd->base,
+-                               m->framebuffer->phys + hnd->base - m->framebuffer->base,
+-                               ctx);
++           ctx->cleancount = 0;
++        }
++
++        if(!ctx->cleancount)
++        {
++            hnd = reinterpret_cast<private_handle_t const*>(ctx->buffer);
++            m = reinterpret_cast<private_module_t*>(ctx->dev->common.module);
++
++            if(ctx->c2dctx != NULL)
++            {
++                resizeToSecFrameBuffer_c2d(hnd->base,
++                           m->framebuffer->phys + hnd->base - m->framebuffer->base,
++                           ctx);
++            }
++            else
++            {
++                resizeToSecFrameBuffer(hnd->base,
++                                   m->framebuffer->phys + hnd->base - m->framebuffer->base,
++                                   ctx);
++            }
+         }
+ 
+         sem_post(&ctx->sec_display_end);
+-- 
+1.8.0
+

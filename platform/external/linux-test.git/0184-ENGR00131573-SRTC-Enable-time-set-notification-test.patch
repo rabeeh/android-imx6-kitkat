@@ -1,0 +1,227 @@
+From 08748e1dcdb943fd2708144a510b704e5944226b Mon Sep 17 00:00:00 2001
+From: Anish Trivedi <anish@freescale.com>
+Date: Tue, 5 Oct 2010 15:49:20 -0500
+Subject: [PATCH 184/435] ENGR00131573 SRTC Enable time set notification test
+
+After upgrade to kernel version 2.6.35, the child process,
+which called RTC_WAIT_TIME_SET ioctl, was not getting a chance
+to execute until parent process, which changes the time, ran to
+completion.
+
+Therefore, it was necessary to swap the roles of the parent
+and child processes so that parent calls RTC_WAIT_TIME_SET ioctl
+while child changes the time. This ensures that the wait call
+happens before the time change, a necessary condition for this
+mechanism to work successfully.
+
+Signed-off-by: Anish Trivedi <anish@freescale.com>
+---
+ test/mxc_rtc/autorun-rtc.sh                 |  5 ---
+ test/mxc_rtc/rtc_timesetnotification_test.c | 67 +++++++++++++++++------------
+ 2 files changed, 39 insertions(+), 33 deletions(-)
+
+diff --git a/test/mxc_rtc/autorun-rtc.sh b/test/mxc_rtc/autorun-rtc.sh
+index 2bde916..ce327fe 100755
+--- a/test/mxc_rtc/autorun-rtc.sh
++++ b/test/mxc_rtc/autorun-rtc.sh
+@@ -39,13 +39,8 @@ if [ "$RTC_IRQS" != "$RTC_IRQS_EXPECTED" ]; then
+ 	STATUS=1
+ else
+ 	echo "checking rtc interrupts PASS"
+-
+-	# Time set notification mechanism has not yet been ported to 2.6.35
+-	KERNEL_VERSION=$( cat /proc/version|cut -d' ' -f3|cut -d'-' -f1)
+-	if [ "$KERNEL_VERSION" != 2.6.35.3 ]; then
+        #RTC wait for time set notification test
+         run_testcase "./rtc_timesetnotification_test.out"
+-      fi
+ fi
+ 
+ print_status
+diff --git a/test/mxc_rtc/rtc_timesetnotification_test.c b/test/mxc_rtc/rtc_timesetnotification_test.c
+index 4ca2d97..85542e0 100644
+--- a/test/mxc_rtc/rtc_timesetnotification_test.c
++++ b/test/mxc_rtc/rtc_timesetnotification_test.c
+@@ -15,11 +15,12 @@
+  *	Real Time Clock Driver Test/Example Program
+  *
+  * rtc_wait_for_time_set_test -- test & demo the use of
+- * RTC_WAIT_FOR_TIME_SET and RTC_READ_TIME_47BIT
++ * RTC_WAIT_TIME_SET and RTC_READ_TIME_47BIT
+  * ioctls in SRTC driver.
+  *
+- * The child process calls RTC_WAIT_FOR_TIME_SET ioctl,
+- * which is a blocking call until the time is set by the parent process.
++ * The parent process, which simulates a DRM process, calls
++ * RTC_WAIT_TIME_SET ioctl, which is a blocking call until
++ * the time is set by the child process, which simulates a user.
+  * The blocking ioctl returns upon time set with a difference
+  * between new time counter value and old time counter value.
+  * Processes such as DRM can utilize these ioctls to keep track of
+@@ -27,12 +28,22 @@
+  * secure clock value = SRTC counter value + offset, where offset
+  * is kept in sync with any changes made to the SRTC clock counter.
+  *
+- * The parent process, in this test, first sets time ahead by 16 seconds
+- * and then sets the time back by 16 seconds. Each time, the child process
++ * The child process, in this test, first sets time ahead by 16 seconds
++ * and then sets the time back by 16 seconds. Each time, the parent process
+  * is woken up, and it returns failure if the time difference is not +16 seconds
+  * and -16 seconds, respectively. When time is changed by seconds, we check
+  * for rollover in the minute and hour fields. However, rollover into the day field
+  * is not checked. Therefore, if this test is run close to midnight, then it may fail.
++ *
++ * IMPORTANT: DRM process, like the parent process in this test, must be waiting
++ * to be notified before the time is changed, and it helps to have the highest
++ * priority. Otherwise, the process that sets the time will not yield to the DRM
++ * process immediately following the time set action, leading to a missed report
++ * of the time change. In this test, however, the parent and child processes have
++ * the same default priority, but the parent does call the RTC_WAIT_TIME_SET
++ * ioctl before the time is set. Therefore the child does yield to the parent
++ * (with same priority) after setting the time.
++ *
+  */
+ 
+ #include <stdio.h>
+@@ -66,7 +77,7 @@ int main(int argc, char **argv)
+ 		exit(errno);
+ 	}
+ 
+-	fprintf(stderr, "\n\t\t\tRTC_WAIT_FOR_TIME_SET Test.\n\n");
++	fprintf(stderr, "\n\t\t\tRTC_WAIT_TIME_SET Test.\n\n");
+ 
+ 
+ 	/* first, let's just read the time from SRTC */
+@@ -93,8 +104,8 @@ int main(int argc, char **argv)
+ 	/* fork a child process that will call the ioctl that waits for time set */
+ 	pid_t pID = fork();
+ 
+-	/* parent process */
+-	if (pID > 0) {
++	/* child process */
++	if (pID == 0) {
+ 
+ 		/* Set the time to 16 sec ahead, and check for rollover of min & hr.
+ 		 * Does not check for rollover of days, so this test may fail
+@@ -112,24 +123,24 @@ int main(int argc, char **argv)
+ 			rtc_tm.tm_hour = 0;
+ 
+ 
+-		fprintf(stderr, "Trying to set RTC date/time to %d-%d-%d, %02d:%02d:%02d.\n",
++		fprintf(stderr, "Child process: Trying to set RTC date/time to %d-%d-%d, %02d:%02d:%02d.\n",
+ 			rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+ 			rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+ 		retval = ioctl(fd_srtc, RTC_SET_TIME, &rtc_tm);
+ 		if (retval == -1) {
+-			perror("Error! RTC_SET_TIME");
++			perror("Child process: Error! RTC_SET_TIME");
+ 			exit(errno);
+ 		}
+ 
+ 		/* check to see if time was indeed set ahead by close to 16 seconds */
+ 		retval = ioctl(fd_srtc, RTC_RD_TIME, &rtc_tm);
+ 		if (retval == -1) {
+-			perror("Error! RTC_RD_TIME");
++			perror("Child process: Error! RTC_RD_TIME");
+ 			exit(errno);
+ 		}
+ 
+-		fprintf(stderr, "Current RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
++		fprintf(stderr, "Child process: Current RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
+ 			rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+ 			rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+@@ -154,73 +165,73 @@ int main(int argc, char **argv)
+ 				rtc_tm.tm_hour = 23;
+ 		}
+ 
+-		fprintf(stderr, "Trying to set RTC date/time to %d-%d-%d, %02d:%02d:%02d.\n",
++		fprintf(stderr, "Child process: Trying to set RTC date/time to %d-%d-%d, %02d:%02d:%02d.\n",
+ 			rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+ 			rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+ 		retval = ioctl(fd_srtc, RTC_SET_TIME, &rtc_tm);
+ 		if (retval == -1) {
+-			perror("Error! RTC_SET_TIME");
++			perror("Child process: Error! RTC_SET_TIME");
+ 			exit(errno);
+ 		}
+ 
+ 		/* check to see if time was indeed set back by close to 16 seconds */
+ 		retval = ioctl(fd_srtc, RTC_RD_TIME, &rtc_tm);
+ 		if (retval == -1) {
+-			perror("Error! RTC_RD_TIME");
++			perror("Child process: Error! RTC_RD_TIME");
+ 			exit(errno);
+ 		}
+ 
+-		fprintf(stderr, "Current RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
++		fprintf(stderr, "Child process: Current RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
+ 			rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+ 			rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+ 
+-		/* wait for child to complete before exiting, and get its return value */
+-		wait(&retval);
+-		retval = WEXITSTATUS(retval);
++		exit(0);
+ 
+ 	}
+-	/* child process */
+-	else if (pID == 0) {
++	/* parent process */
++	else if (pID > 0) {
+ 
+ 		/* this is a blocking call */
+ 		retval = ioctl(fd_srtc, RTC_WAIT_TIME_SET, &time_diff);
+ 		if (retval == -1) {
+-			perror("Child process: Error! RTC_WAIT_TIME_SET");
++			perror("Parent process: Error! RTC_WAIT_TIME_SET");
+ 			exit(errno);
+ 		}
+ 
+ 		/* signed value means add 1 second */
+ 		time_diff += (1 << 15);
+ 
+-		fprintf(stderr, "Child process: time_diff = 0x%llx = %d seconds\n", time_diff, (int) (time_diff >> 15));
++		fprintf(stderr, "Parent process: time_diff = 0x%llx = %d seconds\n", time_diff, (int) (time_diff >> 15));
+ 
+ 		/* The difference should be +16 seconds */
+ 		if ((time_diff >> 15) != 16) {
+-			fprintf(stderr, "Child process: Error! time_diff was not reported as 16 seconds\n");
++			fprintf(stderr, "Parent process: Error! time_diff was not reported as 16 seconds\n");
+ 			exit(1);
+ 		}
+ 
+ 		/* this is a blocking call */
+ 		retval = ioctl(fd_srtc, RTC_WAIT_TIME_SET, &time_diff);
+ 		if (retval == -1) {
+-			perror("Child process: Error! RTC_WAIT_TIME_SET");
++			perror("Parent process: Error! RTC_WAIT_TIME_SET");
+ 			exit(errno);
+ 		}
+ 
+ 		/* signed value means add 1 second */
+ 		time_diff += (1 << 15);
+ 
+-		fprintf(stderr, "Child process: time_diff = 0x%llx = %d seconds\n", time_diff, 	(int) (time_diff >> 15));
++		fprintf(stderr, "Parent process: time_diff = 0x%llx = %d seconds\n", time_diff, 	(int) (time_diff >> 15));
+ 
+ 		/* The difference should be -16 seconds */
+ 		if ((time_diff >> 15) != -16) {
+-			fprintf(stderr, "Child process: Error! time_diff was not reported as -16 seconds\n");
++			fprintf(stderr, "Parent process: Error! time_diff was not reported as -16 seconds\n");
+ 			exit(1);
+ 		}
+ 
+-		exit(0);
++		/* wait for child to complete before exiting, and get its return value */
++		wait(&retval);
++		retval = WEXITSTATUS(retval);
+ 	}
+ 	/* error during fork */
+ 	else {
+-- 
+1.8.0
+

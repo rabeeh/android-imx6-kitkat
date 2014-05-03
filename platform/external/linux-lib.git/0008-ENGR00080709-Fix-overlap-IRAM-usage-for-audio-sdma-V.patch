@@ -1,0 +1,262 @@
+From cb797b182a4572513cf2b63e89cdad7438bbe256 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Tue, 17 Jun 2008 19:48:58 +0800
+Subject: [PATCH 008/249] ENGR00080709: Fix overlap IRAM usage for
+ audio/sdma/VPU
+
+Fix overlap IRAM usage for audio/sdma/VPU Now the IRAM usage for VPU is
+dynamically determined by the free IRAM size in kernel.
+And will choose some of four options in VPU library, the one which
+impacts video performance shall be set in higher priority.
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ vpu/vpu_io.c  | 105 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ vpu/vpu_io.h  |   7 ++++
+ vpu/vpu_lib.c |  34 -------------------
+ vpu/vpu_lib.h |   7 +---
+ 4 files changed, 113 insertions(+), 40 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index ea2d890..e9f7d3b 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -43,6 +43,94 @@ static unsigned long vpu_reg_base;
+ 
+ unsigned int system_rev;
+ 
++enum {
++	USE_DBK_INTERNAL_BUF,	/* MPEG-4 and MPEG-2 output deblocking */
++	USE_OVL_INTERNAL_BUF,	/* overlap filter */
++	USE_IP_INTERNAL_BUF,	/* intra/ACDC prediction */
++	USE_BIT_INTERNAL_BUF,	/* MB prediction */
++};
++
++Uint32 use_iram_table[] = {
++	0x6400,
++	0x2000,
++	0x1900,
++	0x1900,
++};
++
++int get_iram_setting(struct iram_t iram, Uint32 array[], int array_size,
++			int *use_iram_bits)
++{
++	int i;
++	int total = iram.end - iram.start + 1;
++
++	i = array_size - 1;
++	if (total < array[i])
++		return  -1;
++
++	while (total > array[i]) {
++		i--;
++	}
++	i++;
++
++	*use_iram_bits = 0;
++	while (total > array[i] && i < array_size) {
++		if (i == USE_DBK_INTERNAL_BUF) {
++			*use_iram_bits |= 1 << 2;
++		}
++
++		if (i == USE_OVL_INTERNAL_BUF) {
++			*use_iram_bits |= 1 << 3;
++		}
++
++		if (i == USE_IP_INTERNAL_BUF) {
++			*use_iram_bits |= 1 << 1;
++		}
++
++		if (i == USE_BIT_INTERNAL_BUF) {
++			*use_iram_bits |= 1 << 0;
++		}
++
++		total -= array[i];
++		i++;
++	}
++
++	return 0;
++}
++
++int set_iram(struct iram_t iram, Uint32 array[], int array_size,
++			int use_iram_bits)
++{
++	static int dbk_use_size, ovl_use_size, ip_use_size;
++
++	dprintf(3, "use iram_bits:%08x\n", use_iram_bits);
++	VpuWriteReg(BIT_AXI_SRAM_USE, use_iram_bits);
++
++
++	if ((use_iram_bits & 0x8) == 0x8) {
++		VpuWriteReg(BIT_OVL_USE_SRAM_BASE, iram.start);
++		ovl_use_size = array[USE_OVL_INTERNAL_BUF];
++	}
++
++	if ((use_iram_bits & 0x4) == 0x4) {
++		VpuWriteReg(BIT_DBK_USE_SRAM_BASE, iram.start +
++				ovl_use_size);
++		dbk_use_size = array[USE_DBK_INTERNAL_BUF];
++	}
++
++	if ((use_iram_bits & 0x2) == 0x2) {
++		VpuWriteReg(BIT_IP_USE_SRAM_BASE, iram.start +
++				ovl_use_size + dbk_use_size);
++		ip_use_size = array[USE_IP_INTERNAL_BUF];
++	}
++
++	if ((use_iram_bits & 0x1) == 0x1) {
++		VpuWriteReg(BIT_BIT_USE_SRAM_BASE, iram.start +
++				ovl_use_size + dbk_use_size + ip_use_size);
++	}
++
++	return 0;
++}
++
+ int isVpuInitialized(void)
+ {
+ 	return VpuReadReg(BIT_CUR_PC) != 0;
+@@ -106,7 +194,9 @@ inline unsigned long *reg_map(unsigned long offset)
+  */
+ int IOSystemInit(void *callback)
+ {
++	struct iram_t iram;
+ 	int ret;
++	static int use_iram_bits;
+ 
+ 	ret = get_system_rev();
+ 	if (ret == -1) {
+@@ -145,6 +235,13 @@ int IOSystemInit(void *callback)
+ 		goto err;
+ 
+ 	vpu_Init(bit_work_addr.phy_addr);
++	if (cpu_is_mx37()) {
++		IOGetIramBase(&iram);
++		ret = get_iram_setting(iram, use_iram_table, 4, &use_iram_bits);
++		if (ret != -1)
++			set_iram(iram, use_iram_table, 4, use_iram_bits);
++	}
++
+ 	return 0;
+ 
+       err:
+@@ -311,6 +408,14 @@ int IOWaitForInt(int timeout_in_ms)
+ 	return ret;
+ }
+ 
++int IOGetIramBase(iram_t * iram)
++{
++	int ret = 0;
++
++	ret = ioctl(vpu_fd, VPU_IOC_IRAM_BASE, iram);
++	return ret;
++}
++
+ void vl2cc_flush()
+ {
+ 	ioctl(vpu_fd, VPU_IOC_VL2CC_FLUSH, NULL);
+diff --git a/vpu/vpu_io.h b/vpu/vpu_io.h
+index 607b6e2..87c6042 100644
+--- a/vpu/vpu_io.h
++++ b/vpu/vpu_io.h
+@@ -34,6 +34,11 @@ typedef struct vpu_mem_desc {
+ 	unsigned long virt_uaddr;	/*!virtual user space address */
+ } vpu_mem_desc;
+ 
++typedef struct iram_t {
++        unsigned long start;
++        unsigned long end;
++} iram_t;
++
+ #define	VPU_IOC_MAGIC		'V'
+ 
+ #define	VPU_IOC_PHYMEM_ALLOC	_IO(VPU_IOC_MAGIC, 0)
+@@ -42,6 +47,7 @@ typedef struct vpu_mem_desc {
+ #define	VPU_IOC_PHYMEM_DUMP	_IO(VPU_IOC_MAGIC, 3)
+ #define	VPU_IOC_REG_DUMP	_IO(VPU_IOC_MAGIC, 4)
+ #define	VPU_IOC_VL2CC_FLUSH	_IO(VPU_IOC_MAGIC, 5)
++#define	VPU_IOC_IRAM_BASE	_IO(VPU_IOC_MAGIC, 6)
+ 
+ typedef void (*vpu_callback) (int status);
+ 
+@@ -54,6 +60,7 @@ int IOFreePhyMem(vpu_mem_desc * buff);
+ int IOGetVirtMem(vpu_mem_desc * buff);
+ int IOFreeVirtMem(vpu_mem_desc * buff);
+ int IOWaitForInt(int timeout_in_ms);
++int IOGetIramBase(iram_t * iram);
+ 
+ unsigned long VpuWriteReg(unsigned long addr, unsigned int data);
+ unsigned long VpuReadReg(unsigned long addr);
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 70ecc2e..2cc992c 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -187,40 +187,6 @@ RetCode vpu_Init(PhysicalAddress workBuf)
+ 	VpuWriteReg(BIT_BIT_STREAM_CTRL, data);
+ 	VpuWriteReg(BIT_FRAME_MEM_CTRL, IMAGE_ENDIAN);
+ 
+-	if (cpu_is_mx37()) {
+-		VpuWriteReg(BIT_AXI_SRAM_USE, (USE_OVL_INTERNAL_BUF << 3) |
+-					      (USE_DBK_INTERNAL_BUF << 2) |
+-					       (USE_IP_INTERNAL_BUF << 1) |
+-						      USE_BIT_INTERNAL_BUF);
+-
+-/* the following size is enough for worst case */
+-#define	DBK_USE_SIZE	(0x6400 * (USE_DBK_INTERNAL_BUF != 0))
+-#define	OVL_USE_SIZE	(0x2000 * (USE_OVL_INTERNAL_BUF != 0))
+-#define IP_USE_SIZE	(0x1900 * (USE_IP_INTERNAL_BUF != 0))
+-#define BIT_USE_SIZE	(0x1900 * (USE_BIT_INTERNAL_BUF != 0))
+-
+-#define IRAM_BASE_ADDR	0x10000000
+-#define IRAM_END_ADDR	0x10012000
+-
+-#define DBK_USE_IRAM_ADDR	(IRAM_END_ADDR - DBK_USE_SIZE)
+-#define OVL_USE_IRAM_ADDR	(DBK_USE_IRAM_ADDR - OVL_USE_SIZE)
+-#define	IP_USE_IRAM_ADDR	(OVL_USE_IRAM_ADDR - IP_USE_SIZE)
+-#define BIT_USE_IRAM_ADDR	(IP_USE_IRAM_ADDR - BIT_USE_SIZE)
+-
+-#if USE_DBK_INTERNAL_BUF != 0
+-		VpuWriteReg(BIT_DBK_USE_SRAM_BASE, DBK_USE_IRAM_ADDR);
+-#endif
+-#if USE_OVL_INTERNAL_BUF != 0
+-		VpuWriteReg(BIT_OVL_USE_SRAM_BASE, OVL_USE_IRAM_ADDR);
+-#endif
+-#if USE_IP_INTERNAL_BUF != 0
+-		VpuWriteReg(BIT_IP_USE_SRAM_BASE, IP_USE_IRAM_ADDR);
+-#endif
+-#if USE_BIT_INTERNAL_BUF != 0
+-		VpuWriteReg(BIT_BIT_USE_SRAM_BASE, BIT_USE_IRAM_ADDR);
+-#endif
+-	}
+-
+ 	VpuWriteReg(BIT_INT_ENABLE, 8);	/* PIC_RUN irq enable */
+ 
+ 	if (cpu_is_mxc30031()) {
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 2bbc8c4..cd9459b 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -29,11 +29,6 @@ typedef unsigned long Uint32;
+ typedef unsigned short Uint16;
+ typedef Uint32 PhysicalAddress;
+ 
+-#define	USE_BIT_INTERNAL_BUF		1
+-#define USE_IP_INTERNAL_BUF		1
+-#define	USE_DBK_INTERNAL_BUF		1
+-#define	USE_OVL_INTERNAL_BUF		1
+-
+ #define STREAM_FULL_EMPTY_CHECK_DISABLE 0
+ 
+ #define BIT_REG_MARGIN			0x1000
+@@ -429,7 +424,7 @@ typedef struct vpu_versioninfo {
+ #define VPU_LIB_VERSION(major, minor, release)	 \
+ 	(((major) << 12) + ((minor) << 8) + (release))
+ 
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(3, 0, 1)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(3, 0, 2)
+ 
+ extern unsigned int system_rev;
+ 
+-- 
+1.8.0
+

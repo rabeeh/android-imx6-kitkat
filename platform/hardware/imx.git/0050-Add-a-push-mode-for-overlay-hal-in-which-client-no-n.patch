@@ -1,0 +1,341 @@
+From bd029e37022175d7200b704d25764775a813aad3 Mon Sep 17 00:00:00 2001
+From: b07211 <b07211@freescale.com>
+Date: Thu, 1 Jul 2010 15:41:24 -0400
+Subject: [PATCH 050/486] Add a push mode for overlay hal, in which client no
+ need to call dequeue() to get buffer, and just
+ queue the private buffer handle Signed-off-by:
+ b07211 <b07211@freescale.com>
+
+---
+ liboverlay/overlay.cpp      | 133 +++++++++++++++++++++++++++++++++++++-------
+ liboverlay/overlay_thread.h |  36 +++++++-----
+ 2 files changed, 135 insertions(+), 34 deletions(-)
+
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+index 0a323d7..2e69951 100755
+--- a/liboverlay/overlay.cpp
++++ b/liboverlay/overlay.cpp
+@@ -75,6 +75,7 @@ typedef struct
+   pthread_cond_t free_cond;
+   int wait_buf_flag;
+   unsigned int buf_showed;
++  int overlay_mode;
+ } overlay_data_shared_t;
+ 
+ typedef struct
+@@ -196,7 +197,7 @@ class overlay_object : public overlay_t {
+     static overlay_handle_t getHandleRef(struct overlay_t* overlay) {
+         /* returns a reference to the handle, caller doesn't take ownership */
+         overlay_handle_t retPtr = &(static_cast<overlay_object *>(overlay)->mHandle);
+-        LOGI("getHandleRef return overlay_handle_t 0x%x",retPtr);
++        LOGI("getHandleRef return overlay_handle_t 0x%p",retPtr);
+         return retPtr;
+     }
+     
+@@ -830,9 +831,9 @@ static int overlay_init_v4l(struct overlay_control_context_t *dev)
+             //v4l already init this buffer to black
+             //fill the v4l to black;
+             fill_frame_back(vir_addr,v4lbuf->length,dev->xres,dev->yres,dev->outpixelformat);
+-            LOGI("******0x%x 0x%x 0x%x 0x%x",*(vir_addr),*(vir_addr+1),*(vir_addr+2),*(vir_addr+3));
+-            OVERLAY_LOG_INFO("v4l buf[%d] 0x%x: vir 0x%x,phy 0x%x, size %d",
+-                             buf_index,v4lbuf,(unsigned int)vir_addr,v4lbuf->m.offset,v4lbuf->length);
++            //LOGI("******0x%x 0x%x 0x%x 0x%x",*(vir_addr),*(vir_addr+1),*(vir_addr+2),*(vir_addr+3));
++            OVERLAY_LOG_INFO("v4l buf[%d] 0x%p: vir 0x%p,phy 0x%x, size %d",
++                             buf_index,v4lbuf,vir_addr,v4lbuf->m.offset,v4lbuf->length);
+             v4lbuf++;
+         }
+ 
+@@ -961,7 +962,7 @@ static overlay_t* overlay_createOverlay(struct overlay_control_device_t *dev,
+                 ctx->overlay_instance_valid[instance] = 1;
+                 ctx->overlay_intances[instance] = overlay;
+                 ctx->overlay_number++;
+-                OVERLAY_LOG_INFO("Create overlay instance 0x%x id %d total %d",
++                OVERLAY_LOG_INFO("Create overlay instance 0x%p id %d total %d",
+                      overlay,instance,ctx->overlay_number);
+                 overlay->mDataShared->instance_id = instance;
+                 break;
+@@ -1180,7 +1181,7 @@ int overlay_data_initialize(struct overlay_data_device_t *dev,
+     OVERLAY_LOG_FUNC;
+     struct handle_t *overlay_handle = (struct handle_t *)handle;
+     struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
+-    OVERLAY_LOG_INFO("overlay_initialize overlay_handle 0x%x overlay_data_context_t 0x%x pid %d tid %d",
++    OVERLAY_LOG_INFO("overlay_initialize overlay_handle 0x%p overlay_data_context_t 0x%p pid %d tid %d",
+          overlay_handle,ctx,getpid(),gettid());
+     /* 
+      * overlay_handle_t should contain all the information to "inflate" this
+@@ -1250,7 +1251,7 @@ int overlay_data_initialize(struct overlay_data_device_t *dev,
+     }
+     else{
+        memset(ctx->overlay_buffer,0,sizeof(OVERLAY_BUFFER)*bufcount);
+-       OVERLAY_LOG_INFO("overlay_buffer 0x%x",ctx->overlay_buffer);
++       OVERLAY_LOG_INFO("overlay_buffer 0x%p",ctx->overlay_buffer);
+     }
+ 
+ 
+@@ -1281,7 +1282,7 @@ int overlay_data_initialize(struct overlay_data_device_t *dev,
+ 
+         }
+ 
+-        OVERLAY_LOG_INFO("buffer %d: vir 0x%x, phy 0x%x",index,pOverlayBuf->vir_addr,pOverlayBuf->phy_addr);
++        OVERLAY_LOG_INFO("buffer %d: vir 0x%p, phy 0x%x",index,pOverlayBuf->vir_addr,pOverlayBuf->phy_addr);
+         ctx->data_shared->free_bufs[ctx->data_shared->free_tail] = pOverlayBuf->phy_addr;
+         ctx->data_shared->free_count++;
+         ctx->data_shared->free_tail++;
+@@ -1302,10 +1303,16 @@ int overlay_data_dequeueBuffer(struct overlay_data_device_t *dev,
+     struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
+     if(!dev||!buf||!ctx->data_shared) {
+        OVERLAY_LOG_ERR("Error!Invalid parameters for dequeuBuffer");
++       *buf = NULL;
+        return -EINVAL;
+     }
+ 
+     overlay_data_shared_t  *data_shared = ctx->data_shared;
++    if(data_shared->overlay_mode == OVERLAY_PUSH_MODE){
++        OVERLAY_LOG_ERR("Error!Push mode not support dequeueBuffer API");
++        *buf = NULL;
++        return -EINVAL;
++    }
+ 
+     /* blocks until a buffer is available and return an opaque structure
+      * representing this buffer.
+@@ -1397,17 +1404,22 @@ int overlay_data_queueBuffer(struct overlay_data_device_t *dev,
+     }
+ 
+     overlay_data_shared_t  *data_shared = ctx->data_shared;
+-    OVERLAY_BUFFER *overlay_buf = (OVERLAY_BUFFER *)buffer;
++    OVERLAY_BUFFER *overlay_buf = NULL;
+     //Check whether it is a valid buffer
+     //Further check maybe needed:
+     //Cannot be queued twice(not a duplicated node in display buffer queue)
+-    if((overlay_buf < ctx->overlay_buffer)||
+-       (overlay_buf >= (ctx->overlay_buffer+ctx->num_buffer))) {
+-       OVERLAY_LOG_ERR("Error!Id %d:Not a valid overlay buffer for queueBuffer",
+-                       data_shared->instance_id);
+-       return -EINVAL;
++    if(data_shared->overlay_mode != OVERLAY_PUSH_MODE)
++    {
++        overlay_buf = (OVERLAY_BUFFER *)buffer;
++        if((overlay_buf < ctx->overlay_buffer)||
++           (overlay_buf >= (ctx->overlay_buffer+ctx->num_buffer))) {
++           OVERLAY_LOG_ERR("Error!Id %d:Not a valid overlay buffer for queueBuffer",
++                           data_shared->instance_id);
++           return -EINVAL;
++        }
+     }
+ 
++
+     pthread_mutex_lock(&data_shared->obj_lock);
+     //Insert buffer to display buffer queue
+     if(data_shared->queued_count >= ctx->queue_threshold) {
+@@ -1427,8 +1439,15 @@ int overlay_data_queueBuffer(struct overlay_data_device_t *dev,
+         }
+         OVERLAY_LOG_RUNTIME("Id %d:Wait a free slot for queue buffer",data_shared->instance_id);
+     }
++    unsigned int phy_addr;
++    if(data_shared->overlay_mode != OVERLAY_PUSH_MODE){
++        phy_addr = overlay_buf->phy_addr;
++    }
++    else{
++        phy_addr = (unsigned int)buffer;
++    }
++
+ 
+-    int phy_addr = overlay_buf->phy_addr;
+     OVERLAY_LOG_RUNTIME("Id %d:Queue buffer 0x%x at %d,queued count %d",
+                         data_shared->instance_id,
+                         phy_addr,data_shared->queued_tail,data_shared->queued_count+1);
+@@ -1467,6 +1486,12 @@ void *overlay_data_getBufferAddress(struct overlay_data_device_t *dev,
+        return NULL;
+     }
+ 
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++    if(data_shared->overlay_mode == OVERLAY_PUSH_MODE){
++        OVERLAY_LOG_ERR("Error!Push mode not support getBufferAddress API");
++        return NULL;
++    }
++
+     /* this may fail (NULL) if this feature is not supported. In that case,
+      * presumably, there is some other HAL module that can fill the buffer,
+      * using a DSP for instance */
+@@ -1499,6 +1524,12 @@ unsigned int overlay_data_getBufferAddressPhy(struct overlay_data_device_t *dev,
+        return NULL;
+     }
+ 
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++    if(data_shared->overlay_mode == OVERLAY_PUSH_MODE){
++        OVERLAY_LOG_ERR("Error!Push mode not support getBufferAddress API");
++        return 0;
++    }
++
+     /* this may fail (NULL) if this feature is not supported. In that case,
+      * presumably, there is some other HAL module that can fill the buffer,
+      * using a DSP for instance */
+@@ -1550,8 +1581,8 @@ int overlay_data_setCrop(struct overlay_data_device_t *dev,
+     OVERLAY_LOG_FUNC;
+     struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
+     if((!dev)||
+-       ((x+w)> ctx->width)||
+-       ((y+h)> ctx->height)) {
++       ((x+w)> (uint32_t)ctx->width)||
++       ((y+h)> (uint32_t)ctx->height)) {
+        OVERLAY_LOG_ERR("Error!Invalid parameters for overlay_data_setCrop");
+        return -EINVAL;
+     }
+@@ -1599,6 +1630,68 @@ int overlay_data_setParameter(struct overlay_data_device_t *dev,
+     }
+     overlay_data_shared_t  *data_shared = ctx->data_shared;
+     switch(param) {
++        case OVERLAY_MODE:
++            {
++                OVERLAY_LOG_INFO("Id %d:overlay_data_setParameter push mode %d",
++                                 data_shared->instance_id,value);
++                pthread_mutex_lock(&data_shared->obj_lock);
++
++                if(data_shared->overlay_mode == value) {
++                    OVERLAY_LOG_INFO("No mode change needed");
++                    pthread_mutex_unlock(&data_shared->obj_lock);
++                    return 0;
++                }
++                //We only support the change from normal mode to push mode
++                //Default setting of mode should be normal mode
++                if(value != OVERLAY_PUSH_MODE) {
++                    OVERLAY_LOG_ERR("Error!Mode change not supported");
++                    pthread_mutex_unlock(&data_shared->obj_lock);
++                    return 0;
++                }               
++                if(data_shared->free_count != data_shared->num_buffer) {
++                    //The buffer may be used by mixer
++                    //should hold until all buffer are in free queue
++                    OVERLAY_LOG_ERR("Error!Id %d:There are still %d buffers been used",
++                                    data_shared->instance_id,
++                                    data_shared->num_buffer-data_shared->free_count);
++                    pthread_mutex_unlock(&data_shared->obj_lock);
++                    return -EINVAL;
++                }
++    
++                //DeAllocate all buffers
++                for(int i = 0; i< ctx->num_buffer;i++) {
++                    ctx->allocator->deAllocate(&ctx->overlay_buffer[i]);
++                }
++    
++                //DeAllocate all buffer hdr
++                if(ctx->overlay_buffer) {
++                    free(ctx->overlay_buffer);
++                    ctx->overlay_buffer = NULL;
++                }
++    
++                //Delete allocator
++                if(ctx->allocator) {
++                    delete ctx->allocator;
++                    ctx->allocator = NULL;
++                }
++    
++                data_shared->free_count = 0;
++                data_shared->free_head = 0;
++                data_shared->free_tail = 0;
++                memset(data_shared->free_bufs, 0, sizeof(int)*MAX_OVERLAY_BUFFER_NUM);
++                data_shared->queued_count = 0;
++                data_shared->queued_head = 0;
++                data_shared->queued_tail = 0;
++                memset(data_shared->queued_bufs, 0, sizeof(int)*MAX_OVERLAY_BUFFER_NUM);
++                data_shared->overlay_mode = OVERLAY_PUSH_MODE;
++                ctx->num_buffer = 0;
++                data_shared->num_buffer = 0;
++                //Set the threashold to 1 for push mode, to avoid the conflict buffer sharing
++                //between vpu and ipu
++                ctx->queue_threshold = 1;
++                pthread_mutex_unlock(&data_shared->obj_lock);
++            }
++            break;
+         case OVERLAY_BUFNUM:
+             {
+                 OVERLAY_LOG_INFO("Id %d:overlay_data_setParameter buf num %d",
+@@ -1627,11 +1720,13 @@ int overlay_data_setParameter(struct overlay_data_device_t *dev,
+                 //DeAllocate all buffer hdr
+                 if(ctx->overlay_buffer) {
+                     free(ctx->overlay_buffer);
++                    ctx->overlay_buffer = NULL;
+                 }
+     
+                 //Delete allocator
+                 if(ctx->allocator) {
+                     delete ctx->allocator;
++                    ctx->allocator = NULL;
+                 }
+     
+                 data_shared->free_count = 0;
+@@ -1664,7 +1759,7 @@ int overlay_data_setParameter(struct overlay_data_device_t *dev,
+                 }
+                 else{
+                    memset(ctx->overlay_buffer,0,sizeof(OVERLAY_BUFFER)*bufcount);
+-                   OVERLAY_LOG_INFO("overlay_buffer 0x%x",ctx->overlay_buffer);
++                   OVERLAY_LOG_INFO("overlay_buffer 0x%p",ctx->overlay_buffer);
+                 }
+                 //Allocate the buffer
+                 //Insert all allocated buffer into buffer freequeue
+@@ -1680,7 +1775,7 @@ int overlay_data_setParameter(struct overlay_data_device_t *dev,
+             
+                     }
+             
+-                    OVERLAY_LOG_INFO("buffer %d: vir 0x%x, phy 0x%x",index,pOverlayBuf->vir_addr,pOverlayBuf->phy_addr);
++                    OVERLAY_LOG_INFO("buffer %d: vir 0x%p, phy 0x%x",index,pOverlayBuf->vir_addr,pOverlayBuf->phy_addr);
+                     ctx->data_shared->free_bufs[ctx->data_shared->free_tail] = pOverlayBuf->phy_addr;
+                     ctx->data_shared->free_count++;
+                     ctx->data_shared->free_tail++;
+diff --git a/liboverlay/overlay_thread.h b/liboverlay/overlay_thread.h
+index 1ce2978..496bf2d 100755
+--- a/liboverlay/overlay_thread.h
++++ b/liboverlay/overlay_thread.h
+@@ -552,15 +552,18 @@ free_buf_exit:
+             if((overlayObj0)&&(overlay_buf0)) {
+                 pthread_mutex_lock(&dataShared0->obj_lock);
+                 dataShared0->buf_showed++;
+-                dataShared0->free_bufs[dataShared0->free_tail] = overlay_buf0;
+-                OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x at %d free_count %d",
+-                     dataShared0->instance_id,overlay_buf0,dataShared0->free_tail,dataShared0->free_count+1);
+-                dataShared0->free_tail++;
+-                dataShared0->free_tail = dataShared0->free_tail%MAX_OVERLAY_BUFFER_NUM;
+-                dataShared0->free_count++;
+-                if(dataShared0->free_count > dataShared0->num_buffer) {
+-                    OVERLAY_LOG_ERR("Error!free_count %d is greater the total number %d",
+-                                    dataShared0->free_count,dataShared0->num_buffer);
++                //For push mode, no need to return the buffer back
++                if(dataShared0->overlay_mode == OVERLAY_NORAML_MODE) {
++                    dataShared0->free_bufs[dataShared0->free_tail] = overlay_buf0;
++                    OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x at %d free_count %d",
++                         dataShared0->instance_id,overlay_buf0,dataShared0->free_tail,dataShared0->free_count+1);
++                    dataShared0->free_tail++;
++                    dataShared0->free_tail = dataShared0->free_tail%MAX_OVERLAY_BUFFER_NUM;
++                    dataShared0->free_count++;
++                    if(dataShared0->free_count > dataShared0->num_buffer) {
++                        OVERLAY_LOG_ERR("Error!free_count %d is greater the total number %d",
++                                        dataShared0->free_count,dataShared0->num_buffer);
++                    }
+                 }
+ 
+                 if(dataShared0->wait_buf_flag) {
+@@ -578,12 +581,15 @@ free_buf_exit:
+             if((overlayObj1)&&(overlay_buf1)) {
+                 pthread_mutex_lock(&dataShared1->obj_lock);
+                 dataShared1->buf_showed++;
+-                dataShared1->free_bufs[dataShared1->free_tail] = overlay_buf1;
+-                dataShared1->free_tail++;
+-                dataShared1->free_tail = dataShared1->free_tail%MAX_OVERLAY_BUFFER_NUM;
+-                dataShared1->free_count++;
+-                OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x free_count %d",
+-                     dataShared1->instance_id,overlay_buf1,dataShared1->free_count);
++                //For push mode, no need to return the buffer back
++                if(dataShared1->overlay_mode == OVERLAY_NORAML_MODE) {
++                    dataShared1->free_bufs[dataShared1->free_tail] = overlay_buf1;
++                    dataShared1->free_tail++;
++                    dataShared1->free_tail = dataShared1->free_tail%MAX_OVERLAY_BUFFER_NUM;
++                    dataShared1->free_count++;
++                    OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x free_count %d",
++                         dataShared1->instance_id,overlay_buf1,dataShared1->free_count);
++                }
+ 
+                 if(dataShared1->wait_buf_flag) {
+                     dataShared1->wait_buf_flag = 0;
+-- 
+1.8.0
+

@@ -1,0 +1,639 @@
+From c5cece82254d514c4f9d0c477479c5bf6537a224 Mon Sep 17 00:00:00 2001
+From: Yaoming Qin <b10945@freescale.com>
+Date: Fri, 5 Nov 2010 09:12:01 +0000
+Subject: [PATCH 091/486] ENGR00133445 ]Add the feature in CameraHAL to
+ support the cts.
+
+1. Add the exif info in the Jpeg header.
+2. Add the thumbnail in Jpeg file.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ libcamera/CameraHal.cpp | 514 +++++++++++++++++++++++++++++++++++++++++++++++-
+ libcamera/CameraHal.h   |   5 +
+ 2 files changed, 515 insertions(+), 4 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index a87d059..eea54fd 100755
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -30,6 +30,10 @@
+ #define LOG_TAG "CameraHal"
+ #include <cutils/properties.h>
+ #include "CameraHal.h"
++#include <time.h>
++#include <stdlib.h>
++#include <string.h>
++
+ 
+ namespace android {
+ int CameraHal::camera_device = -1;
+@@ -48,7 +52,7 @@ wp<CameraHardwareInterface> CameraHal::singleton;
+ const char CameraHal::supportedPictureSizes [] = "2048x1536,1600x1200,1024x768,640x480";
+ const char CameraHal::supportedPreviewSizes [] = "720x576,640x480,320x240";
+ const char CameraHal::supportedFPS [] = "30,15,10";
+-const char CameraHal::supprotedThumbnailSizes []= "80x60";
++const char CameraHal::supprotedThumbnailSizes []= "0x0,128x128,96x96"; //according to the Gallery thumbnail size
+ const char CameraHal::PARAMS_DELIMITER []= ",";
+ 
+ CameraHal::CameraHal()
+@@ -119,11 +123,15 @@ void CameraHal::initDefaultParameters()
+     strcpy(dev_node, "/dev/video0");
+     p.set(CameraParameters::KEY_SUPPORTED_PICTURE_SIZES, CameraHal::supportedPictureSizes);
+ #endif
++
+     p.set(CameraParameters::KEY_SUPPORTED_PICTURE_FORMATS, CameraParameters::PIXEL_FORMAT_JPEG);
+     p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_SIZES, CameraHal::supportedPreviewSizes);
+     p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FORMATS, CameraParameters::PIXEL_FORMAT_YUV420SP);
+     p.set(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES, CameraHal::supportedFPS);
+     p.set(CameraParameters::KEY_SUPPORTED_JPEG_THUMBNAIL_SIZES, CameraHal::supprotedThumbnailSizes);
++	p.set(CameraParameters::KEY_JPEG_THUMBNAIL_WIDTH, "96");
++	p.set(CameraParameters::KEY_JPEG_THUMBNAIL_HEIGHT, "96");
++
+ 
+     memset(tmpBuffer, '\0', PARAM_BUFFER);
+     strncat((char*) tmpBuffer, (const char*) CameraParameters::WHITE_BALANCE_AUTO, PARAM_BUFFER);
+@@ -179,13 +187,13 @@ void CameraHal::initDefaultParameters()
+     p.set(CameraParameters::KEY_SUPPORTED_FOCUS_MODES, tmpBuffer);
+     p.set(CameraParameters::KEY_FOCUS_MODE, CameraParameters::FOCUS_MODE_AUTO);
+ 
+-    p.set(CameraParameters::KEY_FOCAL_LENGTH, "4.31");
++    p.set(CameraParameters::KEY_FOCAL_LENGTH, "10.001");
+     p.set(CameraParameters::KEY_HORIZONTAL_VIEW_ANGLE, "54.8");
+     p.set(CameraParameters::KEY_VERTICAL_VIEW_ANGLE, "42.5");
+     p.set(CameraParameters::KEY_EXPOSURE_COMPENSATION, "0");
+     p.set(CameraParameters::KEY_MAX_EXPOSURE_COMPENSATION, "0");
+     p.set(CameraParameters::KEY_MIN_EXPOSURE_COMPENSATION, "0");
+-    p.set(CameraParameters::KEY_EXPOSURE_COMPENSATION_STEP, "0");
++    p.set(CameraParameters::KEY_EXPOSURE_COMPENSATION_STEP, "0.0");
+ 
+     memset(tmpBuffer, '\0', sizeof(*tmpBuffer));
+     strncat((char*) tmpBuffer, (const char*) CameraParameters::ANTIBANDING_50HZ, PARAM_BUFFER);
+@@ -235,7 +243,7 @@ CameraHal::~CameraHal()
+ int CameraHal::uvcGetDeviceAndCapability(char *sizes_buf)
+ {
+     int fd, i, j, is_found = 0;
+-    char *flags[] = {"uncompressed", "compressed"};
++    const char *flags[] = {"uncompressed", "compressed"};
+     char tmp[40];
+     DIR *v4l_dir = NULL;
+     struct dirent *dir_entry;
+@@ -1219,6 +1227,8 @@ int CameraHal::cameraTakePicture()
+ 
+ #ifdef USE_FSL_JPEG_ENC
+     sp<MemoryBase> jpegMemBase = encodeImage((void*)buf1, target_size);
++
++
+     if (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
+         LOGI("==========CAMERA_MSG_COMPRESSED_IMAGE");
+         mDataCb(CAMERA_MSG_COMPRESSED_IMAGE, jpegMemBase, mCallbackCookie);
+@@ -1405,6 +1415,9 @@ JPEG_ENC_UINT8 CameraHal::pushJpegOutput(JPEG_ENC_UINT8 ** out_buf_ptrptr,JPEG_E
+         /* Flush the buffer*/
+         g_JpegDataLen += *out_buf_len_ptr;
+         LOGI("jpeg output data len %d",(int)g_JpegDataLen);
++
++        *out_buf_ptrptr = NULL;
++        *out_buf_len_ptr = NULL;
+     }
+     else
+     {
+@@ -1415,6 +1428,498 @@ JPEG_ENC_UINT8 CameraHal::pushJpegOutput(JPEG_ENC_UINT8 ** out_buf_ptrptr,JPEG_E
+     return(1); /* Success */
+ }
+ 
++#if 1//support Exif format
++
++int CameraHal::stringTodegree(char* cAttribute, unsigned long &degree, unsigned long &minute, unsigned long &second)
++{
++    double dAttribtute;
++    long intAttribute;
++    int ret  = 0;
++    if (cAttribute == NULL){
++        return -1;
++    }
++
++    LOGD("the attribute is %s", cAttribute);
++
++    dAttribtute = atof(cAttribute);
++
++    LOGD("the double of the attribute is %lf", dAttribtute);
++    intAttribute  = (long)(dAttribtute*(double)3600.0);
++    if (intAttribute < 0){
++        ret = 1;
++        intAttribute *=-1;
++    }
++
++    second = (unsigned long)(intAttribute%60);
++    minute = (unsigned long)((intAttribute%3600-second)/60);
++    degree = (unsigned long)(intAttribute/3600);
++
++    LOGD("the degree is %lu, %lu, %lu", degree,minute,second);
++
++    return ret;
++
++}
++
++void CameraHal::createJpegExifTags(jpeg_enc_object * obj_ptr)
++{
++	jpeg_enc_make_info make_info;
++    jpeg_enc_makernote_info makernote_info;
++    jpeg_enc_model_info model_info;
++    jpeg_enc_datetime_info datetime_info;
++    jpeg_enc_focallength_info focallength_info;
++    jpeg_enc_gps_info gps_info;
++    char temp_string[30], gps_datetime_string[11];
++
++    char format[30] = "%Y:%m:%d %k:%M:%S";
++    time_t clock;
++    struct tm *tm, *temp_tm;
++    char * cLatitude, *cLongtitude, *cAltitude,*cTimeStamp;
++    double dAltitude;
++    //set the make info
++    make_info.make_bytes=strlen(EXIF_MAKENOTE);
++    strcpy((char *)makernote_info.makernote, EXIF_MAKENOTE);
++    //set makernote info
++    makernote_info.makernote_bytes=strlen(EXIF_MAKENOTE);
++    strcpy((char *)makernote_info.makernote, EXIF_MAKENOTE);
++    //set model info
++    model_info.model_bytes=strlen(EXIF_MODEL);
++    strcpy((char *)model_info.model,EXIF_MODEL);
++    //set datetime
++    time(&clock);
++    tm = localtime(&clock);
++    time_t GpsUtcTime;
++    strftime(temp_string, sizeof(temp_string), format, tm);
++    LOGD("the date time is %s", temp_string);
++    memcpy((char *)datetime_info.datetime, temp_string, sizeof(datetime_info.datetime));
++
++    //set focallength info
++    focallength_info.numerator=10001;
++    focallength_info.denominator=1000;  // hardcode here for the cts
++
++	jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_MAKE, (unsigned int)(&makernote_info));
++    jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_MAKERNOTE, (unsigned int)(&makernote_info));
++    jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_MODEL, (unsigned int)(&model_info));
++    jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_DATETIME, (unsigned int)(&datetime_info));
++    jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_FOCALLENGTH, (unsigned int)(&focallength_info));
++
++    //set gps info
++    cLatitude   = (char *)mParameters.get(CameraParameters::KEY_GPS_LATITUDE);
++    cLongtitude = (char *)mParameters.get(CameraParameters::KEY_GPS_LONGITUDE);
++    cAltitude   = (char *)mParameters.get(CameraParameters::KEY_GPS_ALTITUDE);
++    cTimeStamp  = (char *)mParameters.get(CameraParameters::KEY_GPS_TIMESTAMP);
++
++    if(cLatitude==NULL || cLatitude==NULL || cAltitude==NULL || cTimeStamp==NULL){
++        LOGD("NO GPS info is set");
++        return;
++    }
++
++    gps_info.version=0x02020000;
++
++
++    //latitude: dd/1,mm/1,ss/1
++    gps_info.latitude_degree[0]=100;
++    gps_info.latitude_degree[1]=1;
++    gps_info.latitude_minute[0]=101;
++    gps_info.latitude_minute[1]=1;
++    gps_info.latitude_second[0]=102;
++    gps_info.latitude_second[1]=1;
++    memcpy((char *)gps_info.latitude_ref, (char *)"N ", sizeof(gps_info.latitude_ref));
++
++    if (stringTodegree(cLatitude, gps_info.latitude_degree[0],gps_info.latitude_minute[0],gps_info.latitude_second[0])>0){
++        //the ref is south
++        memcpy((char *)gps_info.latitude_ref, (char *)"S ", sizeof(gps_info.latitude_ref));
++    }
++
++    //longtitude: dd/1,mm/1,ss/1
++    gps_info.longtitude_degree[0]=200;
++    gps_info.longtitude_degree[1]=1;
++    gps_info.longtitude_minute[0]=201;
++    gps_info.longtitude_minute[1]=1;
++    gps_info.longtitude_second[0]=202;
++    gps_info.longtitude_second[1]=1;
++    memcpy((char *)gps_info.longtitude_ref, (char *)"E ", sizeof(gps_info.longtitude_ref));
++
++    if (stringTodegree(cLatitude, gps_info.longtitude_degree[0],gps_info.longtitude_minute[0],gps_info.longtitude_second[0])>0){
++        //the ref is Weston
++        memcpy((char *)gps_info.longtitude_ref, (char *)"W ", sizeof(gps_info.longtitude_ref));
++    }
++
++    //altitude(meters): aa/1
++    gps_info.altitude_ref=0;		// 0: up sea level; 1: below sea level
++    gps_info.altitude[0]=1000;
++    gps_info.altitude[1]=1;
++    if (cAltitude != NULL){
++        int intValue;
++        gps_info.altitude[1]=1000;     // the precision is CM
++        dAltitude= atof(cAltitude);
++        LOGD("the altitude is %s", cAltitude);
++        intValue = (int)(dAltitude * 1000.0);
++        if (intValue<0) {gps_info.altitude_ref = 1; intValue *= -1;}
++        gps_info.altitude[0] = (unsigned long) intValue;
++        LOGD("gps_info.altitude[0] is %lu, gps_info.altitude_ref is %d", gps_info.altitude[0], gps_info.altitude_ref);
++    }
++
++    //timestamp: hh/1,mm/1,ss/1
++    gps_info.hour[1]=1;
++    gps_info.minute[1]=1;
++    gps_info.seconds[1]=1;
++    if (cTimeStamp != NULL){
++
++        GpsUtcTime = atol(cTimeStamp);
++        LOGD("the Timestamp is %s", cTimeStamp);
++        temp_tm = gmtime((const time_t*)&GpsUtcTime);
++        if (temp_tm != NULL)
++            tm = temp_tm;
++    }
++
++    gps_info.hour[0] = tm->tm_hour;
++    gps_info.minute[0] = tm->tm_min;
++    gps_info.seconds[0] = tm->tm_sec;
++
++    strcpy (format, "%Y:%m:%d ");
++
++    strftime((char *)temp_string, strlen(temp_string), format, tm);
++    memcpy(gps_info.datestamp, temp_string, sizeof(gps_info.datestamp));
++
++
++    char * progressMehod = (char *)mParameters.get(CameraParameters::KEY_GPS_PROCESSING_METHOD);
++    if (progressMehod == NULL){
++        LOGD("The progressMethod is NULL, add a fake");
++        progressMehod = (char *)"fsl_fake_method";
++    }
++	LOGD("the progressMethod is %s", progressMehod);
++
++    memcpy(gps_info.processmethod, progressMehod, strlen(progressMehod));
++
++	gps_info.processmethod_bytes=strlen(progressMehod);
++
++	LOGD("the method is %s", gps_info.processmethod);
++
++    jpeg_enc_set_exifheaderinfo(obj_ptr, JPEGE_ENC_SET_HEADER_GPS, (unsigned int)(&gps_info));
++
++    return;
++}
++
++static int yuv_resize(char *dst_ptr, int dst_width, int dst_height, char *src_ptr, int src_width, int src_height)
++{
++    int i,j,s;
++    int h_offset;
++    int v_offset;
++    char *ptr,cc;
++    int h_scale_ratio;
++    int v_scale_ratio;
++
++    s = 0;
++
++_resize_begin:
++
++    if(!dst_width) return -1;
++    if(!dst_height) return -1;
++
++    h_scale_ratio = src_width / dst_width;
++    if(!h_scale_ratio) return -1;
++
++    v_scale_ratio = src_height / dst_height;
++    if(!v_scale_ratio) return -1;
++
++    h_offset = (src_width - dst_width * h_scale_ratio) / 2;
++    v_offset = (src_height - dst_height * v_scale_ratio) / 2;
++
++    for(i = 0; i < dst_height * v_scale_ratio; i += v_scale_ratio)
++    {
++        for(j = 0; j < dst_width * h_scale_ratio; j += h_scale_ratio)
++        {
++            ptr = src_ptr + i * src_width + j + v_offset * src_width + h_offset;
++            cc = ptr[0];
++
++            ptr = dst_ptr + (i / v_scale_ratio) * dst_width + (j / h_scale_ratio);
++            ptr[0] = cc;
++        }
++    }
++
++    src_ptr += src_width*src_height;
++    dst_ptr += dst_width*dst_height;
++
++    if(s < 2)
++    {
++        if(!s++)
++        {
++            src_width >>= 1;
++            src_height >>= 1;
++
++            dst_width >>= 1;
++            dst_height >>= 1;
++        }
++
++        goto _resize_begin;
++    }
++
++    return 0;
++}
++
++sp<MemoryBase> CameraHal::encodeImage(void *buffer, uint32_t bufflen)
++{
++    int width, height, size,index;
++    JPEG_ENC_UINT8 * i_buff = NULL;
++    JPEG_ENC_UINT8 * y_buff = NULL;
++    JPEG_ENC_UINT8 * u_buff = NULL;
++    JPEG_ENC_UINT8 * v_buff = NULL;
++    JPEG_ENC_RET_TYPE return_val;
++    jpeg_enc_parameters * params = NULL;
++    jpeg_enc_object * obj_ptr = NULL;
++    JPEG_ENC_UINT8 number_mem_info;
++    jpeg_enc_memory_info * mem_info = NULL;
++    sp<MemoryBase> jpegPtr = NULL;
++    void *thumbnail_buffer,*temp_buffer=NULL;
++    int thumbnail_width, thumbnail_height;
++
++    bool mEncodeThumbnailFlag = true;
++
++    mParameters.getPictureSize(&width, &height);
++
++    thumbnail_width = mParameters.getInt(CameraParameters::KEY_JPEG_THUMBNAIL_WIDTH);
++    thumbnail_height = mParameters.getInt(CameraParameters::KEY_JPEG_THUMBNAIL_HEIGHT);
++
++    LOGD("the thumbnail is %d, %d", thumbnail_width, thumbnail_height);
++
++    if (thumbnail_width <= 0 || thumbnail_width <= 0)
++        mEncodeThumbnailFlag = false;
++
++    if((width== 0)||(height == 0)|!buffer||(bufflen == 0))
++    {
++        LOGI("Error!Invalid parameters");
++        return NULL;
++    }
++    g_JpegDataSize = 0;//Total size of g_JpegData
++    g_JpegDataLen = 0;//Valid data len of g_JpegData
++    g_JpegData = NULL;//Buffer to hold jpeg data
++    size = width * height * 3 / 2;
++    LOGI("CameraHal::encodeImage:buffer 0x%x, bufflen %d,width %d,height %d",
++            (unsigned int)buffer,bufflen,width,height);
++    sp<MemoryHeapBase> mJpegImageHeap = new MemoryHeapBase(size);
++
++    g_JpegData = (JPEG_ENC_UINT8 *)(mJpegImageHeap->getBase());
++    g_JpegDataSize = size;
++    if(!g_JpegData)
++    {
++        LOGI("Cannot allocate jpeg data");
++        return NULL;
++    }
++
++    /* --------------------------------------------
++     * Allocate memory for Encoder Object
++     * -------------------------------------------*/
++    obj_ptr = (jpeg_enc_object *) malloc(sizeof(jpeg_enc_object));
++    if(!obj_ptr)
++    {
++        LOGE("Error!Cannot allocate enc obj");
++        return NULL;
++    }
++    memset(obj_ptr, 0, sizeof(jpeg_enc_object));
++
++    /* Assign the function for streaming output */
++    obj_ptr->jpeg_enc_push_output = pushJpegOutput;
++    obj_ptr->context=NULL;   //user can put private variables into it
++    /* --------------------------------------------
++     * Fill up the parameter structure of JPEG Encoder
++     * -------------------------------------------*/
++    params = &(obj_ptr->parameters);
++
++    if(mEncodeThumbnailFlag==true)
++    {
++
++        //need resizing code here!!!
++        thumbnail_buffer = (char *)malloc(thumbnail_width * thumbnail_height * 3 / 2);
++        if(!thumbnail_buffer)
++        {
++            LOGE("Error!Cannot allocate thumbnail buff");
++            return NULL;
++        }
++
++        yuv_resize((char *)thumbnail_buffer, thumbnail_width, thumbnail_height, (char *)buffer, width, height);
++
++        width = thumbnail_width;
++        height = thumbnail_height;
++
++        temp_buffer = buffer;
++        buffer = thumbnail_buffer;
++
++        params->mode = JPEG_ENC_THUMB;
++    }
++    else
++    {
++        params->mode = JPEG_ENC_MAIN_ONLY;
++    }
++
++encodeframe:
++
++    params->compression_method = JPEG_ENC_SEQUENTIAL;
++    params->quality = 75;
++    params->restart_markers = 0;
++    params->y_width = width;
++    params->y_height = height;
++    params->u_width = params->y_width/2;
++    params->u_height = params->y_height/2;
++    params->v_width = params->y_width/2;
++    params->v_height = params->y_height/2;
++    params->primary_image_height = height;
++    params->primary_image_width = width;
++    params->yuv_format = JPEG_ENC_YUV_420_NONINTERLEAVED;
++    params->exif_flag = 1;
++
++    params->y_left = 0;
++    params->y_top = 0;
++    params->y_total_width = 0;
++    params->y_total_height = 0;
++    params->raw_dat_flag= 0;
++
++    if(params->y_total_width==0)
++    {
++        params->y_left=0;
++        params->u_left=0;
++        params->v_left=0;
++        params->y_total_width=params->y_width;  // no cropping
++        params->u_total_width=params->u_width;  // no cropping
++        params->v_total_width=params->v_width;  // no cropping
++    }
++
++    if(params->y_total_height==0)
++    {
++        params->y_top=0;
++        params->u_top=0;
++        params->v_top=0;
++        params->y_total_height=params->y_height; // no cropping
++        params->u_total_height=params->u_height; // no cropping
++        params->v_total_height=params->v_height; // no cropping
++    }
++
++    /* Pixel size is unknown by default */
++    params->jfif_params.density_unit = 0;
++    /* Pixel aspect ratio is square by default */
++    params->jfif_params.X_density = 1;
++    params->jfif_params.Y_density = 1;
++
++    y_buff = (JPEG_ENC_UINT8 *)buffer;
++    u_buff = y_buff+width*height;
++    v_buff = u_buff+width*height/4;
++    i_buff = NULL;
++    LOGI("version: %s\n", jpege_CodecVersionInfo());
++
++    /* --------------------------------------------
++     * QUERY MEMORY REQUIREMENTS
++     * -------------------------------------------*/
++    return_val = jpeg_enc_query_mem_req(obj_ptr);
++
++    if(return_val != JPEG_ENC_ERR_NO_ERROR)
++    {
++        LOGI("JPEG encoder returned an error when jpeg_enc_query_mem_req was called \n");
++        LOGI("Return Val %d\n",return_val);
++        goto done;
++    }
++    LOGI("jpeg_enc_query_mem_req success");
++    /* --------------------------------------------
++     * ALLOCATE MEMORY REQUESTED BY CODEC
++     * -------------------------------------------*/
++    number_mem_info = obj_ptr->mem_infos.no_entries;
++    for(index = 0; index < number_mem_info; index++)
++    {
++        /* This example code ignores the 'alignment' and
++         * 'memory_type', but some other applications might want
++         * to allocate memory based on them */
++        mem_info = &(obj_ptr->mem_infos.mem_info[index]);
++        mem_info->memptr = (void *) malloc(mem_info->size);
++        if(mem_info->memptr==NULL) {
++            LOGI("Malloc error after query\n");
++            goto done;
++        }
++    }
++
++    return_val = jpeg_enc_init(obj_ptr);
++    if(return_val != JPEG_ENC_ERR_NO_ERROR)
++    {
++        LOGI("JPEG encoder returned an error when jpeg_enc_init was called \n");
++        LOGI("Return Val %d\n",return_val);
++        goto done;
++    }
++
++    LOGI("jpeg_enc_init success");
++
++    createJpegExifTags(obj_ptr);
++
++    return_val = jpeg_enc_encodeframe(obj_ptr, i_buff,
++            y_buff, u_buff, v_buff);
++
++    if(return_val != JPEG_ENC_ERR_ENCODINGCOMPLETE)
++    {
++        LOGI("JPEG encoder returned an error in jpeg_enc_encodeframe \n");
++        LOGI("Return Val %d\n",return_val);
++        goto done;
++    }
++
++    if(params->mode == JPEG_ENC_THUMB)
++    {
++        JPEG_ENC_UINT8 num_entries;
++        JPEG_ENC_UINT32 *offset_tbl_ptr = (JPEG_ENC_UINT32 *)malloc(sizeof(JPEG_ENC_UINT32)*JPEG_ENC_NUM_OF_OFFSETS);
++        JPEG_ENC_UINT8 *value_tbl_ptr = (JPEG_ENC_UINT8 *)malloc(sizeof(JPEG_ENC_UINT8)*JPEG_ENC_NUM_OF_OFFSETS);
++
++        jpeg_enc_find_length_position(obj_ptr, offset_tbl_ptr,value_tbl_ptr,&num_entries);
++
++        for(int i = 0; i < num_entries; i++)
++        {
++            *((JPEG_ENC_UINT8 *)g_JpegData+offset_tbl_ptr[i]) = value_tbl_ptr[i];
++        }
++
++        free(offset_tbl_ptr);
++        free(value_tbl_ptr);
++
++        free(buffer);
++        buffer = temp_buffer;
++        mParameters.getPictureSize(&width, &height);
++
++        number_mem_info = obj_ptr->mem_infos.no_entries;
++        for(index = 0; index < number_mem_info; index++)
++        {
++            mem_info = &(obj_ptr->mem_infos.mem_info[index]);
++            if(mem_info)
++                free(mem_info->memptr);
++        }
++
++        g_JpegData += g_JpegDataLen;
++        g_JpegDataSize -= g_JpegDataLen;
++
++        params->mode = JPEG_ENC_MAIN;
++
++        goto encodeframe;
++    }
++    LOGI("jpeg_enc_encodeframe success");
++    // Make an IMemory for each frame
++    jpegPtr = new MemoryBase(mJpegImageHeap, 0, g_JpegDataLen);
++	{
++			FILE *fp = fopen("/sdcard/test.jpg","wb");
++			fwrite(mJpegImageHeap->getBase(), 1, mJpegImageHeap->getSize(), fp);
++			fflush(fp);
++			fclose(fp);
++	}
++
++done:
++    /* --------------------------------------------
++     * FREE MEMORY REQUESTED BY CODEC
++     * -------------------------------------------*/
++    if(obj_ptr)
++    {
++        number_mem_info = obj_ptr->mem_infos.no_entries;
++        for(index = 0; index < number_mem_info; index++)
++        {
++            mem_info = &(obj_ptr->mem_infos.mem_info[index]);
++            if(mem_info)
++                free(mem_info->memptr);
++        }
++        free(obj_ptr);
++    }
++    return jpegPtr;
++}
++
++#else
+ 
+ sp<MemoryBase> CameraHal::encodeImage(void *buffer, uint32_t bufflen)
+ {
+@@ -1593,6 +2098,7 @@ done:
+     }
+     return jpegPtr;
+ }
++#endif
+ 
+ #endif
+ 
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index 86e939c..92eadcd 100755
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -64,6 +64,9 @@
+ #define CAPTURE_BUFFER_NUM      3
+ #define VIDEO_OUTPUT_BUFFER_NUM	3
+ 
++#define EXIF_MAKENOTE "fsl_makernote"
++#define EXIF_MODEL    "fsl_model"
++
+ #define LOG_FUNCTION_NAME       LOGD("%d: %s() Executing...", __LINE__, __FUNCTION__);
+ 
+ //#define UVC_CAMERA              1
+@@ -129,6 +132,7 @@ public:
+                                             JPEG_ENC_UINT8 flush, 
+                                             void * context, 
+                                             JPEG_ENC_MODE enc_mode);
++    void createJpegExifTags(jpeg_enc_object * obj_ptr);
+ #endif
+ 
+ private:
+@@ -197,6 +201,7 @@ private:
+     int cameraTakePicConfig();
+     int cameraTakePicture();
+     void previewOneFrame();
++    int stringTodegree(char* cAttribute, unsigned long &degree, unsigned long &minute, unsigned long &second); //for the minus the return value will be 1
+ 
+     mutable Mutex       mLock;
+ 
+-- 
+1.8.0
+

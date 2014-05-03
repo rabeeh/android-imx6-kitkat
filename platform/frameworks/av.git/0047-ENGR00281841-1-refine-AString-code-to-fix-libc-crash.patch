@@ -1,0 +1,317 @@
+From 80b2524474163ba89055dfadd124d03ff60bdbc6 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Thu, 21 Nov 2013 13:56:29 +0800
+Subject: [PATCH 47/50] ENGR00281841-1 refine AString code to fix libc crash.
+
+remove AString kEmptyString and makeMutable().
+when AString is empty, assign the mData to null.
+avoid to call malloc/realloc too frequently.
+because when construct a new AString class, it will
+allocate one byte memory by malloc then call realloc
+to allocate the real memory size.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ include/media/stagefright/foundation/AString.h |  5 +-
+ media/libstagefright/foundation/AString.cpp    | 94 +++++++++++++-------------
+ 2 files changed, 48 insertions(+), 51 deletions(-)
+
+diff --git a/include/media/stagefright/foundation/AString.h b/include/media/stagefright/foundation/AString.h
+index 0f8f1e1..28eb8d7 100644
+--- a/include/media/stagefright/foundation/AString.h
++++ b/include/media/stagefright/foundation/AString.h
+@@ -66,6 +66,7 @@ struct AString {
+ 
+     size_t hash() const;
+ 
++    bool operator==(const char* s) const;
+     bool operator==(const AString &other) const;
+     bool operator<(const AString &other) const;
+     bool operator>(const AString &other) const;
+@@ -78,13 +79,9 @@ struct AString {
+     void tolower();
+ 
+ private:
+-    static const char *kEmptyString;
+-
+     char *mData;
+     size_t mSize;
+     size_t mAllocSize;
+-
+-    void makeMutable();
+ };
+ 
+ AString StringPrintf(const char *format, ...);
+diff --git a/media/libstagefright/foundation/AString.cpp b/media/libstagefright/foundation/AString.cpp
+index dee786d..c4ba695 100644
+--- a/media/libstagefright/foundation/AString.cpp
++++ b/media/libstagefright/foundation/AString.cpp
+@@ -22,43 +22,41 @@
+ 
+ #include "ADebug.h"
+ #include "AString.h"
++#include <utils/Mutex.h>
+ 
+ namespace android {
+ 
+-// static
+-const char *AString::kEmptyString = "";
+-
+ AString::AString()
+-    : mData((char *)kEmptyString),
++    : mData(NULL),
+       mSize(0),
+-      mAllocSize(1) {
++      mAllocSize(0) {
+ }
+ 
+ AString::AString(const char *s)
+     : mData(NULL),
+       mSize(0),
+-      mAllocSize(1) {
++      mAllocSize(0) {
+     setTo(s);
+ }
+ 
+ AString::AString(const char *s, size_t size)
+     : mData(NULL),
+       mSize(0),
+-      mAllocSize(1) {
++      mAllocSize(0) {
+     setTo(s, size);
+ }
+ 
+ AString::AString(const AString &from)
+     : mData(NULL),
+       mSize(0),
+-      mAllocSize(1) {
++      mAllocSize(0) {
+     setTo(from, 0, from.size());
+ }
+ 
+ AString::AString(const AString &from, size_t offset, size_t n)
+     : mData(NULL),
+       mSize(0),
+-      mAllocSize(1) {
++      mAllocSize(0) {
+     setTo(from, offset, n);
+ }
+ 
+@@ -103,14 +101,14 @@ void AString::setTo(const AString &from, size_t offset, size_t n) {
+ }
+ 
+ void AString::clear() {
+-    if (mData && mData != kEmptyString) {
++    if (mData != NULL) {
+         free(mData);
+         mData = NULL;
+     }
+ 
+-    mData = (char *)kEmptyString;
++    mData = NULL;
+     mSize = 0;
+-    mAllocSize = 1;
++    mAllocSize = 0;
+ }
+ 
+ size_t AString::hash() const {
+@@ -127,8 +125,8 @@ bool AString::operator==(const AString &other) const {
+ }
+ 
+ void AString::trim() {
+-    makeMutable();
+-
++    CHECK(mSize > 0);
++    CHECK(mData != NULL);
+     size_t i = 0;
+     while (i < mSize && isspace(mData[i])) {
+         ++i;
+@@ -145,38 +143,31 @@ void AString::trim() {
+ }
+ 
+ void AString::erase(size_t start, size_t n) {
++    CHECK(mData != NULL);
+     CHECK_LT(start, mSize);
+     CHECK_LE(start + n, mSize);
+ 
+-    makeMutable();
+-
+     memmove(&mData[start], &mData[start + n], mSize - start - n);
+     mSize -= n;
+     mData[mSize] = '\0';
+ }
+ 
+-void AString::makeMutable() {
+-    if (mData == kEmptyString) {
+-        mData = strdup(kEmptyString);
+-    }
+-}
+-
+ void AString::append(const char *s) {
+     append(s, strlen(s));
+ }
+ 
+ void AString::append(const char *s, size_t size) {
+-    makeMutable();
+-
+     if (mSize + size + 1 > mAllocSize) {
+-        mAllocSize = (mAllocSize + size + 31) & -32;
++        mAllocSize = (mAllocSize + size + 1 + 31) & -32;
+         mData = (char *)realloc(mData, mAllocSize);
+         CHECK(mData != NULL);
+     }
+ 
+-    memcpy(&mData[mSize], s, size);
+-    mSize += size;
+-    mData[mSize] = '\0';
++    if (mData != NULL) {
++        memcpy(&mData[mSize], s, size);
++        mSize += size;
++        mData[mSize] = '\0';
++    }
+ }
+ 
+ void AString::append(const AString &from) {
+@@ -189,63 +180,72 @@ void AString::append(const AString &from, size_t offset, size_t n) {
+ 
+ void AString::append(int x) {
+     char s[16];
+-    sprintf(s, "%d", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%d", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(unsigned x) {
+     char s[16];
+-    sprintf(s, "%u", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%u", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(long x) {
+     char s[16];
+-    sprintf(s, "%ld", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%ld", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(unsigned long x) {
+     char s[16];
+-    sprintf(s, "%lu", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%lu", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(long long x) {
+     char s[32];
+-    sprintf(s, "%lld", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%lld", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(unsigned long long x) {
+     char s[32];
+-    sprintf(s, "%llu", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%llu", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(float x) {
+     char s[16];
+-    sprintf(s, "%f", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%f", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(double x) {
+     char s[16];
+-    sprintf(s, "%f", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%f", x);
+ 
+     append(s);
+ }
+ 
+ void AString::append(void *x) {
+     char s[16];
+-    sprintf(s, "%p", x);
++    memset(s, 0, sizeof(s));
++    snprintf(s, sizeof(s), "%p", x);
+ 
+     append(s);
+ }
+@@ -270,14 +270,13 @@ void AString::insert(const char *from, size_t size, size_t insertionPos) {
+     CHECK_GE(insertionPos, 0u);
+     CHECK_LE(insertionPos, mSize);
+ 
+-    makeMutable();
+-
+     if (mSize + size + 1 > mAllocSize) {
+-        mAllocSize = (mAllocSize + size + 31) & -32;
++        mAllocSize = (mAllocSize + size + 1 + 31) & -32;
+         mData = (char *)realloc(mData, mAllocSize);
+         CHECK(mData != NULL);
+     }
+ 
++    CHECK(mData != NULL);
+     memmove(&mData[insertionPos + size],
+             &mData[insertionPos], mSize - insertionPos + 1);
+ 
+@@ -286,6 +285,11 @@ void AString::insert(const char *from, size_t size, size_t insertionPos) {
+     mSize += size;
+ }
+ 
++bool AString::operator==(const char* s) const
++{
++    return ((mSize == strlen(s)) && !memcmp(mData, s, mSize));
++}
++
+ bool AString::operator<(const AString &other) const {
+     return compare(other) < 0;
+ }
+@@ -299,8 +303,6 @@ int AString::compare(const AString &other) const {
+ }
+ 
+ void AString::tolower() {
+-    makeMutable();
+-
+     for (size_t i = 0; i < mSize; ++i) {
+         mData[i] = ::tolower(mData[i]);
+     }
+@@ -324,16 +326,14 @@ AString StringPrintf(const char *format, ...) {
+     va_list ap;
+     va_start(ap, format);
+ 
+-    char *buffer;
+-    vasprintf(&buffer, format, ap);
++    char buffer[256];
++    memset(buffer, 0, sizeof(buffer));
++    vsnprintf(buffer, 255, format, ap);
+ 
+     va_end(ap);
+ 
+     AString result(buffer);
+ 
+-    free(buffer);
+-    buffer = NULL;
+-
+     return result;
+ }
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,194 @@
+From 5a72b2825cf8efa820807c2077395f2f190b8259 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Fri, 23 Nov 2012 17:15:32 +0800
+Subject: [PATCH 5/8] ENGR00232760 PARTN not continuous for some USB disk
+
+Change Pendingmap to Addedmap to check how many partition been added
+Enlarge the number of devnode to be checked
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+
+Conflicts:
+	DirectVolume.cpp
+---
+ DirectVolume.cpp | 39 +++++++++++----------------------------
+ DirectVolume.h   |  1 +
+ Volume.cpp       |  6 +++---
+ Volume.h         |  1 +
+ 4 files changed, 16 insertions(+), 31 deletions(-)
+
+diff --git a/DirectVolume.cpp b/DirectVolume.cpp
+index a3ddcfb..27168c1 100644
+--- a/DirectVolume.cpp
++++ b/DirectVolume.cpp
+@@ -24,6 +24,7 @@
+ #define LOG_TAG "DirectVolume"
+ 
+ #include <cutils/log.h>
++#include <cutils/bitops.h>
+ #include <sysutils/NetlinkEvent.h>
+ 
+ #include "DirectVolume.h"
+@@ -38,7 +39,7 @@ DirectVolume::DirectVolume(VolumeManager *vm, const fstab_rec* rec, int flags) :
+     mPaths = new PathCollection();
+     for (int i = 0; i < MAX_PARTITIONS; i++)
+         mPartMinors[i] = -1;
+-    mPendingPartMap = 0;
++    mAddedPartMap = 0;
+     mDiskMajor = -1;
+     mDiskMinor = -1;
+     mDiskNumParts = 0;
+@@ -172,12 +173,7 @@ void DirectVolume::handleDiskAdded(const char *devpath, NetlinkEvent *evt) {
+     if (mDiskNumParts > MAX_PARTITIONS)
+         mDiskNumParts = MAX_PARTITIONS;
+ 
+-    int partmask = 0;
+-    int i;
+-    for (i = 1; i <= mDiskNumParts; i++) {
+-        partmask |= (1 << i);
+-    }
+-    mPendingPartMap = partmask;
++    mAddedPartMap = 0;
+ 
+     if (mDiskNumParts == 0) {
+ #ifdef PARTITION_DEBUG
+@@ -186,8 +182,8 @@ void DirectVolume::handleDiskAdded(const char *devpath, NetlinkEvent *evt) {
+         setState(Volume::State_Idle);
+     } else {
+ #ifdef PARTITION_DEBUG
+-        SLOGD("Dv::diskIns - waiting for %d partitions (mask 0x%x)",
+-             mDiskNumParts, mPendingPartMap);
++        SLOGI("Dv::diskIns - waiting for %d partitions (mask 0x%x)",
++             mDiskNumParts, mAddedPartMap);
+ #endif
+         setState(Volume::State_Pending);
+     }
+@@ -213,25 +209,20 @@ void DirectVolume::handlePartitionAdded(const char *devpath, NetlinkEvent *evt)
+         return;
+     }
+ 
+-    if (part_num > mDiskNumParts) {
+-        mDiskNumParts = part_num;
+-    }
+-
+     if (major != mDiskMajor) {
+         SLOGE("Partition '%s' has a different major than its disk!", devpath);
+         return;
+     }
+ #ifdef PARTITION_DEBUG
+-    SLOGD("Dv:partAdd: part_num = %d, minor = %d\n", part_num, minor);
++    SLOGD("Dv:partAdd: part_num = %d, minor = %d mDiskNumParts %d\n", part_num, minor, mDiskNumParts);
+ #endif
+     if (part_num > MAX_PARTITIONS) {
+         SLOGE("Dv:partAdd: ignoring part_num = %d (max: %d)\n", part_num, MAX_PARTITIONS);
+     } else {
+         mPartMinors[part_num -1] = minor;
+     }
+-    mPendingPartMap &= ~(1 << part_num);
+-
+-    if (!mPendingPartMap) {
++    mAddedPartMap |= (1 << part_num);
++    if (popcount(mAddedPartMap) == mDiskNumParts) {
+ #ifdef PARTITION_DEBUG
+         SLOGD("Dv:partAdd: Got all partitions - ready to rock!");
+ #endif
+@@ -244,7 +235,7 @@ void DirectVolume::handlePartitionAdded(const char *devpath, NetlinkEvent *evt)
+         }
+     } else {
+ #ifdef PARTITION_DEBUG
+-        SLOGD("Dv:partAdd: pending mask now = 0x%x", mPendingPartMap);
++        SLOGD("Dv:partAdd: added mask now = 0x%x", mAddedPartMap);
+ #endif
+     }
+ }
+@@ -269,12 +260,7 @@ void DirectVolume::handleDiskChanged(const char *devpath, NetlinkEvent *evt) {
+     if (mDiskNumParts > MAX_PARTITIONS)
+         mDiskNumParts = MAX_PARTITIONS;
+ 
+-    int partmask = 0;
+-    int i;
+-    for (i = 1; i <= mDiskNumParts; i++) {
+-        partmask |= (1 << i);
+-    }
+-    mPendingPartMap = partmask;
++    mAddedPartMap = 0;
+ 
+     if (getState() != Volume::State_Formatting) {
+         if (mDiskNumParts == 0) {
+@@ -370,7 +356,6 @@ void DirectVolume::handlePartitionRemoved(const char *devpath, NetlinkEvent *evt
+  * Called from base to get a list of devicenodes for mounting
+  */
+ int DirectVolume::getDeviceNodes(dev_t *devs, int max) {
+-
+     if (mPartIdx == -1) {
+         // If the disk has no partitions, try the disk itself
+         if (!mDiskNumParts) {
+@@ -379,9 +364,7 @@ int DirectVolume::getDeviceNodes(dev_t *devs, int max) {
+         }
+ 
+         int i, j;
+-        for (i = 0, j = 0; i < mDiskNumParts; i++) {
+-            if (i == max)
+-                break;
++        for (i = 0, j = 0; i < max; i++) {
+             //Do not make dev for those non valid partition
+             if (mPartMinors[i] == -1)
+                 continue;
+diff --git a/DirectVolume.h b/DirectVolume.h
+index 7be133f..544c8c4 100644
+--- a/DirectVolume.h
++++ b/DirectVolume.h
+@@ -41,6 +41,7 @@ protected:
+     int            mOrigPartMinors[MAX_PARTITIONS];
+     int            mDiskNumParts;
+     unsigned int   mPendingPartMap;
++    unsigned int   mAddedPartMap;
+     int            mIsDecrypted;
+ 
+ public:
+diff --git a/Volume.cpp b/Volume.cpp
+index b8d3c19..c20e852 100644
+--- a/Volume.cpp
++++ b/Volume.cpp
+@@ -314,7 +314,7 @@ bool Volume::isMountpointMounted(const char *path) {
+ }
+ 
+ int Volume::mountVol() {
+-    dev_t deviceNodes[4];
++    dev_t deviceNodes[MAX_PARTITIONS];
+     int n, i, rc = 0;
+     char errmsg[255];
+ 
+@@ -358,7 +358,7 @@ int Volume::mountVol() {
+         return 0;
+     }
+ 
+-    n = getDeviceNodes((dev_t *) &deviceNodes, 4);
++    n = getDeviceNodes((dev_t *) &deviceNodes, MAX_PARTITIONS);
+     if (!n) {
+         SLOGE("Failed to get device nodes (%s)\n", strerror(errno));
+         return -1;
+@@ -406,7 +406,7 @@ int Volume::mountVol() {
+         updateDeviceInfo(nodepath, new_major, new_minor);
+ 
+         /* Get the device nodes again, because they just changed */
+-        n = getDeviceNodes((dev_t *) &deviceNodes, 4);
++        n = getDeviceNodes((dev_t *) &deviceNodes, MAX_PARTITIONS);
+         if (!n) {
+             SLOGE("Failed to get device nodes (%s)\n", strerror(errno));
+             return -1;
+diff --git a/Volume.h b/Volume.h
+index 1444ed3..654420d 100644
+--- a/Volume.h
++++ b/Volume.h
+@@ -39,6 +39,7 @@ public:
+     static const int State_Formatting = 6;
+     static const int State_Shared     = 7;
+     static const int State_SharedMnt  = 8;
++    static const int MAX_PARTITIONS = 7;
+ 
+     static const char *MEDIA_DIR;
+     static const char *FUSE_DIR;
+-- 
+1.8.0
+

@@ -1,0 +1,170 @@
+From 377143aa3185c756fc6a5e65b406c08dc6244391 Mon Sep 17 00:00:00 2001
+From: "Yaoming.Qin" <B10945@freescale.com>
+Date: Mon, 23 May 2011 21:44:06 +0800
+Subject: [PATCH 152/486] ENGR00142603 Camera: The direction for preview image
+ is reversed.
+
+The root cause is that the sensor is not well configured. And We add
+the ioctl to configure it.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ libcamera/CameraHal.cpp            | 15 ++++++++++++++-
+ libcamera/CameraHal.h              | 10 ++++++++++
+ libcamera/CaptureDeviceInterface.h |  9 +++++++++
+ libcamera/V4l2CsiDevice.cpp        | 16 +++++++++++++---
+ 4 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index 842d5ca..4ba8d42 100755
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -67,7 +67,8 @@ namespace android {
+         mCaptureDeviceOpen(false),
+         mPPDeviceNeed(false),
+         mPPDeviceNeedForPic(false),
+-        mPowerLock(false)
++        mPowerLock(false),
++        mPreviewRotate(CAMERA_PREVIEW_BACK_REF)
+     {
+         CAMERA_HAL_LOG_FUNC;
+         preInit();
+@@ -153,6 +154,12 @@ namespace android {
+ 
+         return ret;
+     }
++    void  CameraHal::setPreviewRotate(CAMERA_PREVIEW_ROTATE previewRotate)
++    {
++        CAMERA_HAL_LOG_FUNC;
++        mPreviewRotate = previewRotate;
++        return ;
++    }
+ 
+     CAMERA_HAL_ERR_RET  CameraHal :: AolLocForInterBuf()
+     {
+@@ -1128,6 +1135,7 @@ Pic_out:
+         int  max_fps, min_fps;
+         mParameters.getPreviewSize((int *)&(mCaptureDeviceCfg.width),(int *)&(mCaptureDeviceCfg.height));
+         mCaptureDeviceCfg.fmt = mPreviewCapturedFormat;
++        mCaptureDeviceCfg.rotate = (SENSOR_PREVIEW_ROTATE)mPreviewRotate;
+         mCaptureDeviceCfg.tv.numerator = 1;
+         mCaptureDevice->GetDevName(mCameraSensorName);
+         if (strstr(mCameraSensorName, "uvc") == NULL){
+@@ -1811,6 +1819,11 @@ show_out:
+         if (pCameraHal->Init() < 0)
+             return NULL;
+ 
++        //now the board has only one csi camera sensor, so just do mirror for it
++        if(strstr(SelectedCameraName, "ov") != NULL){
++            pCameraHal->setPreviewRotate(CAMERA_PREVIEW_BACK_REF);
++        }
++
+         sp<CameraHardwareInterface> hardware(pCameraHal);
+         CAMERA_HAL_LOG_INFO("created the fsl Camera hal");
+ 
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index 7df6a1d..3c58351 100755
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -76,6 +76,14 @@ namespace android {
+         CAMERA_HAL_ERR_PP_NULL = -7
+     }CAMERA_HAL_ERR_RET;
+ 
++	typedef enum{
++        CAMERA_PREVIEW_BACK_REF = 0,
++        CAMERA_PREVIEW_VERT_FLIP = 1,
++        CAMERA_PREVIEW_HORIZ_FLIP = 2,
++        CAMERA_PREVIEW_ROATE_180 = 3,
++        CAMERA_PREVIEW_ROATE_LAST = 3
++	}CAMERA_PREVIEW_ROTATE;
++
+     class CameraHal : public CameraHardwareInterface {
+     public:
+         virtual sp<IMemoryHeap> getPreviewHeap() const;
+@@ -117,6 +125,7 @@ namespace android {
+         CAMERA_HAL_ERR_RET setPostProcessDevice(sp<PostProcessDeviceInterface> postprocessdevice);
+         CAMERA_HAL_ERR_RET setJpegEncoder(sp<JpegEncoderInterface>jpegencoder);
+         CAMERA_HAL_ERR_RET  Init();
++        void  setPreviewRotate(CAMERA_PREVIEW_ROTATE previewRotate);
+ 
+         CameraHal();
+         virtual             ~CameraHal();
+@@ -357,6 +366,7 @@ namespace android {
+         pthread_mutex_t mOverlayMutex;
+         pthread_mutex_t mMsgMutex;
+         pthread_mutex_t mPPIOParamMutex;
++        CAMERA_PREVIEW_ROTATE mPreviewRotate;
+ 
+     };
+ 
+diff --git a/libcamera/CaptureDeviceInterface.h b/libcamera/CaptureDeviceInterface.h
+index 2f9a87c..dac77cf 100755
+--- a/libcamera/CaptureDeviceInterface.h
++++ b/libcamera/CaptureDeviceInterface.h
+@@ -52,6 +52,14 @@ namespace android {
+         FRAME_SIZE_FPS = 1
+     }DevParamType;
+ 
++	typedef enum{
++        SENSOR_PREVIEW_BACK_REF = 0,
++        SENSOR_PREVIEW_VERT_FLIP = 1,
++        SENSOR_PREVIEW_HORIZ_FLIP = 2,
++        SENSOR_PREVIEW_ROATE_180 = 3,
++        SENSOR_PREVIEW_ROATE_LAST = 3
++	}SENSOR_PREVIEW_ROTATE;
++
+     struct timeval_fract{
+         unsigned int numerator;
+         unsigned int denominator;
+@@ -64,6 +72,7 @@ namespace android {
+         unsigned int framesize;   //out
+         unsigned int picture_waite_number;//out
+         struct timeval_fract tv;
++		SENSOR_PREVIEW_ROTATE rotate;
+     };
+ 
+ 
+diff --git a/libcamera/V4l2CsiDevice.cpp b/libcamera/V4l2CsiDevice.cpp
+index 67041c9..e391e19 100755
+--- a/libcamera/V4l2CsiDevice.cpp
++++ b/libcamera/V4l2CsiDevice.cpp
+@@ -26,6 +26,7 @@
+ #include <linux/time.h>
+ #include <linux/videodev.h>
+ #include <linux/videodev2.h>
++#include <linux/mxc_v4l2.h>
+ #include <linux/mxcfb.h>
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
+@@ -328,7 +329,6 @@ namespace android{
+     CAPTURE_DEVICE_ERR_RET V4l2CsiDevice :: V4l2SetRot(struct capture_config_t *pCapcfg){
+ 
+         CAMERA_HAL_LOG_FUNC;
+-        int g_rotate = 0;
+         CAPTURE_DEVICE_ERR_RET ret = CAPTURE_DEVICE_ERR_NONE;
+         if (mCameraDevice <= 0 || pCapcfg == NULL){
+             return CAPTURE_DEVICE_ERR_BAD_PARAM;
+@@ -337,8 +337,18 @@ namespace android{
+         struct v4l2_control ctrl;
+ 
+         // Set rotation
+-        ctrl.id = V4L2_CID_PRIVATE_BASE + 0;
+-        ctrl.value = g_rotate;
++        ctrl.id = V4L2_CID_MXC_ROT;
++        if (pCapcfg->rotate == SENSOR_PREVIEW_BACK_REF)
++            ctrl.value = V4L2_MXC_CAM_ROTATE_NONE;
++        else if (pCapcfg->rotate == SENSOR_PREVIEW_VERT_FLIP)
++            ctrl.value = V4L2_MXC_CAM_ROTATE_VERT_FLIP;
++        else if (pCapcfg->rotate == SENSOR_PREVIEW_HORIZ_FLIP)
++            ctrl.value = V4L2_MXC_CAM_ROTATE_HORIZ_FLIP;
++        else if (pCapcfg->rotate == SENSOR_PREVIEW_ROATE_180)
++            ctrl.value = V4L2_MXC_CAM_ROTATE_180;
++        else
++            ctrl.value = V4L2_MXC_ROTATE_NONE;
++
+         if (ioctl(mCameraDevice, VIDIOC_S_CTRL, &ctrl) < 0) {
+             CAMERA_HAL_ERR("set ctrl failed\n");
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+-- 
+1.8.0
+

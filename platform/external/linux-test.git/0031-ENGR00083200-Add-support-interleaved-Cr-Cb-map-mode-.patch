@@ -1,0 +1,146 @@
+From 04c1b5abeb774ebf0ac2fe9a1396615ad379789c Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Tue, 8 Jul 2008 17:21:46 +0800
+Subject: [PATCH 031/435] ENGR00083200: Add support interleaved Cr/Cb map mode
+ for FrameBuffer on MX37
+
+Marley VPU supports two memory map modes for the
+chrominance components in the frame buffers. One is the separate Cb/Cr map mode,
+another is the interleaved Cb/Cr map mode that has only one base address for
+interleaved Cb and Cr samples such as Cb0, Cr0, Cb1, Cr1, Cb2, Cr2,..., CbN, CrN, not
+Cb0, Cb1, Cb2, ..., CbN, Cr0, Cr1, Cr2, ..., CrN. CbN and CrN are the last sample of
+each chrominance component of the decoded frame.
+
+This patch adds support interleaved CrCb map mode for FB, it should be set same as
+CrCb setting in V4L for correct display.
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 59 +++++++++++++++++++++++++++++++++++++++++---
+ test/mxc_vpu_test/utils.c    |  4 +--
+ test/mxc_vpu_test/vpu_test.h |  2 ++
+ 3 files changed, 59 insertions(+), 6 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 25a6b84..18b3aa2 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -457,8 +457,54 @@ decoder_start(struct decode *dec)
+ 			if (cpu_is_mxc30031()) {
+ 				write_to_file(dec, (u8 *)yuv_addr);
+ 			} else {
+-				fwriten(dec->cmdl->dst_fd, (u8 *)yuv_addr,
+-						img_size);
++
++				if (dec->chromaInterleave == 0)
++					fwriten(dec->cmdl->dst_fd,
++						(u8 *)yuv_addr, img_size);
++				else {
++					/*
++					 * Convert framebuffer from interleaved
++					 * Cb/Cr mode to non-interleaved Cb/Cr
++					 * mode.
++					 */
++					img_size = dec->stride * dec->picheight;
++					fwriten(dec->cmdl->dst_fd,
++						(u8 *)yuv_addr, img_size);
++
++					u8 *cb_addr0 = (u8*)(yuv_addr +
++								img_size);
++
++					u8 *cb_addr = malloc(img_size >> 2);
++					if (cb_addr == NULL)
++						return -1;
++
++					u8 *cr_addr = malloc(img_size >> 2);
++					if (cr_addr == NULL) {
++						free(cb_addr);
++						return -1;
++					}
++					u8 *buf1 = cb_addr;
++					u8 *buf2 = cr_addr;
++
++					int y,x;
++					for (y = 0; y < (dec->picheight / 2);
++					  y++) {
++						u8 *tmp = (u8*)(cb_addr0 +
++							dec->picwidth * y);
++						for (x = 0; x < dec->picwidth;
++						  x += 2) {
++							*cb_addr++ = tmp[x];
++							*cr_addr++ = tmp[x + 1];
++						}
++					}
++
++					fwriten(dec->cmdl->dst_fd, (u8 *)buf1,
++							img_size >> 2);
++					fwriten(dec->cmdl->dst_fd, (u8 *)buf2,
++							img_size >> 2);
++					free(buf1);
++					free(buf2);
++				}
+ 			}
+ 
+ 			err = vpu_DecClrDispFlag(handle,
+@@ -750,16 +796,18 @@ decoder_open(struct decode *dec)
+ 	RetCode ret;
+ 	DecHandle handle = {0};
+ 	DecOpenParam oparam = {0};
+-	
++
+ 	oparam.bitstreamFormat = dec->cmdl->format;
+ 	oparam.bitstreamBuffer = dec->phy_bsbuf_addr;
+ 	oparam.bitstreamBufferSize = STREAM_BUF_SIZE;
+ 	oparam.mp4DeblkEnable = dec->cmdl->mp4dblk_en;
+-	oparam.reorderEnable = 0; // FIXME
++	oparam.reorderEnable = dec->reorderEnable;
+ 
+ 	oparam.psSaveBuffer = dec->phy_ps_buf;
+ 	oparam.psSaveBufferSize = PS_SAVE_SIZE;
+ 
++	oparam.chromaInterleave = dec->chromaInterleave;
++
+ 	ret = vpu_DecOpen(&handle, &oparam);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("vpu_DecOpen failed\n");
+@@ -802,6 +850,9 @@ decode_test(void *arg)
+ 
+ 	dec->phy_bsbuf_addr = mem_desc.phy_addr;
+ 	dec->virt_bsbuf_addr = mem_desc.virt_uaddr;
++
++	dec->chromaInterleave = 0;
++	dec->reorderEnable = 0;
+ 	dec->cmdl = cmdl;
+ 
+ 	if (cmdl->format == STD_AVC) {
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index b6cc264..183c522 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -381,8 +381,8 @@ open_files(struct cmd_line *cmd)
+ 	}
+ 	
+ 	if (cmd->dst_scheme == PATH_FILE) {
+-		cmd->dst_fd = open(cmd->output, O_CREAT | O_RDWR, S_IRWXU |
+-					S_IRWXG | S_IRWXO);
++		cmd->dst_fd = open(cmd->output, O_CREAT | O_RDWR | O_TRUNC,
++					S_IRWXU | S_IRWXG | S_IRWXO);
+ 		if (cmd->dst_fd < 0) {
+ 			perror("file open");
+ 
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index a4bb322..86fb2a8 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -153,6 +153,8 @@ struct decode {
+ 	struct frame_buf **pfbpool;
+ 	struct vpu_display *disp;
+ 	vpu_mem_desc *mvcol_memdesc;
++	int reorderEnable;
++	int chromaInterleave;
+ 	struct cmd_line *cmdl;
+ };
+ 
+-- 
+1.8.0
+

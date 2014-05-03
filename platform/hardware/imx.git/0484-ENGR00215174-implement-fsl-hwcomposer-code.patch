@@ -1,0 +1,1100 @@
+From 0ff5d6bf2ae30e2d9c35d561589a515608c0b438 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Tue, 24 Dec 2013 14:04:53 +0800
+Subject: [PATCH 484/486] ENGR00215174 implement fsl hwcomposer code.
+
+the original hwcomposer code is a wrapper of viv hwcomposer.
+now, add the real hwcomposer code.
+and add the property sys.fsl.hwc to switch between the two hwcomposer.
+the default hwcomposer is still a wrapper.
+when the fsl hwcomposer is stable and has good performance,
+it will switch to that by default.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/hwcomposer/Android.mk          |  12 +-
+ mx6/hwcomposer/hwc_composite.cpp   | 436 ++++++++++++++++++++++++++++++++++++
+ mx6/hwcomposer/hwc_context.h       |  10 +-
+ mx6/hwcomposer/hwcomposer.cpp      | 437 ++++++++++++++++++++++++++++++++++---
+ mx6/libgralloc_wrapper/gralloc.cpp |  11 +-
+ 5 files changed, 865 insertions(+), 41 deletions(-)
+ mode change 100755 => 100644 mx6/hwcomposer/Android.mk
+ create mode 100644 mx6/hwcomposer/hwc_composite.cpp
+ mode change 100755 => 100644 mx6/hwcomposer/hwcomposer.cpp
+
+diff --git a/mx6/hwcomposer/Android.mk b/mx6/hwcomposer/Android.mk
+old mode 100755
+new mode 100644
+index 6cee365..dc4aaf7
+--- a/mx6/hwcomposer/Android.mk
++++ b/mx6/hwcomposer/Android.mk
+@@ -29,16 +29,22 @@ LOCAL_SHARED_LIBRARIES :=			\
+ 	libui					\
+ 	libhardware				\
+ 	libhardware_legacy			\
+-	libbinder
++	libbinder \
++    libg2d \
++    libsync
+ 
+ LOCAL_SRC_FILES :=				\
+ 	hwcomposer.cpp				\
+ 	hwc_vsync.cpp				\
+ 	hwc_display.cpp				\
+-	hwc_uevent.cpp
++	hwc_uevent.cpp \
++    hwc_composite.cpp
+ 
+ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+-LOCAL_C_INCLUDES += hardware/imx/mx6/libgralloc_wrapper
++LOCAL_C_INCLUDES += hardware/imx/mx6/libgralloc_wrapper \
++                    device/fsl-proprietary/include \
++                    system/core/include/
++
+ LOCAL_CFLAGS:= -DLOG_TAG=\"hwcomposer\"
+ LOCAL_CFLAGS += -DENABLE_VSYNC
+ LOCAL_MODULE_TAGS := optional
+diff --git a/mx6/hwcomposer/hwc_composite.cpp b/mx6/hwcomposer/hwc_composite.cpp
+new file mode 100644
+index 0000000..3f22b24
+--- /dev/null
++++ b/mx6/hwcomposer/hwc_composite.cpp
+@@ -0,0 +1,436 @@
++/*
++ * Copyright (C) 2009-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#define HWC_REMOVE_DEPRECATED_VERSIONS 1
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++#include <cutils/properties.h>
++#include <utils/threads.h>
++#include <hardware/hwcomposer.h>
++#include <hardware_legacy/uevent.h>
++#include <utils/StrongPointer.h>
++
++#include <linux/mxcfb.h>
++#include <linux/ioctl.h>
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_context.h"
++#include "hwc_vsync.h"
++#include "hwc_uevent.h"
++#include "hwc_display.h"
++#include <g2d.h>
++#include <system/graphics.h>
++
++static bool validateRect(hwc_rect_t& rect)
++{
++    if ((rect.left < 0) || (rect.top < 0) || (rect.right < 0) ||
++        (rect.bottom < 0) || (rect.right - rect.left <= 0) ||
++        (rect.bottom - rect.top <= 0)) {
++        return false;
++    }
++    return true;
++}
++
++static enum g2d_format convertFormat(int format)
++{
++    switch (format) {
++        case HAL_PIXEL_FORMAT_RGBA_8888:
++            return G2D_RGBA8888;
++        case HAL_PIXEL_FORMAT_RGBX_8888:
++            return G2D_RGBX8888;
++        case HAL_PIXEL_FORMAT_RGB_565:
++            return G2D_RGB565;
++        case HAL_PIXEL_FORMAT_BGRA_8888:
++            return G2D_BGRA8888;
++
++        case HAL_PIXEL_FORMAT_YCrCb_420_SP:
++            return G2D_NV21;
++        case HAL_PIXEL_FORMAT_YCbCr_420_SP:
++            return G2D_NV12;
++
++        case HAL_PIXEL_FORMAT_YCbCr_420_P:
++            return G2D_I420;
++        case HAL_PIXEL_FORMAT_YV12:
++            return G2D_YV12;
++
++        case HAL_PIXEL_FORMAT_YCbCr_422_SP:
++            return G2D_NV16;
++        case HAL_PIXEL_FORMAT_YCbCr_422_I:
++            return G2D_YUYV;
++
++        default:
++            ALOGE("unsupported format:0x%x", format);
++            return G2D_RGBA8888;
++    }
++}
++
++static enum g2d_rotation convertRotation(int transform)
++{
++    switch (transform) {
++        case 0:
++            return G2D_ROTATION_0;
++        case HAL_TRANSFORM_ROT_90:
++            return G2D_ROTATION_90;
++        case HAL_TRANSFORM_FLIP_H | HAL_TRANSFORM_FLIP_V:
++            return G2D_ROTATION_180;
++        case HAL_TRANSFORM_FLIP_H | HAL_TRANSFORM_FLIP_V |
++             HAL_TRANSFORM_ROT_90:
++            return G2D_ROTATION_270;
++        case HAL_TRANSFORM_FLIP_H:
++            return G2D_FLIP_H;
++        case HAL_TRANSFORM_FLIP_V:
++            return G2D_FLIP_V;
++        default:
++            return G2D_ROTATION_0;
++    }
++}
++
++static int convertBlending(int blending, struct g2d_surface& src,
++                        struct g2d_surface& dst)
++{
++    switch (blending) {
++        case HWC_BLENDING_PREMULT:
++            src.blendfunc = G2D_ONE;
++            dst.blendfunc = G2D_ONE_MINUS_SRC_ALPHA;
++            break;
++
++        case HWC_BLENDING_COVERAGE:
++            src.blendfunc = G2D_SRC_ALPHA;
++            dst.blendfunc = G2D_ONE_MINUS_SRC_ALPHA;
++            break;
++
++        case HWC_BLENDING_DIM:
++            src.blendfunc = G2D_ONE;
++            dst.blendfunc = G2D_ONE_MINUS_SRC_ALPHA;
++            break;
++
++        default:
++            src.blendfunc = G2D_ONE;
++            dst.blendfunc = G2D_ONE_MINUS_SRC_ALPHA;
++            break;
++    }
++
++    return 0;
++}
++
++static int setG2dSurface(struct g2d_surface& surface,
++             struct private_handle_t *handle, hwc_rect_t& rect)
++{
++    surface.format = convertFormat(handle->format);
++    surface.planes[0] = handle->phys;
++    surface.stride = handle->flags >> 16;
++    switch (surface.format) {
++        case G2D_RGB565: {
++            int alignHeight = (handle->height + 3) & ~0x3;
++            surface.planes[0] += surface.stride * 2 * (alignHeight - handle->height);
++            } break;
++        case G2D_RGBA8888:
++        case G2D_BGRA8888:
++        case G2D_RGBX8888: {
++            int alignHeight = (handle->height + 3) & ~0x3;
++            surface.planes[0] += surface.stride * 4 * (alignHeight - handle->height);
++            } break;
++
++        case G2D_YUYV:
++            break;
++
++        case G2D_NV16:
++        case G2D_NV12:
++        case G2D_NV21: {
++            int stride = surface.stride;
++            surface.planes[1] = handle->phys + stride * handle->height;
++            } break;
++
++        case G2D_I420:
++        case G2D_YV12: {
++            int stride = surface.stride;
++            int c_stride = (stride/2+15)/16*16;
++            surface.planes[1] = handle->phys + stride * handle->height;
++            surface.planes[2] = surface.planes[1] + c_stride * handle->height;
++            } break;
++
++        default:
++            ALOGI("does not support format:%d", surface.format);
++            break;
++    }
++    surface.left = rect.left;
++    surface.top = rect.top;
++    surface.right = rect.right;
++    surface.bottom = rect.bottom;
++    surface.width = handle->width;
++    surface.height = handle->height;
++
++    return 0;
++}
++
++static inline int min(int a, int b) {
++    return (a<b) ? a : b;
++}
++
++static inline int max(int a, int b) {
++    return (a>b) ? a : b;
++}
++
++void convertScalerToInt(hwc_frect_t& in, hwc_rect_t& out)
++{
++    out.left = (int)in.left;
++    out.top = (int)in.top;
++    out.right = (int)in.right;
++    out.bottom = (int)in.bottom;
++}
++
++static void intersect(hwc_rect_t* out, const hwc_rect_t* lhs,
++            const hwc_rect_t* rhs)
++{
++    if (out == NULL || lhs == NULL || rhs == NULL) {
++        return;
++    }
++
++    out->left = max(lhs->left, rhs->left);
++    out->top = max(lhs->top, rhs->top);
++    out->right = min(lhs->right, rhs->right);
++    out->bottom = min(lhs->bottom, rhs->bottom);
++}
++
++static void setRects(hwc_rect_t& src, hwc_rect_t& dst,
++                     const hwc_rect_t& dstClip, int rotation)
++{
++    hwc_rect_t drect = dst;
++    hwc_rect_t srect = src;
++    int32_t srcW, srcH, dstW, dstH, deltaX, deltaY;
++    intersect(&dst, &dstClip, &drect);
++
++    //rotate 90
++    if (rotation == HAL_TRANSFORM_ROT_90) {
++        dstW = drect.bottom - drect.top;
++        dstH = drect.right - drect.left;
++        deltaX = dst.top - drect.top;
++        deltaY = -dst.right + drect.right;
++    }
++    //virtical flip
++    else if (rotation == HAL_TRANSFORM_FLIP_V) {
++        dstW = drect.right - drect.left;
++        dstH = drect.bottom - drect.top;
++        deltaX = dst.left - drect.left;
++        deltaY = -dst.bottom + drect.bottom;
++    }
++    //horizontal flip
++    else if (rotation == HAL_TRANSFORM_FLIP_H) {
++        dstW = drect.right - drect.left;
++        dstH = drect.bottom - drect.top;
++        deltaX = -dst.right + drect.right;
++        deltaY = dst.top - drect.top;
++    }
++    //rotate 270
++    else if (rotation == (HAL_TRANSFORM_FLIP_H | HAL_TRANSFORM_FLIP_V |
++             HAL_TRANSFORM_ROT_90)) {
++        dstW = drect.bottom - drect.top;
++        dstH = drect.right - drect.left;
++        deltaY = dst.left - drect.left;
++        deltaX = -dst.bottom + drect.bottom;
++    }
++    //rotate 180
++    else if (rotation == (HAL_TRANSFORM_FLIP_H | HAL_TRANSFORM_FLIP_V)) {
++        dstW = drect.right - drect.left;
++        dstH = drect.bottom - drect.top;
++        deltaY = -dst.bottom + drect.bottom;
++        deltaX = -dst.right + drect.right;
++    }
++    //rotate 0
++    else {
++        dstW = drect.right - drect.left;
++        dstH = drect.bottom - drect.top;
++        deltaX = dst.left - drect.left;
++        deltaY = dst.top - drect.top;
++    }
++    srcW = srect.right - srect.left;
++    srcH = srect.bottom - srect.top;
++
++    deltaX = deltaX * srcW / dstW;
++    deltaY = deltaY * srcH / dstH;
++
++    src.left = deltaX + srect.left;
++    src.top = deltaY + srect.top;
++    if (rotation & HAL_TRANSFORM_ROT_90) {
++        src.right = src.left + (dstClip.bottom - dstClip.top)* srcW / dstW;
++        src.bottom = src.top + (dstClip.right - dstClip.left)* srcH / dstH;
++    }
++    else {
++        src.right = src.left + (dstClip.right - dstClip.left) * srcW / dstW;
++        src.bottom = src.top + (dstClip.bottom - dstClip.top) * srcH / dstH;
++    }
++}
++
++int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
++                 struct private_handle_t *dstHandle, bool firstLayer)
++{
++    if (ctx == NULL || ctx->g2d_handle == NULL || layer == NULL || dstHandle == NULL) {
++        ALOGE("%s: invalid parameters", __FUNCTION__);
++        return -EINVAL;
++    }
++
++    //sourceCrop change with version.
++    hwc_rect_t srect;
++    convertScalerToInt(layer->sourceCropf, srect);
++    if (!validateRect(srect) && layer->blending != HWC_BLENDING_DIM) {
++        ALOGE("%s: invalid sourceCrop(l:%d,t:%d,r:%d,b:%d)", __FUNCTION__,
++                 srect.left, srect.top, srect.right, srect.bottom);
++        return -EINVAL;
++    }
++
++    hwc_rect_t drect = layer->displayFrame;
++    if (!validateRect(drect)) {
++        ALOGE("%s: invalid displayFrame(l:%d,t:%d,r:%d,b:%d)", __FUNCTION__,
++                 drect.left, drect.top, drect.right, drect.bottom);
++        return -EINVAL;
++    }
++
++    struct g2d_surface dSurface;
++    memset(&dSurface, 0, sizeof(dSurface));
++
++    for (size_t i=0; i<layer->visibleRegionScreen.numRects; i++) {
++        convertScalerToInt(layer->sourceCropf, srect);
++        drect = layer->displayFrame;
++        if (!validateRect((hwc_rect_t&)layer->visibleRegionScreen.rects[i])) {
++            ALOGI("invalid clip rect");
++            continue;
++        }
++        setRects(srect, drect, layer->visibleRegionScreen.rects[i],
++                  layer->transform);
++        if (!validateRect(srect) && layer->blending != HWC_BLENDING_DIM) {
++            ALOGI("%s: invalid srect(l:%d,t:%d,r:%d,b:%d)", __FUNCTION__,
++                    srect.left, srect.top, srect.right, srect.bottom);
++            hwc_rect_t src;
++            convertScalerToInt(layer->sourceCropf, src);
++            hwc_rect_t& vis = (hwc_rect_t&)layer->visibleRegionScreen.rects[i];
++            hwc_rect_t& dis = layer->displayFrame;
++            ALOGI("sourceCrop(l:%d,t:%d,r:%d,b:%d), visible(l:%d,t:%d,r:%d,b:%d), "
++                    "display(l:%d,t:%d,r:%d,b:%d)",
++                    src.left, src.top, src.right, src.bottom,
++                    vis.left, vis.top, vis.right, vis.bottom,
++                    dis.left, dis.top, dis.right, dis.bottom);
++            continue;
++        }
++        if (!validateRect(drect)) {
++            ALOGI("%s: invalid drect(l:%d,t:%d,r:%d,b:%d)", __FUNCTION__,
++                    drect.left, drect.top, drect.right, drect.bottom);
++            continue;
++        }
++
++        ALOGV("draw: src(l:%d,t:%d,r:%d,b:%d), dst(l:%d,t:%d,r:%d,b:%d)",
++                srect.left, srect.top, srect.right, srect.bottom,
++                drect.left, drect.top, drect.right, drect.bottom);
++
++        setG2dSurface(dSurface, dstHandle, drect);
++        dSurface.rot = convertRotation(layer->transform);
++
++        struct g2d_surface sSurface;
++        memset(&sSurface, 0, sizeof(sSurface));
++
++        if (layer->blending != HWC_BLENDING_DIM) {
++            struct private_handle_t *priv_handle;
++            priv_handle = (struct private_handle_t *)(layer->handle);
++            setG2dSurface(sSurface, priv_handle, srect);
++        }
++        else {
++            sSurface.clrcolor = 0xff000000;
++            sSurface.format = G2D_RGBA8888;
++        }
++        ALOGV("blit rot:%d, blending:%d, alpha:%d", layer->transform,
++                layer->blending, layer->planeAlpha);
++
++        if (!firstLayer) {
++            convertBlending(layer->blending, sSurface, dSurface);
++        }
++        sSurface.global_alpha = layer->planeAlpha;
++
++        if (layer->blending != HWC_BLENDING_NONE && !firstLayer) {
++            g2d_enable(ctx->g2d_handle, G2D_GLOBAL_ALPHA);
++            if (layer->blending == HWC_BLENDING_DIM) {
++                ALOGV("enable blend dim");
++                g2d_enable(ctx->g2d_handle, G2D_BLEND_DIM);
++            }
++            else {
++                g2d_enable(ctx->g2d_handle, G2D_BLEND);
++            }
++        }
++
++        g2d_blit(ctx->g2d_handle, &sSurface, &dSurface);
++
++        if (layer->blending != HWC_BLENDING_NONE && !firstLayer) {
++            if (layer->blending == HWC_BLENDING_DIM) {
++                g2d_disable(ctx->g2d_handle, G2D_BLEND_DIM);
++            }
++            else {
++                g2d_disable(ctx->g2d_handle, G2D_BLEND);
++            }
++            g2d_disable(ctx->g2d_handle, G2D_GLOBAL_ALPHA);
++        }
++    }
++
++    return 0;
++}
++
++int hwc_clearWormHole(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                    hwc_region_t &hole)
++{
++    if (ctx == NULL || dstHandle == NULL || hole.rects == NULL) {
++        return -EINVAL;
++    }
++
++    struct g2d_surface surface;
++    memset(&surface, 0, sizeof(surface));
++    for (size_t i=0; i<hole.numRects; i++) {
++        hwc_rect_t& rect = (hwc_rect_t&)hole.rects[i];
++        if (!validateRect(rect)) {
++            continue;
++        }
++
++        setG2dSurface(surface, dstHandle, rect);
++        surface.clrcolor = 0xff << 24;
++        g2d_clear(ctx->g2d_handle, &surface);
++    }
++
++    return 0;
++}
++
++int hwc_clearRect(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                    hwc_rect_t &rect)
++{
++    if (ctx == NULL || dstHandle == NULL) {
++        return -EINVAL;
++    }
++
++    if (!validateRect(rect)) {
++        return -EINVAL;
++    }
++
++    struct g2d_surface surface;
++    memset(&surface, 0, sizeof(surface));
++
++    setG2dSurface(surface, dstHandle, rect);
++    surface.clrcolor = 0xff << 24;
++    g2d_clear(ctx->g2d_handle, &surface);
++
++    return 0;
++}
++
+diff --git a/mx6/hwcomposer/hwc_context.h b/mx6/hwcomposer/hwc_context.h
+index 75dcbbf..0511ad7 100644
+--- a/mx6/hwcomposer/hwc_context.h
++++ b/mx6/hwcomposer/hwc_context.h
+@@ -68,14 +68,20 @@ typedef struct {
+     int ydpi;
+     int blank;
+     int format;
++
++    sp<ANativeWindow> mDisplaySurface;
++    hwc_region_t mWormHole;
++    bool mG2dProcs;
++    //struct g2d_buf* mCurrentBuffer;
++    //buffer_handle_t mLastHandle;
++    //hwc_rect_t mSwapRect[3];
+ } displayInfo;
+ 
+ struct hwc_context_t {
+     hwc_composer_device_1 device;
+     /* our private state goes below here */
+     displayInfo mDispInfo[HWC_NUM_DISPLAY_TYPES];
+-    //hwc_layer_list_t* mDispList[HWC_NUM_DISPLAY_TYPES];
+-    //size_t mListCapacity[HWC_NUM_DISPLAY_TYPES];
++    void* g2d_handle;
+ 
+     bool m_vsync_enable;
+ 
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+old mode 100755
+new mode 100644
+index 03cdfd7..39e5782
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -32,16 +32,33 @@
+ #include <linux/mxcfb.h>
+ #include <linux/ioctl.h>
+ #include <EGL/egl.h>
++#include <EGL/eglext.h>
+ #include "gralloc_priv.h"
+ #include "hwc_context.h"
+ #include "hwc_vsync.h"
+ #include "hwc_uevent.h"
+ #include "hwc_display.h"
++#include <g2d.h>
++#include <sync/sync.h>
+ 
+ /*****************************************************************************/
++#define HWC_G2D   100
++
++typedef EGLClientBuffer (EGLAPIENTRYP PFNEGLGETRENDERBUFFERVIVPROC) (EGLClientBuffer Handle);
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLPOSTBUFFERVIVPROC) (EGLClientBuffer Buffer);
++
++static PFNEGLGETRENDERBUFFERVIVPROC  _eglGetRenderBufferVIV;
++static PFNEGLPOSTBUFFERVIVPROC _eglPostBufferVIV;
++
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+         struct hw_device_t** device);
+ 
++extern int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
++                    struct private_handle_t *dstHandle, bool firstLayer);
++extern int hwc_clearWormHole(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                    hwc_region_t &hole);
++extern int hwc_clearRect(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                    hwc_rect_t &rect);
+ 
+ static struct hw_module_methods_t hwc_module_methods = {
+     open: hwc_device_open
+@@ -96,6 +113,10 @@ static int hwc_device_close(struct hw_device_t *dev)
+                 close(ctx->mDispInfo[i].fd);
+         }
+ 
++        if (ctx->g2d_handle != NULL) {
++            g2d_close(ctx->g2d_handle);
++        }
++
+         if(ctx->m_viv_hwc) {
+             hwc_close_1(ctx->m_viv_hwc);
+         }
+@@ -105,6 +126,239 @@ static int hwc_device_close(struct hw_device_t *dev)
+     return 0;
+ }
+ 
++static bool checkG2dProcs(struct hwc_context_t* ctx,
++                    hwc_display_contents_1_t* list)
++{
++    if (ctx == NULL || list == NULL) {
++        return false;
++    }
++
++    hwc_layer_1_t* layer = NULL;
++    for (size_t i=0; i<list->numHwLayers-1; i++) {
++        layer = &list->hwLayers[i];
++        if (layer->flags & HWC_SKIP_LAYER) {
++            ALOGV("skip layer");
++            return false;
++        }
++
++        if ((layer->blending & 0xFFFF) == HWC_BLENDING_DIM) {
++            ALOGV("dim layer");
++            continue;
++        }
++
++        if (layer->handle == NULL) {
++            ALOGV("layer handle is null");
++            return false;
++        }
++    }
++
++    return true;
++}
++
++static int hwc_prepare_physical(struct hwc_context_t* ctx, int disp,
++                         hwc_display_contents_1_t* list)
++{
++    if (ctx == NULL || ctx->g2d_handle == NULL || list == NULL) {
++        ctx->mDispInfo[disp].mG2dProcs = false;
++        ALOGV("%s: disp:%d invalid parameter", __FUNCTION__, disp);
++        return 0;
++    }
++
++    hwc_layer_1_t* targetLayer = &list->hwLayers[list->numHwLayers-1];
++    struct private_handle_t *targetHandle;
++    targetHandle = (struct private_handle_t *)targetLayer->handle;
++    if (targetHandle == NULL) {
++        ALOGI("prepare: targetHandle is null");
++        return 0;
++    }
++
++    if (!ctx->mDispInfo[disp].connected) {
++        ALOGE("physical display:%d is diconnected", disp);
++        ctx->mDispInfo[disp].mG2dProcs = false;
++        return -EINVAL;
++    }
++
++    bool g2dProcs = checkG2dProcs(ctx, list);
++    if (!g2dProcs) {
++        ALOGV("pass to 3D to handle");
++        ctx->mDispInfo[disp].mG2dProcs = false;
++        return 0;
++    }
++
++    hwc_layer_1_t* layer = NULL;
++    for (size_t i=0; i<list->numHwLayers-1; i++) {
++        layer = &list->hwLayers[i];
++        layer->compositionType = HWC_G2D;
++    }
++    ctx->mDispInfo[disp].mG2dProcs = true;
++
++    return 0;
++}
++
++static int hwc_prepare_virtual(struct hwc_context_t* ctx, int disp,
++                         hwc_display_contents_1_t* list)
++{
++    if (ctx == NULL || ctx->g2d_handle == NULL || list == NULL) {
++        ctx->mDispInfo[disp].mG2dProcs = false;
++        ALOGV("%s: disp:%d invalid parameter", __FUNCTION__, disp);
++        return 0;
++    }
++
++    bool g2dProcs = checkG2dProcs(ctx, list);
++    if (!g2dProcs) {
++        ALOGV("pass to 3D to handle");
++        ctx->mDispInfo[disp].mG2dProcs = false;
++        return 0;
++    }
++
++    hwc_layer_1_t* layer = NULL;
++    for (size_t i=0; i<list->numHwLayers-1; i++) {
++        layer = &list->hwLayers[i];
++        layer->compositionType = HWC_G2D;
++    }
++    ctx->mDispInfo[disp].mG2dProcs = true;
++
++    return 0;
++}
++
++static int hwc_set_physical(struct hwc_context_t* ctx, int disp,
++                         hwc_display_contents_1_t* list)
++{
++    if (ctx == NULL || list == NULL) {
++        ALOGV("%s: disp:%d invalid parameter", __FUNCTION__, disp);
++        return 0;
++    }
++
++    // to do copyback when use swap retangle.
++    hwc_layer_1_t* targetLayer = &list->hwLayers[list->numHwLayers-1];
++    struct private_handle_t *targetHandle;
++    targetHandle = (struct private_handle_t *)targetLayer->handle;
++    if (targetHandle == NULL) {
++        ALOGI("hwc_set: targetHandle is null");
++        return 0;
++    }
++
++    if (!ctx->mDispInfo[disp].mG2dProcs) {
++        if (targetHandle != NULL && ctx->mDispInfo[disp].connected) {
++            ctx->mFbDev[disp]->post(ctx->mFbDev[disp], targetHandle);
++        }
++        return 0;
++    }
++
++    hwc_layer_1_t* layer = NULL;
++    for (size_t i=0; i<list->numHwLayers-1; i++) {
++        layer = &list->hwLayers[i];
++        if (layer->compositionType != HWC_G2D) {
++            ALOGE("invalid compositionType:%d", layer->compositionType);
++            return -EINVAL;
++        }
++    }
++
++    //framebuffer handle.
++    android_native_buffer_t *fbuffer = NULL;
++    struct private_handle_t *frameHandle;
++    fbuffer = (ANativeWindowBuffer *) _eglGetRenderBufferVIV(targetHandle);
++    if (fbuffer == NULL) {
++        ALOGE("get render buffer failed!");
++        return -EINVAL;
++    }
++
++    frameHandle = (struct private_handle_t *)(fbuffer->handle);
++    if (frameHandle == NULL) {
++        ALOGE("invalid frame buffer handle");
++        return -EINVAL;
++    }
++
++    for (size_t i=0; i<list->numHwLayers-1; i++) {
++        layer = &list->hwLayers[i];
++        int fenceFd = layer->acquireFenceFd;
++        if (fenceFd > 0) {
++            ALOGI("fenceFd:%d", fenceFd);
++            //sync_wait(fenceFd, -1);
++            close(fenceFd);
++            layer->acquireFenceFd = -1;
++        }
++
++        if (i == 0) {
++            hwc_composite(ctx, layer, frameHandle, true);
++        }
++        else
++            hwc_composite(ctx, layer, frameHandle, false);
++    }
++
++    g2d_finish(ctx->g2d_handle);
++
++    _eglPostBufferVIV(fbuffer);
++
++    targetHandle = (struct private_handle_t *)targetLayer->handle;
++    if (targetHandle != NULL && ctx->mDispInfo[disp].connected && ctx->mDispInfo[disp].blank == 0) {
++        ctx->mFbDev[disp]->post(ctx->mFbDev[disp], targetHandle);
++    }
++
++    return 0;
++}
++
++static int hwc_set_virtual(struct hwc_context_t* ctx, int disp,
++                         hwc_display_contents_1_t* list)
++{
++    if (ctx == NULL || list == NULL) {
++        return 0;
++    }
++
++    if (list->outbuf == NULL) {
++        ALOGE("invalid outbuf for virtual display");
++        return -EINVAL;
++    }
++
++    struct private_handle_t *frameHandle;
++    frameHandle = (struct private_handle_t *)(list->outbuf);
++    if (frameHandle == NULL) {
++        ALOGE("invalid frame buffer handle");
++        return -EINVAL;
++    }
++
++    if (!ctx->mDispInfo[disp].mG2dProcs) {
++        return 0;
++    }
++
++    hwc_layer_1_t* layer = NULL;
++    for (size_t i=0; i<list->numHwLayers-1; i++) {
++        layer = &list->hwLayers[i];
++        if (layer->compositionType != HWC_G2D) {
++            ALOGE("invalid compositionType:%d", layer->compositionType);
++            return -EINVAL;
++        }
++    }
++
++    int fenceFd = list->outbufAcquireFenceFd;
++    if (fenceFd != -1) {
++        sync_wait(fenceFd, -1);
++        close(fenceFd);
++        list->outbufAcquireFenceFd = -1;
++    }
++    list->retireFenceFd = -1;
++    for (size_t i=0; i<list->numHwLayers-1; i++) {
++        layer = &list->hwLayers[i];
++        int fenceFd = layer->acquireFenceFd;
++        if (fenceFd > 0) {
++            ALOGI("fenceFd:%d", fenceFd);
++            //sync_wait(fenceFd, -1);
++            close(fenceFd);
++            layer->acquireFenceFd = -1;
++        }
++
++        if (i == 0) {
++            hwc_composite(ctx, layer, frameHandle, true);
++        }
++        else
++            hwc_composite(ctx, layer, frameHandle, false);
++    }
++
++    g2d_finish(ctx->g2d_handle);
++
++    return 0;
++}
++
+ static int hwc_prepare(hwc_composer_device_1_t *dev,
+         size_t numDisplays, hwc_display_contents_1_t** displays)
+ {
+@@ -113,14 +367,8 @@ static int hwc_prepare(hwc_composer_device_1_t *dev,
+         return 0;
+     }
+ 
++    int ret = 0;
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+-    hwc_display_contents_1_t *primary_contents = displays[HWC_DISPLAY_PRIMARY];
+-    hwc_display_contents_1_t *external_contents = displays[HWC_DISPLAY_EXTERNAL];
+-    if (primary_contents) {
+-    }
+-
+-    if (external_contents) {
+-    }
+ 
+     if(ctx->m_viv_hwc) {
+         char property[PROPERTY_VALUE_MAX];
+@@ -129,7 +377,37 @@ static int hwc_prepare(hwc_composer_device_1_t *dev,
+         return ctx->m_viv_hwc->prepare(ctx->m_viv_hwc, numDisplays, displays);
+     }
+ 
+-    return 0;
++    if (ctx->g2d_handle == NULL) {
++        g2d_open(&ctx->g2d_handle);
++        if (ctx->g2d_handle == NULL) {
++            ALOGE("%s invalid g2d_handle", __FUNCTION__);
++            return 0;
++        }
++    }
++
++    char property[PROPERTY_VALUE_MAX];
++    property_get("service.bootanim.exit", property, "0");
++    if(!atoi(property)) numDisplays = numDisplays >= 1 ? 1 : 0;
++
++    for (size_t i = 0; i < numDisplays; i++) {
++        hwc_display_contents_1_t *list = displays[i];
++        switch(i) {
++            case HWC_DISPLAY_PRIMARY:
++                ret = hwc_prepare_physical(ctx, i, displays[i]);
++                break;
++            case HWC_DISPLAY_EXTERNAL:
++                ret = hwc_prepare_physical(ctx, i, displays[i]);
++                break;
++            case HWC_DISPLAY_VIRTUAL:
++                ret = hwc_prepare_virtual(ctx, i, displays[i]);
++                break;
++            default:
++                ALOGI("invalid display id:%d", i);
++                break;
++        }
++    }
++
++    return ret;
+ }
+ 
+ static int hwc_set(struct hwc_composer_device_1 *dev,
+@@ -140,34 +418,62 @@ static int hwc_set(struct hwc_composer_device_1 *dev,
+         return 0;
+     }
+ 
++    int ret = 0;
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+-    hwc_display_contents_1_t *primary_contents = displays[HWC_DISPLAY_PRIMARY];
+-    hwc_display_contents_1_t *external_contents = displays[HWC_DISPLAY_EXTERNAL];
+ 
+     if(ctx->m_viv_hwc) {
+-
+         char property[PROPERTY_VALUE_MAX];
+         property_get("service.bootanim.exit", property, "0");
+         if(!atoi(property)) numDisplays = numDisplays >= 1 ? 1 : 0;
+ 
+         int err = ctx->m_viv_hwc->set(ctx->m_viv_hwc, numDisplays, displays);
+-
+         if(err) return err;
++
++        hwc_display_contents_1_t *primary_contents = displays[HWC_DISPLAY_PRIMARY];
++        hwc_display_contents_1_t *external_contents = displays[HWC_DISPLAY_EXTERNAL];
++        if (primary_contents && ctx->mDispInfo[HWC_DISPLAY_PRIMARY].blank == 0) {
++            hwc_layer_1 *fbt = &primary_contents->hwLayers[primary_contents->numHwLayers - 1];
++            if(ctx->mFbDev[HWC_DISPLAY_PRIMARY] != NULL)
++                ctx->mFbDev[HWC_DISPLAY_PRIMARY]->post(ctx->mFbDev[HWC_DISPLAY_PRIMARY],  fbt->handle);
++        }
++
++        if (external_contents && ctx->mDispInfo[HWC_DISPLAY_EXTERNAL].blank == 0) {
++            hwc_layer_1 *fbt = &external_contents->hwLayers[external_contents->numHwLayers - 1];
++            if(ctx->mFbDev[HWC_DISPLAY_EXTERNAL] != NULL)
++                ctx->mFbDev[HWC_DISPLAY_EXTERNAL]->post(ctx->mFbDev[HWC_DISPLAY_EXTERNAL], fbt->handle);
++        }
++
++        return 0;
+     }
+ 
+-    if (primary_contents && ctx->mDispInfo[HWC_DISPLAY_PRIMARY].blank == 0) {
+-        hwc_layer_1 *fbt = &primary_contents->hwLayers[primary_contents->numHwLayers - 1];
+-        if(ctx->mFbDev[HWC_DISPLAY_PRIMARY] != NULL)
+-        ctx->mFbDev[HWC_DISPLAY_PRIMARY]->post(ctx->mFbDev[HWC_DISPLAY_PRIMARY], fbt->handle);
++    if (ctx->g2d_handle == NULL) {
++        ALOGI("%s invalid g2d_handle", __FUNCTION__);
++        return 0;
+     }
+-    
+-    if (external_contents && ctx->mDispInfo[HWC_DISPLAY_EXTERNAL].blank == 0) {
+-        hwc_layer_1 *fbt = &external_contents->hwLayers[external_contents->numHwLayers - 1];
+-        if(ctx->mFbDev[HWC_DISPLAY_EXTERNAL] != NULL)
+-        ctx->mFbDev[HWC_DISPLAY_EXTERNAL]->post(ctx->mFbDev[HWC_DISPLAY_EXTERNAL], fbt->handle);
++
++    char property[PROPERTY_VALUE_MAX];
++    property_get("service.bootanim.exit", property, "0");
++    if(!atoi(property)) numDisplays = numDisplays >= 1 ? 1 : 0;
++
++    for (size_t i = 0; i < numDisplays;i++) {
++        hwc_display_contents_1_t *list = displays[i];
++        switch(i) {
++            case HWC_DISPLAY_PRIMARY:
++                ret = hwc_set_physical(ctx, i, displays[i]);
++                break;
++            case HWC_DISPLAY_EXTERNAL:
++                ret = hwc_set_physical(ctx, i, displays[i]);
++                break;
++            case HWC_DISPLAY_VIRTUAL:
++                ret = hwc_set_virtual(ctx, i, displays[i]);
++                break;
++            default:
++                ALOGI("invalid display id:%d", i);
++                break;
++        }
+     }
+ 
+-    return 0;
++    return ret;
+ }
+ 
+ static void hwc_registerProcs(struct hwc_composer_device_1* dev,
+@@ -304,14 +610,46 @@ static int hwc_getDisplayAttributes(struct hwc_composer_device_1 *dev,
+     return 0;
+ }
+ 
++static int hwc_setDisplaySurface(struct hwc_composer_device_1 *dev,
++        int disp, ANativeWindow* window)
++{
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    if (!ctx || disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES) {
++        return -EINVAL;
++    }
++
++    ALOGI("%s: disp:%d", __FUNCTION__, disp);
++    ctx->mDispInfo[disp].mDisplaySurface = window;
++
++    return 0;
++}
++
++static int hwc_setDisplayWormHole(struct hwc_composer_device_1 *dev,
++        int disp, hwc_region_t& hole)
++{
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    if (!ctx || disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES) {
++        return -EINVAL;
++    }
++
++    ALOGI("%s: disp:%d", __FUNCTION__, disp);
++    ctx->mDispInfo[disp].mWormHole.numRects = hole.numRects;
++    if (hole.numRects > 0 && hole.rects != NULL) {
++        ctx->mDispInfo[disp].mWormHole.rects = (const hwc_rect_t*)malloc(hole.numRects*sizeof(hwc_rect_t));
++        memcpy((void*)ctx->mDispInfo[disp].mWormHole.rects, hole.rects, hole.numRects*sizeof(hwc_rect_t));
++    }
++
++    return 0;
++}
+ /*****************************************************************************/
+ 
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+         struct hw_device_t** device)
+ {
+     int status = -EINVAL;
++    struct hwc_context_t *dev = NULL;
+     if (!strcmp(name, HWC_HARDWARE_COMPOSER)) {
+-        struct hwc_context_t *dev;
++        //struct hwc_context_t *dev;
+         dev = (hwc_context_t*)malloc(sizeof(*dev));
+ 
+         /* initialize our state here */
+@@ -332,6 +670,7 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+         dev->device.blank = hwc_blank;
+         dev->device.getDisplayConfigs = hwc_getDisplayConfigs;
+         dev->device.getDisplayAttributes = hwc_getDisplayAttributes;
++        //dev->device.setDisplaySurface = hwc_setDisplaySurface;
+ 
+         /* our private state goes below here */
+         dev->m_vsync_thread = new VSyncThread(dev);
+@@ -354,27 +693,57 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+             }
+         }
+ 
+-        const hw_module_t *hwc_module;
+-        if(hw_get_module(HWC_VIV_HARDWARE_MODULE_ID,
++        char property[PROPERTY_VALUE_MAX];
++        property_get("sys.fsl.hwc", property, "0");
++        if(!atoi(property)) {
++            const hw_module_t *hwc_module;
++            if(hw_get_module(HWC_VIV_HARDWARE_MODULE_ID,
+                         (const hw_module_t**)&hwc_module) < 0) {
+-            ALOGE("Error! hw_get_module viv_hwc failed");
+-            goto nor_exit;
++                ALOGE("Error! hw_get_module viv_hwc failed");
++            }
++            else if(hwc_open_1(hwc_module, &(dev->m_viv_hwc)) != 0) {
++                ALOGE("Error! viv_hwc open failed");
++            }
++            else {
++                ALOGI("using viv hwc!");
++                goto nor_exit;
++            }
+         }
+ 
+-        if(hwc_open_1(hwc_module, &(dev->m_viv_hwc)) != 0) {
+-            ALOGE("Error! viv_hwc open failed");
+-            goto nor_exit;
++        if (_eglGetRenderBufferVIV == NULL || _eglPostBufferVIV == NULL)
++        {
++            _eglGetRenderBufferVIV = (PFNEGLGETRENDERBUFFERVIVPROC)
++                eglGetProcAddress("eglGetRenderBufferVIV");
++
++            if (_eglGetRenderBufferVIV == NULL)
++            {
++                ALOGE("eglGetRenderBufferVIV not found!");
++                status = -EINVAL;
++                goto err_exit;
++            }
++
++            _eglPostBufferVIV = (PFNEGLPOSTBUFFERVIVPROC)
++                eglGetProcAddress("eglPostBufferVIV");
++
++            if (_eglPostBufferVIV == NULL)
++            {
++                ALOGE("eglPostBufferVIV not found!");
++                status = -EINVAL;
++                goto err_exit;
++            }
+         }
+-nor_exit:
++        ALOGI("using fsl hwc!");
+ 
++nor_exit:
+         *device = &dev->device.common;
+-	ALOGI("%s,%d", __FUNCTION__, __LINE__);
++	    ALOGI("%s,%d", __FUNCTION__, __LINE__);
+         return 0;
++    }
++
+ err_exit:
+ 	if(dev){
+ 	    free(dev);
+ 	}
+-        /****************************************/
+-    }
++    /****************************************/
+     return status;
+ }
+diff --git a/mx6/libgralloc_wrapper/gralloc.cpp b/mx6/libgralloc_wrapper/gralloc.cpp
+index c583fed..3162303 100755
+--- a/mx6/libgralloc_wrapper/gralloc.cpp
++++ b/mx6/libgralloc_wrapper/gralloc.cpp
+@@ -115,10 +115,17 @@ static int gralloc_alloc(alloc_device_t* dev,
+             ALOGE("ctx->ext_dev == NULL");
+             return -EINVAL;
+         }
+-        return m->gpu_device->alloc(ctx->ext_dev, w, h, format, usage, pHandle, pStride);
++        int res = m->gpu_device->alloc(ctx->ext_dev, w, h, format, usage, pHandle, pStride);
++        private_handle_t* hnd = (private_handle_t*)(*pHandle);
++        hnd->flags |= (*pStride & 0xffff) << 16;
++        return res;
+     }
+ 
+-    return m->gpu_device->alloc(dev, w, h, format, usage, pHandle, pStride);
++    int ret = m->gpu_device->alloc(dev, w, h, format, usage, pHandle, pStride);
++    private_handle_t* hnd = (private_handle_t*)(*pHandle);
++    hnd->flags |= (*pStride & 0xffff) << 16;
++
++    return ret;
+ }
+ 
+ static int gralloc_free(alloc_device_t* dev,
+-- 
+1.8.0
+

@@ -1,0 +1,158 @@
+From 004c0ae844d5982454c65b296a2eedbf13fa0897 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 29 May 2013 18:27:52 +0800
+Subject: [PATCH 235/249] ENGR00264701-3 Fix multiple instance bug
+
+VPU lib v5.4.15
+
+Reproduce using TGE-LV-VPU-1016: VPU multiple decode test with 8
+instance
+
+Bug phenomenon:
+1.
+[ERR] vpu_DecGetInitialInfo failed, ret:-12, errorcode:0
+[ERR] decoder parse failed
+Root cause:
+vpu_DecGetInitialInfo was entered twice without vpu_DecOpen in between.
+It indicated pCodecInst->inUse was cleared so that two instance used the
+same instance structure.
+
+[ERR] vpu_DecUpdateBitstreamBuffer failed
+[ERR] dec_fill_bsbuffer failed
+Root cause:
+pCodecInst->inUse is 0. So the instance became invalid.
+
+[ERR] Register frame buffer failed, ret=-2
+Root cause:
+pCodecInst->inUse is 0. So the instance became invalid.
+
+In vpu_semaphore_open, if 2 instances both detected
+!semap->is_initialized, they could both clear pCodecInst->inUse. The
+latter clear could invalidate an instance unintentionally.
+
+2.
+[ERR] Cannot get version info, err:-1
+sometimes also printed
+[ERR] Unknown VPU
+Root cause:
+VPU was still busy when instance tried to get version. This was because
+vpu_semap lost effect.
+
+3.
+[ERR] pCodecInst 0x2b51d034, ppendingInst 0x2abafbc8
+[ERR] vpu_DecGetOutputInfo failed Err code is -2
+(in this case, frame_id = 0)
+Root cause:
+The instance was not the pending instance. This was because
+vpu_semap lost effect.
+
+2&3 are similar to 1. Mutex may be initialized more than once by
+multiple instances which may cause mutex not function on some occasion.
+Typically if instance A locked the mutex, and then instance B
+initialized the mutex, instance B will lock the mutex successfully even
+it was locked by A.
+
+Solution:
+Protect the mutex initialization with IOLockDev which uses a semap in
+driver.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_io.c   | 9 +++++++++
+ vpu/vpu_io.h   | 4 +++-
+ vpu/vpu_lib.h  | 2 +-
+ vpu/vpu_util.c | 6 ++++++
+ 4 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index 3847d2c..5f027c9 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -728,6 +728,15 @@ int IOSysSWReset(void)
+ 	return ret;
+ }
+ 
++int IOLockDev(int on)
++{
++	int ret = 0;
++
++	ret = ioctl(vpu_fd, VPU_IOC_LOCK_DEV, &on);
++
++	return ret;
++}
++
+ /*!
+  * @brief
+  * When the system starts up, resetting is needed in advance.
+diff --git a/vpu/vpu_io.h b/vpu/vpu_io.h
+index a4b611c..392e04a 100644
+--- a/vpu/vpu_io.h
++++ b/vpu/vpu_io.h
+@@ -1,7 +1,7 @@
+ /*
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  *
+- * Copyright (C) 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2004-2013 Freescale Semiconductor, Inc.
+  */
+ 
+ /* The following programs are the sole property of Freescale Semiconductor Inc.,
+@@ -56,6 +56,7 @@ typedef struct iram_t {
+ #define VPU_IOC_QUERY_BITWORK_MEM  _IO(VPU_IOC_MAGIC, 13)
+ #define VPU_IOC_SET_BITWORK_MEM    _IO(VPU_IOC_MAGIC, 14)
+ #define VPU_IOC_PHYMEM_CHECK	_IO(VPU_IOC_MAGIC, 15)
++#define VPU_IOC_LOCK_DEV	_IO(VPU_IOC_MAGIC, 16)
+ 
+ typedef void (*vpu_callback) (int status);
+ 
+@@ -72,6 +73,7 @@ int IOGetIramBase(iram_t * iram);
+ int IOClkGateSet(int on);
+ int IOGetPhyShareMem(vpu_mem_desc * buff);
+ int IOSysSWReset(void);
++int IOLockDev(int on);
+ 
+ unsigned long VpuWriteReg(unsigned long addr, unsigned int data);
+ unsigned long VpuReadReg(unsigned long addr);
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index fabe1af..09f893a 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -663,7 +663,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 14)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 15)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index d584d65..5171b61 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1180,7 +1180,10 @@ semaphore_t *vpu_semaphore_open(void)
+ 		return NULL;
+ 	}
+ 
++	IOLockDev(1);
++
+ 	if (!semap->is_initialized) {
++		dprintf(4, "sema not init\n");
+ 		pthread_mutexattr_init(&psharedm);
+ 		pthread_mutexattr_setpshared(&psharedm, PTHREAD_PROCESS_SHARED);
+ 		pthread_mutex_init(&semap->api_lock, &psharedm);
+@@ -1191,8 +1194,11 @@ semaphore_t *vpu_semaphore_open(void)
+ 			pCodecInst->inUse = 0;
+ 		}
+ 		semap->is_initialized = 1;
++		dprintf(4, "sema inited\n");
+ 	}
+ 
++	IOLockDev(0);
++
+ 	timeout_env = getenv("VPU_MUTEX_TIMEOUT");
+ 	if (timeout_env == NULL)
+ 		mutex_timeout = 10;
+-- 
+1.8.0
+

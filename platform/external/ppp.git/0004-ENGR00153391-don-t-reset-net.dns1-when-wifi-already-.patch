@@ -1,0 +1,76 @@
+From 5b085b96ea4f350cdeb378d9accbdcb6ece7ef36 Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Wed, 20 Jul 2011 17:14:11 +0800
+Subject: [PATCH 04/10] ENGR00153391 don't reset net.dns1 when wifi already up
+
+when 3G already dail up and enable wifi, system will disable
+3G and enable WIFI, but it only call ppp down when wifi got
+dns from AP, but the ip-down-ppp0 call back will reset
+the dns set by wifi.
+
+so the wifi can't access network.
+
+Fix this by don't set these two prop:
+   net.dns1
+   net.dns2
+when wlan0 interface is up.
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ android/ip-down-ppp0.c | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/android/ip-down-ppp0.c b/android/ip-down-ppp0.c
+index a9034e0..8c6e624 100644
+--- a/android/ip-down-ppp0.c
++++ b/android/ip-down-ppp0.c
+@@ -35,6 +35,28 @@
+ #define PPPD_MSG_PPP_DOWN "ppp-down"
+ 
+ #define SOCKET_NAME_RIL_PPP "rild-ppp"
++#define WIFI_INTERFACE "wlan0"
++
++int check_wlan0_state()
++{
++	struct ifreq ifr;
++	int s;
++	int updown;
++	int ret = -1;
++	memset(&ifr, 0, sizeof(struct ifreq));
++	strcpy(ifr.ifr_name,WIFI_INTERFACE);
++	if((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
++	    return ret;
++
++	ioctl(s, SIOCGIFFLAGS, &ifr);
++
++	if (ifr.ifr_flags & IFF_UP)
++	    ret = 0;
++
++	close(s);
++	return ret;
++	
++}
+ 
+ void sendNotification()
+ {
+@@ -97,10 +119,15 @@ int main(int argc, char **argv)
+ 	property_set("net.ppp0.remote-ip", "");
+ 	property_set("net.ppp0.dns1", "");
+ 	property_set("net.ppp0.dns2", "");
+-	property_set("net.dns1", "");
+-	property_set("net.dns2", "");
++
++	if (check_wlan0_state() != 0) {
++	    /* only reset gobal dns when wifi not running. */
++	    property_set("net.dns1", "");
++	    property_set("net.dns2", "");
++	}
+     }
+     //Send a notification to rild
+     sendNotification();
+     return 0;
+ }
++
+-- 
+1.8.0
+

@@ -1,0 +1,334 @@
+From 5c0938e42422ba91f7100144ea140c255ebae897 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Thu, 15 Jul 2010 12:34:50 +0800
+Subject: [PATCH 119/249] ENGR00125035 Add PxP user-space library
+
+This library provides an interface to access PxP staff
+with a lightweight API.
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ pxp/Makefile  |  37 ++++++++++
+ pxp/pxp_lib.c | 215 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ pxp/pxp_lib.h |  43 ++++++++++++
+ 3 files changed, 295 insertions(+)
+ create mode 100644 pxp/Makefile
+ create mode 100644 pxp/pxp_lib.c
+ create mode 100644 pxp/pxp_lib.h
+
+diff --git a/pxp/Makefile b/pxp/Makefile
+new file mode 100644
+index 0000000..17699fe
+--- /dev/null
++++ b/pxp/Makefile
+@@ -0,0 +1,37 @@
++CC=$(CROSS_COMPILE)gcc
++AR=$(CROSS_COMPILE)ar
++
++# list of platforms which want this test case
++INCLUDE_LIST:=IMX50 IMX51 IMX5
++
++OBJ = pxp_lib.o
++
++LIBNAME = libpxp
++
++ifeq ($(PLATFORM), $(findstring $(PLATFORM), $(INCLUDE_LIST)))
++
++all: $(LIBNAME).so $(LIBNAME).a
++
++install: install_headers
++	@mkdir -p $(DEST_DIR)/usr/lib
++	cp $(LIBNAME).* $(DEST_DIR)/usr/lib
++
++install_headers:
++	@mkdir -p $(DEST_DIR)/usr/include
++	cp pxp_lib.h $(DEST_DIR)/usr/include
++else
++all install :
++endif
++
++%.o: %.c
++	$(CC) -D$(PLATFORM) $(INCLUDE) -Wall -O2 -fPIC -c $^ -o $@
++
++$(LIBNAME).so: $(OBJ)
++	$(CC) -shared -nostartfiles -Wl,-soname,$@ $^ -o $@
++
++$(LIBNAME).a: $(OBJ)
++	$(AR) -rc $@  $^
++
++.PHONY: clean
++clean:
++	rm -f $(LIBNAME).* $(OBJ)
+diff --git a/pxp/pxp_lib.c b/pxp/pxp_lib.c
+new file mode 100644
+index 0000000..78e6b93
+--- /dev/null
++++ b/pxp/pxp_lib.c
+@@ -0,0 +1,215 @@
++/*
++ * pxp_lib - a user space library for PxP
++ *
++ * Copyright (C) 2010 Freescale Semiconductor, Inc.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include "pxp_lib.h"
++
++#define	PXP_DEVICE_NAME	"/dev/pxp_device"
++
++#define DBG_DEBUG		3
++#define DBG_INFO		2
++#define DBG_WARNING		1
++#define DBG_ERR			0
++
++static int debug_level = DBG_ERR;
++#define dbg(flag, fmt, args...)	{ if(flag <= debug_level)  printf("%s:%d "fmt, __FILE__, __LINE__,##args); }
++
++static int fd = -1;
++static int active_open_nr;
++
++int pxp_init(void)
++{
++	if (fd > 0) {
++		active_open_nr++;
++		return 0;
++	}
++
++	if (fd < 0) {
++		fd = open(PXP_DEVICE_NAME, O_RDWR, 0);
++		if (fd < 0) {
++			dbg(DBG_ERR, "open file error.\n");
++			return -1;
++		}
++	}
++
++	active_open_nr++;
++	return 0;
++}
++
++int pxp_request_channel(pxp_chan_handle_t *pxp_chan)
++{
++	int cid;
++	int ret = 0;
++
++	ret = ioctl(fd, PXP_IOC_GET_CHAN, &cid);
++	if (ret < 0)
++		return -1;
++
++	pxp_chan->chan_id = cid;
++	return 0;
++}
++
++void pxp_release_channel(pxp_chan_handle_t *pxp_chan)
++{
++	ioctl(fd, PXP_IOC_PUT_CHAN, &(pxp_chan->chan_id));
++}
++
++int pxp_config_channel(pxp_chan_handle_t *pxp_chan, struct pxp_config_data *pxp_conf)
++{
++	int ret = 0;
++
++	pxp_conf->chan_id = pxp_chan->chan_id;
++	dbg(DBG_INFO, "chan_id %d\n\n", pxp_conf->chan_id);
++
++	ret = ioctl(fd, PXP_IOC_CONFIG_CHAN, pxp_conf);
++
++	return ret;
++}
++
++int pxp_start_channel(pxp_chan_handle_t *pxp_chan)
++{
++	int ret = 0;
++
++	ret = ioctl(fd, PXP_IOC_START_CHAN, &(pxp_chan->chan_id));
++
++	return ret;
++}
++
++int pxp_wait_for_completion(pxp_chan_handle_t *pxp_chan, int times)
++{
++	int _times = 0;
++	int ret = 0;
++
++	while ((ret = ioctl(fd, PXP_IOC_WAIT4CMPLT, pxp_chan)) < 0) {
++		_times++;
++		if (_times >= times) {
++			return ret;
++		}
++	}
++
++	return ret;
++}
++
++void pxp_uninit(void)
++{
++	if (fd == -1)
++		return;
++
++	if (active_open_nr > 1) {
++		active_open_nr--;
++	} else if (active_open_nr == 1) {
++		active_open_nr--;
++		if (fd > 0) {
++			close(fd);
++			fd = -1;
++		}
++	}
++}
++
++/*
++ * Below are helper functions to alloc/free the phy/virt buffer
++ */
++int pxp_get_phymem(struct pxp_mem_desc *mem)
++{
++	if (ioctl(fd, PXP_IOC_GET_PHYMEM, mem) < 0) {
++		mem->phys_addr = 0;
++		mem->cpu_addr = 0;
++		dbg(DBG_ERR, "PXP_IOC_GET_PHYMEM err\n");
++		return -1;
++	}
++
++	dbg(DBG_INFO, "succeed mem.phys_addr = 0x%08x\n", mem->phys_addr);
++	return 0;
++}
++
++int pxp_put_phymem(struct pxp_mem_desc *mem)
++{
++	if (ioctl(fd, PXP_IOC_PUT_PHYMEM, mem) < 0) {
++		mem->phys_addr = 0;
++		mem->cpu_addr = 0;
++		dbg(DBG_ERR, "PXP_IOC_PUT_PHYMEM err\n");
++		return -1;
++	}
++
++	dbg(DBG_DEBUG, "succeed\n");
++	return 0;
++}
++
++int pxp_get_virtmem(struct pxp_mem_desc *mem)
++{
++	void *va_addr;
++
++	va_addr = mmap(NULL, mem->size, PROT_READ | PROT_WRITE,
++				      MAP_SHARED, fd, mem->phys_addr);
++
++	if (va_addr == MAP_FAILED) {
++		mem->virt_uaddr = 0;
++		dbg(DBG_ERR, "MAP_FAILED.\n");
++		return -1;
++	}
++
++	mem->virt_uaddr = (unsigned long)va_addr;
++	dbg(DBG_INFO, "virt addr = %08x\n", mem->virt_uaddr);
++
++	return 0;
++}
++
++int pxp_put_virtmem(struct pxp_mem_desc *mem)
++{
++	if (mem->virt_uaddr != 0) {
++		if (munmap((void *)mem->virt_uaddr, mem->size) != 0)
++			dbg(DBG_ERR, "UNMAP_FAILED.\n");
++	}
++
++	mem->virt_uaddr = 0;
++	return 0;
++}
++
++int pxp_get_mem(struct pxp_mem_desc *mem)
++{
++	int ret;
++
++	ret = pxp_get_phymem(mem);
++	if (ret < 0)
++		return ret;
++
++	ret = pxp_get_virtmem(mem);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++int pxp_put_mem(struct pxp_mem_desc *mem)
++{
++	int ret;
++
++	ret = pxp_put_virtmem(mem);
++	if (ret < 0)
++		return ret;
++
++	ret = pxp_put_phymem(mem);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
+diff --git a/pxp/pxp_lib.h b/pxp/pxp_lib.h
+new file mode 100644
+index 0000000..ae4aed5
+--- /dev/null
++++ b/pxp/pxp_lib.h
+@@ -0,0 +1,43 @@
++/*
++ * pxp_lib - a user space library for PxP
++ *
++ * Copyright (C) 2010 Freescale Semiconductor, Inc.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++#ifndef	PXP_LIB_H
++#define	PXP_LIB_H
++
++#include <linux/pxp_dma.h>
++
++#ifndef true
++#define true    1
++#endif
++#ifndef false
++#define false   0
++#endif
++
++typedef struct pxp_chan_handle {
++	int chan_id;
++	int hist_status;
++} pxp_chan_handle_t;
++
++int pxp_init();
++void pxp_uninit();
++int pxp_request_channel(pxp_chan_handle_t *pxp_chan);
++void pxp_release_channel(pxp_chan_handle_t *pxp_chan);
++int pxp_config_channel(pxp_chan_handle_t *pxp_chan, struct pxp_config_data *pxp_conf);
++int pxp_start_channel(pxp_chan_handle_t *pxp_chan);
++int pxp_wait_for_completion(pxp_chan_handle_t *pxp_chan, int times);
++int pxp_get_mem(struct pxp_mem_desc *mem);
++int pxp_put_mem(struct pxp_mem_desc *mem);
++
++#endif
+-- 
+1.8.0
+

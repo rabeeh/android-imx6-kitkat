@@ -1,0 +1,165 @@
+From 8f68c0017ed899a1bd21a98b198f69c4c6f5a1e1 Mon Sep 17 00:00:00 2001
+From: Yaoming Qin <b10945@freescale.com>
+Date: Wed, 8 Dec 2010 09:29:01 +0800
+Subject: [PATCH 097/486] ENGR00136116  Add the CSC to support the
+ CAMERA_MSG_PREVIEW_FRAME
+
+considerd of UVC Camera and VPU encoder, so the Camera output is set
+to I420, so add a csc to convert the captured preview frame to YUV420SP.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ libcamera/CameraHal.cpp | 65 +++++++++++++++++++++++++++++++++++++++++--------
+ libcamera/CameraHal.h   |  5 +++-
+ 2 files changed, 59 insertions(+), 11 deletions(-)
+
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index 7cbdaab..b7c6575 100755
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -654,6 +654,7 @@ void CameraHal::previewOneFrame()
+     image_size = mRecordFrameSize;
+     display_index = buffer_index_maps[display_head];
+ 
++	//for vpu enc, the buffer format is I420
+     if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+         nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+         for(i = 0 ; i < VIDEO_OUTPUT_BUFFER_NUM; i ++) {
+@@ -672,11 +673,16 @@ void CameraHal::previewOneFrame()
+                  LOGD("no Buffer can be used for record\n");
+     }
+ 
++	// for preview frame, the format should be YUV420SP(NV21)
+     if (mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
+-        if (mRecordFormat != V4L2_PIX_FMT_YUYV)
+-            memcpy(mPreviewBuffers[display_index]->pointer(),
+-                     (void*)mCaptureBuffers[display_index].virt_start, image_size);
+-        mDataCb(CAMERA_MSG_PREVIEW_FRAME, mPreviewBuffers[display_index], mCallbackCookie);
++        if (mRecordFormat == V4L2_PIX_FMT_YUYV)
++            convertI420toYUV420SP((uint8_t*)(mPreviewBuffers[display_index]->pointer()),
++                  (uint8_t*)(mPreviewConvertBuffers[display_index]->pointer()),mRecordWidth, mRecordHeight);
++		else
++			convertI420toYUV420SP((uint8_t*)(mCaptureBuffers[display_index].virt_start),
++                 (uint8_t*)(mPreviewConvertBuffers[display_index]->pointer()),mRecordWidth, mRecordHeight);
++
++        mDataCb(CAMERA_MSG_PREVIEW_FRAME, mPreviewConvertBuffers[display_index], mCallbackCookie);
+     }
+ 
+     pthread_mutex_lock(&mOverlay_sem);
+@@ -843,9 +849,9 @@ int CameraHal::previewCaptureFrameThread()
+ #endif
+ 	nCameraBuffersQueued--;
+ 
+-	/* Convert YUYV to YUV420SP and put to mPreviewBuffer */
++	/* Convert YUYV to NV12 and put to mPreviewBuffer */
+ 	if (mRecordFormat == V4L2_PIX_FMT_YUYV) {
+-	    convertYUYVtoYUV420SP(mCaptureBuffers[cfilledbuffer.index].virt_start,
++	    convertYUYVtoI420(mCaptureBuffers[cfilledbuffer.index].virt_start,
+ 				  (uint8_t *)mPreviewBuffers[cfilledbuffer.index]->pointer(), mRecordWidth, mRecordHeight);
+ 	}
+ 
+@@ -889,12 +895,19 @@ status_t CameraHal::startPreview()
+ 
+     LOGD("Clear the old preview memory and Init new memory");
+     mPreviewHeap.clear();
+-    for (i = 0; i< 3; i++)
++    for (i = 0; i< CAPTURE_BUFFER_NUM; i++)
+         mPreviewBuffers[i].clear();
+     mPreviewHeap = new MemoryHeapBase(mRecordFrameSize * VIDEO_OUTPUT_BUFFER_NUM);
+-    for (i = 0; i < 3; i++)
++    for (i = 0; i < CAPTURE_BUFFER_NUM; i++)
+        mPreviewBuffers[i] = new MemoryBase(mPreviewHeap, mRecordFrameSize * i, mRecordFrameSize);
+ 
++    mPreviewConvertHeap.clear();
++    for (i = 0; i< CAPTURE_BUFFER_NUM; i++)
++        mPreviewConvertBuffers[i].clear();
++    mPreviewConvertHeap = new MemoryHeapBase(mRecordFrameSize * VIDEO_OUTPUT_BUFFER_NUM);
++    for (i = 0; i < CAPTURE_BUFFER_NUM; i++)
++       mPreviewConvertBuffers[i] = new MemoryBase(mPreviewConvertHeap, mRecordFrameSize * i, mRecordFrameSize);
++
+     cameraPreviewStart();
+ 
+     sem_init(&avaiable_show_frame, 0, 0);
+@@ -1120,7 +1133,7 @@ status_t CameraHal::cancelAutoFocus()
+     return NO_ERROR;
+ }
+ 
+-void CameraHal::convertYUYVtoYUV420SP(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height)
++void CameraHal::convertYUYVtoI420(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height)
+ {
+     /* Color space conversion from YUYV to YUV420SP */
+     int src_size = 0, out_size = 0;
+@@ -1153,6 +1166,38 @@ void CameraHal::convertYUYVtoYUV420SP(uint8_t *inputBuffer, uint8_t *outputBuffe
+     }
+ }
+ 
++
++
++
++void CameraHal::convertI420toYUV420SP(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height)
++{
++    /* Color space conversion from I420 to YUV420SP */
++    int Ysize = 0, UVsize = 0;
++    uint8_t *Yin, *Uin, *Vin, *Yout, *Uout, *Vout;
++
++    Ysize = width * height;
++	UVsize = width *  height >> 2;
++
++	Yin = inputBuffer;
++	Uin = Yin + Ysize;
++	Vin = Uin + UVsize;
++
++	Yout = outputBuffer;
++	Vout = Yout + Ysize;
++	Uout = Vout + 1;
++
++	memcpy(Yout, Yin, Ysize);
++
++    for(int k = 0; k < UVsize; k++) {
++        *Uout = *Uin;
++        *Vout = *Vin;
++        Uin += 1;
++		Vin += 1;
++		Uout += 2;
++		Vout += 2;
++    }
++}
++
+ int CameraHal::cameraTakePicture()
+ {
+ 
+@@ -1215,7 +1260,7 @@ int CameraHal::cameraTakePicture()
+         error_status = -1;
+     }
+ 
+-    convertYUYVtoYUV420SP(mCaptureBuffers[cfilledbuffer.index].virt_start,
++    convertYUYVtoI420(mCaptureBuffers[cfilledbuffer.index].virt_start,
+                           buf1, mPictureWidth, mPictureHeight);
+ 
+     target_size = mPictureWidth * mPictureHeight * 3 / 2;
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index 67d34db..6e7d4b7 100755
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -186,7 +186,8 @@ private:
+     int validateSize(int w, int h);
+     void* cropImage(unsigned long buffer);
+ 
+-    void convertYUYVtoYUV420SP(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height);
++    void convertYUYVtoI420(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height);
++	void convertI420toYUV420SP(uint8_t *inputBuffer, uint8_t *outputBuffer, int width, int height);
+     int uvcGetDeviceAndCapability(char *sizes_buf);
+ 
+     sp<MemoryBase> encodeImage(void *buffer, uint32_t bufflen);
+@@ -209,6 +210,8 @@ private:
+ 
+     sp<MemoryHeapBase>  mPreviewHeap;
+     sp<MemoryBase>      mPreviewBuffers[CAPTURE_BUFFER_NUM]; // used when UVC camera
++    sp<MemoryHeapBase>  mPreviewConvertHeap;
++    sp<MemoryBase>      mPreviewConvertBuffers[CAPTURE_BUFFER_NUM];
+     bool                mPreviewRunning;
+     int                 mRecordHeight;
+     int                 mRecordWidth;
+-- 
+1.8.0
+

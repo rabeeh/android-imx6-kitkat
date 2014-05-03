@@ -1,0 +1,1891 @@
+From d6e4377625d6dab117b9266f6aef6ee54ae95165 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Tue, 11 Dec 2012 10:28:39 +0800
+Subject: [PATCH 393/486] ENGR00215174 enable dual display for android-4.2.
+
+refine hwcomposer and gralloc code to support
+dual display for android-4.2.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/hwcomposer/Android.mk               |   2 +-
+ mx6/hwcomposer/hwc_context.h            |  36 +++-
+ mx6/hwcomposer/hwc_display.cpp          | 258 +++++++++++++++++++++++++++++
+ mx6/hwcomposer/hwc_vsync.cpp            |  68 +++++++-
+ mx6/hwcomposer/hwc_vsync.h              |   4 +-
+ mx6/hwcomposer/hwcomposer.cpp           | 220 ++++++++++++++++---------
+ mx6/libgralloc_wrapper/Android.mk       |   3 +-
+ mx6/libgralloc_wrapper/DisplayCommand.h |  78 ---------
+ mx6/libgralloc_wrapper/display_mode.cpp | 274 -------------------------------
+ mx6/libgralloc_wrapper/display_mode.h   |  62 -------
+ mx6/libgralloc_wrapper/framebuffer.cpp  | 283 +++-----------------------------
+ mx6/libgralloc_wrapper/gralloc.cpp      |  92 +++++++----
+ mx6/libgralloc_wrapper/gralloc_priv.h   |  12 +-
+ mx6/libgralloc_wrapper/mapper.cpp       |   3 +-
+ 14 files changed, 595 insertions(+), 800 deletions(-)
+ create mode 100644 mx6/hwcomposer/hwc_display.cpp
+ delete mode 100755 mx6/libgralloc_wrapper/DisplayCommand.h
+ delete mode 100644 mx6/libgralloc_wrapper/display_mode.cpp
+ delete mode 100644 mx6/libgralloc_wrapper/display_mode.h
+
+diff --git a/mx6/hwcomposer/Android.mk b/mx6/hwcomposer/Android.mk
+index 87cb9a3..ad5f279 100755
+--- a/mx6/hwcomposer/Android.mk
++++ b/mx6/hwcomposer/Android.mk
+@@ -22,7 +22,7 @@ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+ LOCAL_SHARED_LIBRARIES := liblog libEGL libcutils libutils libui libhardware libhardware_legacy libbinder
+-LOCAL_SRC_FILES := hwcomposer.cpp hwc_vsync.cpp
++LOCAL_SRC_FILES := hwcomposer.cpp hwc_vsync.cpp hwc_display.cpp
+ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+ LOCAL_C_INCLUDES += hardware/imx/mx6/libgralloc_wrapper
+ LOCAL_CFLAGS:= -DLOG_TAG=\"hwcomposer\"
+diff --git a/mx6/hwcomposer/hwc_context.h b/mx6/hwcomposer/hwc_context.h
+index eb06bb5..0b238e8 100644
+--- a/mx6/hwcomposer/hwc_context.h
++++ b/mx6/hwcomposer/hwc_context.h
+@@ -21,6 +21,8 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ 
++#undef LOG_TAG
++#define LOG_TAG "FslHwcomposer"
+ #include <cutils/log.h>
+ #include <cutils/atomic.h>
+ #include <cutils/properties.h>
+@@ -37,19 +39,45 @@
+ /*****************************************************************************/
+ #define HWC_VIV_HARDWARE_MODULE_ID "hwcomposer_viv"
+ #define HWC_MAIN_FB "/dev/graphics/fb0"
++#define HWC_MAX_FB 6
++#define HWC_PATH_LENGTH 256
++#define HWC_STRING_LENGTH 32
++#define HWC_FB_PATH "/dev/graphics/fb"
++#define HWC_FB_SYS "/sys/class/graphics/fb"
+ 
+ class VSyncThread;
+ 
++enum {
++    HWC_DISPLAY_LDB = 1,
++    HWC_DISPLAY_HDMI = 2,
++    HWC_DISPLAY_DVI = 3
++};
++
++typedef struct {
++    int fb_num;
++    bool connected;
++    int type;
++    int fd;
++    int vsync_period;
++    int xres;
++    int yres;
++    int xdpi;
++    int ydpi;
++} displayInfo;
++
+ struct hwc_context_t {
+-    hwc_composer_device_t device;
++    hwc_composer_device_1 device;
+     /* our private state goes below here */
++    displayInfo mDispInfo[HWC_NUM_DISPLAY_TYPES];
++    //hwc_layer_list_t* mDispList[HWC_NUM_DISPLAY_TYPES];
++    //size_t mListCapacity[HWC_NUM_DISPLAY_TYPES];
+ 
+-    int m_mainfb_fd;
+-    float m_mainfb_fps;
+     hwc_procs_t* m_callback;
+     bool m_vsync_enable;
+     sp<VSyncThread> m_vsync_thread;
+-    hwc_composer_device_t* m_viv_hwc;
++    //hwc_composer_device_t* m_viv_hwc;
++    hw_module_t const *m_gralloc_module;
++    framebuffer_device_t* mFbDev[HWC_NUM_DISPLAY_TYPES];
+ };
+ 
+ #endif
+diff --git a/mx6/hwcomposer/hwc_display.cpp b/mx6/hwcomposer/hwc_display.cpp
+new file mode 100644
+index 0000000..fccce34
+--- /dev/null
++++ b/mx6/hwcomposer/hwc_display.cpp
+@@ -0,0 +1,258 @@
++/*
++ * Copyright (C) 2009-2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++#include <hardware/hardware.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++#include <cutils/properties.h>
++#include <utils/threads.h>
++#include <hardware/hwcomposer.h>
++#include <hardware_legacy/uevent.h>
++#include <utils/StrongPointer.h>
++
++#include <linux/mxcfb.h>
++#include <linux/ioctl.h>
++#include <EGL/egl.h>
++#include "gralloc_priv.h"
++#include "hwc_context.h"
++#include "hwc_vsync.h"
++
++static int hwc_judge_display_state(struct hwc_context_t* ctx)
++{
++    char fb_path[HWC_PATH_LENGTH];
++    char tmp[HWC_PATH_LENGTH];
++    char value[HWC_STRING_LENGTH];
++    FILE *fp;
++    int dispid = 0;
++
++    for (int i=0; i<HWC_MAX_FB; i++) {
++        if(dispid >= HWC_NUM_DISPLAY_TYPES) {
++            ALOGW("system can't support more than %d devices", dispid);
++            break;
++        }
++
++        displayInfo *pInfo = &ctx->mDispInfo[dispid];
++        memset(fb_path, 0, sizeof(fb_path));
++        snprintf(fb_path, HWC_PATH_LENGTH, HWC_FB_SYS"%d", i);
++        //check the fb device exist.
++        if (!(fp = fopen(fb_path, "r"))) {
++            ALOGW("open %s failed", fb_path);
++            continue;
++        }
++        fclose(fp);
++
++        //check if it is a real device
++        memset(tmp, 0, sizeof(tmp));
++        strcpy(tmp, fb_path);
++        strcat(tmp, "/name");
++        if (!(fp = fopen(tmp, "r"))) {
++            ALOGW("open %s failed", tmp);
++            continue;
++        }
++        memset(value, 0, sizeof(value));
++        if (!fgets(value, sizeof(value), fp)) {
++            ALOGE("Unable to read fb%d name %s", i, tmp);
++            fclose(fp);
++            continue;
++        }
++        if (strstr(value, "FG")) {
++            ALOGI("fb%d is overlay device", i);
++            fclose(fp);
++            continue;
++        }
++        fclose(fp);
++
++        //read fb device name
++        memset(tmp, 0, sizeof(tmp));
++        strcpy(tmp, fb_path);
++        strcat(tmp, "/fsl_disp_dev_property");
++        if (!(fp = fopen(tmp, "r"))) {
++            ALOGI("open %s failed", tmp);
++            continue;
++            //make default type to ldb.
++            //pInfo->type = HWC_DISPLAY_LDB;
++            //pInfo->connected = true;
++        }
++        else {
++            memset(value, 0, sizeof(value));
++            if (!fgets(value, sizeof(value), fp)) {
++                ALOGI("read %s failed", tmp);
++                continue;
++                //make default type to ldb.
++                //pInfo->type = HWC_DISPLAY_LDB;
++                //pInfo->connected = true;
++            }
++            else if (strstr(value, "hdmi")) {
++                ALOGI("fb%d is %s device", i, value);
++                pInfo->type = HWC_DISPLAY_HDMI;
++            }
++            else if (strstr(value, "dvi")) {
++                ALOGI("fb%d is %s device", i, value);
++                pInfo->type = HWC_DISPLAY_DVI;
++            }
++            else {
++                ALOGI("fb%d is %s device", i, value);
++                pInfo->type = HWC_DISPLAY_LDB;
++                pInfo->connected = true;
++            }
++            fclose(fp);
++        }
++
++        pInfo->fb_num = i;
++        if(pInfo->type != HWC_DISPLAY_LDB) {
++            //judge connected device state
++            memset(tmp, 0, sizeof(tmp));
++            strcpy(tmp, fb_path);
++            strcat(tmp, "/disp_dev/cable_state");
++            if (!(fp = fopen(tmp, "r"))) {
++                ALOGI("open %s failed", tmp);
++                //make default to false.
++                pInfo->connected = false;
++            }
++            else {
++                memset(value,  0, sizeof(value));
++                if (!fgets(value, sizeof(value), fp)) {
++                    ALOGI("read %s failed", tmp);
++                    //make default to false.
++                    pInfo->connected = false;
++                }
++                else if (strstr(value, "plugin")) {
++                    ALOGI("fb%d device %s", i, value);
++                    pInfo->connected = true;
++                }
++                else {
++                    ALOGI("fb%d device %s", i, value);
++                    pInfo->connected = false;
++                }
++                fclose(fp);
++            }
++        }
++
++        dispid ++;
++    }
++
++    return 0;
++}
++
++int hwc_get_framebuffer_info(displayInfo *pInfo)
++{
++    char fb_path[HWC_PATH_LENGTH];
++    int refreshRate;
++
++    memset(fb_path, 0, sizeof(fb_path));
++    snprintf(fb_path, HWC_PATH_LENGTH, HWC_FB_PATH"%d", pInfo->fb_num);
++    pInfo->fd = open(fb_path, O_RDWR);
++    if(pInfo->fd < 0) {
++        ALOGE("open %s failed", fb_path);
++        return BAD_VALUE;
++    }
++
++    struct fb_var_screeninfo info;
++    if (ioctl(pInfo->fd, FBIOGET_VSCREENINFO, &info) == -1) {
++        ALOGE("FBIOGET_VSCREENINFO ioctl failed: %s", strerror(errno));
++        close(pInfo->fd);
++        return BAD_VALUE;
++    }
++
++    refreshRate = 1000000000000LLU /
++        (
++         uint64_t( info.upper_margin + info.lower_margin + info.yres + info.vsync_len)
++         * ( info.left_margin  + info.right_margin + info.xres + info.hsync_len)
++         * info.pixclock
++        );
++
++    if (refreshRate == 0) {
++        ALOGW("invalid refresh rate, assuming 60 Hz");
++        refreshRate = 60;
++    }
++
++    pInfo->xres = info.xres;
++    pInfo->yres = info.yres;
++    pInfo->xdpi = 1000 * (info.xres * 25.4f) / info.width;
++    pInfo->ydpi = 1000 * (info.yres * 25.4f) / info.height;
++    pInfo->vsync_period  = 1000000000 / refreshRate;
++
++    ALOGV("using\n"
++          "xres         = %d px\n"
++          "yres         = %d px\n"
++          "width        = %d mm (%f dpi)\n"
++          "height       = %d mm (%f dpi)\n"
++          "refresh rate = %d Hz\n",
++          dev->xres, dev->yres, info.width, dev->xdpi / 1000.0,
++          info.height, dev->ydpi / 1000.0, refreshRate);
++
++    return NO_ERROR;
++}
++#if 0
++static int hwc_get_framebuffer_info(struct hwc_context_t* ctx)
++{
++    struct fb_var_screeninfo info;
++    if (ioctl(ctx->m_mainfb_fd, FBIOGET_VSCREENINFO, &info) == -1) {
++        ALOGE("<%s,%d> FBIOGET_VSCREENINFO failed", __FUNCTION__, __LINE__);
++        return -errno;
++    }
++
++    int refreshRate = 1000000000000000LLU / (uint64_t(info.upper_margin +
++                                                      info.lower_margin +
++                                                      info.yres +
++                                                      info.vsync_len) *
++                                             (info.left_margin  +
++                                              info.right_margin +
++                                              info.xres +
++                                              info.hsync_len) * info.pixclock);
++    if (refreshRate == 0)
++        refreshRate = 60 * 1000;  // 60 Hz
++
++    ctx->m_mainfb_fps = refreshRate / 1000.0f;
++    return 0;
++}
++#endif
++int hwc_get_display_info(struct hwc_context_t* ctx)
++{
++    int err = 0;
++    int dispid = 0;
++
++    hwc_judge_display_state(ctx);
++    for(dispid=0; dispid<HWC_NUM_DISPLAY_TYPES; dispid++) {
++        displayInfo *pInfo = &ctx->mDispInfo[dispid];
++        if(pInfo->connected) {
++            err = hwc_get_framebuffer_info(pInfo);
++        }
++    }
++
++    return err;
++}
++
++
++int hwc_get_display_fbid(struct hwc_context_t* ctx, int disp_type)
++{
++    int fbid = -1;
++    int dispid = 0;
++    for(dispid=0; dispid<HWC_NUM_DISPLAY_TYPES; dispid++) {
++        displayInfo *pInfo = &ctx->mDispInfo[dispid];
++        if(pInfo->type == disp_type) {
++            fbid = pInfo->fb_num;
++            break;
++        }
++    }
++
++    return fbid;
++}
+diff --git a/mx6/hwcomposer/hwc_vsync.cpp b/mx6/hwcomposer/hwc_vsync.cpp
+index 44657e7..4a0050d 100644
+--- a/mx6/hwcomposer/hwc_vsync.cpp
++++ b/mx6/hwcomposer/hwc_vsync.cpp
+@@ -20,6 +20,9 @@
+ 
+ using namespace android;
+ 
++extern int hwc_get_display_fbid(struct hwc_context_t* ctx, int disp_type);
++extern int hwc_get_framebuffer_info(displayInfo *pInfo);
++
+ VSyncThread::VSyncThread(hwc_context_t *ctx)
+     : Thread(false), mCtx(ctx)
+ {
+@@ -36,17 +39,17 @@ status_t VSyncThread::readyToRun()
+     return NO_ERROR;
+ }
+ 
+-void VSyncThread::handleUevent(const char *buff, int len)
++void VSyncThread::handleVsyncUevent(const char *buff, int len)
+ {
+     uint64_t timestamp = 0;
+     const char *s = buff;
+ 
+-    if(!mCtx || !mCtx->m_callback || !mCtx->m_callback->vsync)
++    if (!mCtx || !mCtx->m_callback || !mCtx->m_callback->vsync)
+        return;
+ 
+     s += strlen(s) + 1;
+ 
+-    while(*s) {
++    while (*s) {
+         if (!strncmp(s, "VSYNC=", strlen("VSYNC=")))
+             timestamp = strtoull(s + strlen("VSYNC="), NULL, 0);
+ 
+@@ -58,16 +61,69 @@ void VSyncThread::handleUevent(const char *buff, int len)
+     mCtx->m_callback->vsync(mCtx->m_callback, 0, timestamp);
+ }
+ 
++void VSyncThread::handleHdmiUevent(const char *buff, int len)
++{
++    if (!mCtx || !mCtx->m_callback || !mCtx->m_callback->hotplug)
++        return;
++
++    int fbid = -1;
++    const char *s = buff;
++    s += strlen(s) + 1;
++
++    while (*s) {
++        if (!strncmp(s, "EVENT=plugin", strlen("EVENT=plugin"))) {
++            mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = true;
++            fbid = hwc_get_display_fbid(mCtx, HWC_DISPLAY_HDMI);
++            if (fbid < 0) {
++                ALOGE("unrecognized fb num for hdmi");
++            }
++            else {
++                ALOGI("-----------hdmi---plug--in----");
++                if (mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].xres == 0) {
++                    hwc_get_framebuffer_info(&mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL]);
++                }
++            }
++        }
++        else if (!strncmp(s, "EVENT=plugout", strlen("EVENT=plugout"))) {
++            mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = false;
++            ALOGI("-----------hdmi---plug--out----");
++        }
++
++        s += strlen(s) + 1;
++        if (s - buff >= len)
++            break;
++    }
++
++    if (fbid >= 0 && mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] == NULL && mCtx->m_gralloc_module != NULL) {
++        ALOGI("-----------hdmi---open framebuffer----");
++        mCtx->mFbDev[HWC_DISPLAY_EXTERNAL] = (framebuffer_device_t*)fbid;
++        char fbname[HWC_STRING_LENGTH];
++        memset(fbname, 0, sizeof(fbname));
++        sprintf(fbname, "fb%d", fbid);
++        mCtx->m_gralloc_module->methods->open(mCtx->m_gralloc_module, fbname,
++                     (struct hw_device_t**)&mCtx->mFbDev[HWC_DISPLAY_EXTERNAL]);
++    }
++
++    mCtx->m_callback->hotplug(mCtx->m_callback, HWC_DISPLAY_EXTERNAL, 
++                      mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected);
++}
++
+ bool VSyncThread::threadLoop()
+ {
+     char uevent_desc[4096];
+     memset(uevent_desc, 0, sizeof(uevent_desc));
+     int len = uevent_next_event(uevent_desc, sizeof(uevent_desc) - 2);
+-    const char *pUeventName = FB_VSYNC_EVENT_PREFIX;
+-    bool vsync = !strncmp(uevent_desc, pUeventName, strlen(pUeventName));
++    const char *pVsyncEvent = FB_VSYNC_EVENT_PREFIX;
++    const char *pHdmiEvent = HDMI_PLUG_EVENT;
++    bool vsync = !strncmp(uevent_desc, pVsyncEvent, strlen(pVsyncEvent));
++    bool hdmi = !strncmp(uevent_desc, pHdmiEvent, strlen(pHdmiEvent));
+     if(vsync) {
+-        handleUevent(uevent_desc, len);
++        handleVsyncUevent(uevent_desc, len);
+     }
++    else if(hdmi) {
++        handleHdmiUevent(uevent_desc, len);
++    }
++
+     return true;
+ }
+ 
+diff --git a/mx6/hwcomposer/hwc_vsync.h b/mx6/hwcomposer/hwc_vsync.h
+index 3c3c8f1..f3cd62c 100644
+--- a/mx6/hwcomposer/hwc_vsync.h
++++ b/mx6/hwcomposer/hwc_vsync.h
+@@ -37,6 +37,7 @@
+ /*****************************************************************************/
+ #define FB_VSYNC_EVENT "change@/devices/platform/mxc_sdc_fb.0/graphics/fb0"
+ #define FB_VSYNC_EVENT_PREFIX "change@/devices/platform/mxc_sdc_fb"
++#define HDMI_PLUG_EVENT "change@/devices/platform/mxc_hdmi"
+ 
+ using namespace android;
+ 
+@@ -51,7 +52,8 @@ private:
+     virtual void onFirstRef();
+     virtual status_t readyToRun();
+     virtual bool threadLoop();
+-    void handleUevent(const char *buff, int len);
++    void handleVsyncUevent(const char *buff, int len);
++    void handleHdmiUevent(const char *buff, int len);
+ 
+     hwc_context_t *mCtx;
+ };
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index 2c35b51..96f1a68 100755
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -20,6 +20,7 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ 
++#define HWC_REMOVE_DEPRECATED_VERSIONS 1
+ #include <cutils/log.h>
+ #include <cutils/atomic.h>
+ #include <cutils/properties.h>
+@@ -38,6 +39,7 @@
+ /*****************************************************************************/
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+         struct hw_device_t** device);
++extern int hwc_get_display_info(struct hwc_context_t* ctx);
+ 
+ static struct hw_module_methods_t hwc_module_methods = {
+     open: hwc_device_open
+@@ -59,7 +61,7 @@ hwc_module_t HAL_MODULE_INFO_SYM = {
+ 
+ /*****************************************************************************/
+ 
+-static void dump_layer(hwc_layer_t const* l) {
++static void dump_layer(hwc_layer_1_t const* l) {
+     ALOGD("\ttype=%d, flags=%08x, handle=%p, tr=%02x, blend=%04x, {%d,%d,%d,%d}, {%d,%d,%d,%d}",
+             l->compositionType, l->flags, l->handle, l->transform, l->blending,
+             l->sourceCrop.left,
+@@ -73,54 +75,70 @@ static void dump_layer(hwc_layer_t const* l) {
+ }
+ 
+ /***********************************************************************/
++static int hwc_device_close(struct hw_device_t *dev)
++{
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    if (ctx) {
++        if (ctx->m_vsync_thread != NULL) {
++            ctx->m_vsync_thread->requestExitAndWait();
++        }
++        for (int i=0; i<HWC_NUM_DISPLAY_TYPES; i++) {
++            if(ctx->mDispInfo[i].connected)
++                close(ctx->mDispInfo[i].fd);
++        }
+ 
+-static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+-
+-    struct hwc_context_t *ctx = (struct hwc_context_t *)dev;
+-    if(ctx && ctx->m_viv_hwc && ctx->m_viv_hwc->prepare) {
+-        ctx->m_viv_hwc->prepare(ctx->m_viv_hwc, list);
++        free(ctx);
+     }
+     return 0;
+ }
+ 
+-static int hwc_set(hwc_composer_device_t *dev,
+-        hwc_display_t dpy,
+-        hwc_surface_t sur,
+-        hwc_layer_list_t* list)
++static int hwc_prepare(hwc_composer_device_1_t *dev,
++        size_t numDisplays, hwc_display_contents_1_t** displays)
+ {
+-    struct hwc_context_t *ctx = (struct hwc_context_t *)dev;
+-
+-    EGLBoolean sucess;
+-    if(ctx && ctx->m_viv_hwc && ctx->m_viv_hwc->set) {
+-        sucess = !ctx->m_viv_hwc->set(ctx->m_viv_hwc, dpy, sur, list);
++    if (!numDisplays || !displays || !dev) {
++        ALOGI("%s invalid parameter", __FUNCTION__);
++        return 0;
+     }
+-    else {
+-        sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
++
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    hwc_display_contents_1_t *primary_contents = displays[HWC_DISPLAY_PRIMARY];
++    hwc_display_contents_1_t *external_contents = displays[HWC_DISPLAY_EXTERNAL];
++    if (primary_contents) {
+     }
+-    if (!sucess) {
+-        return HWC_EGL_ERROR;
++
++    if (external_contents) {
+     }
+ 
+     return 0;
+ }
+ 
+-static int hwc_device_close(struct hw_device_t *dev)
++static int hwc_set(struct hwc_composer_device_1 *dev,
++        size_t numDisplays, hwc_display_contents_1_t** displays)
+ {
+-    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+-    if (ctx) {
+-        if(ctx->m_viv_hwc)
+-            hwc_close(ctx->m_viv_hwc);
++    if (!numDisplays || !displays || !dev) {
++        ALOGI("%s invalid parameter", __FUNCTION__);
++        return 0;
++    }
+ 
+-        if(ctx->m_vsync_thread != NULL) {
+-            ctx->m_vsync_thread->requestExitAndWait();
+-        }
+-        free(ctx);
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    hwc_display_contents_1_t *primary_contents = displays[HWC_DISPLAY_PRIMARY];
++    hwc_display_contents_1_t *external_contents = displays[HWC_DISPLAY_EXTERNAL];
++    if (primary_contents) {
++        hwc_layer_1 *fbt = &primary_contents->hwLayers[primary_contents->numHwLayers - 1];
++        if(ctx->mFbDev[HWC_DISPLAY_PRIMARY] != NULL)
++        ctx->mFbDev[HWC_DISPLAY_PRIMARY]->post(ctx->mFbDev[HWC_DISPLAY_PRIMARY], fbt->handle);
+     }
++    
++    if (external_contents) {
++        hwc_layer_1 *fbt = &external_contents->hwLayers[external_contents->numHwLayers - 1];
++        if(ctx->mFbDev[HWC_DISPLAY_EXTERNAL] != NULL)
++        ctx->mFbDev[HWC_DISPLAY_EXTERNAL]->post(ctx->mFbDev[HWC_DISPLAY_EXTERNAL], fbt->handle);
++    }
++
+     return 0;
+ }
+ 
+-#ifdef ENABLE_VSYNC
+-static void hwc_registerProcs(struct hwc_composer_device* dev,
++static void hwc_registerProcs(struct hwc_composer_device_1* dev,
+             hwc_procs_t const* procs) {
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+     if(ctx) {
+@@ -128,14 +146,14 @@ static void hwc_registerProcs(struct hwc_composer_device* dev,
+     }
+ }
+ 
+-static int hwc_eventControl(struct hwc_composer_device* dev, int event, int enabled)
++static int hwc_eventControl(struct hwc_composer_device_1* dev, int dpy, int event, int enabled)
+ {
+     int ret = -EINVAL;
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+     if(ctx && event == HWC_EVENT_VSYNC) {
+         int val = !!enabled;
+         ctx->m_vsync_enable = val;
+-        ret = ioctl(ctx->m_mainfb_fd, MXCFB_ENABLE_VSYNC_EVENT, &val);
++        ret = ioctl(ctx->mDispInfo[0].fd, MXCFB_ENABLE_VSYNC_EVENT, &val);
+         if(ret < 0) {
+             ALOGE("ioctl FB_ENABLE_VSYNC_IOCTL failed: %d, %s", ret, strerror(errno));
+         }
+@@ -147,11 +165,7 @@ static int hwc_eventControl(struct hwc_composer_device* dev, int event, int enab
+     return ret;
+ }
+ 
+-static const struct hwc_methods hwc_methods = {
+-    eventControl: hwc_eventControl
+-};
+-
+-static int hwc_query(struct hwc_composer_device* dev,
++static int hwc_query(struct hwc_composer_device_1* dev,
+         int what, int* value)
+ {
+     struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
+@@ -163,7 +177,7 @@ static int hwc_query(struct hwc_composer_device* dev,
+         break;
+     case HWC_VSYNC_PERIOD:
+         // vsync period in nanosecond
+-        value[0] = 1000000000.0 / ctx->m_mainfb_fps;
++        value[0] = ctx->mDispInfo[0].vsync_period;
+         break;
+     default:
+         // unsupported query
+@@ -172,30 +186,87 @@ static int hwc_query(struct hwc_composer_device* dev,
+     return 0;
+ }
+ 
+-static int hwc_get_framebuffer_info(struct hwc_context_t* ctx)
++static int hwc_blank(struct hwc_composer_device_1 *dev, int disp, int blank)
+ {
+-    struct fb_var_screeninfo info;
+-    if (ioctl(ctx->m_mainfb_fd, FBIOGET_VSCREENINFO, &info) == -1) {
+-        ALOGE("<%s,%d> FBIOGET_VSCREENINFO failed", __FUNCTION__, __LINE__);
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    if (!ctx || disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES) {
++        return 0;
++    }
++
++    int fb_blank = blank ? FB_BLANK_POWERDOWN : FB_BLANK_UNBLANK;
++    int err = ioctl(ctx->mDispInfo[disp].fd, FBIOBLANK, fb_blank);
++    if (err < 0) {
++        ALOGE("blank ioctl failed");
+         return -errno;
+     }
+ 
+-    int refreshRate = 1000000000000000LLU / (uint64_t(info.upper_margin +
+-                                                      info.lower_margin +
+-                                                      info.yres +
+-                                                      info.vsync_len) *
+-                                             (info.left_margin  +
+-                                              info.right_margin +
+-                                              info.xres +
+-                                              info.hsync_len) * info.pixclock);
+-    if (refreshRate == 0)
+-        refreshRate = 60 * 1000;  // 60 Hz
+-
+-    ctx->m_mainfb_fps = refreshRate / 1000.0f;
+     return 0;
+ }
+ 
+-#endif
++static int hwc_getDisplayConfigs(struct hwc_composer_device_1 *dev,
++        int disp, uint32_t *configs, size_t *numConfigs)
++{
++    if (*numConfigs == 0)
++        return 0;
++
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    if (!ctx || disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES) {
++        return -EINVAL;
++    }
++
++    if (ctx->mDispInfo[disp].connected) {
++        configs[0] = 0;
++        *numConfigs = 1;
++        return 0;
++    }
++
++    return -EINVAL;
++}
++
++static int hwc_getDisplayAttributes(struct hwc_composer_device_1 *dev,
++        int disp, uint32_t config, const uint32_t *attributes, int32_t *values)
++{
++    struct hwc_context_t* ctx = (struct hwc_context_t*)dev;
++    if (!ctx || disp < 0 || disp >= HWC_NUM_DISPLAY_TYPES) {
++        return -EINVAL;
++    }
++
++    for (int i = 0; attributes[i] != HWC_DISPLAY_NO_ATTRIBUTE; i++) {
++        switch(attributes[i]) {
++            case HWC_DISPLAY_VSYNC_PERIOD:
++                values[i] = ctx->mDispInfo[disp].vsync_period;
++                break;
++
++            case HWC_DISPLAY_WIDTH:
++                values[i] = ctx->mDispInfo[disp].xres;
++                break;
++
++            case HWC_DISPLAY_HEIGHT:
++                values[i] = ctx->mDispInfo[disp].yres;
++                break;
++
++            case HWC_DISPLAY_DPI_X:
++                if(ctx->mDispInfo[disp].type == HWC_DISPLAY_LDB)
++                    values[i] = ctx->mDispInfo[disp].xdpi;
++                else
++                    values[i] = 0;
++                break;
++
++            case HWC_DISPLAY_DPI_Y:
++                if(ctx->mDispInfo[disp].type == HWC_DISPLAY_LDB)
++                    values[i] = ctx->mDispInfo[disp].ydpi;
++                else
++                    values[i] = 0;
++                break;
++            default:
++                ALOGE("unknown display attribute %u", attributes[i]);
++                continue;
++        }
++    }
++
++    return 0;
++}
++
+ /*****************************************************************************/
+ 
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+@@ -211,37 +282,38 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+ 
+         /* initialize the procs */
+         dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        //dev->device.common.version = HWC_DEVICE_API_VERSION_0_3;
+         dev->device.common.module = const_cast<hw_module_t*>(module);
+         dev->device.common.close = hwc_device_close;
+ 
+         dev->device.prepare = hwc_prepare;
+         dev->device.set = hwc_set;
+-#ifdef ENABLE_VSYNC
+-        dev->device.common.version = HWC_DEVICE_API_VERSION_0_3;
++        dev->device.common.version = HWC_DEVICE_API_VERSION_1_1;
+         dev->device.registerProcs = hwc_registerProcs;
+-        dev->device.methods = &hwc_methods;
++        dev->device.eventControl = hwc_eventControl;
+         dev->device.query = hwc_query;
+ 
+-        //*device = &dev->device.common;
++        dev->device.blank = hwc_blank;
++        dev->device.getDisplayConfigs = hwc_getDisplayConfigs;
++        dev->device.getDisplayAttributes = hwc_getDisplayAttributes;
+ 
+         /* our private state goes below here */
+-        dev->m_mainfb_fd = open(HWC_MAIN_FB, O_RDWR);
+         dev->m_vsync_thread = new VSyncThread(dev);
+-        hwc_get_framebuffer_info(dev);
+-#else
+-        dev->device.common.version = 0;
+-#endif
+-        const hw_module_t *hwc_module;
+-        if(hw_get_module(HWC_VIV_HARDWARE_MODULE_ID,
+-                        (const hw_module_t**)&hwc_module) < 0) {
+-            ALOGE("Error! hw_get_module viv_hwc failed");
+-            goto nor_exit;
+-        }
+-        if(hwc_open(hwc_module, &(dev->m_viv_hwc)) != 0) {
+-            ALOGE("Error! viv_hwc open failed");
+-            goto nor_exit;
++        hwc_get_display_info(dev);
++
++        hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &dev->m_gralloc_module);
++        for(int dispid=0; dispid<HWC_NUM_DISPLAY_TYPES; dispid++) {
++            if(dev->mDispInfo[dispid].connected && dev->m_gralloc_module != NULL) {
++                int fbid = dev->mDispInfo[dispid].fb_num;
++                char fbname[HWC_STRING_LENGTH];
++                memset(fbname, 0, sizeof(fbname));
++                sprintf(fbname, "fb%d", fbid);
++                ALOGI("hwcomposer: open framebuffer %s", fbname);
++                dev->mFbDev[dispid] = (framebuffer_device_t*)fbid;
++                dev->m_gralloc_module->methods->open(dev->m_gralloc_module, fbname,
++                           (struct hw_device_t**)&dev->mFbDev[dispid]);
++            }
+         }
++
+ nor_exit:
+ 
+         *device = &dev->device.common;
+diff --git a/mx6/libgralloc_wrapper/Android.mk b/mx6/libgralloc_wrapper/Android.mk
+index 6a15227..9f186ca 100755
+--- a/mx6/libgralloc_wrapper/Android.mk
++++ b/mx6/libgralloc_wrapper/Android.mk
+@@ -26,8 +26,7 @@ LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libhardware libutils
+ LOCAL_SRC_FILES := 	\
+ 	gralloc.cpp 	\
+ 	framebuffer.cpp \
+-	mapper.cpp      \
+-	display_mode.cpp
++	mapper.cpp
+ 
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX
+diff --git a/mx6/libgralloc_wrapper/DisplayCommand.h b/mx6/libgralloc_wrapper/DisplayCommand.h
+deleted file mode 100755
+index eb2cb2a..0000000
+--- a/mx6/libgralloc_wrapper/DisplayCommand.h
++++ /dev/null
+@@ -1,78 +0,0 @@
+-/*
+-* Copyright (C) 2012 Freescale Semiconductor, Inc.
+-*
+-* Licensed under the Apache License, Version 2.0 (the "License");
+-* you may not use this file except in compliance with the License.
+-* You may obtain a copy of the License at
+-*
+-*      http://www.apache.org/licenses/LICENSE-2.0
+-*
+-* Unless required by applicable law or agreed to in writing, software
+-* distributed under the License is distributed on an "AS IS" BASIS,
+-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-* See the License for the specific language governing permissions and
+-* limitations under the License.
+-*/
+-
+-#ifndef ANDROID_DISPLAY_COMMAND_H
+-#define ANDROID_DISPLAY_COMMAND_H
+-
+-#include <stdint.h>
+-#include <sys/types.h>
+-#include <binder/Parcel.h>
+-#include <utils/Errors.h>
+-#include <utils/String16.h>
+-
+-
+-#define FSL_SETTINGS_PREFERENCE "data/data/com.android.settings/shared_prefs/com.android.settings_preferences.xml"
+-#define FSL_PREFERENCE_KEEPRATE "display_keeprate_0"
+-#define FSL_PREFERENCE_MODE "display_mode_0"
+-#define FSL_PREFERENCE_COLORDEPTH "display_colordepth_0"
+-#define FSL_PREFERENCE_MODE_DEFAULT "keepHighestMode"
+-
+-//namespace android {
+-using namespace android;
+-
+-enum DISPLAY_OPERATE_CODE {
+-    OPERATE_CODE_ENABLE = 0x1000,
+-    OPERATE_CODE_DISABLE = 0x2000,
+-    OPERATE_CODE_CHANGE = 0x4000,
+-    OPERATE_CODE_INVALIDE = 0x8000,
+-
+-    OPERATE_CODE_CHANGE_RESOLUTION = 0x1,
+-    OPERATE_CODE_CHANGE_OVERSCAN = 0x2,
+-    OPERATE_CODE_CHANGE_MIRROR = 0x4,
+-    OPERATE_CODE_CHANGE_COLORDEPTH = 0x8,
+-    OPERATE_CODE_CHANGE_ROTATION = 0x10,
+-    OPERATE_CODE_CHANGE_KEEPRATE = 0x20
+-};
+-
+-enum DISPLAY_SETTING_MODE {
+-    SETTING_MODE_FULL_SCREEN = 0x1000,
+-    SETTING_MODE_KEEP_PRIMARY_RATE = 0x2000,
+-    SETTING_MODE_KEEP_16_9_RATE = 0x4000,
+-    SETTING_MODE_KEEP_4_3_RATE = 0x8000
+-};
+-
+-struct configParam {
+-    configParam() : displayId(-1), operateCode(OPERATE_CODE_INVALIDE),
+-      rotation(0), xOverScan(0), yOverScan(0), mirror(0), colorDepth(0), keepRate(SETTING_MODE_FULL_SCREEN), mode()
+-    {
+-    }
+-
+-    status_t write(Parcel& output) const;
+-    status_t read(const Parcel& input);
+-    int displayId;
+-    int operateCode; //operate code: enable, change or disable display.
+-    int rotation;
+-    int xOverScan;
+-    int yOverScan;
+-    int mirror;
+-    int colorDepth;
+-    int keepRate;
+-    String16 mode;
+-};
+-
+-//};
+-#endif
+-
+diff --git a/mx6/libgralloc_wrapper/display_mode.cpp b/mx6/libgralloc_wrapper/display_mode.cpp
+deleted file mode 100644
+index 9f673b8..0000000
+--- a/mx6/libgralloc_wrapper/display_mode.cpp
++++ /dev/null
+@@ -1,274 +0,0 @@
+-/*
+- * Copyright (C) 2008 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2010-2012 Freescale Semiconductor, Inc. */
+-
+-#include <fcntl.h>
+-#include <errno.h>
+-#include <cutils/properties.h>
+-#include <stdlib.h>
+-#include "display_mode.h"
+-#include "cutils/log.h"
+-
+-static int str2int(char *p, int *len)
+-{
+-        int val = 0;
+-        int length =0;
+-        if(!p) return -1;
+-
+-        while(p[0] >= '0' && p[0] <= '9')
+-        {
+-                val = val * 10 + p[0] - '0';
+-                p++;
+-                length ++;
+-        }
+-    *len = length;
+-        return val;
+-}
+-
+-static int disp_mode_compare( const void *arg1, const void *arg2)
+-{
+-        disp_mode *dm1 = (disp_mode *)arg1;
+-        disp_mode *dm2 = (disp_mode *)arg2;
+-
+-    if(dm1->width  > dm2->width)  return -1;
+-    else if (dm1->width  < dm2->width) return 1;
+-    else {
+-        if(dm1->height > dm2->height) return -1;
+-        else if (dm1->height < dm2->height )  return 1;
+-        else {
+-            if (dm1->freq > dm2->freq ) return -1;
+-            else if (dm1->freq < dm2->freq ) return 1;
+-            else return 0;
+-        }
+-    }
+-
+-        return 0;
+-}
+-
+-static int get_available_mode(int fbid, const char *mode_list)
+-{
+-        int disp_threshold = 0;
+-        int i,disp_mode_count = 0;
+-        read_state state = CHECK_NEXT_STATE;
+-        char *p = (char *)mode_list;
+-        char *start = p;
+-        char *end   = p;
+-    int len = 0;
+-    if(!p) return 0;
+-
+-
+-        while(p[0])
+-        {
+-                switch(state)
+-                {
+-                case CHECK_NEXT_STATE:
+-                        if(!strncmp(p, "D:", 2)
+-                                || !strncmp(p, "S:", 2)
+-                                || !strncmp(p, "U:", 2)
+-                                || !strncmp(p, "V:", 2))
+-                        {
+-                                start = p;
+-                                state = FIND_WIDTH_STATE;
+-                                p+=2;
+-                        }
+-                        else p++;
+-                        break;
+-                case FIND_WIDTH_STATE:
+-                        if(p[0]>='0' && p[0]<='9')
+-                        {
+-                            len = 0;
+-                                disp_class_list[fbid].disp_mode_list[disp_mode_count].width = str2int(p, &len);
+-                                state = FIND_JOINT_STATE;
+-                                p =  p +len;
+-                        }
+-                        else p++;
+-                        break;
+-                case FIND_JOINT_STATE:
+-                        if(p[0] == 'x' || p[0] == 'X')
+-                        {
+-                            p++;
+-                                state = FIND_HEIGHT_STATE;
+-                        }
+-                        else p++;
+-                        break;
+-                case FIND_HEIGHT_STATE:
+-                        if(p[0]>='0' && p[0]<='9')
+-                        {
+-                            len = 0;
+-                                disp_class_list[fbid].disp_mode_list[disp_mode_count].height = str2int(p,&len);
+-                                state = PREFIX_FREQ_STATE;
+-                                p =  p +len;
+-                        }
+-                        else p++;
+-                        break;
+-                case PREFIX_FREQ_STATE:
+-                        if(!strncmp(p, "p-", 2) || !strncmp(p, "i-", 2))
+-                        {
+-                                state = FREQUENCY_STATE;
+-                                p+=2;
+-                        }
+-                        else p++;
+-                        break;
+-                case  FREQUENCY_STATE:
+-                        if(p[0]>='0' && p[0]<='9')
+-                        {
+-                            len = 0;
+-                                disp_class_list[fbid].disp_mode_list[disp_mode_count].freq = str2int(p,&len);
+-                                state = FIND_NEWLINE_STATE;
+-                                p =  p +len;
+-                        }
+-                        else p++;
+-                        break;
+-                case FIND_NEWLINE_STATE:
+-                        if(p[0] == '\n')
+-                        {
+-                                end = p+1;
+-                                strncpy(disp_class_list[fbid].disp_mode_list[disp_mode_count].mode, start, (size_t)end -(size_t)start);
+-                                disp_mode_count ++;
+-                                state = CHECK_NEXT_STATE;
+-                                p++;
+-                if((unsigned int)disp_mode_count >= sizeof(disp_class_list[fbid].disp_mode_list)/sizeof(disp_class_list[fbid].disp_mode_list[0])) goto check_mode_end;
+-                        }
+-                        else p++;
+-                        break;
+-                default:
+-                        p++;
+-                        break;
+-                }
+-        }
+-
+-check_mode_end:
+-
+-        qsort(&disp_class_list[fbid].disp_mode_list[0], disp_mode_count, sizeof(disp_mode), disp_mode_compare);
+-
+-    disp_class_list[fbid].disp_mode_length = disp_mode_count;
+-
+-    return 0;
+-}
+-
+-static disp_mode g_config_mode[32];
+-static int g_config_len = 0;
+-static int read_mode_finished = 0;
+-
+-static int read_graphics_fb_mode(int fb)
+-{
+-    int size=0;
+-    int fp_modes=0;
+-    char fb_modes[1024];
+-    char temp_name[256];
+-
+-    if (g_config_len == 0) {
+-        char conf_modes[1024];
+-        //int size;
+-        memset(conf_modes, 0, sizeof(conf_modes));
+-        memset(&g_config_mode[0], 0, sizeof(g_config_mode));
+-        int fd = open("/system/etc/display_mode_fb0.conf", O_RDONLY, 0);
+-        if(fd < 0) {
+-            ALOGE("Warning: /system/etc/display_mode_fb0.conf not defined");
+-        }
+-        else {
+-            size = read(fd, conf_modes, sizeof(conf_modes));
+-            if(size > 0) {
+-                char* m_start = conf_modes;
+-                int m_len = 0;
+-                char *pmode = conf_modes;
+-                while(*pmode != '\0') {
+-                    if (*pmode == '\n') {
+-                        m_len = pmode - m_start + 1;
+-                        strncpy(g_config_mode[g_config_len].mode, m_start, m_len);
+-                        g_config_len ++;
+-                        m_start = pmode + 1;
+-                    }
+-                    pmode ++;
+-                }//while
+-            }
+-            close(fd);
+-        }//else
+-    }
+-
+-    sprintf(temp_name, "/sys/class/graphics/fb%d/modes", fb);
+-    fp_modes = open(temp_name,O_RDONLY, 0);
+-    if(fp_modes < 0) {
+-        ALOGI("Error %d! Cannot open %s", fp_modes, temp_name);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    memset(fb_modes, 0, sizeof(fb_modes));
+-    size = read(fp_modes, fb_modes, sizeof(fb_modes));
+-    if(size <= 0)
+-    {
+-        ALOGI("Error! Cannot read %s", temp_name);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    close(fp_modes); fp_modes = 0;
+-
+-    if(size == sizeof(fb_modes)) fb_modes[size -1] = 0;
+-
+-    get_available_mode(fb, fb_modes);
+-
+-    read_mode_finished = 1;
+-    return 0;
+-
+-set_graphics_fb_mode_error:
+-
+-    if(fp_modes > 0) close(fp_modes);
+-
+-    return -1;
+-}
+-
+-int isModeValid(int fb, char* pMode, int len)
+-{
+-    int err = 0;
+-    int i;
+-
+-    //ALOGW("isModeValid:pMode=%s, len=%d", pMode, len);
+-    if(read_mode_finished == 0) {
+-        err = read_graphics_fb_mode(fb);
+-        if(err)
+-            return 0;
+-    }
+-
+-    for(i=0; i<disp_class_list[fb].disp_mode_length; i++) {
+-        //ALOGW("isModeValid:disp_mode_list[%d].mode=%s", i, disp_class_list[fb].disp_mode_list[i].mode);
+-        if(!strncmp(disp_class_list[fb].disp_mode_list[i].mode, pMode, len)) {
+-            return 1;
+-        }
+-    }
+-
+-    return 0;
+-}
+-
+-char* getHighestMode(int fb)
+-{
+-    int i = 0;
+-
+-    if(read_mode_finished == 0) {
+-        read_graphics_fb_mode(fb);
+-    }
+-
+-    if(g_config_len > 0) {
+-        for(i = 0; i<g_config_len; i++) {
+-            if(isModeValid(fb, g_config_mode[i].mode, strlen(g_config_mode[i].mode)))
+-                break;
+-        }
+-        return g_config_mode[i].mode;
+-    }
+-
+-    return disp_class_list[fb].disp_mode_list[i].mode;
+-}
+-
+diff --git a/mx6/libgralloc_wrapper/display_mode.h b/mx6/libgralloc_wrapper/display_mode.h
+deleted file mode 100644
+index 88869c9..0000000
+--- a/mx6/libgralloc_wrapper/display_mode.h
++++ /dev/null
+@@ -1,62 +0,0 @@
+-/*
+- * Copyright (C) 2008 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/* Copyright 2010-2012 Freescale Semiconductor, Inc. */
+-
+-#ifndef _DISPLAY_MODE_H_
+-#define _DISPLAY_MODE_H_
+-
+-#define MAX_DISP_DEVICE                  4
+-#define MAX_DISP_DEVICE_MODE                  128
+-
+-typedef int boolean;
+-typedef struct
+-{
+-        char mode[20];
+-        int width;
+-        int height;
+-        int freq;
+-} disp_mode;
+-
+-typedef enum {
+-    CHECK_NEXT_STATE,
+-    FIND_WIDTH_STATE,
+-    FIND_JOINT_STATE,
+-    FIND_HEIGHT_STATE,
+-    PREFIX_FREQ_STATE,
+-    FREQUENCY_STATE,
+-    FIND_NEWLINE_STATE
+-} read_state;
+-
+-typedef struct
+-{
+-    boolean disp_connected;
+-    boolean disp_enabled;
+-    disp_mode disp_mode_list[MAX_DISP_DEVICE_MODE];
+-    int disp_mode_length;
+-} disp_class;
+-
+-//most support 4 pluggable display device;
+-static  disp_class disp_class_list[MAX_DISP_DEVICE];
+-
+-static int   str2int(char *p, int *len);
+-static int   disp_mode_compare( const void *arg1, const void *arg2);
+-
+-static int     get_available_mode(int fbid, const char *mode_list);
+-static int     read_graphics_fb_mode(int fbid);
+-
+-extern int isModeValid(int fb, char* pMode, int len);
+-#endif
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 01ea936..f02abf5 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2010-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,8 +15,6 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2010-2012 Freescale Semiconductor Inc. */
+-
+ #include <sys/mman.h>
+ 
+ #include <dlfcn.h>
+@@ -50,8 +49,6 @@
+ #include <semaphore.h>
+ 
+ #include <utils/String8.h>
+-
+-#include "DisplayCommand.h"
+ #include "gralloc_priv.h"
+ /*****************************************************************************/
+ 
+@@ -76,55 +73,6 @@ struct fb_context_t {
+ 
+ static int nr_framebuffers;
+ 
+-sem_t * fslwatermark_sem_open()
+-{
+-    int fd;
+-    int ret;
+-    sem_t *pSem = NULL;
+-    char *shm_path, shm_file[256];
+-
+-    shm_path = getenv("CODEC_SHM_PATH");      /*the CODEC_SHM_PATH is on a memory map the fs */ 
+-
+-    if (shm_path == NULL)
+-        strcpy(shm_file, "/dev/shm");   /* default path */
+-    else
+-        strcpy(shm_file, shm_path);
+-
+-    strcat(shm_file, "/"); 
+-    strcat(shm_file, "codec.shm");
+-
+-    fd = open(shm_file, O_RDWR, 0666);
+-    if (fd < 0) { 
+-        /* first thread/process need codec protection come here */
+-        fd = open(shm_file, O_RDWR | O_CREAT | O_EXCL, 0666);
+-       if(fd < 0)
+-       {
+-           return NULL;
+-       }
+-       ftruncate(fd, sizeof(sem_t));
+-
+-       /* map the semaphore variant in the file */ 
+-       pSem = (sem_t *)mmap(NULL, sizeof(sem_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+-       if((void *)(-1) == pSem)
+-       {
+-           return NULL;
+-       }
+-       /* do the semaphore initialization */
+-       ret = sem_init(pSem, 0, 1);
+-       if(-1 == ret)
+-       {
+-           return NULL;
+-       }
+-    }
+-    else
+-      pSem = (sem_t *)mmap(NULL, sizeof(sem_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+-
+-    close(fd);
+-
+-    return pSem;
+-}
+-
+-
+ /*****************************************************************************/
+ 
+ static int fb_setSwapInterval(struct framebuffer_device_t* dev,
+@@ -221,126 +169,7 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev)
+ }
+ 
+ /*****************************************************************************/
+-extern int isModeValid(int fb, char* pMode, int len);
+-
+-static int set_graphics_fb_mode(int fb, struct configParam* param)
+-{
+-    char temp_name[256];
+-    char fb_mode[256];
+-    const char *disp_mode = NULL;
+-    char* start_index = 0;
+-    int fd_mode = 0;
+-    int size=0;
+-    int n = 0;
+-
+-    if(param == NULL) {
+-        /*
+-         * file /data/misc/display.conf format:
+-         * mode=S1920:x1080p-60
+-         * colordepth=32
+-         * usage: change fb display mode.
+-        */
+-        int fb_misc = open("/data/misc/display.conf", O_RDWR, 0);
+-        if(fb_misc > 0) {
+-            memset(fb_mode, 0, sizeof(fb_mode));
+-            size = read(fb_misc, fb_mode, sizeof(fb_mode));
+-            if(size > 0) {
+-                disp_mode = fb_mode;
+-                while(*disp_mode != '\0') {
+-                    if(*disp_mode == '\n') {
+-                        disp_mode++;
+-                        n = disp_mode - start_index;
+-                        *(char*)disp_mode = '\0';
+-
+-                        if(!isModeValid(fb, start_index + 1, n-1)) {
+-                            ALOGI("Warning: display %d does not support len:%d, %s", fb, n-1, start_index + 1);
+-                            memset(fb_mode, 0, sizeof(fb_mode));
+-                            memset(temp_name, 0, sizeof(temp_name));
+-                            sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+-                            fd_mode = open(temp_name,O_RDWR, 0);
+-                            if(fd_mode < 0) {
+-                                ALOGI("Error %d! Cannot open %s", fd_mode, temp_name);
+-                                return -1;
+-                            }
+-                            strncpy(fb_mode, "mode=", 5);
+-                            size = 5;
+-                            size += read(fd_mode, fb_mode+size, sizeof(fb_mode)-size);
+-                            ALOGW("fb_mode is %s", fb_mode);
+-                            close(fd_mode);
+-
+-                            memset(temp_name, 0, sizeof(temp_name));
+-                            sprintf(temp_name, "/sys/class/graphics/fb%d/bits_per_pixel", fb);
+-                            fd_mode = open(temp_name, O_RDONLY, 0);
+-                            if(fd_mode < 0) {
+-                                ALOGI("Error %d! Cannot open %s", fd_mode, temp_name);
+-                                return -1;
+-                            }
+-                            strncpy(fb_mode+size, "colordepth=", 11);
+-                            size += 11;
+-                            size += read(fd_mode, fb_mode+size, sizeof(fb_mode)-size);
+-                            ALOGW("fb_mode is size=%d, %s", size, fb_mode);
+-                            close(fd_mode);
+-
+-                            close(fb_misc);
+-                            fb_misc = open("/data/misc/display.conf", O_RDWR | O_TRUNC, 0);
+-                            if(fb_misc < 0)
+-                                return -1;
+-                            write(fb_misc, fb_mode, size);
+-                            close(fb_misc);
+-                            return -1;
+-                        }//end !isModeValid
+-
+-                        memset(temp_name, 0, sizeof(temp_name));
+-			sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+-			fd_mode = open(temp_name,O_RDWR, 0);
+-			if(fd_mode < 0) {
+-			    ALOGI("Error %d! Cannot open %s", fd_mode, temp_name);
+-			    return -1;
+-			}
+-                        write(fd_mode, start_index + 1, n);
+-                        close(fd_mode);
+-                        break;
+-                    }
+-                    if(*disp_mode == '=') start_index = (char*)disp_mode;
+-                    disp_mode++;
+-                }
+-            }
+-        }
+-        close(fb_misc);
+-        return 0;
+-    }
+-
+-    String8 str8_mode(param->mode);
+-    disp_mode = str8_mode.string();
+-    if(disp_mode == NULL) {
+-        ALOGE("<%s,%d> invalide parameter", __FUNCTION__, __LINE__);
+-        return -1;
+-    }
+-    memset(temp_name, 0, sizeof(temp_name));
+-    sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+-    fd_mode = open(temp_name,O_RDWR, 0);
+-    if(fd_mode < 0) {
+-        ALOGI("Error %d! Cannot open %s", fd_mode, temp_name);
+-        return -1;
+-    }
+-
+-    memset(fb_mode, 0, sizeof(fb_mode));
+-    n = strlen(disp_mode);
+-    memcpy(fb_mode, disp_mode, n);
+-    fb_mode[n] = '\n';
+-    fb_mode[n + 1] = '\0';
+-    size = write(fd_mode, fb_mode, n + 2);
+-    if(size <= 0)
+-    {
+-        ALOGI("Error %d %s! Cannot write %s", errno, strerror(errno), temp_name);
+-    }
+-
+-    close(fd_mode);
+-
+-    return 0;
+-}
+-
+-static int mapFrameBufferWithParamLocked(struct private_module_t* module, struct configParam* param)
++static int mapFrameBufferWithFbid(struct private_module_t* module, int fbid)
+ {
+     // already initialized...
+     if (module->framebuffer) {
+@@ -355,15 +184,9 @@ static int mapFrameBufferWithParamLocked(struct private_module_t* module, struct
+     int fd = -1;
+     int i=0;
+     char name[64];
+-    int dpy = 0;
+-
+-    if(param != NULL) {
+-        dpy = param->displayId;
+-    }
+-    set_graphics_fb_mode(dpy, param);
+ 
+     while ((fd==-1) && device_template[i]) {
+-        snprintf(name, 64, device_template[i], dpy);
++        snprintf(name, 64, device_template[i], fbid);
+         fd = open(name, O_RDWR, 0);
+         i++;
+     }
+@@ -372,7 +195,7 @@ static int mapFrameBufferWithParamLocked(struct private_module_t* module, struct
+         return -errno;
+     }
+ 
+-    if(param != NULL) {
++    if(fbid != 0) {
+         int blank = FB_BLANK_UNBLANK;
+         if(ioctl(fd, FBIOBLANK, blank) < 0) {
+             ALOGE("<%s, %d> ioctl FBIOBLANK failed", __FUNCTION__, __LINE__);
+@@ -391,21 +214,6 @@ static int mapFrameBufferWithParamLocked(struct private_module_t* module, struct
+         return -errno;
+     }
+ 
+-    if(param != NULL) {
+-        if(param->colorDepth == 16 || param->colorDepth == 32) {
+-            info.bits_per_pixel = param->colorDepth;
+-        }
+-        if(param->operateCode & OPERATE_CODE_CHANGE_RESOLUTION) {
+-            //info.xres = param->width;
+-            //info.yres = param->height;
+-        }
+-
+-        if(info.bits_per_pixel == 0) { //|| info.xres == 0 || info.yres == 0 
+-            ALOGE("<%s,%d> the bpp or xres yres is 0", __FUNCTION__, __LINE__);
+-            return -1;
+-        }
+-    }
+-
+     info.reserved[0] = 0;
+     info.reserved[1] = 0;
+     info.reserved[2] = 0;
+@@ -572,7 +380,7 @@ static int mapFrameBufferWithParamLocked(struct private_module_t* module, struct
+ 
+ int mapFrameBufferLocked(struct private_module_t* module)
+ {
+-    return mapFrameBufferWithParamLocked(module, NULL);
++    return mapFrameBufferWithFbid(module, 0);
+ }
+ 
+ static int mapFrameBuffer(struct private_module_t* module)
+@@ -611,77 +419,25 @@ static int unMapFrameBuffer(fb_context_t* ctx, struct private_module_t* module)
+ 
+     return err;
+ }
+-
+-static int mapFrameBufferWithParam(struct private_module_t* module, struct configParam* param)
+-{
+-    pthread_mutex_lock(&module->lock);
+-    int err = mapFrameBufferWithParamLocked(module, param);
+-    pthread_mutex_unlock(&module->lock);
+-    return err;
+-}
+ /*****************************************************************************/
+ 
+ static int fb_close(struct hw_device_t *dev)
+ {
+     fb_context_t* ctx = (fb_context_t*)dev;
++    if(ctx) free(ctx);
++    return 0;
++#if 0
++    fb_context_t* ctx = (fb_context_t*)dev;
+     if (ctx) {
+         if (ctx->priv_m != NULL) {
+-            unMapFrameBuffer(ctx, ctx->priv_m);
++            //unMapFrameBuffer(ctx, ctx->priv_m);
+             if(!ctx->isMainDisp)
+                 free(ctx->priv_m);
+         }
+         free(ctx);
+     }
+     return 0;
+-}
+-
+-static void fb_device_init(private_module_t* m, fb_context_t *dev);
+-
+-static int fb_perform(struct gralloc_module_t const* module,
+-        int operation, ... )
+-{
+-    int err = 0;
+-    va_list args;
+-
+-    va_start(args, operation);
+-    struct configParam* param= va_arg(args, struct configParam*);
+-    fb_context_t* ctx = va_arg(args, fb_context_t*);
+-    private_module_t* pm = (private_module_t*)module;
+-    switch(operation & 0xf000) {
+-        case OPERATE_CODE_ENABLE:
+-            err = mapFrameBufferWithParam(pm, param);
+-            if(err >= 0) {
+-                fb_device_init(pm, ctx);
+-            }
+-            break;
+-
+-        case OPERATE_CODE_DISABLE:
+-            err = unMapFrameBuffer(ctx, pm);
+-            break;
+-
+-        case OPERATE_CODE_CHANGE:
+-            switch(operation & 0x0fff) {
+-                case OPERATE_CODE_CHANGE_ROTATION:
+-                case OPERATE_CODE_CHANGE_OVERSCAN: {
+-		    size_t fbSize = pm->framebuffer->size;
+-		    void* addr = (void*)(pm->framebuffer->base);
+-		    memset(addr, 0, fbSize);
+-                    } break;
+-                default:
+-                    ALOGE("<%s, %d> invalide operate code %d!", __FUNCTION__, __LINE__, (int)operation);
+-                    err = -1;
+-                    break;
+-            } 
+-            break;
+-        default:
+-            ALOGE("<%s, %d> invalide operate code %d!", __FUNCTION__, __LINE__, (int)operation);
+-            err = -1;
+-            break;
+-    }
+-
+-    va_end(args);
+- 
+-    return err;
++#endif
+ }
+ 
+ static void fb_device_init(private_module_t* m, fb_context_t *dev)
+@@ -744,24 +500,29 @@ int fb_device_open(hw_module_t const* module, const char* name,
+             dev->priv_m = m;
+             dev->mainDisp_fd = m->framebuffer->fd;
+             dev->isMainDisp = 1;
+-            gralloc_module_t* gr_m = reinterpret_cast<gralloc_module_t*>(m);
+-            gr_m->perform = fb_perform;
+-            fslwatermark_sem_open();
+         } else {
+             private_module_t* orig_m = (private_module_t*)module;
+             private_module_t* priv_m = (private_module_t*)malloc(sizeof(*priv_m));
+             memset(priv_m, 0, sizeof(*priv_m));
+             memcpy(priv_m, orig_m, sizeof(*priv_m));
+ 
++            orig_m->external_module = priv_m;
++
+             dev->device.common.module = (hw_module_t*)(priv_m);
+             priv_m->framebuffer = NULL;
+-            priv_m->gpu_device = 0;
++            int fbid = (int)*device;
++            status = mapFrameBufferWithFbid(priv_m, fbid);
++            if (status >= 0) {
++                fb_device_init(priv_m, dev);
++            }
+ 
+-            gralloc_module_t* gra_m = reinterpret_cast<gralloc_module_t*>(priv_m);
+-            gra_m->perform = fb_perform;
+             dev->priv_m = priv_m;
+             dev->mainDisp_fd = orig_m->framebuffer->fd;
+             dev->isMainDisp = 0;
++
++            gralloc_context_t* gra_dev = (gralloc_context_t*)orig_m->priv_dev;
++            alloc_device_t *ext = gra_dev->ext_dev;
++            ext->common.module = (hw_module_t*)(priv_m);
+         }
+ 
+         *device = &dev->device.common;
+diff --git a/mx6/libgralloc_wrapper/gralloc.cpp b/mx6/libgralloc_wrapper/gralloc.cpp
+index 2d5c14a..2ad03a2 100755
+--- a/mx6/libgralloc_wrapper/gralloc.cpp
++++ b/mx6/libgralloc_wrapper/gralloc.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2010-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,8 +15,6 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2009-2012 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+ #include <limits.h>
+ #include <unistd.h>
+ #include <fcntl.h>
+@@ -37,15 +36,6 @@
+ #include <hardware/gralloc.h>
+ 
+ #include "gralloc_priv.h"
+-//#include "allocator.h"
+-
+-/*****************************************************************************/
+-
+-struct gralloc_context_t {
+-    alloc_device_t  device;
+-    /* our private data here */
+-};
+-
+ /*****************************************************************************/
+ 
+ int fb_device_open(const hw_module_t* module, const char* name,
+@@ -83,12 +73,16 @@ struct private_module_t HAL_MODULE_INFO_SYM = {
+             id: GRALLOC_HARDWARE_MODULE_ID,
+             name: "Graphics Memory Allocator Module",
+             author: "The Android Open Source Project",
+-            methods: &gralloc_module_methods
++            methods: &gralloc_module_methods,
++            dso: NULL,
++            reserved: {0}
+         },
+         registerBuffer: gralloc_register_buffer,
+         unregisterBuffer: gralloc_unregister_buffer,
+         lock: gralloc_lock,
+         unlock: gralloc_unlock,
++        perform: 0,
++        reserved_proc: {0}
+     },
+     framebuffer: 0,
+     numBuffers: 0,
+@@ -109,11 +103,20 @@ static int gralloc_alloc(alloc_device_t* dev,
+     }
+ 
+     private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+-    if(!m || !m->gpu_device) {
++    if (!m || !m->gpu_device) {
+         ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
+         return -EINVAL;
+     }
+ 
++    if (usage & GRALLOC_USAGE_HW_FBX) {
++        gralloc_context_t *ctx = (gralloc_context_t *)dev;
++        if (ctx->ext_dev == NULL) {
++            ALOGE("ctx->ext_dev == NULL");
++            return -EINVAL;
++        }
++        return m->gpu_device->alloc(ctx->ext_dev, w, h, format, usage, pHandle, pStride);
++    }
++
+     return m->gpu_device->alloc(dev, w, h, format, usage, pHandle, pStride);
+ }
+ 
+@@ -121,8 +124,24 @@ static int gralloc_free(alloc_device_t* dev,
+         buffer_handle_t handle)
+ {
+     private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+-    if(!m || !m->gpu_device)
+-       return -EINVAL;
++    if (!m || !m->gpu_device) {
++        ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
++        return -EINVAL;
++    }
++
++    if (m->external_module != NULL && m->external_module->framebuffer != NULL) {
++        private_handle_t* ext_fb = m->external_module->framebuffer;
++        private_handle_t* priv_handle = (private_handle_t*)handle;
++        if(priv_handle->base >= ext_fb->base && priv_handle->base < ext_fb->base + ext_fb->size) {
++            gralloc_context_t *ctx = (gralloc_context_t *)dev;
++            if (ctx->ext_dev == NULL) {
++                ALOGW("ctx->ext_dev == NULL");
++                return -EINVAL;
++            }
++
++            return m->gpu_device->free(ctx->ext_dev, handle);
++        }
++    }
+ 
+     return m->gpu_device->free(dev, handle);
+ }
+@@ -152,9 +171,19 @@ int gralloc_device_open(const hw_module_t* module, const char* name,
+ {
+     int status = -EINVAL;
+     hw_module_t *hw = const_cast<hw_module_t *>(module);
++
+     private_module_t* m = reinterpret_cast<private_module_t*>(hw);
++    if (!m->gpu_device) {
++       hw_module_t const* gpu_module;;
++       if (hw_get_module(GRALLOC_VIV_HARDWARE_MODULE_ID, &gpu_module) == 0) {
++          status = gralloc_open(gpu_module, &m->gpu_device);
++          if(status || !m->gpu_device){
++             ALOGE("gralloc_device_open: gpu gralloc device open failed!");
++          }
++       }
++    }
+ 
+-    if (!strcmp(name, GRALLOC_HARDWARE_GPU0)) {
++    if (!m->priv_dev) {
+         gralloc_context_t *dev;
+         dev = (gralloc_context_t*)malloc(sizeof(*dev));
+ 
+@@ -170,27 +199,22 @@ int gralloc_device_open(const hw_module_t* module, const char* name,
+         dev->device.alloc   = gralloc_alloc;
+         dev->device.free    = gralloc_free;
+ 
+-        *device = &dev->device.common;
+-        status = 0;
++        gralloc_context_t* ext;
++        ext = (gralloc_context_t*)malloc(sizeof(*ext));
++        memset(ext, 0, sizeof(*ext));
++        memcpy(ext, dev, sizeof(*ext));
++        dev->ext_dev = (alloc_device_t*)ext;
+ 
+-        if(!m->gpu_device)
+-        {
+-           hw_module_t const* gpu_module;;
+-           if (hw_get_module(GRALLOC_VIV_HARDWARE_MODULE_ID, &gpu_module) == 0) {
+-              status = gralloc_open(gpu_module, &m->gpu_device);
+-              if(status || !m->gpu_device){
+-                 ALOGE("gralloc_device_open: gpu gralloc device open failed!");
+-              }
+-           }
+-        }
+-    } else {
+-
+-        m->flags = 0;
+-        m->master_phys = 0;
+-        //m->gpu_device = 0;
+-        //m->gralloc_viv= 0;
++        m->priv_dev = (alloc_device_t*)dev;
++    }
+ 
++    if (!strcmp(name, GRALLOC_HARDWARE_GPU0)) {
++        *device = &m->priv_dev->common;
++        status = 0;
++    }
++    else {
+         status = fb_device_open(module, name, device);
+     }
++
+     return status;
+ }
+diff --git a/mx6/libgralloc_wrapper/gralloc_priv.h b/mx6/libgralloc_wrapper/gralloc_priv.h
+index 8b2ddc2..896b1fd 100755
+--- a/mx6/libgralloc_wrapper/gralloc_priv.h
++++ b/mx6/libgralloc_wrapper/gralloc_priv.h
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright 2009-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2009-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -44,6 +44,12 @@
+ struct private_module_t;
+ struct private_handle_t;
+ 
++struct gralloc_context_t {
++    alloc_device_t  device;
++    /* our private data here */
++    alloc_device_t *ext_dev;
++};
++
+ struct private_module_t {
+ /** do NOT change the elements below **/
+     gralloc_module_t base;
+@@ -64,6 +70,10 @@ struct private_module_t {
+     unsigned long master_phys;
+     alloc_device_t *gpu_device;
+     gralloc_module_t* gralloc_viv;
++
++    struct alloc_device_t *priv_dev;
++    struct private_module_t *external_module;
++    int primary_fd;
+     enum {
+         // flag to indicate we'll post this buffer
+         PRIV_USAGE_LOCKED_FOR_POST = 0x80000000
+diff --git a/mx6/libgralloc_wrapper/mapper.cpp b/mx6/libgralloc_wrapper/mapper.cpp
+index f536d6e..e93a8a6 100755
+--- a/mx6/libgralloc_wrapper/mapper.cpp
++++ b/mx6/libgralloc_wrapper/mapper.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2010-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,8 +15,6 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2009-2012 Freescale Semiconductor, Inc. All Rights Reserved.*/
+-
+ #include <limits.h>
+ #include <errno.h>
+ #include <pthread.h>
+-- 
+1.8.0
+

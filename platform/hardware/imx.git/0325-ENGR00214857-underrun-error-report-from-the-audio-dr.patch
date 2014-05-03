@@ -1,0 +1,53 @@
+From 740275a937bf678d157c0acbb75da4c95a4ba2bc Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Wed, 8 Aug 2012 14:25:08 +0800
+Subject: [PATCH 325/486] ENGR00214857 underrun error report from the audio
+ driver
+
+HAL will drop two frame data when underrun happened. changing the
+logic to resend the data when underrun happened.
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/tinyalsa_hal.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index 6d28966..fa97604 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -847,12 +847,30 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
+     else
+         ret = pcm_write(out->pcm, (void *)buf, out_frames * frame_size);
+ 
+-    if(ret != 0) LOGW("ret %d, pcm write error %s.", ret, pcm_get_error(out->pcm));
++    if(ret !=0) {
++        LOGW("ret %d, pcm write %d error %s.", ret, bytes, pcm_get_error(out->pcm));
++
++        switch(pcm_state(out->pcm)) {
++            case PCM_STATE_SETUP:
++            case PCM_STATE_XRUN:
++                 ret = pcm_prepare(out->pcm);
++                 if(ret != 0) goto exit;
++                 break;
++            default:
++                 goto exit;
++        }
++
++        if(out->write_flags & PCM_MMAP)
++            ret = pcm_mmap_write(out->pcm, (void *)buf, out_frames * frame_size);
++        else
++            ret = pcm_write(out->pcm, (void *)buf, out_frames * frame_size);
++     }
+ 
+ exit:
+     pthread_mutex_unlock(&out->lock);
+ 
+     if (ret != 0) {
++        LOGW("write error, sleep few ms");
+         usleep(bytes * 1000000 / audio_stream_frame_size(&stream->common) /
+                out_get_sample_rate(&stream->common));
+     }
+-- 
+1.8.0
+

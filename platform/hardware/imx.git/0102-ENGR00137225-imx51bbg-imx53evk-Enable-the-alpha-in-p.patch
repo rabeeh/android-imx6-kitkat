@@ -1,0 +1,101 @@
+From 9b1085f2d4983672b834b3705a13b9f4879916b1 Mon Sep 17 00:00:00 2001
+From: Yaoming Qin <b10945@freescale.com>
+Date: Tue, 21 Dec 2010 08:51:41 +0800
+Subject: [PATCH 102/486] ENGR00137225 [imx51bbg/imx53evk] Enable the alpha in
+ pixel for overlay
+
+Enable the alpha in pixel for overlay, and this can be configured by
+cmdline add the bpp=32, without this option, still the gloable alpha.
+
+Signed-off-by: Yaoming Qin<B10945@freescale.com>
+---
+ libgralloc/framebuffer.cpp | 40 ++++++++++++++++++++++++++++++++++++++++
+ liboverlay/overlay.cpp     |  6 +++++-
+ 2 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index cd253a1..0214948 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -553,6 +553,21 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         info.blue.length    = 8;
+         info.transp.offset  = 0;
+         info.transp.length  = 0;
++#ifndef FSL_EPDC_FB
++        /*
++         *  set the alpha in pixel
++         *  only when the fb set to 32bit
++         */
++        struct mxcfb_loc_alpha l_alpha;
++        l_alpha.enable = true;
++        l_alpha.alpha_in_pixel = true;
++        if (ioctl(fd, MXCFB_SET_LOC_ALPHA,
++                    &l_alpha) < 0) {
++            printf("Set local alpha failed\n");
++            close(fd);
++            return -errno;
++        }
++#endif
+     }
+     else{
+         /*
+@@ -567,6 +582,31 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         info.blue.length    = 5;
+         info.transp.offset  = 0;
+         info.transp.length  = 0;
++
++#ifndef FSL_EPDC_FB
++        /* for the 16bit case, only involke the glb alpha */
++        struct mxcfb_gbl_alpha gbl_alpha;
++
++        gbl_alpha.alpha = 255;
++        gbl_alpha.enable = 1;
++        int ret = ioctl(fd, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
++        if(ret <0)
++        {
++            LOGE("Error!MXCFB_SET_GBL_ALPHA failed!");
++            return -1;
++        }
++
++        struct mxcfb_color_key key;
++        key.enable = 1;
++        key.color_key = 0x00000000; // Black
++        ret = ioctl(fd, MXCFB_SET_CLR_KEY, &key);
++        if(ret <0)
++        {
++            LOGE("Error!Colorkey setting failed for dev ");
++            return -1;
++        }
++#endif
++
+     }
+ 
+ 
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+index 77ffa73..444f312 100755
+--- a/liboverlay/overlay.cpp
++++ b/liboverlay/overlay.cpp
+@@ -620,8 +620,11 @@ static int overlay_init_fbdev(struct overlay_control_context_t *dev)
+     
+     int ret = 0;
+     struct fb_var_screeninfo fb_var;
+-    struct mxcfb_gbl_alpha gbl_alpha;
+ 
++    //disable the gbl alpha
++
++#if 0
++    struct mxcfb_gbl_alpha gbl_alpha;
+     gbl_alpha.alpha = 255;
+     gbl_alpha.enable = 1;
+     ret = ioctl(dev->fb_dev, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
+@@ -642,6 +645,7 @@ static int overlay_init_fbdev(struct overlay_control_context_t *dev)
+       OVERLAY_LOG_ERR("Error!Colorkey setting failed for dev %s",FB_DEV_NAME);
+       return -1;
+     }
++#endif
+ 
+     if ( ioctl(dev->fb_dev, FBIOGET_VSCREENINFO, &fb_var) < 0) {
+         OVERLAY_LOG_ERR("Error!VSCREENINFO getting failed for dev %s",FB_DEV_NAME);
+-- 
+1.8.0
+

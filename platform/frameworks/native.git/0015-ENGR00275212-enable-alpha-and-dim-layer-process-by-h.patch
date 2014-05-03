@@ -1,0 +1,162 @@
+From 40c572865332541247402488b75fb725c9f2c08b Mon Sep 17 00:00:00 2001
+From: Richard Liu <r66033@freescale.com>
+Date: Wed, 14 Aug 2013 15:28:14 +0800
+Subject: [PATCH 15/23] ENGR00275212 enable alpha and dim layer process by
+ hwcomposer
+
+enable alpha and dim layer process by hwcomposer,
+else mx6sl UI operation is very slow, JB4.3 already
+has such code for alpha layer, here we enable dim
+layer also, pay attention it need define hwcomposer
+version HWC_DEVICE_API_VERSION_1_2.
+
+Signed-off-by: Richard Liu <r66033@freescale.com>
+---
+ services/surfaceflinger/LayerDim.cpp | 107 +++++++++++++++++++++++++++++++++++
+ services/surfaceflinger/LayerDim.h   |   5 ++
+ 2 files changed, 112 insertions(+)
+
+diff --git a/services/surfaceflinger/LayerDim.cpp b/services/surfaceflinger/LayerDim.cpp
+index 4e82bab..fb4ef03 100644
+--- a/services/surfaceflinger/LayerDim.cpp
++++ b/services/surfaceflinger/LayerDim.cpp
+@@ -17,6 +17,7 @@
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <sys/types.h>
++#include <math.h>
+ 
+ #include <utils/Errors.h>
+ #include <utils/Log.h>
+@@ -57,6 +58,112 @@ bool LayerDim::isVisible() const {
+     return !(s.flags & layer_state_t::eLayerHidden) && s.alpha;
+ }
+ 
++Rect LayerDim::computeCrop(const sp<const DisplayDevice>& hw) const {
++    /*
++     * The way we compute the crop (aka. texture coordinates when we have a
++     * Layer) produces a different output from the GL code in
++     * drawWithOpenGL() due to HWC being limited to integers. The difference
++     * can be large if getContentTransform() contains a large scale factor.
++     * See comments in drawWithOpenGL() for more details.
++     */
++
++    // the content crop is the area of the content that gets scaled to the
++    // layer's size.
++    Rect crop(getContentCrop());
++
++    // the active.crop is the area of the window that gets cropped, but not
++    // scaled in any ways.
++    const State& s(drawingState());
++
++    // apply the projection's clipping to the window crop in
++    // layerstack space, and convert-back to layer space.
++    // if there are no window scaling (or content scaling) involved,
++    // this operation will map to full pixels in the buffer.
++    // NOTE: should we revert to GL composition if a scaling is involved
++    // since it cannot be represented in the HWC API?
++    Rect activeCrop(s.transform.transform(s.active.crop));
++    activeCrop.intersect(hw->getViewport(), &activeCrop);
++    activeCrop = s.transform.inverse().transform(activeCrop);
++
++    // paranoia: make sure the window-crop is constrained in the
++    // window's bounds
++    activeCrop.intersect(Rect(s.active.w, s.active.h), &activeCrop);
++
++    if (!activeCrop.isEmpty()) {
++        // Transform the window crop to match the buffer coordinate system,
++        // which means using the inverse of the current transform set on the
++        // SurfaceFlingerConsumer.
++        uint32_t invTransform = getContentTransform();
++        int winWidth = s.active.w;
++        int winHeight = s.active.h;
++        if (invTransform & NATIVE_WINDOW_TRANSFORM_ROT_90) {
++            invTransform ^= NATIVE_WINDOW_TRANSFORM_FLIP_V |
++                    NATIVE_WINDOW_TRANSFORM_FLIP_H;
++            winWidth = s.active.h;
++            winHeight = s.active.w;
++        }
++        const Rect winCrop = activeCrop.transform(
++                invTransform, s.active.w, s.active.h);
++
++        // the code below essentially performs a scaled intersection
++        // of crop and winCrop
++        float xScale = float(crop.width()) / float(winWidth);
++        float yScale = float(crop.height()) / float(winHeight);
++
++        int insetL = int(ceilf( winCrop.left                * xScale));
++        int insetT = int(ceilf( winCrop.top                 * yScale));
++        int insetR = int(ceilf((winWidth  - winCrop.right ) * xScale));
++        int insetB = int(ceilf((winHeight - winCrop.bottom) * yScale));
++
++        crop.left   += insetL;
++        crop.top    += insetT;
++        crop.right  -= insetR;
++        crop.bottom -= insetB;
++    }
++    return crop;
++}
++
++
++void LayerDim::setGeometry(
++    const sp<const DisplayDevice>& hw,
++        HWComposer::HWCLayerInterface& layer)
++{
++    layer.setDefaultState();
++
++    // enable this layer
++    layer.setSkip(false);
++
++    // blending mode
++    layer.setBlending(HWC_BLENDING_DIM);
++
++    // set dim value
++    const State& s(drawingState());
++    layer.setPlaneAlpha(s.alpha);
++
++    if (isSecure() && !hw->isSecure()) {
++        layer.setSkip(true);
++    }
++    // apply the layer's transform, followed by the display's global transform
++    // here we're guaranteed that the layer's transform preserves rects
++    Rect frame(s.transform.transform(computeBounds()));
++    frame.intersect(hw->getViewport(), &frame);
++    const Transform& tr(hw->getTransform());
++    layer.setFrame(tr.transform(frame));
++    layer.setCrop(computeCrop(hw));
++}
++
++void LayerDim::setPerFrameData(const sp<const DisplayDevice>& hw,
++        HWComposer::HWCLayerInterface& layer) {
++    // we have to set the visible region on every frame because
++    // we currently free it during onLayerDisplayed(), which is called
++    // after HWComposer::commit() -- every frame.
++    // Apply this display's projection's viewport to the visible region
++    // before giving it to the HWC HAL.
++    const Transform& tr = hw->getTransform();
++    Region visible = tr.transform(visibleRegion.intersect(hw->getViewport()));
++    layer.setVisibleRegionScreen(visible);
++    // leave it as it is for dim layer.
++}
+ 
+ // ---------------------------------------------------------------------------
+ 
+diff --git a/services/surfaceflinger/LayerDim.h b/services/surfaceflinger/LayerDim.h
+index 6561d7f..d6a7e0e 100644
+--- a/services/surfaceflinger/LayerDim.h
++++ b/services/surfaceflinger/LayerDim.h
+@@ -39,6 +39,11 @@ public:
+     virtual bool isSecure() const         { return false; }
+     virtual bool isFixedSize() const      { return true; }
+     virtual bool isVisible() const;
++    Rect computeCrop(const sp<const DisplayDevice>& hw) const;
++    virtual void setGeometry(const sp<const DisplayDevice>& hw,
++            HWComposer::HWCLayerInterface& layer);
++    virtual void setPerFrameData(const sp<const DisplayDevice>& hw,
++            HWComposer::HWCLayerInterface& layer);
+ };
+ 
+ // ---------------------------------------------------------------------------
+-- 
+1.8.0
+

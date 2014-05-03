@@ -1,0 +1,168 @@
+From 6c8bfda765a3fadc249a017534cdd00eed68464d Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Thu, 28 Mar 2013 13:40:24 +0800
+Subject: [PATCH 437/486] ENGR00255059 Enlarge the buffersize to reduce the
+ noise
+
+1. Recording will lost data sometimes, so enlarge the buffersize to
+reduce the noise.
+2. Refine the record stop_threshold, when camera recording, there will
+be I/O error in the middle.
+
+Change-Id: I0849281b894dae3bf4b95f9b57048ad6d50c2459
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/tinyalsa_hal.c | 55 ++++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 42 insertions(+), 13 deletions(-)
+
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index 50af0b7..2b98bbe 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -71,7 +71,9 @@
+ /* number of periods for low power playback */
+ #define PLAYBACK_LONG_PERIOD_COUNT  8
+ /* number of periods for capture */
+-#define CAPTURE_PERIOD_COUNT 4
++#define CAPTURE_PERIOD_SIZE  192
++/* number of periods for capture */
++#define CAPTURE_PERIOD_COUNT 8
+ /* minimum sleep time in out_write() when write threshold is not reached */
+ #define MIN_WRITE_SLEEP_US 5000
+ 
+@@ -134,9 +136,11 @@ struct pcm_config pcm_config_esai_multi = {
+ struct pcm_config pcm_config_mm_in = {
+     .channels = 2,
+     .rate = MM_FULL_POWER_SAMPLING_RATE,
+-    .period_size = LONG_PERIOD_SIZE,
++    .period_size = CAPTURE_PERIOD_SIZE,
+     .period_count = CAPTURE_PERIOD_COUNT,
+     .format = PCM_FORMAT_S16_LE,
++    .start_threshold = 0,
++    .avail_min = 0,
+ };
+ 
+ const struct string_to_enum out_channels_name_to_enum_table[] = {
+@@ -164,6 +168,7 @@ static int adev_get_rate_for_device(struct imx_audio_device *adev, uint32_t devi
+ static int adev_get_channels_for_device(struct imx_audio_device *adev, uint32_t devices, unsigned int flag);
+ static int adev_get_format_for_device(struct imx_audio_device *adev, uint32_t devices, unsigned int flag);
+ static void in_update_aux_channels(struct imx_stream_in *in, effect_handle_t effect);
++static int pcm_read_wrapper(struct pcm *pcm, const void * buffer, size_t bytes);
+ 
+ /* Returns true on devices that are sabreauto, false otherwise */
+ static int is_device_auto(void)
+@@ -1052,7 +1057,7 @@ static int out_set_volume(struct audio_stream_out *stream, float left,
+     return -ENOSYS;
+ }
+ 
+-static int pcm_read_wrapper(struct imx_stream_in *in, struct pcm *pcm, void *data, unsigned int count)
++static int pcm_read_convert(struct imx_stream_in *in, struct pcm *pcm, void *data, unsigned int count)
+ {
+     bool bit_24b_2_16b = false;
+     bool mono2stereo = false;
+@@ -1074,22 +1079,45 @@ static int pcm_read_wrapper(struct imx_stream_in *in, struct pcm *pcm, void *dat
+                      in->read_tmp_buf, size_in_bytes_tmp);
+         }
+ 
+-        in->read_status = pcm_read(pcm, (void*)in->read_tmp_buf, size_in_bytes_tmp);
++        in->read_status = pcm_read_wrapper(pcm, (void*)in->read_tmp_buf, size_in_bytes_tmp);
+ 
+         if (in->read_status != 0) {
+-            ALOGE("get_next_buffer() pcm_read error %d", in->read_status);
++            ALOGE("get_next_buffer() pcm_read_wrapper error %d", in->read_status);
+             return in->read_status;
+         }
+-
+         convert_record_data((void *)in->read_tmp_buf, (void *)data, frames_rq, bit_24b_2_16b, mono2stereo, stereo2mono);
+     }
+     else {
+-        in->read_status = pcm_read(pcm, (void*)data, count);
++        in->read_status = pcm_read_wrapper(pcm, (void*)data, count);
+     }
+ 
+     return in->read_status;
+ }
+ 
++static int pcm_read_wrapper(struct pcm *pcm, const void * buffer, size_t bytes)
++{
++    int ret = 0;
++    ret = pcm_read(pcm, (void *)buffer, bytes);
++
++    if(ret !=0) {
++         ALOGV("ret %d, pcm read %d error %s.", ret, bytes, pcm_get_error(pcm));
++
++         switch(pcm_state(pcm)) {
++              case PCM_STATE_SETUP:
++              case PCM_STATE_XRUN:
++                   ret = pcm_prepare(pcm);
++                   if(ret != 0) return ret;
++                   break;
++              default:
++                   return ret;
++         }
++
++         ret = pcm_read(pcm, (void *)buffer, bytes);
++    }
++
++    return ret;
++}
++
+ static int pcm_write_wrapper(struct pcm *pcm, const void * buffer, size_t bytes, int flags)
+ {
+     int ret = 0;
+@@ -1120,7 +1148,6 @@ static int pcm_write_wrapper(struct pcm *pcm, const void * buffer, size_t bytes,
+     return ret;
+ }
+ 
+-
+ static ssize_t out_write_primary(struct audio_stream_out *stream, const void* buffer,
+                          size_t bytes)
+ {
+@@ -1345,11 +1372,11 @@ static int start_input_stream(struct imx_stream_in *in)
+         }
+     }
+ 
+-    in->config.stop_threshold = in->config.period_size * in->config.period_count;
+-
+     /*Error handler for usb mic plug in/plug out when recording. */
+     memcpy(&in->config, &pcm_config_mm_in, sizeof(pcm_config_mm_in));
+ 
++    in->config.stop_threshold = in->config.period_size * in->config.period_count;
++
+     if (in->device & AUDIO_DEVICE_IN_USB_DEVICE) {
+         channels = adev_get_channels_for_device(adev, in->device, PCM_IN);
+         if (channels == 2){
+@@ -1765,10 +1792,10 @@ static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
+                   in->read_buf, size_in_bytes);
+         }
+ 
+-        in->read_status = pcm_read_wrapper(in, in->pcm, (void*)in->read_buf, size_in_bytes);
++        in->read_status = pcm_read_convert(in, in->pcm, (void*)in->read_buf, size_in_bytes);
+ 
+         if (in->read_status != 0) {
+-            ALOGE("get_next_buffer() pcm_read error %d", in->read_status);
++            ALOGE("get_next_buffer() pcm_read_convert error %d", in->read_status);
+             buffer->raw = NULL;
+             buffer->frame_count = 0;
+             return in->read_status;
+@@ -1994,7 +2021,7 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
+     else if (in->resampler != NULL)
+         ret = read_frames(in, buffer, frames_rq);
+     else
+-        ret = pcm_read_wrapper(in, in->pcm, buffer, bytes);
++        ret = pcm_read_convert(in, in->pcm, buffer, bytes);
+  
+     if(ret < 0) ALOGW("ret %d, pcm read error %s.", ret, pcm_get_error(in->pcm));
+ 
+@@ -2657,6 +2684,8 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
+     if (out->resampler)
+         release_resampler(out->resampler);
+     free(stream);
++
++    ALOGW("adev_close_output_stream...%d end",(int)out);
+ }
+ 
+ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
+-- 
+1.8.0
+

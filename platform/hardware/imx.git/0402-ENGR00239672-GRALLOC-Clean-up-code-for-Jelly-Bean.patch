@@ -1,0 +1,1642 @@
+From edc3bd36fdfb11d84e1fe11abb32ee346d7abf7a Mon Sep 17 00:00:00 2001
+From: Oliver Brown <oliver.brown@freescale.com>
+Date: Thu, 10 Jan 2013 11:20:43 -0600
+Subject: [PATCH 402/486] ENGR00239672 GRALLOC: Clean up code for Jelly Bean
+
+Removing dead/untested code, extra includes, and unused/untested build
+options.
+
+Signed-off-by: Oliver Brown <oliver.brown@freescale.com>
+---
+ mx5x/libgralloc/Android.mk      |   17 -
+ mx5x/libgralloc/framebuffer.cpp | 1262 +--------------------------------------
+ mx5x/libgralloc/gr.h            |   21 +-
+ mx5x/libgralloc/gralloc_priv.h  |   11 +-
+ mx5x/libgralloc/mapper.cpp      |   27 +-
+ 5 files changed, 19 insertions(+), 1319 deletions(-)
+
+diff --git a/mx5x/libgralloc/Android.mk b/mx5x/libgralloc/Android.mk
+index 0fe9f0f..4099eb6 100644
+--- a/mx5x/libgralloc/Android.mk
++++ b/mx5x/libgralloc/Android.mk
+@@ -22,11 +22,7 @@ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := true
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+ LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu libion
+-ifeq ($(BOARD_SOC_TYPE),IMX50)
+-LOCAL_SHARED_LIBRARIES += libc2d_z160
+-else
+ LOCAL_SHARED_LIBRARIES += libc2d_z430
+-endif
+ LOCAL_C_INCLUDES += external/linux-lib/ipu
+ LOCAL_C_INCLUDES += hardware/imx/mx5x/libcopybit
+ 
+@@ -37,19 +33,6 @@ LOCAL_SRC_FILES := 	\
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX -Wno-missing-field-initializers
+ 
+-
+-ifeq ($(HAVE_FSL_EPDC_FB),true)
+-LOCAL_CFLAGS += -DFSL_EPDC_FB
+-endif
+-
+-ifeq ($(HAVE_FSL_IMX_IPU),true)
+-LOCAL_CFLAGS += -DFSL_IMX_DISPLAY
+-else ifeq ($(HAVE_FSL_IMX_GPU3D),true)
+-LOCAL_CFLAGS += -DFSL_IMX_DISPLAY
+-else ifeq ($(HAVE_FSL_IMX_GPU2D),true)
+-LOCAL_CFLAGS += -DFSL_IMX_DISPLAY
+-endif
+-
+ LOCAL_MODULE_TAGS := eng
+ 
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/mx5x/libgralloc/framebuffer.cpp b/mx5x/libgralloc/framebuffer.cpp
+index 5512e03..1c5ca14 100644
+--- a/mx5x/libgralloc/framebuffer.cpp
++++ b/mx5x/libgralloc/framebuffer.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,46 +15,25 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2009-2012 Freescale Semiconductor, Inc. */
+-
+-#include <sys/mman.h>
+-
+-#include <dlfcn.h>
+-
+-#include <cutils/ashmem.h>
+-#include <cutils/log.h>
+-
+-#include <hardware/hardware.h>
+-#include <hardware/gralloc.h>
+-
+ #include <fcntl.h>
+ #include <errno.h>
+-#include <sys/ioctl.h>
+-#include <string.h>
+ #include <stdlib.h>
+-
+-#include <cutils/log.h>
+-#include <cutils/atomic.h>
+-#include <cutils/properties.h>
+-
+-#if HAVE_ANDROID_OS
+ #include <linux/fb.h>
+-#include <linux/mxcfb.h>
+-#include <linux/videodev.h>
+-#include <sys/mman.h>
++#include <sys/ioctl.h>
+ #include <sys/stat.h>
++#include <sys/mman.h>
+ 
+-#include <linux/ipu.h>
+-
+-#endif
+ #include <GLES/gl.h>
+ #include <pthread.h>
+ #include <semaphore.h>
+ 
++#include <cutils/log.h>
++#include <hardware/gralloc.h>
++#include <hardware/hardware.h>
++
+ #include "gralloc_priv.h"
+ #include "gr.h"
+ #define  MAX_RECT_NUM   20
+-/*****************************************************************************/
+ 
+ // numbers of buffers for page flipping
+ #define NUM_BUFFERS 3
+@@ -65,181 +45,11 @@ enum {
+ 
+ struct fb_context_t {
+     framebuffer_device_t  device;
+-#ifdef FSL_EPDC_FB
+-    //Partial udate feature
+-    bool rect_update;
+-    int count;      //count need less than MAX_RECT_NUM ;
+-    int updatemode[20];
+-    int partial_left[20];
+-    int partial_top[20];
+-    int partial_width[20];
+-    int partial_height[20];
+-#endif
+-#ifdef FSL_IMX_DISPLAY
+-    bool sec_display_inited;
+-    int sec_fp;
+-    int sec_disp_w;
+-    int sec_disp_h;
+-    int sec_disp_base;
+-    int sec_disp_phys;
+-    int sec_frame_size;
+-    int sec_disp_next_buf;
+-    struct fb_var_screeninfo sec_info;
+-    struct fb_fix_screeninfo sec_finfo;
+-    struct framebuffer_device_t* dev;
+-    buffer_handle_t buffer;
+-    sem_t sec_display_begin;
+-    sem_t sec_display_end;
+-    pthread_t thread_id;
+-  //  C2D_CONTEXT c2dctx;
+-    int sec_rotation;
+-    int cleancount;
+-    int mRotate;
+-    struct ipu_task mTask;
+-    int mIpuFd;
+-#endif
+ };
+ 
+ static int nr_framebuffers;
+ static int no_ipu = 0;
+ 
+-#ifdef FSL_IMX_DISPLAY
+-#define MAX_SEC_DISP_WIDTH (1024)
+-#define MAX_SEC_DISP_HEIGHT (1024)
+-static int mapSecFrameBuffer(fb_context_t* ctx);
+-static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx);
+-static int resizeToSecFrameBuffer_c2d(int base,int phys,fb_context_t* ctx);
+-void * secDispShowFrames(void * arg);
+-#endif
+-
+-#ifdef FSL_EPDC_FB
+-#define WAVEFORM_MODE_INIT                      0x0   // Screen goes to white (clears)
+-#define WAVEFORM_MODE_DU                        0x1   // Grey->white/grey->black
+-#define WAVEFORM_MODE_GC16                      0x2   // High fidelity (flashing)
+-#define WAVEFORM_MODE_GC4                       0x3   //
+-//#define WAVEFORM_MODE_AUTO                    257  // defined in mxcfb.h
+-
+-
+-#define EINK_WAVEFORM_MODE_INIT      0x00000000
+-#define EINK_WAVEFORM_MODE_DU        0x00000001
+-#define EINK_WAVEFORM_MODE_GC16      0x00000002
+-#define EINK_WAVEFORM_MODE_GC4       0x00000003
+-#define EINK_WAVEFORM_MODE_AUTO      0x00000004
+-#define EINK_WAVEFORM_MODE_MASK      0x0000000F
+-#define EINK_AUTO_MODE_REGIONAL      0x00000000
+-#define EINK_AUTO_MODE_AUTOMATIC     0x00000010
+-#define EINK_AUTO_MODE_MASK          0x00000010
+-#define EINK_UPDATE_MODE_PARTIAL     0x00000000
+-#define EINK_UPDATE_MODE_FULL        0x00000020
+-#define EINK_UPDATE_MODE_MASK        0x00000020
+-#define EINK_WAIT_MODE_NOWAIT        0x00000000
+-#define EINK_WAIT_MODE_WAIT          0x00000040
+-#define EINK_WAIT_MODE_MASK          0x00000040
+-#define EINK_COMBINE_MODE_NOCOMBINE  0x00000000
+-#define EINK_COMBINE_MODE_COMBINE    0x00000080
+-#define EINK_COMBINE_MODE_MASK       0x00000080
+-#define EINK_DITHER_MODE_NODITHER    0x00000000
+-#define EINK_DITHER_MODE_DITHER      0x00000100
+-#define EINK_DITHER_MODE_MASK        0x00000100
+-#define EINK_INVERT_MODE_NOINVERT    0x00000000
+-#define EINK_INVERT_MODE_INVERT      0x00000200
+-#define EINK_INVERT_MODE_MASK        0x00000200
+-#define EINK_CONVERT_MODE_NOCONVERT  0x00000000
+-#define EINK_CONVERT_MODE_CONVERT    0x00000400
+-#define EINK_CONVERT_MODE_MASK       0x00000400
+-
+-#define EINK_DEFAULT_MODE            0x00000004
+-
+-__u32 marker_val = 1;
+-static void update_to_display(int left, int top, int width, int height, int updatemode, int fb_dev)
+-{
+-	struct mxcfb_update_data upd_data;
+-	int retval;
+-	bool wait_for_complete;
+-	int auto_update_mode = AUTO_UPDATE_MODE_REGION_MODE;
+-	memset(&upd_data, 0, sizeof(mxcfb_update_data));
+-
+-    ALOGI("update_to_display:left=%d, top=%d, width=%d, height=%d updatemode=%d\n", left, top, width, height,updatemode);
+-
+-
+-    if((updatemode & EINK_WAVEFORM_MODE_MASK) == EINK_WAVEFORM_MODE_DU)
+-	   upd_data.waveform_mode = WAVEFORM_MODE_DU;
+-	else if((updatemode & EINK_WAVEFORM_MODE_MASK) == EINK_WAVEFORM_MODE_GC4)
+-	   upd_data.waveform_mode = WAVEFORM_MODE_GC4;
+-	else if((updatemode & EINK_WAVEFORM_MODE_MASK) == EINK_WAVEFORM_MODE_GC16)
+-	   upd_data.waveform_mode = WAVEFORM_MODE_GC16;
+-	else if((updatemode & EINK_WAVEFORM_MODE_MASK) == EINK_WAVEFORM_MODE_AUTO)
+-	   upd_data.waveform_mode = WAVEFORM_MODE_AUTO;
+-	else 
+-        ALOGI("waveform_mode  wrong\n");
+-	   
+-    if((updatemode & EINK_AUTO_MODE_MASK) == EINK_AUTO_MODE_REGIONAL)
+-        auto_update_mode = AUTO_UPDATE_MODE_REGION_MODE;
+-    else if((updatemode & EINK_AUTO_MODE_MASK) == EINK_AUTO_MODE_AUTOMATIC)
+-        auto_update_mode = AUTO_UPDATE_MODE_AUTOMATIC_MODE;
+-    else 
+-        ALOGI("wait_for_complete  wrong\n");
+-        
+-    if((updatemode & EINK_UPDATE_MODE_MASK) == EINK_UPDATE_MODE_PARTIAL)
+-        upd_data.update_mode = UPDATE_MODE_PARTIAL;
+-    else if((updatemode & EINK_UPDATE_MODE_MASK) == EINK_UPDATE_MODE_FULL)
+-        upd_data.update_mode = UPDATE_MODE_FULL;
+-    else
+-        ALOGI("update_mode  wrong\n");
+-
+-    if((updatemode & EINK_WAIT_MODE_MASK) == EINK_WAIT_MODE_NOWAIT)
+-        wait_for_complete = false;
+-    else if((updatemode & EINK_WAIT_MODE_MASK) == EINK_WAIT_MODE_WAIT)
+-        wait_for_complete = true;
+-    else 
+-        ALOGI("wait_for_complete  wrong\n");
+-
+-    if((updatemode & EINK_INVERT_MODE_MASK) == EINK_INVERT_MODE_INVERT)
+-	{
+-	   upd_data.flags |= EPDC_FLAG_ENABLE_INVERSION;
+-       ALOGI("invert mode \n");
+-    }
+-
+-	retval = ioctl(fb_dev, MXCFB_SET_AUTO_UPDATE_MODE, &auto_update_mode);
+-	if (retval < 0) {
+-		ALOGI("set auto update mode failed.  Error = 0x%x", retval);
+-	}    
+-    
+-    upd_data.temp = 24; //the temperature is get from linux team
+-	upd_data.update_region.left = left;
+-	upd_data.update_region.width = width;
+-	upd_data.update_region.top = top;
+-	upd_data.update_region.height = height;
+-
+-	if (wait_for_complete) {
+-		/* Get unique marker value */
+-		upd_data.update_marker = marker_val++;
+-	} else {
+-		upd_data.update_marker = 0;
+-	}
+-
+-	retval = ioctl(fb_dev, MXCFB_SEND_UPDATE, &upd_data);
+-	while (retval < 0) {
+-		/* We have limited memory available for updates, so wait and
+-		 * then try again after some updates have completed */
+-		usleep(300000);
+-		retval = ioctl(fb_dev, MXCFB_SEND_UPDATE, &upd_data);
+-        ALOGI("MXCFB_SEND_UPDATE  retval = 0x%x try again maybe", retval);
+-	}
+-
+-	if (wait_for_complete) {
+-		/* Wait for update to complete */
+-		retval = ioctl(fb_dev, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
+-		if (retval < 0) {
+-			ALOGI("Wait for update complete failed.  Error = 0x%x", retval);
+-		}
+-	}
+-
+-
+-}
+-#endif
+-
+-
+ sem_t * fslwatermark_sem_open()
+ {
+     int fd;
+@@ -290,9 +100,6 @@ sem_t * fslwatermark_sem_open()
+     return pSem;
+ }
+ 
+-
+-/*****************************************************************************/
+-
+ static int fb_setSwapInterval(struct framebuffer_device_t* dev,
+             int interval)
+ {
+@@ -303,32 +110,6 @@ static int fb_setSwapInterval(struct framebuffer_device_t* dev,
+     return 0;
+ }
+ 
+-#ifdef FSL_EPDC_FB
+-static int fb_setUpdateRect(struct framebuffer_device_t* dev,
+-        int* left, int* top, int* width, int* height, int* updatemode, int count)
+-{
+-    fb_context_t* ctx = (fb_context_t*)dev;
+-    if(count > MAX_RECT_NUM)
+-    {
+-        ALOGE("count > MAX_RECT_NUM in fb_setUpdateRect\n");
+-        return -EINVAL;
+-    }
+-
+-    ctx->rect_update      = true;
+-    ctx->count            = 0;
+-    for(int i=0; i < count; i++)
+-    {
+-        if (((width[i]|height[i]) <= 0) || ((left[i]|top[i])<0))  return -EINVAL;
+-        ctx->updatemode[i]       = updatemode[i];
+-        ctx->partial_left[i]     = left[i];
+-        ctx->partial_top[i]      = top[i];
+-        ctx->partial_width[i]    = width[i];
+-        ctx->partial_height[i]   = height[i];
+-    }
+-    ctx->count            = count;
+-    return 0;
+-}
+-#else
+ static int fb_setUpdateRect(struct framebuffer_device_t* dev,
+         int l, int t, int w, int h)
+ {
+@@ -337,37 +118,6 @@ static int fb_setUpdateRect(struct framebuffer_device_t* dev,
+     return 0;
+ }
+ 
+-#ifdef FSL_IMX_DISPLAY
+-static int fb_setSecRotation(struct framebuffer_device_t* dev,int secRotation)
+-{
+-    fb_context_t* ctx = (fb_context_t*)dev;
+-    //ALOGI("fb_setSecRotation %d",secRotation);
+-    if((ctx->sec_rotation != secRotation)&&(ctx->sec_disp_base != 0))      
+-       memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*nr_framebuffers);
+-    ctx->sec_rotation = secRotation;
+-    switch(secRotation)
+-    {
+-    case 4:
+-       ctx->mRotate = 90;
+-       break;
+-    case 3:
+-       ctx->mRotate = 180;
+-       break;
+-    case 7:
+-       ctx->mRotate = 270;
+-       break;
+-    case 0:
+-    default:
+-       ctx->mRotate = 0;
+-       break;
+-    }
+-    return 0;
+-}
+-#endif
+-#endif
+-
+-
+-
+ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ {
+     if (!buffer)
+@@ -376,7 +126,7 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+     fb_context_t* ctx = (fb_context_t*)dev;
+ 
+     private_handle_t const* hnd = reinterpret_cast<private_handle_t const*>(buffer);
+-	private_module_t* m = reinterpret_cast<private_module_t*>(
++    private_module_t* m = reinterpret_cast<private_module_t*>(
+             dev->common.module);
+     if (m->currentBuffer) {
+         m->base.unlock(&m->base, m->currentBuffer);
+@@ -394,177 +144,12 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+         m->info.activate = FB_ACTIVATE_VBL;
+         m->info.yoffset = offset / m->finfo.line_length;
+ 
+-        #ifdef FSL_IMX_DISPLAY
+-        //Check the prop rw.SECOND_DISPLAY_CONNECTED
+-        char value[PROPERTY_VALUE_MAX];
+-     
+-        property_get("rw.SECOND_DISPLAY_CONNECTED", value, "");
+-        if (strcmp(value, "1") == 0) {
+-            if(!ctx->sec_display_inited) {
+-                //Init the second display
+-                if(mapSecFrameBuffer(ctx)== 0)
+-                {    
+-                    ctx->sec_display_inited = true;
+-               //     c2dCreateContext(&ctx->c2dctx);
+-                    ctx->mIpuFd = open("/dev/mxc_ipu", O_RDWR, 0);
+-                    if(ctx->mIpuFd < 0) {
+-                        ALOGE("%s:%d,open ipu dev failed", __FUNCTION__, __LINE__);
+-                    }
+-
+-                    sem_init(&ctx->sec_display_begin, 0, 0);
+-                    sem_init(&ctx->sec_display_end, 0, 0);
+-                     
+-                    pthread_create(&ctx->thread_id, NULL, &secDispShowFrames, (void *)ctx);
+-                                        
+-                    //Set the prop rw.SECOND_DISPLAY_ENABLED to 1
+-                    ALOGI("sys.SECOND_DISPLAY_ENABLED Set to 1");
+-                    property_set("sys.SECOND_DISPLAY_ENABLED", "1");
+-                }
+-            }
+-
+-            if(ctx->sec_display_inited) {
+-                //Resize the primary display to the second display
+-                ctx->dev = dev;
+-                ctx->buffer = buffer;
+-                sem_post(&ctx->sec_display_begin);
+-            }
+-        }
+-        else{
+-            if(ctx->sec_display_inited) {
+-                
+-                ctx->sec_display_inited = false;
+-                
+-                sem_post(&ctx->sec_display_begin);
+-                sem_wait(&ctx->sec_display_end);
+-                
+-                sem_destroy(&ctx->sec_display_begin);
+-                sem_destroy(&ctx->sec_display_end);
+-                
+-            //    if (ctx->c2dctx != NULL)c2dDestroyContext(ctx->c2dctx);
+-                if(ctx->mIpuFd >= 0)close(ctx->mIpuFd);
+-                
+-                //Set the prop rw.SECOND_DISPLAY_ENABLED to 0
+-                ALOGI("Switch back to display 0");
+-                ALOGI("sys.SECOND_DISPLAY_ENABLED Set to 0");
+-                property_set("sys.SECOND_DISPLAY_ENABLED", "0");
+-                memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*nr_framebuffers);
+-                //unmap the sec_disp_base
+-                munmap((void *)ctx->sec_disp_base, ctx->sec_frame_size*nr_framebuffers);
+-                ctx->sec_disp_base = 0;
+-                //DeInit the second display
+-                if(ctx->sec_fp) {
+-                    int fp_property = open("/sys/class/graphics/fb2/fsl_disp_property",O_RDWR, 0); 
+-                    if(fp_property >= 0) {
+-                        char overlayStr[32];
+-                        int blank;
+-                        int fb2_fp;
+-                        struct fb_var_screeninfo fb0_var;
+-
+-                        blank = 1;
+-
+-                        fb2_fp = open("/dev/graphics/fb2",O_RDWR, 0);
+-                        if (fb2_fp < 0){
+-                            ALOGE("Error!Cannot open the /dev/graphics/fb2");
+-                        }
+-                        else{
+-                            if(ioctl(fb2_fp, FBIOBLANK, blank) < 0) {
+-                        		ALOGI("Error!BLANK FB2 failed!\n");
+-                        	}
+-                            close(fb2_fp);
+-                        }
+-
+-                    	if(ioctl(ctx->sec_fp, FBIOBLANK, blank) < 0) {
+-                            ALOGI("Error!BLANK FB2 failed!\n");
+-                    	}
+-                    
+-                        if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
+-                    		ALOGI("Error!BLANK FB0 failed!\n");
+-                    	}
+-
+-                        memset(overlayStr, 0 ,32);
+-                        strcpy(overlayStr, "1-layer-fb\n");
+-                        ALOGI("WRITE 1-layer-fb to fb2/fsl_disp_property");
+-                        write(fp_property, overlayStr, strlen(overlayStr)+1);
+-                        close(fp_property);
+-
+-                        blank = FB_BLANK_POWERDOWN;
+-                    	if(ioctl(ctx->sec_fp, FBIOBLANK, blank) < 0) {
+-                            ALOGI("Error!BLANK FB2 failed!\n");
+-                    	}
+-                        blank = FB_BLANK_UNBLANK;
+-                    	if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
+-                    		ALOGI("Error!UNBLANK FB0 failed!\n");
+-                    	}
+-
+-			if (ioctl(m->framebuffer->fd, FBIOGET_VSCREENINFO,
+-				  &fb0_var) < 0) {
+-                            ALOGE("Error!Cannot get var info for fb0");
+-			}
+-
+-			if (fb0_var.bits_per_pixel == 32) {
+-				struct mxcfb_loc_alpha l_alpha;
+-
+-				l_alpha.enable = true;
+-				l_alpha.alpha_in_pixel = true;
+-				if (ioctl(m->framebuffer->fd, MXCFB_SET_LOC_ALPHA,
+-				            &l_alpha) < 0) {
+-				    ALOGE("Error!MXCFB_SET_LOC_ALPHA failed!");
+-				}
+-			} else {
+-				struct mxcfb_gbl_alpha gbl_alpha;
+-	                        struct mxcfb_color_key key;
+-
+-				gbl_alpha.alpha = 255;
+-				gbl_alpha.enable = 1;
+-				if (ioctl(m->framebuffer->fd, MXCFB_SET_GBL_ALPHA,
+-					  &gbl_alpha) < 0) {
+-				    ALOGE("Error!MXCFB_SET_GBL_ALPHA failed!");
+-				}
+-
+-	                        key.enable = 1;
+-	                        key.color_key = 0x00000000; // Black
+-	                        ALOGI("MXCFB_SET_CLR_KEY");
+-	                        if( ioctl(m->framebuffer->fd, MXCFB_SET_CLR_KEY,
+-					  &key) < 0)
+-	                        {
+-	                            ALOGE("Error!MXCFB_SET_CLR_KEY for fb0");
+-	                        }
+-			}
+-                    }
+-                    close(ctx->sec_fp);
+-                    ctx->sec_fp = 0;
+-                }
+-            }
+-        }
+-
+-        #endif
+-
+         if (ioctl(m->framebuffer->fd, FBIOPAN_DISPLAY, &m->info) == -1) {
+             ALOGE("FBIOPAN_DISPLAY failed");
+             m->base.unlock(&m->base, buffer); 
+             return -errno;
+         }
+ 
+-    #ifdef FSL_IMX_DISPLAY
+-        if(ctx->sec_display_inited) sem_wait(&ctx->sec_display_end);
+-    #endif
+-
+-#ifdef FSL_EPDC_FB
+-        if(ctx->rect_update) {
+-            for(int i=0; i < ctx->count; i++)
+-            {
+-                update_to_display(ctx->partial_left[i],ctx->partial_top[i],
+-                              ctx->partial_width[i],ctx->partial_height[i],
+-                              ctx->updatemode[i],m->framebuffer->fd);
+-            }
+-
+-            ctx->rect_update = false;
+-        }
+-        else{
+-            update_to_display(0,0,m->info.xres,m->info.yres,EINK_DEFAULT_MODE,m->framebuffer->fd);
+-        }
+-#endif
+-
+         m->currentBuffer = buffer;
+         
+     } else {
+@@ -586,22 +171,6 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ 
+         memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * ALIGN_PIXEL_128(m->info.yres));
+ 
+-#ifdef FSL_EPDC_FB
+-        if(ctx->rect_update) {
+-            for(int i=0; i < ctx->count; i++)
+-            {
+-                update_to_display(ctx->partial_left[i],ctx->partial_top[i],
+-                              ctx->partial_width[i],ctx->partial_height[i],
+-                              ctx->updatemode[i],m->framebuffer->fd);
+-            }
+-
+-            ctx->rect_update = false;
+-        }
+-        else{
+-            update_to_display(0,0,m->info.xres,m->info.yres, EINK_DEFAULT_MODE ,m->framebuffer->fd);
+-        }
+-#endif
+-
+         m->base.unlock(&m->base, buffer); 
+         m->base.unlock(&m->base, m->framebuffer); 
+     }
+@@ -615,255 +184,6 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev)
+     return 0;
+ }
+ 
+-/*****************************************************************************/
+-#define SINGLE_DISPLAY_CAPABILITY  (1920 * 1080 * 60)
+-#define DUAL_DISPLAY_CAPABILITY    (1920 * 1080 * 30)
+-
+-typedef struct
+-{
+-	char* start;
+-	char* end;
+-	int width;
+-	int height;
+-	int freq;
+-}
+-disp_mode;
+-
+-static int str2int(char *p)
+-{
+-	int val = 0;
+-	if(!p) return -1;
+-
+-	while(p[0] >= '0' && p[0] <= '9')
+-	{
+-		val = val * 10 + p[0] - '0';
+-		p++;
+-	}
+-
+-	return val;
+-}
+-
+-typedef enum {
+-    CHECK_NEXT_STATE,
+-    FIND_WIDTH_STATE,
+-    FIND_JOINT_STATE,
+-    FIND_HEIGHT_STATE,
+-    PREFIX_FREQ_STATE,
+-    FREQUENCY_STATE,
+-    FIND_NEWLINE_STATE
+-}
+-read_state;
+-
+-static disp_mode disp_mode_list[128];
+-static int disp_mode_compare( const void *arg1, const void *arg2)
+-{
+-	disp_mode *dm1 = (disp_mode *)arg1;
+-	disp_mode *dm2 = (disp_mode *)arg2;
+-
+-	if(dm1->width * dm1->height > dm2->width * dm2->height) return -1;
+-	if(dm1->width * dm1->height == dm2->width * dm2->height)
+-	{
+-		return dm1->freq > dm2->freq ? -1 : 1;
+-	}
+-
+-	return 1;
+-}
+-static char* find_available_mode(const char *mode_list, int dual_disp)
+-{
+-	int disp_threshold = 0;
+-	unsigned int i,disp_mode_count = 0;
+-	read_state state = CHECK_NEXT_STATE;
+-	char *p = (char *)mode_list;
+-
+-    if(!p) return NULL;
+-
+-	while(p[0])
+-	{
+-		switch(state)
+-		{
+-		case CHECK_NEXT_STATE:
+-			if(!strncmp(p, "D:", 2)
+-				|| !strncmp(p, "S:", 2)
+-				|| !strncmp(p, "U:", 2)
+-				|| !strncmp(p, "V:", 2))
+-			{
+-				disp_mode_list[disp_mode_count].start = p;
+-				state = FIND_WIDTH_STATE;
+-				p+=2;
+-			}
+-			else p++;
+-			break;
+-		case FIND_WIDTH_STATE:
+-			if(p[0]>='0' && p[0]<='9')
+-			{
+-				disp_mode_list[disp_mode_count].width = str2int(p);
+-				state = FIND_JOINT_STATE;
+-			}
+-			p++;
+-			break;
+-		case FIND_JOINT_STATE:
+-			if(p[0] == 'x' || p[0] == 'X')
+-			{
+-				state = FIND_HEIGHT_STATE;
+-			}
+-			p++;
+-			break;
+-		case FIND_HEIGHT_STATE:
+-			if(p[0]>='0' && p[0]<='9')
+-			{
+-				disp_mode_list[disp_mode_count].height = str2int(p);
+-				state = PREFIX_FREQ_STATE;
+-			}
+-			p++;
+-			break;
+-		case PREFIX_FREQ_STATE:
+-			if(!strncmp(p, "p-", 2) || !strncmp(p, "i-", 2))
+-			{
+-				state = FREQUENCY_STATE;
+-				p+=2;
+-			}
+-			else p++;
+-			break;
+-		case  FREQUENCY_STATE:
+-			if(p[0]>='0' && p[0]<='9')
+-			{
+-				disp_mode_list[disp_mode_count].freq = str2int(p);
+-				state = FIND_NEWLINE_STATE;
+-			}
+-			p++;
+-			break;
+-		case FIND_NEWLINE_STATE:
+-			if(p[0] == '\n')
+-			{
+-				disp_mode_list[disp_mode_count++].end = p+1;
+-				state = CHECK_NEXT_STATE;
+-                if(disp_mode_count >= sizeof(disp_mode_list)/sizeof(disp_mode_list[0])) goto check_mode_end;
+-			}
+-			p++;
+-			break;
+-		default:
+-			p++;
+-			break;
+-		}
+-	}
+-
+-check_mode_end:
+-
+-	qsort(&disp_mode_list[0], disp_mode_count, sizeof(disp_mode), disp_mode_compare);
+-
+-	disp_threshold = dual_disp ? DUAL_DISPLAY_CAPABILITY : SINGLE_DISPLAY_CAPABILITY;
+-
+-	for(i=0; i<disp_mode_count; i++)
+-	{
+-		if(disp_mode_list[i].width * disp_mode_list[i].height * disp_mode_list[i].freq <= disp_threshold)
+-			break;
+-	}
+-
+-	if(disp_mode_list[i].end) disp_mode_list[i].end[0] = 0;
+-
+-    return disp_mode_list[i].start;
+-}
+-
+-static int set_graphics_fb_mode(int fb, int dual_disp)
+-{
+-    int size=0;
+-    int fp_cmd=0;
+-    int fp_mode=0;
+-    int fp_modes=0;
+-    char fb_mode[256];
+-    char fb_modes[1024];
+-    char cmd_line[1024];
+-    char temp_name[256];
+-    char *disp_mode=NULL;
+-
+-    char value[PROPERTY_VALUE_MAX];
+-    property_get("ro.AUTO_CONFIG_DISPLAY", value, "0");
+-    if (strcmp(value, "1") != 0)  return 0;
+-
+-    fp_cmd = open("/proc/cmdline",O_RDONLY, 0);
+-    if(fp_cmd < 0) {
+-        ALOGI("Error %d! Cannot open /proc/cmdline", fp_cmd);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    memset(cmd_line, 0, sizeof(cmd_line));
+-    size = read(fp_cmd, cmd_line, sizeof(cmd_line));
+-    if(size <= 0)
+-    {
+-        ALOGI("Error! Cannot read /proc/cmdline");
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    close(fp_cmd); fp_cmd = 0;
+-
+-    if(fb==0 && strstr(cmd_line, "di1_primary")) return 0;//XGA detected
+-
+-    sprintf(temp_name, "/sys/class/graphics/fb%d/modes", fb);
+-    fp_modes = open(temp_name,O_RDONLY, 0);
+-    if(fp_modes < 0) {
+-        ALOGI("Error %d! Cannot open %s", fp_modes, temp_name);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    memset(fb_modes, 0, sizeof(fb_modes));
+-    size = read(fp_modes, fb_modes, sizeof(fb_modes));
+-    if(size <= 0)
+-    {
+-        ALOGI("Error! Cannot read %s", temp_name);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    close(fp_modes); fp_modes = 0;
+-
+-    if(size == sizeof(fb_modes)) fb_modes[size -1] = 0;
+-
+-    disp_mode = find_available_mode(fb_modes, dual_disp);
+-    if(!disp_mode)
+-    {
+-        ALOGI("Error! Cannot find available mode for fb%d", fb);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    ALOGI("find fb%d available mode %s", fb,disp_mode);
+-
+-    sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+-    fp_mode = open(temp_name,O_RDWR, 0);
+-    if(fp_mode < 0) {
+-        ALOGI("Error %d! Cannot open %s", fp_mode, temp_name);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    memset(fb_mode, 0, sizeof(fb_mode));
+-    size = read(fp_mode, fb_mode, sizeof(fb_mode));
+-    if(size < 0)
+-    {
+-        ALOGI("Error! Cannot read %s", temp_name);
+-        goto set_graphics_fb_mode_error;
+-    }
+-
+-    if(strncmp(fb_mode, disp_mode, strlen(disp_mode)+1))
+-    {
+-        size = write(fp_mode, disp_mode, strlen(disp_mode)+1);
+-        if(size <= 0)
+-        {
+-           ALOGI("Error! Cannot write %s", temp_name);
+-        }
+-    }
+-
+-    close(fp_mode); fp_mode = 0;
+-
+-    return 0;
+-
+-set_graphics_fb_mode_error:
+-
+-    if(fp_modes > 0) close(fp_modes);
+-    if(fp_mode > 0) close(fp_mode);
+-    if(fp_cmd > 0) close(fp_cmd);
+-
+-    return -1;
+-
+-}
+-
+ int mapFrameBufferLocked(struct private_module_t* module)
+ {
+     // already initialized...
+@@ -880,23 +200,10 @@ int mapFrameBufferLocked(struct private_module_t* module)
+     int i=0;
+     char name[64];
+ 
+-    char value[PROPERTY_VALUE_MAX];
+-    property_get("ro.UI_TVOUT_DISPLAY", value, "");
+-    if (strcmp(value, "1") != 0) {
+-        set_graphics_fb_mode(0, 0);
+-        while ((fd==-1) && device_template[i]) {
+-            snprintf(name, 64, device_template[i], 0);
+-            fd = open(name, O_RDWR, 0);
+-            i++;
+-        }
+-    }
+-    else{
+-        set_graphics_fb_mode(1, 0);
+-        while ((fd==-1) && device_template[i]) {
+-            snprintf(name, 64, device_template[i], 1);
+-            fd = open(name, O_RDWR, 0);
+-            i++;
+-        }
++    while ((fd==-1) && device_template[i]) {
++        snprintf(name, 64, device_template[i], 0);
++        fd = open(name, O_RDWR, 0);
++        i++;
+     }
+ 
+     if (fd < 0)
+@@ -910,8 +217,6 @@ int mapFrameBufferLocked(struct private_module_t* module)
+     if (ioctl(fd, FBIOGET_VSCREENINFO, &info) == -1)
+         return -errno;
+ 
+-
+-
+     info.reserved[0] = 0;
+     info.reserved[1] = 0;
+     info.reserved[2] = 0;
+@@ -937,21 +242,6 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         info.transp.offset    = 24;
+         info.transp.length    = 8;
+         info.transp.msb_right = 0;
+-#if 0 //ndef FSL_EPDC_FB
+-        /*
+-         *  set the alpha in pixel
+-         *  only when the fb set to 32bit
+-         */
+-        struct mxcfb_loc_alpha l_alpha;
+-        l_alpha.enable = true;
+-        l_alpha.alpha_in_pixel = true;
+-        if (ioctl(fd, MXCFB_SET_LOC_ALPHA,
+-                    &l_alpha) < 0) {
+-            printf("Set local alpha failed\n");
+-            close(fd);
+-            return -errno;
+-        }
+-#endif
+     }
+     else{
+         /*
+@@ -971,27 +261,6 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         info.transp.length    = 0;
+         info.transp.msb_right = 0;
+ 
+-        if (0) {
+-            /* for the 16bit case, only involke the glb alpha */
+-            struct mxcfb_gbl_alpha gbl_alpha;
+-
+-            gbl_alpha.alpha = 255;
+-            gbl_alpha.enable = 1;
+-            int ret = ioctl(fd, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
+-            if(ret <0) {
+-	        ALOGE("Error!MXCFB_SET_GBL_ALPHA failed!");
+-	        return -1;
+-            }
+-
+-            struct mxcfb_color_key key;
+-            key.enable = 1;
+-            key.color_key = 0x00000000; // Black
+-            ret = ioctl(fd, MXCFB_SET_CLR_KEY, &key);
+-            if(ret <0) {
+-	        ALOGE("Error!Colorkey setting failed for dev ");
+-	        return -1;
+-            }
+-        }
+     }
+ 
+     /*
+@@ -1000,12 +269,6 @@ int mapFrameBufferLocked(struct private_module_t* module)
+     info.yres_virtual = ALIGN_PIXEL_128(info.yres) * nr_framebuffers;
+     info.xres_virtual = ALIGN_PIXEL(info.xres);
+     
+-#ifdef FSL_EPDC_FB
+-    info.bits_per_pixel = 16;
+-    info.grayscale = 0;
+-    info.yoffset = 0;
+-#endif
+-
+     uint32_t flags = PAGE_FLIP;
+     if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1) {
+         info.yres_virtual = ALIGN_PIXEL_128(info.yres);
+@@ -1026,21 +289,6 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         return -errno;
+     }
+ 
+-#ifdef FSL_EPDC_FB
+-    int auto_update_mode = AUTO_UPDATE_MODE_REGION_MODE;
+-    int retval = ioctl(fd, MXCFB_SET_AUTO_UPDATE_MODE, &auto_update_mode);
+-    if (retval < 0) {
+-	ALOGE("Error! set auto update mode error!\n");
+-	return -errno;
+-    }
+-
+-    int scheme_mode = UPDATE_SCHEME_QUEUE_AND_MERGE;
+-    retval = ioctl(fd, MXCFB_SET_UPDATE_SCHEME, &scheme_mode);
+-    if (retval < 0) {
+-	ALOGE("Error! set update scheme error!\n");
+-	return -errno;
+-    }
+-#endif
+     int refreshRate = 1000000000000000LLU /
+     (
+             uint64_t(info.upper_margin + info.lower_margin + info.yres + info.vsync_len)
+@@ -1140,477 +388,6 @@ static int mapFrameBuffer(struct private_module_t* module)
+     return err;
+ }
+ 
+-#ifdef FSL_IMX_DISPLAY
+-static int mapSecFrameBuffer(fb_context_t* ctx)
+-{
+-    int retCode = 0;
+-    int sec_fp = 0,fp_property = 0;
+-    size_t fbSize = 0;
+-    int blank;
+-    void* vaddr = NULL;
+-    struct mxcfb_gbl_alpha gbl_alpha;
+-    struct mxcfb_color_key key; 
+-    char overlayStr[32];
+-    int fb2_fp;
+-    private_module_t* m = reinterpret_cast<private_module_t*>(
+-            ctx->device.common.module);
+-
+-    set_graphics_fb_mode(1,1);
+-
+-    sec_fp = open("/dev/graphics/fb2",O_RDWR, 0);
+-    if (sec_fp < 0){
+-        ALOGE("Error!Cannot open the /dev/graphics/fb2 for second display");
+-        goto disp_init_error;
+-    }
+-
+-    //Switch overlay to second display after ipu deinit
+-    //echo 1-layer-fb >  /sys/class/graphics/fb0/fsl_disp_property 
+-    blank = 1;
+-
+-    fb2_fp = open("/dev/graphics/fb2",O_RDWR, 0);
+-    if (fb2_fp < 0){
+-        ALOGE("Error!Cannot open the /dev/graphics/fb2");
+-        goto disp_init_error;
+-    }
+-    if(ioctl(fb2_fp, FBIOBLANK, blank) < 0) {
+-		ALOGI("Error!BLANK FB0 failed!\n");
+-        goto disp_init_error;
+-	}
+-    close(fb2_fp);
+-
+-	if(ioctl(sec_fp, FBIOBLANK, blank) < 0) {
+-		ALOGI("Error!BLANK FB2 failed!\n");
+-        goto disp_init_error;
+-	}
+-
+-    if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
+-		ALOGI("Error!BLANK FB0 failed!\n");
+-        goto disp_init_error;
+-	}
+-    
+-    ALOGI("Open fb0/fsl_disp_property");
+-    fp_property = open("/sys/class/graphics/fb0/fsl_disp_property",O_RDWR, 0); 
+-    if(fp_property < 0) {
+-         ALOGI("Error!Cannot switch the overlay to second disp");
+-         goto disp_init_error;
+-    }
+-    
+-    memset(overlayStr, 0 ,32);
+-    strcpy(overlayStr, "1-layer-fb\n");
+-    ALOGI("WRITE 1-layer-fb to fb0/fsl_disp_property");
+-    write(fp_property, overlayStr, strlen(overlayStr)+1);
+-    close(fp_property);
+-
+-    blank = FB_BLANK_UNBLANK;
+-	if(ioctl(sec_fp, FBIOBLANK, blank) < 0) {
+-		ALOGI("Error!UNBLANK FB2 failed!\n");
+-        goto disp_init_error;
+-	}
+-
+-	if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
+-		ALOGI("Error!UNBLANK FB0 failed!\n");
+-        goto disp_init_error;
+-	}
+-
+-    struct fb_fix_screeninfo finfo;
+-    if (ioctl(sec_fp, FBIOGET_FSCREENINFO, &finfo) == -1)
+-       goto disp_init_error;
+-                
+-    struct fb_var_screeninfo info;
+-    if (ioctl(sec_fp, FBIOGET_VSCREENINFO, &info) == -1)
+-        goto disp_init_error;
+-                
+-    ALOGI("Second display: xres %d,yres %d, xres_virtual %d, yres_virtual %d",
+-         info.xres,info.xres_virtual,info.yres,info.yres_virtual);
+-
+-    info.reserved[0] = 0;
+-    info.reserved[1] = 0;
+-    info.reserved[2] = 0;
+-    info.xoffset = 0;
+-    info.yoffset = 0;
+-    info.activate = FB_ACTIVATE_NOW;
+-
+-    info.yres_virtual = ALIGN_PIXEL_128(info.yres) * nr_framebuffers;
+-    info.xres_virtual = ALIGN_PIXEL(info.xres);
+-                        
+-    if (ioctl(sec_fp, FBIOPUT_VSCREENINFO, &info) == -1) {
+-        ALOGE("Error!Second display FBIOPUT_VSCREENINFO");
+-        goto disp_init_error;
+-    }
+-                    
+-    if (ioctl(sec_fp, FBIOGET_VSCREENINFO, &info) == -1){
+-        ALOGE("Error!Second display FBIOGET_VSCREENINFO");
+-        goto disp_init_error;
+-    }
+-                    
+-    if (ioctl(sec_fp, FBIOGET_FSCREENINFO, &finfo) == -1){
+-        ALOGE("Error!Second display FBIOGET_FSCREENINFO");
+-        goto disp_init_error;
+-    }
+-                    
+-    if(finfo.smem_len <= 0)
+-        goto disp_init_error;
+-
+-    fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);  
+-                   
+-    vaddr = mmap(0, fbSize, PROT_READ|PROT_WRITE, MAP_SHARED, sec_fp, 0);
+-    if (vaddr == MAP_FAILED) {
+-        ALOGE("Error!mapping the framebuffer (%s)", strerror(errno));
+-        goto disp_init_error;
+-    }
+-
+-    key.enable = 1;
+-    key.color_key = 0x00000000; // Black
+-    ALOGI("MXCFB_SET_CLR_KEY");
+-    if( ioctl(sec_fp, MXCFB_SET_CLR_KEY, &key) < 0)
+-    {
+-        ALOGE("Error!MXCFB_SET_CLR_KEY");
+-        goto disp_init_error;
+-    }
+-
+-    gbl_alpha.alpha = 255;
+-    gbl_alpha.enable = 1;
+-    ALOGI("MXCFB_SET_GBL_ALPHA");
+-    if(ioctl(sec_fp, MXCFB_SET_GBL_ALPHA, &gbl_alpha) <0)
+-    {
+-        ALOGI("Error!MXCFB_SET_GBL_ALPHA error");
+-        goto disp_init_error;
+-    }
+-
+-    ctx->sec_disp_base = intptr_t(vaddr);
+-    ctx->sec_disp_phys = intptr_t(finfo.smem_start);
+-    memset(vaddr, 0, fbSize);
+-    ctx->sec_fp = sec_fp;
+-    ctx->sec_disp_w = info.xres;
+-    ctx->sec_disp_h = info.yres;
+-    ctx->sec_frame_size = fbSize/nr_framebuffers;
+-    ctx->sec_disp_next_buf = ((info.yoffset * nr_framebuffers / info.yres_virtual) + 1) % nr_framebuffers;
+-    ctx->sec_info = info;
+-    ctx->sec_finfo = finfo;
+-#if 0
+-    struct fb_fix_screeninfo fb0_finfo;
+-    if (ioctl(m->framebuffer->fd, FBIOGET_FSCREENINFO, &fb0_finfo) == -1)
+-       goto disp_init_error;
+-                
+-    struct fb_var_screeninfo fb0_info;
+-    if (ioctl(m->framebuffer->fd, FBIOGET_VSCREENINFO, &fb0_info) == -1)
+-        goto disp_init_error;
+-                
+-    ALOGI("fb0_info display: xres %d,yres %d, xres_virtual %d, yres_virtual %d",
+-         fb0_info.xres,fb0_info.xres_virtual,
+-         fb0_info.yres,fb0_info.yres_virtual);
+-
+-    fb0_info.reserved[0] = 0;
+-    fb0_info.reserved[1] = 0;
+-    fb0_info.reserved[2] = 0;
+-    fb0_info.xoffset = 0;
+-    fb0_info.yoffset = 0;
+-    fb0_info.activate = FB_ACTIVATE_NOW;
+-                
+-    /*
+-    * Explicitly request 5/6/5
+-    */
+-    fb0_info.bits_per_pixel = 16;
+-    fb0_info.nonstd = 0;
+-    fb0_info.red.offset     = 11;
+-    fb0_info.red.length     = 5;
+-    fb0_info.green.offset   = 5;
+-    fb0_info.green.length   = 6;
+-    fb0_info.blue.offset    = 0;
+-    fb0_info.blue.length    = 5;
+-    fb0_info.transp.offset  = 0;
+-    fb0_info.transp.length  = 0;
+-    fb0_info.yres_virtual = ALIGN_PIXEL_128(fb0_info.yres) * nr_framebuffers;
+-	fb0_info.xres_virtual = fb0_info.xres;
+-#endif
+-    if (ioctl(m->framebuffer->fd, FBIOPUT_VSCREENINFO, &m->info) == -1) {
+-        ALOGE("Error!Second display FBIOPUT_VSCREENINFO");
+-        goto disp_init_error;
+-    }
+-
+-    return 0;
+-
+- disp_init_error:
+-    if(sec_fp) {
+-        close(sec_fp);
+-        sec_fp = 0;
+-        ctx->sec_fp = 0;
+-    }
+-    return -1;
+-}
+-
+-static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx)
+-{
+-    private_module_t* m = reinterpret_cast<private_module_t*>(ctx->dev->common.module);
+-
+-    if(ctx->mIpuFd < 0){
+-        ALOGE("%s:%d, invalid ipu device !!!!", __FUNCTION__, __LINE__);
+-        return -EINVAL;
+-    }
+-
+-    if(m->info.bits_per_pixel == 32){
+-        ctx->mTask.input.format = v4l2_fourcc('B', 'G', 'R', '4');
+-    }
+-    else {
+-        ctx->mTask.input.format = v4l2_fourcc('R', 'G', 'B', 'P');
+-    }
+-    ctx->mTask.input.width = ctx->device.width;
+-    ctx->mTask.input.height = ctx->device.height;
+-    ctx->mTask.input.crop.pos.x = 0;
+-    ctx->mTask.input.crop.pos.y = 0;
+-    ctx->mTask.input.crop.w = ctx->device.width;
+-    ctx->mTask.input.crop.h = ctx->device.height;
+-    ctx->mTask.input.paddr = phys;
+-
+-    if (ctx->sec_info.bits_per_pixel == 32) {
+-        ctx->mTask.output.format = v4l2_fourcc('B', 'G', 'R', '4');
+-    }
+-    else {
+-        ctx->mTask.output.format = v4l2_fourcc('R', 'G', 'B', 'P');
+-    }
+-    ctx->mTask.output.width = ctx->sec_disp_w;
+-    ctx->mTask.output.height = ctx->sec_disp_h;
+-    ctx->mTask.output.crop.w = ctx->sec_disp_w;
+-    ctx->mTask.output.crop.h = ctx->sec_disp_h;
+-    
+-    if((ctx->mRotate == 0)||(ctx->mRotate == 180))
+-    {
+-        if((unsigned int)ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.width/ctx->device.height){
+-            ctx->mTask.output.crop.w = ctx->sec_disp_h*ctx->device.width/ctx->device.height;
+-        }
+-        else{
+-            ctx->mTask.output.crop.h = ctx->sec_disp_w*ctx->device.height/ctx->device.width;
+-        }
+-    }
+-    else{
+-        if((unsigned int)ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.height/ctx->device.width){
+-            ctx->mTask.output.crop.w = ctx->sec_disp_h*ctx->device.height/ctx->device.width;
+-        }
+-        else{
+-            ctx->mTask.output.crop.h = ctx->sec_disp_w*ctx->device.width/ctx->device.height;
+-        }
+-    }
+-
+-    ctx->mTask.output.crop.pos.x = (ctx->sec_disp_w - ctx->mTask.output.crop.w)/2;
+-    ctx->mTask.output.crop.pos.y = (ctx->sec_disp_h - ctx->mTask.output.crop.h)/2;
+-
+-    ctx->mTask.output.rotate = ctx->sec_rotation;
+-    ctx->mTask.output.paddr = ctx->sec_disp_phys + ctx->sec_disp_next_buf*ctx->sec_frame_size;
+-
+-    int status = -EINVAL;
+-    int ret = IPU_CHECK_ERR_INPUT_CROP;
+-
+-    while(ret != IPU_CHECK_OK && ret > IPU_CHECK_ERR_MIN) {
+-        ret = ioctl(ctx->mIpuFd, IPU_CHECK_TASK, &ctx->mTask);
+-        switch(ret) {
+-            case IPU_CHECK_OK:
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_INPUTW_OVER:
+-                ctx->mTask.input.crop.w -= 8;
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_INPUTH_OVER:
+-                ctx->mTask.input.crop.h -= 8;
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_OUTPUTW_OVER:
+-                ctx->mTask.output.crop.w -= 8;
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_OUTPUTH_OVER:
+-                ctx->mTask.output.crop.h -= 8;
+-                break;
+-            default:
+-                return status;
+-        }
+-    }
+-    status = ioctl(ctx->mIpuFd, IPU_QUEUE_TASK, &ctx->mTask);
+-    if(status < 0) {
+-        ALOGE("%s:%d, IPU_QUEUE_TASK failed %d", __FUNCTION__, __LINE__ ,status);
+-    }
+-
+-    return status;
+-}
+-
+-#if 0
+-/** convert HAL_PIXEL_FORMAT to C2D format */
+-static C2D_COLORFORMAT get_format(int format) {
+-    switch (format) {
+-	case HAL_PIXEL_FORMAT_BGRA_8888:   return C2D_COLOR_8888;
+-    case HAL_PIXEL_FORMAT_RGB_565:     return C2D_COLOR_0565;
+-    default:                           return C2D_COLOR_0565;
+-    }
+-}
+-
+-/** get  pixelbit from HAL_PIXEL_FORMAT format */
+-static int get_pixelbit(int format) {
+-    switch (format) {
+-    case HAL_PIXEL_FORMAT_BGRA_8888:   return 32;
+-    case HAL_PIXEL_FORMAT_RGB_565:     return 16;
+-    default:                           return 16;
+-    }
+-}
+-
+-static int resizeToSecFrameBuffer_c2d(int base,int phys,fb_context_t* ctx)
+-{
+-    C2D_SURFACE_DEF srcSurfaceDef;
+-    C2D_SURFACE_DEF dstSurfaceDef;
+-    C2D_SURFACE srcSurface;
+-    C2D_SURFACE dstSurface; 
+-    C2D_RECT dstRect;
+-
+-    if(!ctx || !ctx->c2dctx) return -1;
+-
+-    srcSurfaceDef.format = get_format(ctx->device.format);
+-    srcSurfaceDef.width =  ctx->device.width;
+-    srcSurfaceDef.height = ctx->device.height;
+-
+-	//make sure stride is 32 pixel aligned
+-    srcSurfaceDef.stride = ((ctx->device.width + 31) & ~31)*get_pixelbit(ctx->device.format)>>3;
+-
+-    srcSurfaceDef.buffer = (void *)phys;
+-    srcSurfaceDef.host = (void *)base;
+-    srcSurfaceDef.flags = C2D_SURFACE_NO_BUFFER_ALLOC;
+-
+-    if (c2dSurfAlloc(ctx->c2dctx, &srcSurface, &srcSurfaceDef) != C2D_STATUS_OK)
+-    {
+-        ALOGE("srcSurface c2dSurfAlloc fail");
+-        return -EINVAL;
+-    }
+-
+-    dstSurfaceDef.format = get_format(HAL_PIXEL_FORMAT_RGB_565);
+-    dstSurfaceDef.width =  ctx->sec_disp_w;
+-    dstSurfaceDef.height = ctx->sec_disp_h;
+-
+-    //make sure stride is 32 pixel aligned
+-    dstSurfaceDef.stride = ((ctx->sec_disp_w + 31) & ~31)*get_pixelbit(HAL_PIXEL_FORMAT_RGB_565)>>3;
+-
+-    dstSurfaceDef.buffer = (void *)ctx->sec_disp_phys + ctx->sec_disp_next_buf*ctx->sec_frame_size;
+-    dstSurfaceDef.host = (void *)ctx->sec_disp_base + ctx->sec_disp_next_buf*ctx->sec_frame_size;
+-    dstSurfaceDef.flags = C2D_SURFACE_NO_BUFFER_ALLOC;
+-
+-    dstRect.x = dstRect.y = 0;
+-    dstRect.width = dstSurfaceDef.width;
+-    dstRect.height = dstSurfaceDef.height;
+-                
+-    if((ctx->mRotate == 0)||(ctx->mRotate == 180))
+-    {
+-        if(ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.width/ctx->device.height){
+-            dstRect.width = ctx->sec_disp_h*ctx->device.width/ctx->device.height;
+-        }
+-        else{
+-            dstRect.height = ctx->sec_disp_w*ctx->device.height/ctx->device.width;
+-        }
+-    }
+-    else{
+-        if(ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.height/ctx->device.width){
+-            dstRect.width = ctx->sec_disp_h*ctx->device.height/ctx->device.width;
+-        }
+-        else{
+-            dstRect.height = ctx->sec_disp_w*ctx->device.width/ctx->device.height;
+-        }
+-    }
+-
+-    dstRect.x = (ctx->sec_disp_w - dstRect.width)/2;
+-    dstRect.y = (ctx->sec_disp_h - dstRect.height)/2;
+-            
+-    if (c2dSurfAlloc(ctx->c2dctx, &dstSurface, &dstSurfaceDef) != C2D_STATUS_OK)
+-    {
+-        ALOGE("dstSurface c2dSurfAlloc fail");
+-        c2dSurfFree(ctx->c2dctx, srcSurface);
+-        return -EINVAL;
+-    }
+-
+-    c2dSetSrcSurface(ctx->c2dctx, srcSurface);
+-    c2dSetDstSurface(ctx->c2dctx, dstSurface); 
+-    c2dSetSrcRotate(ctx->c2dctx, ctx->mRotate);
+-
+-    c2dSetStretchMode(ctx->c2dctx, C2D_STRETCH_BILINEAR_SAMPLING);
+-    c2dSetBlendMode(ctx->c2dctx, C2D_ALPHA_BLEND_NONE);         
+-    c2dSetDither(ctx->c2dctx, 0); 
+- 
+-    c2dSetDstRectangle(ctx->c2dctx, &dstRect);
+-    c2dDrawBlit(ctx->c2dctx); 
+-        
+-    c2dFinish(ctx->c2dctx);
+-    c2dSurfFree(ctx->c2dctx, srcSurface);
+-    c2dSurfFree(ctx->c2dctx, dstSurface);
+-
+-    return 0;
+-}
+-#endif
+-void * secDispShowFrames(void * arg)
+-{
+-    private_module_t* m = NULL;
+-    private_handle_t const* hnd = NULL;
+-    fb_context_t* ctx = (fb_context_t*)arg;
+-    
+-    while(1)
+-    {
+-        sem_wait(&ctx->sec_display_begin);
+-
+-        if(!ctx->sec_display_inited)
+-        {
+-            sem_post(&ctx->sec_display_end);
+-            break;
+-        }
+-
+-        char value[PROPERTY_VALUE_MAX];
+-        property_get("ro.secfb.disable-overlay", value, "0");
+-        if (!strcmp(value, "1"))
+-        {
+-            property_get("media.VIDEO_PLAYING", value, "0");
+-        }
+-
+-        if (strcmp(value, "1") == 0)
+-        {
+-            if(ctx->cleancount)
+-            {
+-                sem_post(&ctx->sec_display_end);
+-                continue;
+-            }
+-
+-            ctx->cleancount++;
+-            memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*nr_framebuffers);
+-        }
+-        else
+-        {
+-           ctx->cleancount = 0;
+-        }
+-
+-        if(!ctx->cleancount)
+-        {
+-            hnd = reinterpret_cast<private_handle_t const*>(ctx->buffer);
+-            m = reinterpret_cast<private_module_t*>(ctx->dev->common.module);
+-#if 0
+-            if(ctx->c2dctx != NULL)
+-            {
+-                resizeToSecFrameBuffer_c2d(hnd->base,
+-                           m->framebuffer->phys + hnd->base - m->framebuffer->base,
+-                           ctx);
+-            }
+-            else
+-#endif
+-            {
+-                resizeToSecFrameBuffer(hnd->base,
+-                                   m->framebuffer->phys + hnd->base - m->framebuffer->base,
+-                                   ctx);
+-            }
+-        }
+-
+-        sem_post(&ctx->sec_display_end);
+-        
+-        ctx->sec_info.yoffset = (ctx->sec_info.yres_virtual/nr_framebuffers) * ctx->sec_disp_next_buf;
+-        ctx->sec_disp_next_buf = (ctx->sec_disp_next_buf + 1) % nr_framebuffers;
+-        ctx->sec_info.activate = FB_ACTIVATE_VBL;
+-
+-        ioctl(ctx->sec_fp, FBIOPAN_DISPLAY, &ctx->sec_info);
+-    }
+-
+-    return NULL;
+-}
+-
+-#endif
+-
+-/*****************************************************************************/
+-
+ static int fb_close(struct hw_device_t *dev)
+ {
+     fb_context_t* ctx = (fb_context_t*)dev;
+@@ -1624,19 +401,11 @@ int fb_device_open(hw_module_t const* module, const char* name,
+         hw_device_t** device)
+ {
+     int status = -EINVAL;
+-    char value[PROPERTY_VALUE_MAX];
+ 
+     if (!strcmp(name, GRALLOC_HARDWARE_FB0)) {
+         alloc_device_t* gralloc_device;
+         framebuffer_device_t *fbdev;
+ 
+-        nr_framebuffers = NUM_BUFFERS;
+-        property_get("ro.product.device", value, "");
+-        if (0 == strcmp(value, "imx50_rdp")) {
+-            nr_framebuffers = 2;
+-            no_ipu = 1;
+-        }
+-
+         status = gralloc_open(module, &gralloc_device);
+         if (status < 0)
+             return status;
+@@ -1652,15 +421,8 @@ int fb_device_open(hw_module_t const* module, const char* name,
+         dev->device.common.close = fb_close;
+         dev->device.setSwapInterval = fb_setSwapInterval;
+         dev->device.post            = fb_post;
+-        #ifndef FSL_EPDC_FB
+-        dev->device.setUpdateRect = 0;
+-        #else
+         dev->device.setUpdateRect = fb_setUpdateRect;
+-        #endif
+         dev->device.compositionComplete = fb_compositionComplete;
+-        #if 0 //def FSL_IMX_DISPLAY
+-        dev->device.setSecRotation = fb_setSecRotation;
+-        #endif
+ 
+         private_module_t* m = (private_module_t*)module;
+         status = mapFrameBuffer(m);
+diff --git a/mx5x/libgralloc/gr.h b/mx5x/libgralloc/gr.h
+index 1660c79..b2e60fd 100644
+--- a/mx5x/libgralloc/gr.h
++++ b/mx5x/libgralloc/gr.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,26 +15,11 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2009-2012 Freescale Semiconductor, Inc. */
+-
+ #ifndef GR_H_
+ #define GR_H_
+ 
+-#include <stdint.h>
+-#ifdef HAVE_ANDROID_OS      // just want PAGE_SIZE define
+-# include <asm/page.h>
+-#else
+-# include <sys/user.h>
+-#endif
+-#include <limits.h>
+-#include <sys/cdefs.h>
+-#include <hardware/gralloc.h>
++#include <asm/page.h>
+ #include <pthread.h>
+-#include <errno.h>
+-
+-#include <cutils/native_handle.h>
+-
+-/*****************************************************************************/
+ 
+ struct private_module_t;
+ struct private_handle_t;
+@@ -45,8 +31,6 @@ inline size_t roundUpToPageSize(size_t x) {
+ int mapFrameBufferLocked(struct private_module_t* module);
+ int terminateBuffer(gralloc_module_t const* module, private_handle_t* hnd);
+ 
+-/*****************************************************************************/
+-
+ class Locker {
+     pthread_mutex_t mutex;
+ public:
+@@ -61,5 +45,4 @@ public:
+     inline void lock()     { pthread_mutex_lock(&mutex); }
+     inline void unlock()   { pthread_mutex_unlock(&mutex); }
+ };
+-
+ #endif /* GR_H_ */
+diff --git a/mx5x/libgralloc/gralloc_priv.h b/mx5x/libgralloc/gralloc_priv.h
+index c8ddad2..6acd690 100644
+--- a/mx5x/libgralloc/gralloc_priv.h
++++ b/mx5x/libgralloc/gralloc_priv.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,22 +15,16 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2009-2012 Freescale Semiconductor, Inc. */
+-
+ #ifndef GRALLOC_PRIV_H_
+ #define GRALLOC_PRIV_H_
+ 
+ #include <stdint.h>
+-#include <limits.h>
+-#include <sys/cdefs.h>
+-#include <hardware/gralloc.h>
+ #include <pthread.h>
+ #include <errno.h>
+-#include <unistd.h>
++#include <linux/fb.h>
+ 
+ #include <cutils/native_handle.h>
+-
+-#include <linux/fb.h>
++#include <hardware/gralloc.h>
+ 
+ #define  ALIGN_PIXEL(x)  ((x+ 31) & ~31)
+ #define  ALIGN_PIXEL_64(x)  ((x+ 63) & ~63)
+diff --git a/mx5x/libgralloc/mapper.cpp b/mx5x/libgralloc/mapper.cpp
+index 2399187..b7513b4 100644
+--- a/mx5x/libgralloc/mapper.cpp
++++ b/mx5x/libgralloc/mapper.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,41 +15,21 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright 2009-2012 Freescale Semiconductor, Inc. */
+ 
+-#include <limits.h>
+ #include <errno.h>
+ #include <pthread.h>
+-#include <unistd.h>
+-#include <string.h>
+-#include <stdarg.h>
+-
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+-#include <sys/ioctl.h>
++#include <ion/ion.h>
+ 
+ #include <cutils/log.h>
+ #include <cutils/atomic.h>
+-
+ #include <hardware/hardware.h>
+ #include <hardware/gralloc.h>
+ 
+-#include <ion/ion.h>
+-
+ #include "gralloc_priv.h"
+ 
+-
+-/* desktop Linux needs a little help with gettid() */
+-#if defined(ARCH_X86) && !defined(HAVE_ANDROID_OS)
+-#define __KERNEL__
+-# include <linux/unistd.h>
+-pid_t gettid() { return syscall(__NR_gettid);}
+-#undef __KERNEL__
+-#endif
+-
+-/*****************************************************************************/
+-
+ static int gralloc_map(gralloc_module_t const* module,
+         buffer_handle_t handle,
+         void** vaddr)
+@@ -98,12 +79,8 @@ static int gralloc_unmap(gralloc_module_t const* module,
+     return 0;
+ }
+ 
+-/*****************************************************************************/
+-
+ static pthread_mutex_t sMapLock = PTHREAD_MUTEX_INITIALIZER; 
+ 
+-/*****************************************************************************/
+-
+ int gralloc_register_buffer(gralloc_module_t const* module,
+         buffer_handle_t handle)
+ {
+-- 
+1.8.0
+

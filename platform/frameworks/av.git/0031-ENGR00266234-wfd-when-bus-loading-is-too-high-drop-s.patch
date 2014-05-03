@@ -1,0 +1,104 @@
+From 16b43c3e4874ed864f161074a75406b7c5e782da Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Wed, 25 Sep 2013 16:46:01 +0800
+Subject: [PATCH 31/50] ENGR00266234 wfd: when bus loading is too high, drop
+ some audio.
+
+when bus loading is too high, drop some audio.
+make sure latency can be low down.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ media/libstagefright/wifi-display/MediaSender.cpp | 43 +++++++++++++++++++++++
+ media/libstagefright/wifi-display/MediaSender.h   |  2 ++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/media/libstagefright/wifi-display/MediaSender.cpp b/media/libstagefright/wifi-display/MediaSender.cpp
+index b1cdec0..fef0a65 100644
+--- a/media/libstagefright/wifi-display/MediaSender.cpp
++++ b/media/libstagefright/wifi-display/MediaSender.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2013, The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -241,6 +242,7 @@ status_t MediaSender::queueAccessUnit(
+             }
+ 
+             if (minTrackIndex < 0) {
++                adjustAudioQueue();
+                 return OK;
+             }
+ 
+@@ -282,6 +284,47 @@ status_t MediaSender::queueAccessUnit(
+                 ? RTPSender::PACKETIZATION_AAC : RTPSender::PACKETIZATION_H264);
+ }
+ 
++void MediaSender::adjustAudioQueue()
++{
++    for (size_t i = 0; i < mTrackInfos.size(); ++i) {
++        TrackInfo &info = (TrackInfo &)mTrackInfos.itemAt(i);
++        if (info.mAccessUnits.size() > 10) {
++            List< sp<ABuffer> >::iterator lasti = info.mAccessUnits.end();
++            List< sp<ABuffer> >::iterator firsti = info.mAccessUnits.begin();
++            lasti --;
++            sp<ABuffer> first = *firsti;
++            sp<ABuffer> last = *lasti;
++            int64_t lastTimeUs = 0, firstTimeUs = 0;
++            first->meta()->findInt64("timeUs", &firstTimeUs);
++            last->meta()->findInt64("timeUs", &lastTimeUs);
++
++            // if audio timestamp span in the queue large than 300ms.
++            // start to drop audio frames.
++            if ((lastTimeUs - firstTimeUs) > 300000) {
++                ALOGI("adjustAudioQueue timeus:%lld", lastTimeUs - firstTimeUs);
++                int64_t startTimeUs = 0;
++                sp<ABuffer> start;
++                List< sp<ABuffer> >::iterator starti;
++                while (firsti != lasti) {
++                    starti = firsti;
++                    start = *starti;
++                    firsti ++;
++                    int64_t startTimeUs = 0;
++                    start->meta()->findInt64("timeUs", &startTimeUs);
++                    // drop audio timestamp span more than 200ms.
++                    if (lastTimeUs - startTimeUs >= 200000) {
++                        ALOGI("adjustAudioQueue drop timeus:%lld", lastTimeUs - startTimeUs);
++                        info.mAccessUnits.erase(starti);
++                    }
++                    else {
++                        break;
++                    }
++                }//end while
++            }
++        }//end if
++    }//end for
++}
++
+ void MediaSender::onMessageReceived(const sp<AMessage> &msg) {
+     switch (msg->what()) {
+         case kWhatSenderNotify:
+diff --git a/media/libstagefright/wifi-display/MediaSender.h b/media/libstagefright/wifi-display/MediaSender.h
+index 04538ea..666f515 100644
+--- a/media/libstagefright/wifi-display/MediaSender.h
++++ b/media/libstagefright/wifi-display/MediaSender.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright 2013, The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -117,6 +118,7 @@ private:
+     void notifyInitDone(status_t err);
+     void notifyError(status_t err);
+     void notifyNetworkStall(size_t numBytesQueued);
++    void adjustAudioQueue();
+ 
+     status_t packetizeAccessUnit(
+             size_t trackIndex,
+-- 
+1.8.0
+

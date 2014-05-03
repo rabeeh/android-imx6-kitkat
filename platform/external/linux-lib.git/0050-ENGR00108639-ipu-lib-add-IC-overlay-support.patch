@@ -1,0 +1,2409 @@
+From c8b106f0f2acd1cbb8d329f62f01f28c9629f260 Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Fri, 24 Apr 2009 13:01:17 +0800
+Subject: [PATCH 050/249] ENGR00108639 ipu-lib : add IC overlay support
+
+1. add IC overlay support to ipu lib.
+2. add screenlayer lib based on ipu lib.
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ ipu/mxc_ipu_hl_lib.c      | 784 +++++++++++++++++++++++++++++++++++++---------
+ ipu/mxc_ipu_hl_lib.h      | 108 +++++--
+ screenlayer/Makefile      |  24 ++
+ screenlayer/ScreenLayer.c | 738 +++++++++++++++++++++++++++++++++++++++++++
+ screenlayer/ScreenLayer.h |  99 ++++++
+ 5 files changed, 1577 insertions(+), 176 deletions(-)
+ create mode 100644 screenlayer/Makefile
+ create mode 100644 screenlayer/ScreenLayer.c
+ create mode 100644 screenlayer/ScreenLayer.h
+
+diff --git a/ipu/mxc_ipu_hl_lib.c b/ipu/mxc_ipu_hl_lib.c
+index b9eec5c..ac7e87f 100644
+--- a/ipu/mxc_ipu_hl_lib.c
++++ b/ipu/mxc_ipu_hl_lib.c
+@@ -20,6 +20,10 @@
+  * @ingroup IPU
+  */
+ 
++#ifdef __cplusplus
++extern "C"{
++#endif
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <errno.h>
+@@ -36,7 +40,6 @@
+ #include <sys/mman.h>
+ #include <linux/autoconf.h>
+ #include <linux/videodev.h>
+-#include <linux/ipu.h>
+ #include "mxc_ipu_hl_lib.h"
+ 
+ #define FBDEV0	"/dev/fb0"
+@@ -48,7 +51,7 @@
+ #define DBG_WARNING		1
+ #define DBG_ERR			0
+ 
+-static int debug_level = DBG_INFO;
++static int debug_level = DBG_ERR;
+ #define dbg(flag, fmt, args...)	{ if(flag <= debug_level)  printf("%s:%d "fmt, __FILE__, __LINE__,##args); }
+ 
+ /* this mutex only can protect within same process context,
+@@ -74,6 +77,7 @@ typedef enum {
+ 	NULL_MODE = 0,
+ 	IC_MODE = 0x1,
+ 	ROT_MODE = 0x2,
++	COPY_MODE = 0x4,
+ } task_mode_t;
+ 
+ typedef enum {
+@@ -91,11 +95,18 @@ typedef struct {
+ 	int output_bufnum;
+ 	int update_bufnum;
+         ipu_mem_info i_minfo[2];
++        ipu_mem_info ov_minfo[2];
+ 	int iwidth;
+ 	int iheight;
+ 	int i_off;
+ 	int i_uoff;
+ 	int i_voff;
++	int overlay_en;
++	int ovwidth;
++	int ovheight;
++	int ov_off;
++	int ov_uoff;
++	int ov_voff;
+ 
+ 	int input_fr_cnt;
+ 	int output_fr_cnt;
+@@ -117,18 +128,15 @@ typedef struct {
+ 		void * fb_mem;
+ 		int screen_size;
+ 		ipu_channel_t fb_chan;
++
++		int owidth;
++		int oheight;
++		int o_off;
++		int o_uoff;
++		int o_voff;
+ 	} output[2];
+ } ipu_lib_priv_handle_t;
+ 
+-static void ipu_msleep(int ms)
+-{
+-      struct timeval tv;
+-
+-      tv.tv_sec = ms/1000;
+-      tv.tv_usec = (ms % 1000) * 1000;
+-      select(0, NULL, NULL, NULL, &tv);
+-}
+-
+ static u32 fmt_to_bpp(u32 pixelformat)
+ {
+ 	u32 bpp;
+@@ -302,7 +310,8 @@ static int _ipu_is_task_busy(int ipu_task)
+ 
+ static task_mode_t __ipu_task_check(ipu_lib_priv_handle_t * ipu_priv_handle,
+ 		ipu_lib_input_param_t * input,
+-		ipu_lib_output_param_t * output)
++		ipu_lib_output_param_t * output,
++		int out_idx)
+ {
+ 	task_mode_t task_mode = NULL_MODE;
+ 	int tmp;
+@@ -310,21 +319,24 @@ static task_mode_t __ipu_task_check(ipu_lib_priv_handle_t * ipu_priv_handle,
+ 	if(output->rot >= _ipu_get_arch_rot_begin()){
+ 		if(output->rot >= IPU_ROTATE_90_RIGHT){
+ 			/*output swap*/
+-			tmp = output->width;
+-			output->width = output->height;
+-			output->height = tmp;
++			tmp = ipu_priv_handle->output[out_idx].owidth;
++			ipu_priv_handle->output[out_idx].owidth =
++				ipu_priv_handle->output[out_idx].oheight;
++			ipu_priv_handle->output[out_idx].oheight = tmp;
+ 		}
+ 		task_mode |= ROT_MODE;
+ 	}
+ 
+ 	/* make sure width is 8 pixel align*/
+-	output->width = output->width - output->width%8;
++	ipu_priv_handle->output[out_idx].owidth =
++		ipu_priv_handle->output[out_idx].owidth - ipu_priv_handle->output[out_idx].owidth%8;
+ 	if (task_mode & ROT_MODE)
+-		output->height = output->height - output->height%8;
++		ipu_priv_handle->output[out_idx].oheight =
++			ipu_priv_handle->output[out_idx].oheight - ipu_priv_handle->output[out_idx].oheight%8;
+ 
+ 	/*need resize or CSC?*/
+-	if((ipu_priv_handle->iwidth != output->width) ||
+-			(ipu_priv_handle->iheight != output->height) ||
++	if((ipu_priv_handle->iwidth != ipu_priv_handle->output[out_idx].owidth) ||
++			(ipu_priv_handle->iheight != ipu_priv_handle->output[out_idx].oheight) ||
+ 			need_csc(input->fmt,output->fmt))
+ 		task_mode |= IC_MODE;
+ 
+@@ -336,16 +348,28 @@ static task_mode_t __ipu_task_check(ipu_lib_priv_handle_t * ipu_priv_handle,
+ 	if((task_mode == NULL_MODE) && (input->fmt != output->fmt))
+ 		task_mode |= IC_MODE;
+ 
++	if(output->rot >= _ipu_get_arch_rot_begin()){
++		if(output->rot >= IPU_ROTATE_90_RIGHT){
++			/*output swap*/
++			tmp = ipu_priv_handle->output[out_idx].owidth;
++			ipu_priv_handle->output[out_idx].owidth =
++				ipu_priv_handle->output[out_idx].oheight;
++			ipu_priv_handle->output[out_idx].oheight = tmp;
++		}
++	}
++
+ 	return task_mode;
+ }
+ 
+ static int _ipu_task_check(ipu_lib_input_param_t * input,
++		ipu_lib_overlay_param_t * overlay,
+ 		ipu_lib_output_param_t * output0,
+ 		ipu_lib_output_param_t * output1,
+ 		ipu_lib_handle_t * ipu_handle)
+ {
+-	int ipu_task_busy = 0;
++	int ipu_task_busy = 0, output_num, i;
+ 	int ret = 0, hope_task_mode;
++	ipu_lib_output_param_t * output;
+ 	ipu_lib_priv_handle_t * ipu_priv_handle = (ipu_lib_priv_handle_t *)ipu_handle->priv;
+ 
+ 	hope_task_mode = ipu_priv_handle->mode & 0x07;
+@@ -356,6 +380,18 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 			goto done;
+ 		}
+ 	}
++	if (overlay && hope_task_mode) {
++		if (!(hope_task_mode & (TASK_VF_MODE | TASK_PP_MODE))) {
++			dbg(DBG_ERR, "Must use PP or VF task for overlay!\n");
++			ret = -1;
++			goto done;
++		}
++	}
++	if (overlay && output1) {
++		dbg(DBG_ERR, "Do not consider overlay+output1 case!\n");
++		ret = -1;
++		goto done;
++	}
+ 
+ 	if ((input->input_crop_win.win_w > 0) || (input->input_crop_win.win_h > 0)) {
+ 		if ((input->input_crop_win.win_w + input->input_crop_win.pos.x) > input->width)
+@@ -365,57 +401,204 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 		ipu_priv_handle->iwidth = input->input_crop_win.win_w;
+ 		ipu_priv_handle->iheight = input->input_crop_win.win_h;
+ 
+-		/* NOTE: u v offset should based on start point of i_off*/
+-		switch (input->fmt) {
+-		case IPU_PIX_FMT_YUV420P2:
+-		case IPU_PIX_FMT_YUV420P:
+-			ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
+-                                input->input_crop_win.pos.x;
+-			ipu_priv_handle->i_uoff = (input->width * (input->height - input->input_crop_win.pos.y)
+-				- input->input_crop_win.pos.x)
+-				+ ((input->width/2 * input->input_crop_win.pos.y/2)
+-				+ input->input_crop_win.pos.x/2);
+-			ipu_priv_handle->i_voff = ipu_priv_handle->i_uoff +
+-				(input->width/2 * input->height/2);
+-			break;
+-		case IPU_PIX_FMT_YVU422P:
+-			ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
+-                                input->input_crop_win.pos.x;
+-			ipu_priv_handle->i_voff = (input->width * (input->height - input->input_crop_win.pos.y)
+-				- input->input_crop_win.pos.x)
+-				+ ((input->width * input->input_crop_win.pos.y)/2 + input->input_crop_win.pos.x/2);
+-			ipu_priv_handle->i_uoff = ipu_priv_handle->i_voff +
+-				(input->width * input->height)/2;
+-			break;
+-		case IPU_PIX_FMT_YUV422P:
+-			ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
+-                                input->input_crop_win.pos.x;
+-			ipu_priv_handle->i_uoff = (input->width * (input->height - input->input_crop_win.pos.y)
+-				- input->input_crop_win.pos.x)
+-				+ (input->width * input->input_crop_win.pos.y)/2 + input->input_crop_win.pos.x/2;
+-			ipu_priv_handle->i_voff = ipu_priv_handle->i_uoff +
+-				(input->width * input->height)/2;
+-			break;
+-		case IPU_PIX_FMT_NV12:
+-			ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
+-                                input->input_crop_win.pos.x;
+-			ipu_priv_handle->i_uoff = (input->width * (input->height - input->input_crop_win.pos.y)
+-				- input->input_crop_win.pos.x)
+-				+ input->width * input->input_crop_win.pos.y + input->input_crop_win.pos.x;
+-			break;
+-		default:
+-			ipu_priv_handle->i_off = (input->input_crop_win.pos.y * input->width +
+-				input->input_crop_win.pos.x) * fmt_to_bpp(input->fmt)/8;
+-			break;
++		if ((ipu_priv_handle->iwidth != input->width) || (ipu_priv_handle->iheight != input->height)) {
++			/* NOTE: u v offset should based on start point of i_off*/
++			switch (input->fmt) {
++				case IPU_PIX_FMT_YUV420P2:
++				case IPU_PIX_FMT_YUV420P:
++					ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
++						input->input_crop_win.pos.x;
++					ipu_priv_handle->i_uoff = (input->width * (input->height - input->input_crop_win.pos.y)
++							- input->input_crop_win.pos.x)
++						+ ((input->width/2 * input->input_crop_win.pos.y/2)
++								+ input->input_crop_win.pos.x/2);
++					ipu_priv_handle->i_voff = ipu_priv_handle->i_uoff +
++						(input->width/2 * input->height/2);
++					break;
++				case IPU_PIX_FMT_YVU422P:
++					ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
++						input->input_crop_win.pos.x;
++					ipu_priv_handle->i_voff = (input->width * (input->height - input->input_crop_win.pos.y)
++							- input->input_crop_win.pos.x)
++						+ ((input->width * input->input_crop_win.pos.y)/2 + input->input_crop_win.pos.x/2);
++					ipu_priv_handle->i_uoff = ipu_priv_handle->i_voff +
++						(input->width * input->height)/2;
++					break;
++				case IPU_PIX_FMT_YUV422P:
++					ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
++						input->input_crop_win.pos.x;
++					ipu_priv_handle->i_uoff = (input->width * (input->height - input->input_crop_win.pos.y)
++							- input->input_crop_win.pos.x)
++						+ (input->width * input->input_crop_win.pos.y)/2 + input->input_crop_win.pos.x/2;
++					ipu_priv_handle->i_voff = ipu_priv_handle->i_uoff +
++						(input->width * input->height)/2;
++					break;
++				case IPU_PIX_FMT_NV12:
++					ipu_priv_handle->i_off = input->input_crop_win.pos.y * input->width +
++						input->input_crop_win.pos.x;
++					ipu_priv_handle->i_uoff = (input->width * (input->height - input->input_crop_win.pos.y)
++							- input->input_crop_win.pos.x)
++						+ input->width * input->input_crop_win.pos.y + input->input_crop_win.pos.x;
++					break;
++				default:
++					ipu_priv_handle->i_off = (input->input_crop_win.pos.y * input->width +
++							input->input_crop_win.pos.x) * fmt_to_bpp(input->fmt)/8;
++					break;
++			}
+ 		}
+ 	} else {
+ 		ipu_priv_handle->iwidth = input->width;
+ 		ipu_priv_handle->iheight = input->height;
+ 	}
+ 
+-	ipu_priv_handle->output[0].task_mode = __ipu_task_check(ipu_priv_handle, input, output0);
++	if (overlay) {
++		if ((overlay->ov_crop_win.win_w > 0) || (overlay->ov_crop_win.win_h > 0)) {
++			if ((overlay->ov_crop_win.win_w + overlay->ov_crop_win.pos.x) > overlay->width)
++				overlay->ov_crop_win.win_w = overlay->width - overlay->ov_crop_win.pos.x;
++			if ((overlay->ov_crop_win.win_h + overlay->ov_crop_win.pos.y) > overlay->height)
++				overlay->ov_crop_win.win_h = overlay->height - overlay->ov_crop_win.pos.y;
++			ipu_priv_handle->ovwidth = overlay->ov_crop_win.win_w;
++			ipu_priv_handle->ovheight = overlay->ov_crop_win.win_h;
++
++			if ((ipu_priv_handle->ovwidth != overlay->width) || (ipu_priv_handle->ovheight != overlay->height)) {
++				/* NOTE: u v offset should based on start point of ov_off*/
++				switch (overlay->fmt) {
++					case IPU_PIX_FMT_YUV420P2:
++					case IPU_PIX_FMT_YUV420P:
++						ipu_priv_handle->ov_off = overlay->ov_crop_win.pos.y * overlay->width +
++							overlay->ov_crop_win.pos.x;
++						ipu_priv_handle->ov_uoff = (overlay->width * (overlay->height - overlay->ov_crop_win.pos.y)
++								- overlay->ov_crop_win.pos.x)
++							+ ((overlay->width/2 * overlay->ov_crop_win.pos.y/2)
++									+ overlay->ov_crop_win.pos.x/2);
++						ipu_priv_handle->ov_voff = ipu_priv_handle->ov_uoff +
++							(overlay->width/2 * overlay->height/2);
++						break;
++					case IPU_PIX_FMT_YVU422P:
++						ipu_priv_handle->ov_off = overlay->ov_crop_win.pos.y * overlay->width +
++							overlay->ov_crop_win.pos.x;
++						ipu_priv_handle->ov_voff = (overlay->width * (overlay->height - overlay->ov_crop_win.pos.y)
++								- overlay->ov_crop_win.pos.x)
++							+ ((overlay->width * overlay->ov_crop_win.pos.y)/2 + overlay->ov_crop_win.pos.x/2);
++						ipu_priv_handle->ov_uoff = ipu_priv_handle->i_voff +
++							(overlay->width * overlay->height)/2;
++						break;
++					case IPU_PIX_FMT_YUV422P:
++						ipu_priv_handle->ov_off = overlay->ov_crop_win.pos.y * overlay->width +
++							overlay->ov_crop_win.pos.x;
++						ipu_priv_handle->ov_uoff = (overlay->width * (overlay->height - overlay->ov_crop_win.pos.y)
++								- overlay->ov_crop_win.pos.x)
++							+ (overlay->width * overlay->ov_crop_win.pos.y)/2 + overlay->ov_crop_win.pos.x/2;
++						ipu_priv_handle->ov_voff = ipu_priv_handle->i_uoff +
++							(overlay->width * overlay->height)/2;
++						break;
++					case IPU_PIX_FMT_NV12:
++						ipu_priv_handle->ov_off = overlay->ov_crop_win.pos.y * overlay->width +
++							overlay->ov_crop_win.pos.x;
++						ipu_priv_handle->ov_uoff = (overlay->width * (overlay->height - overlay->ov_crop_win.pos.y)
++								- overlay->ov_crop_win.pos.x)
++							+ overlay->width * overlay->ov_crop_win.pos.y + overlay->ov_crop_win.pos.x;
++						break;
++					default:
++						ipu_priv_handle->ov_off = (overlay->ov_crop_win.pos.y * overlay->width +
++								overlay->ov_crop_win.pos.x) * fmt_to_bpp(overlay->fmt)/8;
++						break;
++				}
++			}
++		} else {
++			ipu_priv_handle->ovwidth = overlay->width;
++			ipu_priv_handle->ovheight = overlay->height;
++		}
++	}
++
+ 	if (output1)
+-		ipu_priv_handle->output[1].task_mode = __ipu_task_check(ipu_priv_handle, input, output1);
++		output_num = 2;
++	else
++		output_num = 1;
++
++	for (i=0;i<output_num;i++) {
++		if (i == 0)
++			output = output0;
++		else
++			output = output1;
++
++		if ((output->output_win.win_w > 0) || (output->output_win.win_h > 0)) {
++			if ((output->output_win.win_w + output->output_win.pos.x) > output->width)
++				output->output_win.win_w = output->width - output->output_win.pos.x;
++			if ((output->output_win.win_h + output->output_win.pos.y) > output->height)
++				output->output_win.win_h = output->height - output->output_win.pos.y;
++			ipu_priv_handle->output[i].owidth = output->output_win.win_w;
++			ipu_priv_handle->output[i].oheight = output->output_win.win_h;
++
++			if ((ipu_priv_handle->output[i].owidth != output->width) ||
++				(ipu_priv_handle->output[i].oheight != output->height)) {
++				/* NOTE: u v offset should based on start point of i_off*/
++				switch (output->fmt) {
++					case IPU_PIX_FMT_YUV420P2:
++					case IPU_PIX_FMT_YUV420P:
++						ipu_priv_handle->output[i].o_off = output->output_win.pos.y * output->width +
++							output->output_win.pos.x;
++						ipu_priv_handle->output[i].o_uoff = (output->width * (output->height - output->output_win.pos.y)
++								- output->output_win.pos.x)
++							+ ((output->width/2 * output->output_win.pos.y/2)
++									+ output->output_win.pos.x/2);
++						ipu_priv_handle->output[i].o_voff = ipu_priv_handle->output[i].o_uoff +
++							(output->width/2 * output->height/2);
++						break;
++					case IPU_PIX_FMT_YVU422P:
++						ipu_priv_handle->output[i].o_off = output->output_win.pos.y * output->width +
++							output->output_win.pos.x;
++						ipu_priv_handle->output[i].o_voff = (output->width * (output->height - output->output_win.pos.y)
++								- output->output_win.pos.x)
++							+ ((output->width * output->output_win.pos.y)/2 + output->output_win.pos.x/2);
++						ipu_priv_handle->output[i].o_uoff = ipu_priv_handle->output[i].o_voff +
++							(output->width * output->height)/2;
++						break;
++					case IPU_PIX_FMT_YUV422P:
++						ipu_priv_handle->output[i].o_off = output->output_win.pos.y * output->width +
++							output->output_win.pos.x;
++						ipu_priv_handle->output[i].o_uoff = (output->width * (output->height - output->output_win.pos.y)
++								- output->output_win.pos.x)
++							+ (output->width * output->output_win.pos.y)/2 + output->output_win.pos.x/2;
++						ipu_priv_handle->output[i].o_voff = ipu_priv_handle->output[i].o_uoff +
++							(output->width * output->height)/2;
++						break;
++					case IPU_PIX_FMT_NV12:
++						ipu_priv_handle->output[i].o_off = output->output_win.pos.y * output->width +
++							output->output_win.pos.x;
++						ipu_priv_handle->output[i].o_uoff = (output->width * (output->height - output->output_win.pos.y)
++								- output->output_win.pos.x)
++							+ output->width * output->output_win.pos.y + output->output_win.pos.x;
++						break;
++					default:
++						ipu_priv_handle->output[i].o_off = (output->output_win.pos.y * output->width +
++								output->output_win.pos.x) * fmt_to_bpp(output->fmt)/8;
++						break;
++				}
++			}
++		} else {
++			ipu_priv_handle->output[i].owidth = output->width;
++			ipu_priv_handle->output[i].oheight = output->height;
++		}
++	}
++
++	if (overlay) {
++		if ((ipu_priv_handle->ovwidth != ipu_priv_handle->output[0].owidth) ||
++				(ipu_priv_handle->ovheight != ipu_priv_handle->output[0].oheight)) {
++			dbg(DBG_ERR, "width/height of overlay and output should be same!\n");
++			ret = -1;
++			goto done;
++		}
++	}
++
++	ipu_priv_handle->output[0].task_mode = __ipu_task_check(ipu_priv_handle, input, output0, 0);
++	if (output1)
++		ipu_priv_handle->output[1].task_mode = __ipu_task_check(ipu_priv_handle, input, output1, 1);
++
++	if (overlay) {
++		ipu_priv_handle->output[0].task_mode |= IC_MODE;
++		ipu_priv_handle->overlay_en = 1;
++	}
+ 
+ 	if (output1) {
+ 		/* 2 output case, should use VF & ENC task*/
+@@ -460,9 +643,16 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 	} else {
+ 		/* 1 output case */
+ 		if (ipu_priv_handle->output[0].task_mode == NULL_MODE) {
+-			dbg(DBG_ERR, "Do not need any operation! Will do nothing!\n");
+-			ret = -1;
+-			goto done;
++			if (input->user_def_paddr[0] && output0->user_def_paddr[0]) {
++				ipu_priv_handle->output[0].task_mode = COPY_MODE;
++				dbg(DBG_INFO, "Copy case!\n");
++				goto done;
++
++			} else {
++				dbg(DBG_ERR, "Do not need any operation! Will do nothing!\n");
++				ret = -1;
++				goto done;
++			}
+ 		}
+ 
+ 		/* try ENC first */
+@@ -471,11 +661,11 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 		if (ipu_priv_handle->output[0].task_mode & IC_MODE)
+ 			ipu_priv_handle->output[0].ipu_task |= IC_ENC;
+ 
+-		if (_ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
++		if (overlay || _ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
+ 			(hope_task_mode && ((hope_task_mode & TASK_ENC_MODE) == 0))) {
+ 
+ 			/* hope mode ENC task is busy ? */
+-			if (hope_task_mode && (hope_task_mode & TASK_ENC_MODE)) {
++			if (!overlay && hope_task_mode && (hope_task_mode & TASK_ENC_MODE)) {
+ 				ipu_task_busy = 1;
+ 				goto done;
+ 			}
+@@ -503,6 +693,7 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 				if (ipu_priv_handle->output[0].task_mode & IC_MODE)
+ 					ipu_priv_handle->output[0].ipu_task |= IC_VF;
+ 
++				/* left only VF task to try */
+ 				if (_ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
+ 					(hope_task_mode && ((hope_task_mode & TASK_VF_MODE) == 0)))
+ 					ipu_task_busy = 1;
+@@ -536,6 +727,7 @@ done:
+ }
+ 
+ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
++		ipu_lib_overlay_param_t * overlay,
+ 		ipu_lib_output_param_t * output0,
+ 		ipu_lib_output_param_t * output1,
+ 		ipu_lib_handle_t * ipu_handle)
+@@ -560,7 +752,7 @@ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 
+ 	for (i=0;i<bufcnt;i++) {
+ 		/* user can choose other input phy addr*/
+-		if (input->paddr[i] == 0) {
++		if (input->user_def_paddr[i] == 0) {
+ 			ipu_handle->ifr_size = ipu_priv_handle->i_minfo[i].size =
+ 					input->width/8*input->height*fmt_to_bpp(input->fmt);
+ 			if (ioctl(ipu_priv_handle->fd_ipu, IPU_ALOC_MEM, &(ipu_priv_handle->i_minfo[i])) < 0) {
+@@ -580,8 +772,34 @@ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 			dbg(DBG_INFO, "\033[0;35mAlocate %d dma mem [%d] for input, dma addr 0x%x, mmap to %p!\033[0m\n",
+ 					ipu_handle->ifr_size, i, ipu_priv_handle->i_minfo[i].paddr, ipu_handle->inbuf_start[i]);
+ 		} else {
+-			ipu_priv_handle->i_minfo[i].paddr = input->paddr[i];
+-			dbg(DBG_INFO, "\033[0;35mSet input dma mem [%d] addr 0x%x by user!\033[0m\n", i, input->paddr[i]);
++			ipu_priv_handle->i_minfo[i].paddr = input->user_def_paddr[i];
++			dbg(DBG_INFO, "\033[0;35mSet input dma mem [%d] addr 0x%x by user!\033[0m\n", i, input->user_def_paddr[i]);
++		}
++
++		if (overlay) {
++			if (overlay->user_def_paddr[i] == 0) {
++				ipu_handle->ovfr_size = ipu_priv_handle->ov_minfo[i].size =
++					overlay->width/8*overlay->height*fmt_to_bpp(overlay->fmt);
++				if (ioctl(ipu_priv_handle->fd_ipu, IPU_ALOC_MEM, &(ipu_priv_handle->ov_minfo[i])) < 0) {
++					dbg(DBG_ERR, "Ioctl IPU_ALOC_MEM failed!\n");
++					ret = -1;
++					goto err;
++				}
++				/* mmap virtual addr for user*/
++				ipu_handle->ovbuf_start[i] = mmap (NULL, ipu_priv_handle->ov_minfo[i].size,
++						PROT_READ | PROT_WRITE, MAP_SHARED,
++						ipu_priv_handle->fd_ipu, ipu_priv_handle->ov_minfo[i].paddr);
++				if (ipu_handle->ovbuf_start[i] == MAP_FAILED) {
++					dbg(DBG_ERR, "mmap failed!\n");
++					ret = -1;
++					goto err;
++				}
++				dbg(DBG_INFO, "\033[0;35mAlocate %d dma mem [%d] for overlay, dma addr 0x%x, mmap to %p!\033[0m\n",
++						ipu_handle->ovfr_size, i, ipu_priv_handle->ov_minfo[i].paddr, ipu_handle->ovbuf_start[i]);
++			} else {
++				ipu_priv_handle->ov_minfo[i].paddr = overlay->user_def_paddr[i];
++				dbg(DBG_INFO, "\033[0;35mSet overlay dma mem [%d] addr 0x%x by user!\033[0m\n", i, overlay->user_def_paddr[i]);
++			}
+ 		}
+ 
+ 		for (j=0;j<output_num;j++) {
+@@ -591,7 +809,7 @@ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 				output = output1;
+ 
+ 			/* user can choose other output phy addr*/
+-			if ((output->show_to_fb == 0) && (output->paddr[i] == 0)) {
++			if ((output->show_to_fb == 0) && (output->user_def_paddr[i] == 0)) {
+ 				ipu_handle->ofr_size[j] = ipu_priv_handle->output[j].o_minfo[i].size =
+ 					output->width/8*output->height*fmt_to_bpp(output->fmt);
+ 				if (ioctl(ipu_priv_handle->fd_ipu, IPU_ALOC_MEM,
+@@ -626,15 +844,16 @@ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 							ipu_handle->ofr_size[j], i, ipu_priv_handle->output[j].o_minfo[i].paddr,
+ 							ipu_handle->outbuf_start1[i]);
+ 				}
+-			} else if (output->paddr[i] != 0) {
+-				ipu_priv_handle->output[j].o_minfo[i].paddr = output->paddr[i];
+-				dbg(DBG_INFO, "\033[0;35mSet output%d dma mem [%d] addr 0x%x by user!\033[0m\n", j, i, output->paddr[i]);
++			} else if (output->user_def_paddr[i] != 0) {
++				ipu_priv_handle->output[j].o_minfo[i].paddr = output->user_def_paddr[i];
++				dbg(DBG_INFO, "\033[0;35mSet output%d dma mem [%d] addr 0x%x by user!\033[0m\n", j, i, output->user_def_paddr[i]);
+ 			}
+ 
+ 			/* allocate dma buffer for rotation? */
+ 			if(ipu_priv_handle->output[j].task_mode == (ROT_MODE | IC_MODE)) {
+ 				ipu_priv_handle->output[j].r_minfo[i].size =
+-						output->width/8*output->height*fmt_to_bpp(output->fmt);
++						ipu_priv_handle->output[j].owidth/8*ipu_priv_handle->output[j].oheight
++						*fmt_to_bpp(output->fmt);
+ 				if (ioctl(ipu_priv_handle->fd_ipu, IPU_ALOC_MEM,
+ 						&(ipu_priv_handle->output[j].r_minfo[i])) < 0) {
+ 					dbg(DBG_ERR, "Ioctl IPU_ALOC_MEM failed!\n");
+@@ -707,13 +926,8 @@ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 					ipu_priv_handle->output[j].fb_chan = MEM_FG_SYNC;
+ 			}
+ 
+-			if(output->rot >= IPU_ROTATE_90_RIGHT){
+-				owidth = output->height;
+-				oheight = output->width;
+-			} else {
+-				owidth = output->width;
+-				oheight = output->height;
+-			}
++			owidth = output->width;
++			oheight = output->height;
+ 
+ 			if (ipu_priv_handle->output[j].fb_chan == MEM_FG_SYNC) {
+ 				fb_var.xres = owidth;
+@@ -831,6 +1045,13 @@ static void _ipu_mem_free(ipu_lib_handle_t * ipu_handle)
+ 			dbg(DBG_INFO, "\033[0;35mFree %d dma mem [%d] for input, dma addr 0x%x!\033[0m\n",
+ 					ipu_handle->ifr_size, i, ipu_priv_handle->i_minfo[i].paddr);
+ 		}
++		if (ipu_priv_handle->ov_minfo[i].vaddr) {
++			if (ipu_handle->ovbuf_start[i])
++				munmap(ipu_handle->ovbuf_start[i], ipu_priv_handle->ov_minfo[i].size);
++			ioctl(ipu_priv_handle->fd_ipu, IPU_FREE_MEM, &(ipu_priv_handle->ov_minfo[i]));
++			dbg(DBG_INFO, "\033[0;35mFree %d dma mem [%d] for overlay, dma addr 0x%x!\033[0m\n",
++					ipu_handle->ovfr_size, i, ipu_priv_handle->ov_minfo[i].paddr);
++		}
+ 
+ 		for (j=0;j<output_num;j++) {
+ 			if (ipu_priv_handle->output[j].show_to_fb == 0) {
+@@ -862,16 +1083,18 @@ static void _ipu_mem_free(ipu_lib_handle_t * ipu_handle)
+ 
+ 	for (j=0;j<output_num;j++) {
+ 		if (ipu_priv_handle->output[j].show_to_fb){
+-			if (((ipu_priv_handle->mode & OP_STREAM_MODE) == 0) ||
+-				((ipu_priv_handle->input_fr_cnt % 2) &&
+-				(ipu_priv_handle->mode & OP_STREAM_MODE))) {
+-				/* make sure buffer1 still at fbmem base*/
+-				memcpy(ipu_priv_handle->output[j].fb_mem,
++			struct fb_var_screeninfo fb_var;
++
++			/* make sure buffer1 still at fbmem base*/
++			memcpy(ipu_priv_handle->output[j].fb_mem,
+ 					ipu_priv_handle->output[j].fb_mem +
+ 					ipu_priv_handle->output[j].screen_size,
+ 					ipu_priv_handle->output[j].screen_size);
+-				ipu_select_buffer(ipu_priv_handle->output[j].fb_chan, IPU_INPUT_BUFFER, 1);
+-			}
++
++			ioctl(ipu_priv_handle->output[j].fd_fb, FBIOGET_VSCREENINFO, &fb_var);
++			fb_var.activate |= FB_ACTIVATE_FORCE;
++			ioctl(ipu_priv_handle->output[j].fd_fb, FBIOPUT_VSCREENINFO, &fb_var);
++
+ 			if (ipu_priv_handle->output[j].fb_mem)
+ 				munmap(ipu_priv_handle->output[j].fb_mem, 2*ipu_priv_handle->output[j].screen_size);
+ 			close(ipu_priv_handle->output[j].fd_fb);
+@@ -880,6 +1103,7 @@ static void _ipu_mem_free(ipu_lib_handle_t * ipu_handle)
+ }
+ 
+ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
++		ipu_lib_overlay_param_t * overlay,
+ 		ipu_lib_output_param_t * output0,
+ 		ipu_lib_output_param_t * output1,
+ 		ipu_lib_handle_t * ipu_handle)
+@@ -926,6 +1150,28 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 	dbg(DBG_INFO, "\t\tbuf0 0x%x\n", ipu_priv_handle->i_minfo[0].paddr);
+ 	dbg(DBG_INFO, "\t\tbuf1 0x%x\n", ipu_priv_handle->i_minfo[1].paddr);
+ 
++	if (overlay) {
++		dbg(DBG_INFO, "\033[0;34moverlay info:\033[0m\n");
++		dbg(DBG_INFO, "\tw: %d\n", overlay->width);
++		dbg(DBG_INFO, "\th: %d\n", overlay->height);
++		dbg(DBG_INFO, "\tfmt: 0x%x\n", overlay->fmt);
++		dbg(DBG_INFO, "\t\tw_posx: %d\n", overlay->ov_crop_win.pos.x);
++		dbg(DBG_INFO, "\t\tw_posy: %d\n", overlay->ov_crop_win.pos.y);
++		dbg(DBG_INFO, "\t\tw_w: %d\n", overlay->ov_crop_win.win_w);
++		dbg(DBG_INFO, "\t\tw_h: %d\n", overlay->ov_crop_win.win_h);
++
++		dbg(DBG_INFO, "\t\033[0;34moverlay crop:\033[0m\n");
++		dbg(DBG_INFO, "\t\tovwidth: %d\n", ipu_priv_handle->ovwidth);
++		dbg(DBG_INFO, "\t\tovheight: %d\n", ipu_priv_handle->ovheight);
++		dbg(DBG_INFO, "\t\tov_off 0x%x\n", ipu_priv_handle->ov_off);
++		dbg(DBG_INFO, "\t\tov_uoff 0x%x\n", ipu_priv_handle->ov_uoff);
++		dbg(DBG_INFO, "\t\tov_voff 0x%x\n", ipu_priv_handle->ov_voff);
++
++		dbg(DBG_INFO, "\t\033[0;34moverlay buf paddr:\033[0m\n");
++		dbg(DBG_INFO, "\t\tbuf0 0x%x\n", ipu_priv_handle->ov_minfo[0].paddr);
++		dbg(DBG_INFO, "\t\tbuf1 0x%x\n", ipu_priv_handle->ov_minfo[1].paddr);
++	}
++
+ 	dbg(DBG_INFO, "\033[0;34moutput0 info:\033[0m\n");
+ 	dbg(DBG_INFO, "\tw: %d\n", output0->width);
+ 	dbg(DBG_INFO, "\th: %d\n", output0->height);
+@@ -937,6 +1183,14 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 		dbg(DBG_INFO, "\t\tfb_w_posx: %d\n", output0->fb_disp.pos.x);
+ 		dbg(DBG_INFO, "\t\tfb_w_posy: %d\n", output0->fb_disp.pos.y);
+ 	}
++
++	dbg(DBG_INFO, "\t\033[0;34moutput0 window:\033[0m\n");
++	dbg(DBG_INFO, "\t\towidth: %d\n", ipu_priv_handle->output[0].owidth);
++	dbg(DBG_INFO, "\t\toheight: %d\n", ipu_priv_handle->output[0].oheight);
++	dbg(DBG_INFO, "\t\toff 0x%x\n", ipu_priv_handle->output[0].o_off);
++	dbg(DBG_INFO, "\t\tuoff 0x%x\n", ipu_priv_handle->output[0].o_uoff);
++	dbg(DBG_INFO, "\t\tvoff 0x%x\n", ipu_priv_handle->output[0].o_voff);
++
+ 	dbg(DBG_INFO, "\t\033[0;34moutput0 buf paddr:\033[0m\n");
+ 	dbg(DBG_INFO, "\t\tbuf0 0x%x\n", ipu_priv_handle->output[0].o_minfo[0].paddr);
+ 	dbg(DBG_INFO, "\t\tbuf1 0x%x\n", ipu_priv_handle->output[0].o_minfo[1].paddr);
+@@ -953,6 +1207,14 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			dbg(DBG_INFO, "\t\tfb_w_posx: %d\n", output1->fb_disp.pos.x);
+ 			dbg(DBG_INFO, "\t\tfb_w_posy: %d\n", output1->fb_disp.pos.y);
+ 		}
++
++		dbg(DBG_INFO, "\t\033[0;34moutput0 window:\033[0m\n");
++		dbg(DBG_INFO, "\t\towidth: %d\n", ipu_priv_handle->output[1].owidth);
++		dbg(DBG_INFO, "\t\toheight: %d\n", ipu_priv_handle->output[1].oheight);
++		dbg(DBG_INFO, "\t\toff 0x%x\n", ipu_priv_handle->output[1].o_off);
++		dbg(DBG_INFO, "\t\tuoff 0x%x\n", ipu_priv_handle->output[1].o_uoff);
++		dbg(DBG_INFO, "\t\tvoff 0x%x\n", ipu_priv_handle->output[1].o_voff);
++
+ 		dbg(DBG_INFO, "\t\033[0;34moutput1 buf paddr:\033[0m\n");
+ 		dbg(DBG_INFO, "\t\tbuf0 0x%x\n", ipu_priv_handle->output[1].o_minfo[0].paddr);
+ 		dbg(DBG_INFO, "\t\tbuf1 0x%x\n", ipu_priv_handle->output[1].o_minfo[1].paddr);
+@@ -961,6 +1223,8 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 	dbg(DBG_INFO, "\033[0;34mEnabling:\033[0m\n");
+ 	/*Setup ipu channel*/
+ 	for (i=0;i<output_num;i++) {
++		unsigned int task_mode;
++
+ 		if (i == 0)
+ 			output = output0;
+ 		else
+@@ -968,7 +1232,8 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 
+ 		dbg(DBG_INFO, "\033[0;34mTask %d:\033[0m \n", i);
+ 
+-		if(ipu_priv_handle->output[i].task_mode == IC_MODE){
++		task_mode = ipu_priv_handle->output[i].task_mode & ~(COPY_MODE);
++		if(task_mode == IC_MODE){
+ 			dbg(DBG_INFO, "\tOnly IC, begin & end chan:\n");
+ 
+ 			if (ipu_priv_handle->output[i].ipu_task & IC_ENC) {
+@@ -988,10 +1253,19 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			params.mem_prp_vf_mem.in_height = ipu_priv_handle->iheight;
+ 			params.mem_prp_vf_mem.in_pixel_fmt = input->fmt;
+ 
+-			params.mem_prp_vf_mem.out_width = output->width;
+-			params.mem_prp_vf_mem.out_height = output->height;
++			params.mem_prp_vf_mem.out_width = ipu_priv_handle->output[i].owidth;
++			params.mem_prp_vf_mem.out_height = ipu_priv_handle->output[i].oheight;
+ 			params.mem_prp_vf_mem.out_pixel_fmt = output->fmt;
+ 
++			if (overlay) {
++				params.mem_prp_vf_mem.in_g_pixel_fmt = overlay->fmt;
++				params.mem_prp_vf_mem.graphics_combine_en = 1;
++				params.mem_prp_vf_mem.global_alpha_en = overlay->alpha_en;
++				params.mem_prp_vf_mem.alpha = overlay->alpha;
++				params.mem_prp_vf_mem.key_color_en = overlay->key_color_en;
++				params.mem_prp_vf_mem.key_color = overlay->key_color;
++			}
++
+ 			ret = ipu_init_channel(ipu_priv_handle->output[i].ic_chan, &params);
+ 			if (ret < 0)
+ 				goto done;
+@@ -1012,6 +1286,24 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				goto done;
+ 			}
+ 
++			if (overlay) {
++				ret = ipu_init_channel_buffer(ipu_priv_handle->output[i].ic_chan,
++						IPU_GRAPH_IN_BUFFER,
++						overlay->fmt,
++						ipu_priv_handle->ovwidth,
++						ipu_priv_handle->ovheight,
++						overlay->width*bytes_per_pixel(overlay->fmt),
++						IPU_ROTATE_NONE,
++						ipu_priv_handle->ov_minfo[0].paddr + ipu_priv_handle->ov_off,
++						ipu_priv_handle->mode & OP_STREAM_MODE ?
++						ipu_priv_handle->ov_minfo[1].paddr + ipu_priv_handle->ov_off : 0,
++						ipu_priv_handle->ov_uoff, ipu_priv_handle->ov_voff);
++				if (ret < 0) {
++					ipu_uninit_channel(ipu_priv_handle->output[i].ic_chan);
++					goto done;
++				}
++			}
++
+ 			if (output->show_to_fb) {
+ 				out_stride = ipu_priv_handle->output[i].fb_stride;
+ 			} else
+@@ -1020,14 +1312,16 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			ret = ipu_init_channel_buffer(ipu_priv_handle->output[i].ic_chan,
+ 					IPU_OUTPUT_BUFFER,
+ 					output->fmt,
+-					output->width,
+-					output->height,
++					ipu_priv_handle->output[i].owidth,
++					ipu_priv_handle->output[i].oheight,
+ 					out_stride,
+ 					output->rot,
+-					ipu_priv_handle->output[i].o_minfo[0].paddr,
++					ipu_priv_handle->output[i].o_minfo[0].paddr +
++					ipu_priv_handle->output[i].o_off,
+ 					ipu_priv_handle->mode & OP_STREAM_MODE ?
+-						ipu_priv_handle->output[i].o_minfo[1].paddr : 0,
+-					0, 0);
++						ipu_priv_handle->output[i].o_minfo[1].paddr +
++						ipu_priv_handle->output[i].o_off : 0,
++					ipu_priv_handle->output[i].o_uoff, ipu_priv_handle->output[i].o_voff);
+ 			if (ret < 0) {
+ 				ipu_uninit_channel(ipu_priv_handle->output[i].ic_chan);
+ 				goto done;
+@@ -1038,7 +1332,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 					ipu_priv_handle->output[i].ic_chan;
+ 		}
+ 		/*Only ROT*/
+-		else if (ipu_priv_handle->output[i].task_mode == ROT_MODE){
++		else if (task_mode == ROT_MODE){
+ 			dbg(DBG_INFO, "\tOnly ROT, begin & end chan:\n");
+ 
+ 			if (ipu_priv_handle->output[i].ipu_task & ROT_ENC) {
+@@ -1073,13 +1367,6 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				goto done;
+ 			}
+ 
+-			if(output->rot >= IPU_ROTATE_90_RIGHT){
+-				/*output swap*/
+-				tmp = output->width;
+-				output->width = output->height;
+-				output->height = tmp;
+-			}
+-
+ 			if (output->show_to_fb)
+ 				out_stride = ipu_priv_handle->output[i].fb_stride;
+ 			else
+@@ -1088,14 +1375,16 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			ret = ipu_init_channel_buffer(ipu_priv_handle->output[i].rot_chan,
+ 					IPU_OUTPUT_BUFFER,
+ 					output->fmt,
+-					output->width,
+-					output->height,
++					ipu_priv_handle->output[i].owidth,
++					ipu_priv_handle->output[i].oheight,
+ 					out_stride,
+ 					IPU_ROTATE_NONE,
+-					ipu_priv_handle->output[i].o_minfo[0].paddr,
++					ipu_priv_handle->output[i].o_minfo[0].paddr +
++					ipu_priv_handle->output[i].o_off,
+ 					ipu_priv_handle->mode & OP_STREAM_MODE ?
+-						ipu_priv_handle->output[i].o_minfo[1].paddr : 0,
+-					0, 0);
++						ipu_priv_handle->output[i].o_minfo[1].paddr +
++						ipu_priv_handle->output[i].o_off : 0,
++					ipu_priv_handle->output[i].o_uoff, ipu_priv_handle->output[i].o_voff);
+ 			if (ret < 0) {
+ 				ipu_uninit_channel(ipu_priv_handle->output[i].rot_chan);
+ 				goto done;
+@@ -1106,7 +1395,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 					ipu_priv_handle->output[i].rot_chan;
+ 		}
+ 		/*IC ROT*/
+-		else if(ipu_priv_handle->output[i].task_mode == (IC_MODE | ROT_MODE)){
++		else if(task_mode == (IC_MODE | ROT_MODE)){
+ 			dbg(DBG_INFO, "\tIC + ROT, begin chan:\n");
+ 
+ 			if (ipu_priv_handle->output[i].ipu_task & IC_ENC) {
+@@ -1133,16 +1422,32 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				dbg(DBG_INFO, "\t\tMEM_ROT_PP_MEM\n");
+ 			}
+ 
++			if(output->rot >= IPU_ROTATE_90_RIGHT){
++				/*output swap*/
++				tmp = ipu_priv_handle->output[i].owidth;
++				ipu_priv_handle->output[i].owidth = ipu_priv_handle->output[i].oheight;
++				ipu_priv_handle->output[i].oheight = tmp;
++			}
++
+ 			memset(&params, 0, sizeof (params));
+ 
+ 			params.mem_prp_vf_mem.in_width = ipu_priv_handle->iwidth;
+ 			params.mem_prp_vf_mem.in_height = ipu_priv_handle->iheight;
+ 			params.mem_prp_vf_mem.in_pixel_fmt = input->fmt;
+ 
+-			params.mem_prp_vf_mem.out_width = output->width;
+-			params.mem_prp_vf_mem.out_height = output->height;
++			params.mem_prp_vf_mem.out_width = ipu_priv_handle->output[i].owidth;
++			params.mem_prp_vf_mem.out_height = ipu_priv_handle->output[i].oheight;
+ 			params.mem_prp_vf_mem.out_pixel_fmt = output->fmt;
+ 
++			if (overlay) {
++				params.mem_prp_vf_mem.in_g_pixel_fmt = overlay->fmt;
++				params.mem_prp_vf_mem.graphics_combine_en = 1;
++				params.mem_prp_vf_mem.global_alpha_en = overlay->alpha_en;
++				params.mem_prp_vf_mem.alpha = overlay->alpha;
++				params.mem_prp_vf_mem.key_color_en = overlay->key_color_en;
++				params.mem_prp_vf_mem.key_color = overlay->key_color;
++			}
++
+ 			ret = ipu_init_channel(ipu_priv_handle->output[i].ic_chan, &params);
+ 			if (ret < 0) {
+ 				goto done;
+@@ -1164,12 +1469,30 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				goto done;
+ 			}
+ 
++			if (overlay) {
++				ret = ipu_init_channel_buffer(ipu_priv_handle->output[i].ic_chan,
++						IPU_GRAPH_IN_BUFFER,
++						overlay->fmt,
++						ipu_priv_handle->ovwidth,
++						ipu_priv_handle->ovheight,
++						overlay->width*bytes_per_pixel(overlay->fmt),
++						IPU_ROTATE_NONE,
++						ipu_priv_handle->ov_minfo[0].paddr + ipu_priv_handle->ov_off,
++						ipu_priv_handle->mode & OP_STREAM_MODE ?
++						ipu_priv_handle->ov_minfo[1].paddr + ipu_priv_handle->ov_off : 0,
++						ipu_priv_handle->ov_uoff, ipu_priv_handle->ov_voff);
++				if (ret < 0) {
++					ipu_uninit_channel(ipu_priv_handle->output[i].ic_chan);
++					goto done;
++				}
++			}
++
+ 			ret = ipu_init_channel_buffer(ipu_priv_handle->output[i].ic_chan,
+ 					IPU_OUTPUT_BUFFER,
+ 					output->fmt,
+-					output->width,
+-					output->height,
+-					output->width*bytes_per_pixel(output->fmt),
++					ipu_priv_handle->output[i].owidth,
++					ipu_priv_handle->output[i].oheight,
++					ipu_priv_handle->output[i].owidth*bytes_per_pixel(output->fmt),
+ 					IPU_ROTATE_NONE,
+ 					ipu_priv_handle->output[i].r_minfo[0].paddr,
+ 					ipu_priv_handle->mode & OP_STREAM_MODE ?
+@@ -1189,9 +1512,9 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			ret = ipu_init_channel_buffer(ipu_priv_handle->output[i].rot_chan,
+ 					IPU_INPUT_BUFFER,
+ 					output->fmt,
+-					output->width,
+-					output->height,
+-					output->width*bytes_per_pixel(output->fmt),
++					ipu_priv_handle->output[i].owidth,
++					ipu_priv_handle->output[i].oheight,
++					ipu_priv_handle->output[i].owidth*bytes_per_pixel(output->fmt),
+ 					output->rot,
+ 					ipu_priv_handle->output[i].r_minfo[0].paddr,
+ 					ipu_priv_handle->mode & OP_STREAM_MODE ?
+@@ -1205,9 +1528,9 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 
+ 			if(output->rot >= IPU_ROTATE_90_RIGHT){
+ 				/*output swap*/
+-				tmp = output->width;
+-				output->width = output->height;
+-				output->height = tmp;
++				tmp = ipu_priv_handle->output[i].owidth;
++				ipu_priv_handle->output[i].owidth = ipu_priv_handle->output[i].oheight;
++				ipu_priv_handle->output[i].oheight = tmp;
+ 			}
+ 
+ 			if (output->show_to_fb)
+@@ -1218,14 +1541,16 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			ret = ipu_init_channel_buffer(ipu_priv_handle->output[i].rot_chan,
+ 					IPU_OUTPUT_BUFFER,
+ 					output->fmt,
+-					output->width,
+-					output->height,
++					ipu_priv_handle->output[i].owidth,
++					ipu_priv_handle->output[i].oheight,
+ 					out_stride,
+ 					IPU_ROTATE_NONE,
+-					ipu_priv_handle->output[i].o_minfo[0].paddr,
++					ipu_priv_handle->output[i].o_minfo[0].paddr +
++					ipu_priv_handle->output[i].o_off,
+ 					ipu_priv_handle->mode & OP_STREAM_MODE ?
+-						ipu_priv_handle->output[i].o_minfo[1].paddr : 0,
+-					0, 0);
++						ipu_priv_handle->output[i].o_minfo[1].paddr +
++						ipu_priv_handle->output[i].o_off : 0,
++					ipu_priv_handle->output[i].o_uoff, ipu_priv_handle->output[i].o_voff);
+ 			if (ret < 0) {
+ 				ipu_uninit_channel(ipu_priv_handle->output[i].ic_chan);
+ 				ipu_uninit_channel(ipu_priv_handle->output[i].rot_chan);
+@@ -1293,19 +1618,117 @@ done:
+ 	return ret;
+ }
+ 
++static int _ipu_copy_setup(ipu_lib_input_param_t * input,
++		ipu_lib_output_param_t * output,
++		ipu_lib_handle_t * ipu_handle)
++{
++	int ret = 0, hope_task_mode, ipu_task_busy = 0;
++	ipu_lib_priv_handle_t * ipu_priv_handle = (ipu_lib_priv_handle_t *)ipu_handle->priv;
++	unsigned int task;
++
++	hope_task_mode = ipu_priv_handle->mode & 0x07;
++	if (ipu_priv_handle->mode & OP_STREAM_MODE) {
++		if (!input->user_def_paddr[0] ||
++			!input->user_def_paddr[1] ||
++			!output->user_def_paddr[0] ||
++			!output->user_def_paddr[1]) {
++			dbg(DBG_ERR, "Should set both user def paddr for stream mode!\n");
++			ret = -1;
++			goto done;
++		}
++	}
++
++	ipu_priv_handle->output[0].show_to_fb = 0;
++	ipu_priv_handle->i_minfo[0].paddr = input->user_def_paddr[0];
++	ipu_priv_handle->i_minfo[1].paddr = input->user_def_paddr[1];
++	ipu_priv_handle->output[0].o_minfo[0].paddr = output->user_def_paddr[0];
++	ipu_priv_handle->output[0].o_minfo[1].paddr = output->user_def_paddr[1];
++
++	/* try IC-ENC first */
++	ipu_priv_handle->output[0].ipu_task = IC_ENC;
++	if (_ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
++		(hope_task_mode && ((hope_task_mode & TASK_ENC_MODE) == 0))) {
++
++		/* try ROT-ENC */
++		ipu_priv_handle->output[0].ipu_task = ROT_ENC;
++		if (_ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
++			(hope_task_mode && ((hope_task_mode & TASK_ENC_MODE) == 0))) {
++			/* hope mode ENC task is busy ? */
++			if (hope_task_mode && (hope_task_mode & TASK_ENC_MODE)) {
++				ipu_task_busy = 1;
++				goto done;
++			}
++
++			/* try IC-PP */
++			ipu_priv_handle->output[0].ipu_task = IC_PP;
++			if (_ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
++				(hope_task_mode && ((hope_task_mode & TASK_PP_MODE) == 0))) {
++
++				/* try ROT-PP */
++				ipu_priv_handle->output[0].ipu_task = ROT_PP;
++				if (_ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
++					(hope_task_mode && ((hope_task_mode & TASK_PP_MODE) == 0))) {
++					/* hope mode PP task is busy ? */
++					if (hope_task_mode && (hope_task_mode & TASK_PP_MODE)) {
++						ipu_task_busy = 1;
++						goto done;
++					}
++
++					/* try ROT-VF */
++					ipu_priv_handle->output[0].ipu_task = ROT_VF;
++					if (_ipu_is_task_busy(ipu_priv_handle->output[0].ipu_task) ||
++						(hope_task_mode && ((hope_task_mode & TASK_VF_MODE) == 0))) {
++						ipu_task_busy = 1;
++						goto done;
++					}
++				}
++			}
++		}
++	}
++	task = ipu_priv_handle->output[0].ipu_task;
++	dbg(DBG_INFO, "\033[0;34mCOPY mode will take ipu task\033[0m\n");
++	if (task & IC_ENC)
++		dbg(DBG_INFO, "\tIC_ENC\n");
++	if (task & IC_PP)
++		dbg(DBG_INFO, "\tIC_PP\n");
++	if (task & ROT_ENC)
++		dbg(DBG_INFO, "\tROT_ENC\n");
++	if (task & ROT_VF)
++		dbg(DBG_INFO, "\tROT_VF\n");
++	if (task & ROT_PP)
++		dbg(DBG_INFO, "\tROT_PP\n");
++
++	if ((ipu_priv_handle->output[0].ipu_task == IC_ENC) ||
++		(ipu_priv_handle->output[0].ipu_task == IC_PP))
++		ipu_priv_handle->output[0].task_mode |= IC_MODE;
++	else
++		ipu_priv_handle->output[0].task_mode |= ROT_MODE;
++
++	ret = _ipu_channel_setup(input, NULL, output, NULL, ipu_handle);
++done:
++	if (ipu_task_busy) {
++		ret = -1;
++		dbg(DBG_ERR, "ipu is busy\n");
++		if (hope_task_mode)
++			dbg(DBG_ERR, " for hope task mode 0x%x!\n", hope_task_mode);
++	}
++	return ret;
++}
++
+ static int _ipu_task_setup(ipu_lib_input_param_t * input,
++		ipu_lib_overlay_param_t * overlay,
+ 		ipu_lib_output_param_t * output0,
+ 		ipu_lib_output_param_t * output1,
+ 		ipu_lib_handle_t * ipu_handle)
+ {
+ 	int ret = 0;
+ 
+-	if ((ret = _ipu_mem_alloc(input, output0, output1, ipu_handle)) < 0) {
++	if ((ret = _ipu_mem_alloc(input, overlay, output0, output1, ipu_handle)) < 0) {
+ 		_ipu_mem_free(ipu_handle);
+ 		return ret;
+ 	}
+ 
+-	if ((ret = _ipu_channel_setup(input, output0, output1, ipu_handle)) < 0) {
++	if ((ret = _ipu_channel_setup(input, overlay, output0, output1, ipu_handle)) < 0) {
+ 		_ipu_mem_free(ipu_handle);
+ 		return ret;
+ 	}
+@@ -1318,6 +1741,8 @@ static int _ipu_task_setup(ipu_lib_input_param_t * input,
+  *
+  * @param	input		Input parameter for ipu task.
+  *
++ * @param	overlay		Overlay parameter for ipu task.
++ *
+  * @param	output0		The first output paramter for ipu task.
+  *
+  * @param	output1 	Ipu can support 2 output after postprocess
+@@ -1334,6 +1759,7 @@ static int _ipu_task_setup(ipu_lib_input_param_t * input,
+  * 		fail.
+  */
+ int mxc_ipu_lib_task_init(ipu_lib_input_param_t * input,
++		ipu_lib_overlay_param_t * overlay,
+ 		ipu_lib_output_param_t * output0,
+ 		ipu_lib_output_param_t * output1,
+ 		int mode, ipu_lib_handle_t * ipu_handle)
+@@ -1343,6 +1769,11 @@ int mxc_ipu_lib_task_init(ipu_lib_input_param_t * input,
+ 
+ 	dbg(DBG_INFO, "\033[0;34m*** mxc_ipu_lib_task_init ***\033[0m\n");
+ 
++	if (ipu_handle == NULL) {
++		dbg(DBG_ERR, "Pls allocate ipu_handle!\n");
++		return -1;
++	}
++
+ 	pthread_mutex_lock(&mutex);
+ 
+ 	memset(ipu_handle, 0, sizeof(ipu_lib_handle_t));
+@@ -1362,11 +1793,22 @@ int mxc_ipu_lib_task_init(ipu_lib_input_param_t * input,
+ 	if ((ret = ipu_priv_handle->fd_ipu  = ipu_open()) < 0)
+ 		goto done;
+ 
+-	if ((ret = _ipu_task_check(input, output0, output1, ipu_handle)) < 0)
++	if ((ret = _ipu_task_check(input, overlay, output0, output1, ipu_handle)) < 0) {
++		ipu_close();
+ 		goto done;
++	}
+ 
+-	if ((ret = _ipu_task_setup(input, output0, output1, ipu_handle)) < 0)
+-		goto done;
++	if (ipu_priv_handle->output[0].task_mode & COPY_MODE) {
++		if ((ret = _ipu_copy_setup(input, output0, ipu_handle)) < 0) {
++			ipu_close();
++			goto done;
++		}
++	} else {
++		if ((ret = _ipu_task_setup(input, overlay, output0, output1, ipu_handle)) < 0) {
++			ipu_close();
++			goto done;
++		}
++	}
+ 
+ 	g_task_in_use |= (ipu_priv_handle->output[0].ipu_task | ipu_priv_handle->output[1].ipu_task);
+ 
+@@ -1394,7 +1836,7 @@ void mxc_ipu_lib_task_uninit(ipu_lib_handle_t * ipu_handle)
+ 
+ 	/* if stream mode, wait for latest frame finish */
+ 	if (ipu_priv_handle->mode & OP_STREAM_MODE) {
+-		if (_ipu_wait_for_irq(ipu_priv_handle->irq, 100)) {
++		if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1000)) {
+ 			dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+ 		} else
+ 			ipu_priv_handle->output_fr_cnt++;
+@@ -1453,7 +1895,8 @@ void mxc_ipu_lib_task_uninit(ipu_lib_handle_t * ipu_handle)
+ 
+ 	dbg(DBG_INFO, "g_task_in_use 0x%x\n", g_task_in_use);
+ 
+-	_ipu_mem_free(ipu_handle);
++	if (!(ipu_priv_handle->output[0].task_mode & COPY_MODE))
++		_ipu_mem_free(ipu_handle);
+ 
+ 	ipu_close();
+ 
+@@ -1466,6 +1909,7 @@ int _ipu_task_enable(ipu_lib_handle_t * ipu_handle)
+ {
+ 	int ret = 0, bufcnt, i, output_num;
+ 	ipu_lib_priv_handle_t * ipu_priv_handle = (ipu_lib_priv_handle_t *)ipu_handle->priv;
++	unsigned int task_mode;
+ 
+ 	if (ipu_priv_handle->mode & OP_STREAM_MODE)
+ 		bufcnt = 2;
+@@ -1487,33 +1931,42 @@ int _ipu_task_enable(ipu_lib_handle_t * ipu_handle)
+ 
+ 	/* set channel buffer ready */
+ 	for (i=0;i<output_num;i++) {
+-		if(ipu_priv_handle->output[i].task_mode == IC_MODE){
++		task_mode = ipu_priv_handle->output[i].task_mode & ~(COPY_MODE);
++		if(task_mode == IC_MODE){
+ 			if (i == 0)
+ 				ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_INPUT_BUFFER, 0);
++			if (ipu_priv_handle->overlay_en)
++				ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_GRAPH_IN_BUFFER, 0);
+ 			ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_OUTPUT_BUFFER, 0);
+ 			if (bufcnt == 2) {
+ 				if (i == 0)
+ 					ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_INPUT_BUFFER, 1);
++				if (ipu_priv_handle->overlay_en)
++					ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_GRAPH_IN_BUFFER, 1);
+ 				ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_OUTPUT_BUFFER, 1);
+ 			}
+-		} else if (ipu_priv_handle->output[i].task_mode == ROT_MODE){
++		} else if (task_mode == ROT_MODE){
+ 			ipu_select_buffer(ipu_priv_handle->output[i].rot_chan, IPU_INPUT_BUFFER, 0);
+ 			ipu_select_buffer(ipu_priv_handle->output[i].rot_chan, IPU_OUTPUT_BUFFER, 0);
+ 			if (bufcnt == 2) {
+ 				ipu_select_buffer(ipu_priv_handle->output[i].rot_chan, IPU_INPUT_BUFFER, 1);
+ 				ipu_select_buffer(ipu_priv_handle->output[i].rot_chan, IPU_OUTPUT_BUFFER, 1);
+ 			}
+-		} else if(ipu_priv_handle->output[i].task_mode == (IC_MODE | ROT_MODE)){
++		} else if(task_mode == (IC_MODE | ROT_MODE)){
+ 			ipu_select_buffer(ipu_priv_handle->output[i].rot_chan, IPU_OUTPUT_BUFFER, 0);
+ 			if (bufcnt == 2)
+ 				ipu_select_buffer(ipu_priv_handle->output[i].rot_chan, IPU_OUTPUT_BUFFER, 1);
+ 
+ 			if (i == 0)
+ 				ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_INPUT_BUFFER, 0);
++			if (ipu_priv_handle->overlay_en)
++				ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_GRAPH_IN_BUFFER, 0);
+ 			ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_OUTPUT_BUFFER, 0);
+ 			if (bufcnt == 2) {
+ 				if (i == 0)
+ 					ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_INPUT_BUFFER, 1);
++				if (ipu_priv_handle->overlay_en)
++					ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_GRAPH_IN_BUFFER, 1);
+ 				ipu_select_buffer(ipu_priv_handle->output[i].ic_chan, IPU_OUTPUT_BUFFER, 1);
+ 			}
+ 		}
+@@ -1575,7 +2028,7 @@ void _ipu_task_disable(ipu_lib_handle_t * ipu_handle)
+ 	}
+ }
+ 
+-int _ipu_wait_for_irq(int irq, int ms)
++int _ipu_wait_for_irq(int irq, int times)
+ {
+ 	int wait = 0;
+ 	ipu_event_info info;
+@@ -1583,13 +2036,12 @@ int _ipu_wait_for_irq(int irq, int ms)
+ 
+ 	while (ipu_get_interrupt_event(&info) < 0) {
+ 		dbg(DBG_INFO, "Can not get wait irq %d, try again!\n", irq);
+-		ipu_msleep(10);
+-		wait += 10;
+-		if (wait >= ms)
++		wait += 1;
++		if (wait >= times)
+ 			break;
+ 	}
+ 
+-	if (wait < ms)
++	if (wait < times)
+ 		return 0;
+ 	else
+ 		return 1;
+@@ -1598,16 +2050,30 @@ int _ipu_wait_for_irq(int irq, int ms)
+ /*!
+  * This function update the buffer for special ipu task, it must be run after
+  * init function.
++ * For OP_STREAM_MODE mode, ipu task will take double buffer method, this function
++ * will return the next need-update buffer index number(0 or 1) on success, user
++ * should update input buffer according to it.
++ * Similar with it, output_callback's second parameter indicates the current output
++ * buffer index number(0 or 1), user should read output data from exact buffer
++ * according to it.
++ * For OP_NORMAL_MODE mode, ipu task will take single buffer method, so this function
++ * will always return 0 on success(next update buffer will keep on index 0), the same,
++ * output_callback's second parameter will keep on 0 too.
++ * How to update input buffer? If user has phys buffer themselves, please just update
++ * the phys buffer address by parameter phyaddr; if not, user can fill the input data
++ * to ipu_handle->inbuf_start[].
+  *
+  * @param	ipu_handle	The ipu task handle need to update buffer.
+  *
+- * @param	phyaddr		User can set phyaddr to their own allocated
++ * @param	new_inbuf_paddr	User can set phyaddr to their own allocated
+  * 				buffer addr, ipu lib will update the buffer
+  * 				from this address for process. If user do not
+  * 				want to use it, please let it be zero, and
+  * 				fill the buffer according to inbuf_start
+  * 				parameter in ipu_handle.
+  *
++ * @param	new_ovbuf_paddr User defined overlay physical buffer address.
++ *
+  * @param	output_callback	IPU lib will call output_callback funtion
+  * 				when there is output data.
+  *
+@@ -1617,8 +2083,8 @@ int _ipu_wait_for_irq(int irq, int ms)
+  * 		or negative error code on fail.
+  */
+ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+-	dma_addr_t phyaddr, void (output_callback)(void *, int),
+-	void * output_cb_arg)
++	dma_addr_t new_inbuf_paddr, dma_addr_t new_ovbuf_paddr,
++	void (output_callback)(void *, int), void * output_cb_arg)
+ {
+ 	int ret, i, output_num;
+ 	ipu_lib_priv_handle_t * ipu_priv_handle = (ipu_lib_priv_handle_t *)ipu_handle->priv;
+@@ -1645,7 +2111,7 @@ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+ 		else
+ 			ipu_priv_handle->input_fr_cnt = 1;
+ 
+-		if (_ipu_wait_for_irq(ipu_priv_handle->irq, 100)) {
++		if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1000)) {
+ 			dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+ 			return -1;
+ 		}
+@@ -1669,7 +2135,7 @@ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+ 		dbg(DBG_DEBUG, "output pingpang %d\n", ipu_priv_handle->output_bufnum);
+ 
+ 		if (ipu_priv_handle->mode & OP_STREAM_MODE) {
+-			if (_ipu_wait_for_irq(ipu_priv_handle->irq, 100)) {
++			if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1000)) {
+ 				dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+ 				return -1;
+ 			}
+@@ -1682,18 +2148,26 @@ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+ 			if (!ipu_priv_handle->output[i].show_to_fb)
+ 				ipu_select_buffer(ipu_priv_handle->output[i].end_chan,
+ 					IPU_OUTPUT_BUFFER, ipu_priv_handle->update_bufnum);
+-		if (phyaddr) {
+-			dbg(DBG_DEBUG, "update with user defined buffer phy 0x%x\n", phyaddr);
++		if (new_inbuf_paddr) {
++			dbg(DBG_DEBUG, "update input with user defined buffer phy 0x%x\n", new_inbuf_paddr);
+ 			ipu_update_channel_buffer(ipu_priv_handle->output[0].begin_chan, IPU_INPUT_BUFFER,
+-				ipu_priv_handle->update_bufnum, phyaddr);
++				ipu_priv_handle->update_bufnum, new_inbuf_paddr);
++		}
++		if (new_ovbuf_paddr && ipu_priv_handle->overlay_en) {
++			dbg(DBG_DEBUG, "update overlay with user defined buffer phy 0x%x\n", new_ovbuf_paddr);
++			ipu_update_channel_buffer(ipu_priv_handle->output[0].begin_chan, IPU_GRAPH_IN_BUFFER,
++				ipu_priv_handle->update_bufnum, new_ovbuf_paddr);
+ 		}
+ 		ipu_select_buffer(ipu_priv_handle->output[0].begin_chan, IPU_INPUT_BUFFER,
+ 					ipu_priv_handle->update_bufnum);
++		if (ipu_priv_handle->overlay_en)
++			ipu_select_buffer(ipu_priv_handle->output[0].begin_chan, IPU_GRAPH_IN_BUFFER,
++					ipu_priv_handle->update_bufnum);
+ 
+ 		if (ipu_priv_handle->mode & OP_STREAM_MODE)
+ 			ipu_priv_handle->update_bufnum = ipu_priv_handle->update_bufnum ? 0 : 1;
+ 		else {
+-			if (_ipu_wait_for_irq(ipu_priv_handle->irq, 100)) {
++			if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1000)) {
+ 				dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+ 				return -1;
+ 			}
+@@ -1711,3 +2185,7 @@ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+ 
+ 	return ipu_priv_handle->update_bufnum;
+ }
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ipu/mxc_ipu_hl_lib.h b/ipu/mxc_ipu_hl_lib.h
+index bf9458b..bc250e6 100644
+--- a/ipu/mxc_ipu_hl_lib.h
++++ b/ipu/mxc_ipu_hl_lib.h
+@@ -22,28 +22,46 @@
+  * 1. mxc_ipu_lib_task_init()
+  *
+  * First, call mxc_ipu_lib_task_init() function with user defined setting.
+- * user could set input/output setting like width/height/format/input crop/
+- * output to framebuffer etc.
+- * User can allocate input and output buffer by themselves(must be physical
+- * continuous), if user allocated buffers by themselves, they must set
+- * parameter paddr in ipu_lib_input_param_t/ipu_lib_output_param_t. For
+- * OP_STREAM_MODE mode, they should set both of paddr[2], for OP_NORMAL_MODE
+- * mode they only need set paddr[0].
+- * mxc_ipu_lib_task_init() will return inbuf_start/outbuf_start in ipu_handle
+- * if user did not set paddr, these are virtual buffer address allocated by
+- * ipu lib.
+- * User should fill input data input paddr or inbuf_start before call function
+- * mxc_ipu_lib_task_buf_update().
++ * user could set input/overlay/output setting like width/height/format/
++ * input crop/output to framebuffer etc.
++ * User can allocate input, overlay and output buffer by themselves(must be
++ * physical continuous), if user allocated buffers by themselves, they must set
++ * parameter user_def_paddr in ipu_lib_input_param_t/ipu_lib_output_param_t.
++ * For OP_STREAM_MODE mode, they should set both of user_def_paddr[2], for
++ * OP_NORMAL_MODE mode they only need set user_def_paddr[0].
++ * mxc_ipu_lib_task_init() will return inbuf_start/ovbuf_start/outbuf_start
++ * in ipu_handle if user did not set user_def_paddr, these are virtual buffer
++ * start address allocated by ipu lib.
++ * User should fill input/overlay data into user_def_paddr or inbuf_start/
++ * ovbuf_start before call function mxc_ipu_lib_task_buf_update().
++ *
++ * NOTE: overlay is a special function of ipu, which can combine input and
++ * overlay to one output based on alpha and color-key setting. Pay attention
++ * that overlay's width/height should be the same as output. If user do not
++ * want to use overlay function, then just let this parameter to NULL.
+  *
+  * 2. mxc_ipu_lib_task_buf_update()
+  *
+  * User should call mxc_ipu_lib_task_buf_update() function after they finish fill
+- * input data into input paddr(user allocated buffer)/inbuf_start(ipu lib allocated
+- * buffer). At first time calling this update function, for OP_STREAM_MODE mode,
+- * user should fill data to both input buffer paddr[2]/inbuf_start[2], for
+- * OP_NORMAL_MODE mode user only need to fill paddr[0]/inbuf_start[0]; next time
++ * input/overlay data into input/overlay user_def_paddr(user allocated buffer)
++ * or inbuf_start/ovbuf_start(ipu lib allocated buffer).
++ * At first time calling this update function, for OP_STREAM_MODE mode,
++ * user should fill data to both input buffer inbuf_start[2], for
++ * OP_NORMAL_MODE mode user only need to fill inbuf_start[0]; next time
+  * calling this update function, user only need to fill buffer accoring to the index
+  * return by mxc_ipu_lib_task_buf_update() last time.
++ * Above method is using buffers allocated by ipu lib, user can also use buffers
++ * allocated by themselves:
++ *
++ * User defined buffer queue example(OP_STREAM_MODE mode):
++ * a. user allocate 5 physical continuous memory buffers: paddr[0~4];
++ * b. set input.user_def_paddr[2] as paddr[0] and paddr[1];
++ * c. call mxc_ipu_lib_task_init();
++ * d. fill input data to paddr[0] and paddr[1];
++ * e. call mxc_ipu_lib_task_buf_update();
++ * f. fill input data to paddr[2];
++ * g. call mxc_ipu_lib_task_buf_update(..&paddr[2]..);
++ *
+  * In mxc_ipu_lib_task_buf_update() function, ipu lib will call
+  * output_callback(void *arg, int output_buf_index)
+  * (if user set this call back function in parameter) while there is output data,
+@@ -59,6 +77,11 @@
+ #ifndef __MXC_IPU_HL_LIB_H__
+ #define __MXC_IPU_HL_LIB_H__
+ 
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++#include <linux/ipu.h>
+ #include <linux/mxcfb.h>
+ 
+ /*
+@@ -102,9 +125,28 @@ typedef struct {
+ 		unsigned int win_h;
+ 	} input_crop_win;
+ 
+-	dma_addr_t paddr[2];
++	dma_addr_t user_def_paddr[2];
+ } ipu_lib_input_param_t;
+ 
++typedef struct {
++	unsigned int width;
++	unsigned int height;
++	unsigned int fmt;
++
++	struct {
++		struct mxcfb_pos pos;
++		unsigned int win_w;
++		unsigned int win_h;
++	} ov_crop_win;
++
++	dma_addr_t user_def_paddr[2];
++
++	unsigned char alpha_en;
++	unsigned char key_color_en;
++	unsigned char alpha; /* 0 ~ 255*/
++	unsigned int key_color; /* RBG 24bit */
++} ipu_lib_overlay_param_t;
++
+ /*
+  * output parameter settings.
+  *
+@@ -131,13 +173,21 @@ typedef struct {
+ 	unsigned int fmt;
+ 	unsigned int rot;
+ 
+-	dma_addr_t paddr[2];
++	dma_addr_t user_def_paddr[2];
+ 
+ 	int show_to_fb;
+ 	struct {
+ 		struct mxcfb_pos pos;
+ 		unsigned int fb_num;
+ 	} fb_disp;
++
++	/* output_win is doing similar thing as fb_disp */
++	/* they output data to part of the whole output */
++	struct {
++		struct mxcfb_pos pos;
++		unsigned int win_w;
++		unsigned int win_h;
++	} output_win;
+ } ipu_lib_output_param_t;
+ 
+ /*
+@@ -145,16 +195,18 @@ typedef struct {
+  *
+  * This handle will be return after mxc_ipu_lib_task_init function.
+  * If user did not define paddr of input/output buffer, then they can get
+- * virtual address of input/output buffer by inbuf_start/outbuf_startx
++ * virtual address of input/output buffer by inbuf_start/outbuf_start
+  * which allocated by ipu lib.
+  * The ifr_size/ofr_size indicate the size of input/output buffer.
+  * User should not care the priv parameter and DO NOT change it.
+  */
+ typedef struct {
+         void * inbuf_start[2];
+-	int ifr_size;
++        void * ovbuf_start[2];
+ 	void * outbuf_start0[2];
+ 	void * outbuf_start1[2];
++	int ifr_size;
++	int ovfr_size;
+ 	int ofr_size[2];
+ 
+ 	void * priv;
+@@ -165,6 +217,8 @@ typedef struct {
+  *
+  * @param	input		Input parameter for ipu task.
+  *
++ * @param	overlay		Overlay parameter for ipu task.
++ *
+  * @param	output0		The first output paramter for ipu task.
+  *
+  * @param	output1 	Ipu can support 2 output after postprocess
+@@ -183,6 +237,7 @@ typedef struct {
+  * 		fail.
+  */
+ int mxc_ipu_lib_task_init(ipu_lib_input_param_t * input,
++		ipu_lib_overlay_param_t * overlay,
+ 		ipu_lib_output_param_t * output0,
+ 		ipu_lib_output_param_t * output1,
+ 		int mode, ipu_lib_handle_t * ipu_handle);
+@@ -215,13 +270,15 @@ void mxc_ipu_lib_task_uninit(ipu_lib_handle_t * ipu_handle);
+  *
+  * @param	ipu_handle	The ipu task handle need to update buffer.
+  *
+- * @param	phyaddr		User can set phyaddr to their own allocated
++ * @param	new_inbuf_paddr	User can set phyaddr to their own allocated
+  * 				buffer addr, ipu lib will update the buffer
+  * 				from this address for process. If user do not
+  * 				want to use it, please let it be zero, and
+  * 				fill the buffer according to inbuf_start
+  * 				parameter in ipu_handle.
+  *
++ * @param	new_ovbuf_paddr User defined overlay physical buffer address.
++ *
+  * @param	output_callback	IPU lib will call output_callback funtion
+  * 				when there is output data.
+  *
+@@ -231,6 +288,11 @@ void mxc_ipu_lib_task_uninit(ipu_lib_handle_t * ipu_handle);
+  * 		or negative error code on fail.
+  */
+ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+-	dma_addr_t phyaddr, void (output_callback)(void *, int),
+-	void * output_cb_arg);
++	dma_addr_t new_inbuf_paddr, dma_addr_t new_ovbuf_paddr,
++	void (output_callback)(void *, int), void * output_cb_arg);
++
++#ifdef __cplusplus
++}
++#endif
++
+ #endif
+diff --git a/screenlayer/Makefile b/screenlayer/Makefile
+new file mode 100644
+index 0000000..12305ec
+--- /dev/null
++++ b/screenlayer/Makefile
+@@ -0,0 +1,24 @@
++CC=$(CROSS_COMPILE)gcc
++AR=$(CROSS_COMPILE)ar
++
++OBJS = ScreenLayer.o
++
++LIBNAME=libIpuScreenLayer
++
++all: $(LIBNAME).so
++
++install:
++	@mkdir -p $(DEST_DIR)/usr/lib
++	cp $(LIBNAME).* $(DEST_DIR)/usr/lib
++	@mkdir -p $(DEST_DIR)/usr/include
++	cp ScreenLayer.h $(DEST_DIR)/usr/include
++
++$(LIBNAME).so: $(OBJS)
++	$(CC) -shared -nostartfiles -Wl,-soname,$@ -o $@ $^ -L../ipu -lipu
++
++%.o: %.c
++	$(CC) $(INCLUDE) -Wall -O2 -c $^ -o $@
++
++.PHONY: clean
++clean:
++	@rm -f $(OBJS) $(LIBNAME).*
+diff --git a/screenlayer/ScreenLayer.c b/screenlayer/ScreenLayer.c
+new file mode 100644
+index 0000000..bb3d84d
+--- /dev/null
++++ b/screenlayer/ScreenLayer.c
+@@ -0,0 +1,738 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++#include <stdio.h>
++#include <errno.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <malloc.h>
++#include <string.h>
++#include <pthread.h>
++#include <linux/ipu.h>
++#include <linux/mxcfb.h>
++#include <linux/videodev.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include "ScreenLayer.h"
++#include "mxc_ipu_hl_lib.h"
++
++#define DBG_DEBUG		3
++#define DBG_INFO		2
++#define DBG_WARNING		1
++#define DBG_ERR			0
++
++static int debug_level = DBG_ERR;
++#define dbg(flag, fmt, args...)	{ if(flag <= debug_level)  printf("%s:%d "fmt, __FILE__, __LINE__,##args); }
++
++static pthread_mutex_t SLmutex = PTHREAD_MUTEX_INITIALIZER;
++
++typedef struct {
++	u8		isPrimary;
++	u8 		bufNum;
++	u8		curBufIdx;
++	dma_addr_t	dispPaddr[2];
++	u8		curDispIdx;
++	ScreenLayer 	* pPreLayer;
++	ScreenLayer 	* pNextLayer;
++	u8		alphaEnable;
++	u8		alpha;
++	u8		keyColorEnable;
++	u32		keyColor;
++	u8		layerEnable;
++	s32		fdIpu;
++        ipu_mem_info 	* bufMinfo;
++        ipu_mem_info 	dispMinfo;
++} ScreenLayerPriv;
++
++static u32 fmt_to_bpp(u32 pixelformat)
++{
++	u32 bpp;
++
++	switch (pixelformat)
++	{
++		case IPU_PIX_FMT_RGB565:
++		/*interleaved 422*/
++		case IPU_PIX_FMT_YUYV:
++		case IPU_PIX_FMT_UYVY:
++		/*non-interleaved 422*/
++		case IPU_PIX_FMT_YUV422P:
++		case IPU_PIX_FMT_YVU422P:
++			bpp = 16;
++			break;
++		case IPU_PIX_FMT_BGR24:
++		case IPU_PIX_FMT_RGB24:
++		case IPU_PIX_FMT_YUV444:
++			bpp = 24;
++			break;
++		case IPU_PIX_FMT_BGR32:
++		case IPU_PIX_FMT_BGRA32:
++		case IPU_PIX_FMT_RGB32:
++		case IPU_PIX_FMT_RGBA32:
++		case IPU_PIX_FMT_ABGR32:
++			bpp = 32;
++			break;
++		/*non-interleaved 420*/
++		case IPU_PIX_FMT_YUV420P:
++		case IPU_PIX_FMT_YUV420P2:
++		case IPU_PIX_FMT_NV12:
++			bpp = 12;
++			break;
++		default:
++			bpp = 8;
++			break;
++	}
++	return bpp;
++}
++
++SLRetCode _MemAllocSL(ScreenLayer *pSL)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	u8 i;
++	u32 width, height, screen_size;
++
++	pSLPriv->fdIpu = open("/dev/mxc_ipu",O_RDWR);
++	if(pSLPriv->fdIpu < 0) {
++		ret = E_RET_DEV_FAIL;
++		goto done;
++	}
++
++	/*
++ 	 * alloc disp buf, for primary layer should be framebuffer from fb device,
++ 	 * otherwise, a tmp buffer may be allocated.
++ 	 *
++ 	 * 3 cases:
++ 	 *
++ 	 * a. only primary
++ 	 * 	PrimarySL(dispBuf)
++ 	 * b. primary + one overlay
++ 	 * 	PrimarySL -> OverlaySL0(dispBuf)
++ 	 * c. primary + two overlay
++ 	 * 	PrimarySL -> OverlaySL0(tmpDispBuf) -> OverlaySL1(dispBuf)
++ 	 */
++	if (!pSLPriv->isPrimary) {
++		ScreenLayerPriv *pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
++
++		if (pSLPriv->pPreLayer != pSL->pPrimary) {
++			/* case b -> c */
++			width = ((ScreenLayer *)pSL->pPrimary)->screenRect.right - ((ScreenLayer *)pSL->pPrimary)->screenRect.left;
++			height = ((ScreenLayer *)pSL->pPrimary)->screenRect.bottom - ((ScreenLayer *)pSL->pPrimary)->screenRect.top;
++			pPreSLPriv->dispMinfo.size = width/8*height*fmt_to_bpp(((ScreenLayer *)pSL->pPrimary)->fmt);
++			if (ioctl(pPreSLPriv->fdIpu, IPU_ALOC_MEM, &(pPreSLPriv->dispMinfo)) < 0) {
++				ret = E_RET_MEM_ALOC_FAIL;
++				goto done;
++			}
++
++			pSLPriv->dispPaddr[0] = pPreSLPriv->dispPaddr[0];
++			pSLPriv->dispPaddr[1] = pPreSLPriv->dispPaddr[1];
++			pSLPriv->curDispIdx = pPreSLPriv->curDispIdx;
++			pPreSLPriv->dispPaddr[0] = pPreSLPriv->dispMinfo.paddr;
++			pPreSLPriv->dispPaddr[1] = 0;
++			pPreSLPriv->curDispIdx = 0;
++
++			dbg(DBG_DEBUG, "allocate %d memory paddr 0x%x for pre layer\n", pPreSLPriv->dispMinfo.size, pPreSLPriv->dispMinfo.paddr);
++		} else {
++			/* case a -> b */
++			pSLPriv->dispPaddr[0] = pPreSLPriv->dispPaddr[0];
++			pSLPriv->dispPaddr[1] = pPreSLPriv->dispPaddr[1];
++			pSLPriv->curDispIdx = pPreSLPriv->curDispIdx;
++			pPreSLPriv->dispPaddr[0] = 0;
++			pPreSLPriv->dispPaddr[1] = 0;
++			pPreSLPriv->curDispIdx = 0;
++		}
++	} else {
++		/* case a */
++		s32 fd_fb;
++		struct fb_fix_screeninfo fb_fix;
++		struct fb_var_screeninfo fb_var;
++
++		if ((fd_fb = open(pSL->fbdev, O_RDWR, 0)) < 0) {
++			memcpy(pSL->fbdev, "/dev/fb", 8);
++			if ((fd_fb = open(pSL->fbdev, O_RDWR, 0)) < 0) {
++				ret = E_RET_DEV_FAIL;
++				goto done;
++			}
++		}
++
++		if ( ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix) < 0) {
++			ret = E_RET_DEV_FAIL;
++			close(fd_fb);
++			goto done;
++		}
++		if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
++			ret = E_RET_DEV_FAIL;
++			close(fd_fb);
++			goto done;
++		}
++
++		if (fb_var.bits_per_pixel != fmt_to_bpp(pSL->fmt)) {
++			dbg(DBG_ERR, "request format should be the same as fb dev!\n");
++			ret = E_RET_WRONG_FMT;
++			goto done;
++		}
++
++		/* make the primary layer the same size as fb device */
++		pSL->screenRect.left = pSL->screenRect.top = 0;
++		pSL->screenRect.right =  fb_var.xres;
++		pSL->screenRect.bottom =  fb_var.yres;
++
++		screen_size = fb_var.yres * fb_fix.line_length;
++		pSLPriv->dispPaddr[0] = fb_fix.smem_start;
++		pSLPriv->dispPaddr[1] = fb_fix.smem_start + screen_size;
++
++		dbg(DBG_DEBUG, "screen layer display to %s, dispPaddr 0x%x 0x%x\n", pSL->fbdev, pSLPriv->dispPaddr[0], pSLPriv->dispPaddr[1]);
++
++		close(fd_fb);
++	}
++
++	width = pSL->screenRect.right - pSL->screenRect.left;
++	height = pSL->screenRect.bottom - pSL->screenRect.top;
++
++	pSL->bufPaddr = (dma_addr_t *)malloc(pSLPriv->bufNum * sizeof(dma_addr_t));
++	pSL->bufVaddr = (void **)malloc(pSLPriv->bufNum * sizeof(void *));
++	pSLPriv->bufMinfo = (ipu_mem_info *)malloc(pSLPriv->bufNum * sizeof(ipu_mem_info));
++	pSL->bufSize = width/8*height*fmt_to_bpp(pSL->fmt);
++
++	for (i=0;i<pSLPriv->bufNum;i++) {
++		pSLPriv->bufMinfo[i].size = pSL->bufSize;
++		if (ioctl(pSLPriv->fdIpu, IPU_ALOC_MEM, &(pSLPriv->bufMinfo[i])) < 0) {
++			ret = E_RET_MEM_ALOC_FAIL;
++			goto err;
++		}
++		pSL->bufPaddr[i] = pSLPriv->bufMinfo[i].paddr;
++		/* mmap virtual addr for user*/
++		pSL->bufVaddr[i] = mmap (NULL, pSLPriv->bufMinfo[i].size,
++				PROT_READ | PROT_WRITE, MAP_SHARED,
++				pSLPriv->fdIpu, pSLPriv->bufMinfo[i].paddr);
++		if (pSL->bufVaddr[i] == MAP_FAILED) {
++			ret = E_RET_MMAP_FAIL;
++			goto err;
++		}
++
++		dbg(DBG_DEBUG, "allocate %d memory paddr 0x%x, mmap to %p for current layer\n", pSLPriv->bufMinfo[i].size, pSL->bufPaddr[i], pSL->bufVaddr[i]);
++	}
++
++	goto done;
++
++err:
++	if (pSL->bufPaddr)
++		free(pSL->bufPaddr);
++	if (pSL->bufVaddr)
++		free(pSL->bufVaddr);
++	if (pSLPriv->bufMinfo)
++		free(pSLPriv->bufMinfo);
++done:
++	return ret;
++}
++
++void _MemFreeSL(ScreenLayer *pSL)
++{
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	u8 i;
++
++	for (i=0;i<pSLPriv->bufNum;i++) {
++		dbg(DBG_DEBUG, "free %d memory paddr 0x%x, mmap to %p for current layer\n", pSLPriv->bufMinfo[i].size, pSL->bufPaddr[i], pSL->bufVaddr[i]);
++		if (pSL->bufVaddr[i])
++			munmap(pSL->bufVaddr[i], pSLPriv->bufMinfo[i].size);
++		ioctl(pSLPriv->fdIpu, IPU_FREE_MEM, &(pSLPriv->bufMinfo[i]));
++	}
++
++	if (pSLPriv->pPreLayer && pSLPriv->pNextLayer) {
++		/* case c -> b, destory middle layer */
++		dbg(DBG_DEBUG, "free %d memory disppaddr 0x%x for current layer\n", pSLPriv->dispMinfo.size, pSLPriv->dispPaddr[0]);
++		ioctl(pSLPriv->fdIpu, IPU_FREE_MEM, &(pSLPriv->dispMinfo));
++	} else if (pSLPriv->pPreLayer) {
++		ScreenLayerPriv *pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
++		if (pSLPriv->pPreLayer == pSL->pPrimary) {
++			/* case b -> a */
++			pPreSLPriv->dispPaddr[0] = pSLPriv->dispPaddr[0];
++			pPreSLPriv->dispPaddr[1] = pSLPriv->dispPaddr[1];
++			pPreSLPriv->curDispIdx = pSLPriv->curDispIdx;
++			pSLPriv->dispPaddr[0] = 0;
++			pSLPriv->dispPaddr[1] = 0;
++		} else {
++			/* case c -> b, destory top layer */
++			dbg(DBG_DEBUG, "free %d memory disppaddr 0x%x for pre layer\n", pPreSLPriv->dispMinfo.size, pPreSLPriv->dispPaddr[0]);
++			ioctl(pPreSLPriv->fdIpu, IPU_FREE_MEM, &(pPreSLPriv->dispMinfo));
++			pPreSLPriv->dispPaddr[0] = pSLPriv->dispPaddr[0];
++			pPreSLPriv->dispPaddr[1] = pSLPriv->dispPaddr[1];
++			pPreSLPriv->curDispIdx = pSLPriv->curDispIdx;
++			pSLPriv->dispPaddr[0] = 0;
++			pSLPriv->dispPaddr[1] = 0;
++		}
++	}
++
++	if (pSL->bufPaddr)
++		free(pSL->bufPaddr);
++	if (pSL->bufVaddr)
++		free(pSL->bufVaddr);
++	if (pSLPriv->bufMinfo)
++		free(pSLPriv->bufMinfo);
++
++	close(pSLPriv->fdIpu);
++}
++
++SLRetCode CreateScreenLayer(ScreenLayer *pSL, u8 nBufNum)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pSLPriv;
++
++	pSL->pPriv = (void *)malloc(sizeof(ScreenLayerPriv));
++	memset(pSL->pPriv, 0, sizeof(ScreenLayerPriv));
++	pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++
++	if (pSL->pPrimary) {
++		ScreenLayerPriv *pPriSLPriv = (ScreenLayerPriv *)((ScreenLayer *)pSL->pPrimary)->pPriv;
++		ScreenLayerPriv *pCurSLPriv;
++		ScreenLayer *pCurSL;
++
++		if (!pPriSLPriv->isPrimary) {
++			dbg(DBG_ERR, "new screen layer should created based on a primary one!\n");
++			ret = E_RET_PRIMARY_ERR;
++			goto done;
++		}
++
++		if ((pSL->screenRect.left >= ((ScreenLayer *)pSL->pPrimary)->screenRect.right) ||
++			(pSL->screenRect.right > ((ScreenLayer *)pSL->pPrimary)->screenRect.right) ||
++			(pSL->screenRect.top >= ((ScreenLayer *)pSL->pPrimary)->screenRect.bottom) ||
++			(pSL->screenRect.bottom > ((ScreenLayer *)pSL->pPrimary)->screenRect.bottom)) {
++			dbg(DBG_ERR, "new screen layer is bigger than primary one!\n");
++			ret = E_RET_RECT_OVERFLOW;
++			goto done;
++		}
++
++		pCurSL = (ScreenLayer *)pSL->pPrimary;
++		pCurSLPriv = pPriSLPriv;
++		while (pCurSLPriv->pNextLayer) {
++			pCurSL = pCurSLPriv->pNextLayer;
++			pCurSLPriv = (ScreenLayerPriv *)pCurSL->pPriv;
++		}
++		pCurSLPriv->pNextLayer = pSL;
++		pSLPriv->pPreLayer = pCurSL;
++
++		pSLPriv->isPrimary = 0;
++	} else
++		pSLPriv->isPrimary = 1;
++
++	pSLPriv->bufNum = nBufNum;
++
++	ret = _MemAllocSL(pSL);
++done:
++	return ret;
++}
++
++SLRetCode DestoryScreenLayer(ScreenLayer *pSL)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pPreSLPriv, *pNextSLPriv;
++
++	if (pSLPriv->isPrimary && pSLPriv->pNextLayer) {
++		dbg(DBG_ERR, "Err: destory primary with sub layer, pls destory sub layer first!\n");
++		ret = E_RET_DESTORY_PRI_WITH_SUBSL;
++		goto done;
++	}
++
++	_MemFreeSL(pSL);
++
++	if (pSLPriv->pPreLayer) {
++		if (pSLPriv->pNextLayer) {
++			pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
++			pNextSLPriv = (ScreenLayerPriv *)pSLPriv->pNextLayer->pPriv;
++			pPreSLPriv->pNextLayer = pSLPriv->pNextLayer;
++			pNextSLPriv->pPreLayer = pSLPriv->pPreLayer;
++		} else {
++			pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
++			pPreSLPriv->pNextLayer = NULL;
++		}
++	}
++	free(pSLPriv);
++done:
++	return ret;
++}
++
++SLRetCode LoadScreenLayer(ScreenLayer *pSL, LoadParam *pParam, u8 nBufIdx)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ipu_lib_handle_t ipu_handle;
++	ipu_lib_input_param_t input;
++	ipu_lib_output_param_t output;
++	int mode;
++
++	memset(&ipu_handle, 0, sizeof(ipu_lib_handle_t));
++	memset(&input, 0, sizeof(ipu_lib_input_param_t));
++	memset(&output, 0, sizeof(ipu_lib_output_param_t));
++
++	if (nBufIdx >= pSLPriv->bufNum) {
++		ret = E_RET_BUFIDX_ERR;
++		goto done;
++	}
++
++	pthread_mutex_lock(&SLmutex);
++
++	if ((pParam->srcRect.left >=  pParam->srcWidth) ||
++		(pParam->srcRect.right > pParam->srcWidth) ||
++		(pParam->srcRect.top >= pParam->srcHeight) ||
++		(pParam->srcRect.bottom > pParam->srcHeight)){
++		dbg(DBG_WARNING, "LoadScreenLayer src rect size not fit!\n")
++		pParam->srcRect.left = 0;
++		pParam->srcRect.top = 0;
++		pParam->srcRect.right = pParam->srcWidth;
++		pParam->srcRect.bottom = pParam->srcHeight;
++	}
++
++	if ((pParam->destRect.left >=  (pSL->screenRect.right - pSL->screenRect.left)) ||
++		(pParam->destRect.right > (pSL->screenRect.right - pSL->screenRect.left)) ||
++		(pParam->destRect.top >= (pSL->screenRect.bottom - pSL->screenRect.top)) ||
++		(pParam->destRect.bottom > (pSL->screenRect.bottom - pSL->screenRect.top))){
++		dbg(DBG_WARNING, "LoadScreenLayer dest rect size not fit!\n")
++		pParam->destRect.left = 0;
++		pParam->destRect.top = 0;
++		pParam->destRect.right = pSL->screenRect.right - pSL->screenRect.left;
++		pParam->srcRect.bottom = pSL->screenRect.bottom - pSL->screenRect.top;
++	}
++
++	mode = OP_NORMAL_MODE | TASK_PP_MODE;
++        input.width = pParam->srcWidth;
++        input.height = pParam->srcHeight;
++	input.input_crop_win.pos.x = pParam->srcRect.left;
++	input.input_crop_win.pos.y = pParam->srcRect.top;
++	input.input_crop_win.win_w = pParam->srcRect.right - pParam->srcRect.left;
++	input.input_crop_win.win_h = pParam->srcRect.bottom - pParam->srcRect.top;
++        input.fmt = pParam->srcFmt;
++	input.user_def_paddr[0] = pParam->srcPaddr;
++
++	output.width = pSL->screenRect.right -  pSL->screenRect.left;
++	output.height = pSL->screenRect.bottom -  pSL->screenRect.top;
++	output.output_win.pos.x = pParam->destRect.left;
++	output.output_win.pos.y = pParam->destRect.top;
++	output.output_win.win_w = pParam->destRect.right - pParam->destRect.left;
++	output.output_win.win_h = pParam->destRect.bottom - pParam->destRect.top;
++	output.fmt = pSL->fmt;
++	output.rot = pParam->destRot;
++	output.user_def_paddr[0] = pSL->bufPaddr[pSLPriv->curBufIdx];
++
++	if (mxc_ipu_lib_task_init(&input, NULL, &output, NULL, mode, &ipu_handle) < 0) {
++		ret = E_RET_TASK_SETUP_ERR;
++		pthread_mutex_unlock(&SLmutex);
++		goto done;
++	}
++
++	if (mxc_ipu_lib_task_buf_update(&ipu_handle, 0, 0, 0, 0) < 0) {
++		ret = E_RET_TASK_RUN_ERR;
++		pthread_mutex_unlock(&SLmutex);
++		goto done;
++	}
++
++	mxc_ipu_lib_task_uninit(&ipu_handle);
++
++	pthread_mutex_unlock(&SLmutex);
++
++done:
++	return ret;
++}
++
++SLRetCode FlipScreenLayerBuf(ScreenLayer *pSL, u8 nBufIdx)
++{
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++
++	if (nBufIdx >= pSLPriv->bufNum)
++		return E_RET_FLIP_ERR;
++
++	pSLPriv->curBufIdx = nBufIdx;
++
++	return E_RET_SUCCESS;
++}
++
++SLRetCode _CopyScreenLayer(ScreenLayer *pSrcSL, ScreenLayer *pTgtSL)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pSrcSLPriv = (ScreenLayerPriv *)pSrcSL->pPriv;
++	ScreenLayerPriv *pTgtSLPriv = (ScreenLayerPriv *)pTgtSL->pPriv;
++	ScreenLayer *pPriSL;
++	ipu_lib_handle_t ipu_handle;
++	ipu_lib_input_param_t input;
++	ipu_lib_output_param_t output;
++	s32 mode;
++
++	memset(&ipu_handle, 0, sizeof(ipu_lib_handle_t));
++	memset(&input, 0, sizeof(ipu_lib_input_param_t));
++	memset(&output, 0, sizeof(ipu_lib_output_param_t));
++
++	/* Top SL should show to fb */
++	if (!pTgtSLPriv->pNextLayer)
++		pTgtSLPriv->curDispIdx = pTgtSLPriv->curDispIdx ? 0 : 1;
++
++	if (pSrcSLPriv->isPrimary)
++		pPriSL = pSrcSL;
++	else
++		pPriSL = (ScreenLayer *)pSrcSL->pPrimary;
++
++	mode = OP_NORMAL_MODE | TASK_PP_MODE;
++        input.width = output.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
++        input.height = output.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
++        input.fmt = output.fmt = pPriSL->fmt;
++	if (pSrcSL == pPriSL)
++		input.user_def_paddr[0] = pSrcSL->bufPaddr[pSrcSLPriv->curBufIdx];
++	else
++		input.user_def_paddr[0] = pSrcSLPriv->dispPaddr[pSrcSLPriv->curDispIdx];
++	output.user_def_paddr[0] = pTgtSLPriv->dispPaddr[pTgtSLPriv->curDispIdx];
++
++	if (mxc_ipu_lib_task_init(&input, NULL, &output, NULL, mode, &ipu_handle) < 0) {
++		ret = E_RET_TASK_SETUP_ERR;
++		goto done;
++	}
++
++	if (mxc_ipu_lib_task_buf_update(&ipu_handle, 0, 0, 0, 0) < 0) {
++		ret = E_RET_TASK_RUN_ERR;
++		goto done;
++	}
++
++	mxc_ipu_lib_task_uninit(&ipu_handle);
++
++	dbg(DBG_DEBUG, "Copy screen layer in %d %d, from 0x%x to 0x%x\n", input.width, input.height,
++			input.user_def_paddr[0], output.user_def_paddr[0]);
++done:
++	return ret;
++}
++
++SLRetCode _CombScreenLayers(ScreenLayer *pBotSL, ScreenLayer *pTopSL)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pBotSLPriv = (ScreenLayerPriv *)pBotSL->pPriv;
++	ScreenLayerPriv *pTopSLPriv = (ScreenLayerPriv *)pTopSL->pPriv;
++	ScreenLayer *pPriSL;
++	ipu_lib_handle_t ipu_handle;
++	ipu_lib_input_param_t input;
++	ipu_lib_overlay_param_t overlay;
++	ipu_lib_output_param_t output;
++	s32 mode;
++
++	memset(&ipu_handle, 0, sizeof(ipu_lib_handle_t));
++	memset(&input, 0, sizeof(ipu_lib_input_param_t));
++	memset(&overlay, 0, sizeof(ipu_lib_overlay_param_t));
++	memset(&output, 0, sizeof(ipu_lib_output_param_t));
++
++	if (pBotSLPriv->isPrimary)
++		pPriSL = pBotSL;
++	else
++		pPriSL = (ScreenLayer *)pBotSL->pPrimary;
++
++	if (pTopSLPriv->alphaEnable && (pTopSLPriv->alpha == 255)
++		&& !pTopSLPriv->keyColorEnable) {
++		/* this case we can do copy directly, no combination needed*/
++		dbg(DBG_DEBUG, "Do copy directly for Comb!\n");
++
++		mode = OP_NORMAL_MODE | TASK_PP_MODE;
++
++		/* top/overlay layer (graphic) */
++		input.width = pTopSL->screenRect.right - pTopSL->screenRect.left;
++		input.height = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
++		input.fmt = pTopSL->fmt;
++		input.user_def_paddr[0] = pTopSL->bufPaddr[pTopSLPriv->curBufIdx];
++
++		/* output */
++		output.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
++		output.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
++		output.output_win.pos.x = pTopSL->screenRect.left;
++		output.output_win.pos.y = pTopSL->screenRect.top;
++		output.output_win.win_w = pTopSL->screenRect.right - pTopSL->screenRect.left;
++		output.output_win.win_h = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
++		output.fmt = pPriSL->fmt;
++		output.user_def_paddr[0] = pTopSLPriv->dispPaddr[pTopSLPriv->curDispIdx];
++
++		if (mxc_ipu_lib_task_init(&input, NULL, &output, NULL, mode, &ipu_handle) < 0) {
++			ret = E_RET_TASK_SETUP_ERR;
++			goto done;
++		}
++	} else {
++		dbg(DBG_DEBUG, "Use IC Comb!\n");
++
++		mode = OP_NORMAL_MODE | TASK_PP_MODE;
++		/* bottom layer */
++		input.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
++		input.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
++		input.input_crop_win.pos.x = pTopSL->screenRect.left;
++		input.input_crop_win.pos.y = pTopSL->screenRect.top;
++		input.input_crop_win.win_w = pTopSL->screenRect.right - pTopSL->screenRect.left;
++		input.input_crop_win.win_h = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
++		input.fmt = pPriSL->fmt;
++		if (pBotSL == pPriSL)
++			input.user_def_paddr[0] = pBotSL->bufPaddr[pBotSLPriv->curBufIdx];
++		else
++			input.user_def_paddr[0] = pBotSLPriv->dispPaddr[pBotSLPriv->curDispIdx];
++
++		/* top/overlay layer (graphic) */
++		overlay.width = pTopSL->screenRect.right - pTopSL->screenRect.left;
++		overlay.height = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
++		overlay.fmt = pTopSL->fmt;
++		overlay.user_def_paddr[0] = pTopSL->bufPaddr[pTopSLPriv->curBufIdx];
++		overlay.alpha_en = pTopSLPriv->alphaEnable;
++		overlay.key_color_en = pTopSLPriv->keyColorEnable;
++		overlay.alpha = pTopSLPriv->alpha;
++		overlay.key_color = pTopSLPriv->keyColor;
++
++		/* output */
++		output.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
++		output.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
++		output.output_win.pos.x = pTopSL->screenRect.left;
++		output.output_win.pos.y = pTopSL->screenRect.top;
++		output.output_win.win_w = pTopSL->screenRect.right - pTopSL->screenRect.left;
++		output.output_win.win_h = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
++		output.fmt = pPriSL->fmt;
++		output.user_def_paddr[0] = pTopSLPriv->dispPaddr[pTopSLPriv->curDispIdx];
++
++		if (mxc_ipu_lib_task_init(&input, &overlay, &output, NULL, mode, &ipu_handle) < 0) {
++			ret = E_RET_TASK_SETUP_ERR;
++			goto done;
++		}
++	}
++
++	if (mxc_ipu_lib_task_buf_update(&ipu_handle, 0, 0, 0, 0) < 0) {
++		ret = E_RET_TASK_RUN_ERR;
++		goto done;
++	}
++
++	mxc_ipu_lib_task_uninit(&ipu_handle);
++
++	dbg(DBG_DEBUG, "Comb screen layer in [(%d,%d),(%d,%d)]\n", pTopSL->screenRect.left,
++		pTopSL->screenRect.top, pTopSL->screenRect.right, pTopSL->screenRect.bottom);
++done:
++	return ret;
++}
++
++SLRetCode _UpdateFramebuffer(ScreenLayer *pSL)
++{
++	s32 fd_fb = 0;
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayer *pPriSL;
++	struct fb_var_screeninfo fb_var;
++
++	if (pSLPriv->isPrimary)
++		pPriSL = pSL;
++	else
++		pPriSL = (ScreenLayer *)pSL->pPrimary;
++
++	if ((fd_fb = open(pPriSL->fbdev, O_RDWR, 0)) < 0) {
++		ret = E_RET_DEV_FAIL;
++		goto done;
++	}
++
++	if (ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
++		ret = E_RET_DEV_FAIL;
++		goto done;
++	}
++
++	if (pSLPriv->curDispIdx == 0)
++		fb_var.yoffset = 0;
++	else
++		fb_var.yoffset = fb_var.yres;
++
++	if (ioctl(fd_fb, FBIOPAN_DISPLAY, &fb_var) < 0) {
++		ret = E_RET_DEV_FAIL;
++		goto done;
++	}
++	dbg(DBG_DEBUG, "update fb: pan display offset %d\n", fb_var.yoffset);
++done:
++	if (fd_fb)
++		close(fd_fb);
++	return ret;
++}
++
++SLRetCode UpdateScreenLayer(ScreenLayer *pSL)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayer *pCurSL;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pCurSLPriv;
++
++	pthread_mutex_lock(&SLmutex);
++
++	/* primary update? */
++	if (pSLPriv->isPrimary && !pSLPriv->pNextLayer) {
++		/* there is only primary, update it only */
++		dbg(DBG_DEBUG, "Update primary layer only, just copy!\n");
++		pCurSL = pSL;
++		ret = _CopyScreenLayer(pCurSL, pCurSL);
++		if (ret != E_RET_SUCCESS)
++			goto done;
++	} else {
++		/* update from primary to top SL*/
++		dbg(DBG_DEBUG, "Update multi layers, from primary to top!\n");
++		if (pSLPriv->isPrimary)
++			pCurSL = pSL;
++		else
++			pCurSL = (ScreenLayer *)pSL->pPrimary;
++
++		pCurSLPriv = (ScreenLayerPriv *)pCurSL->pPriv;
++		while(pCurSLPriv->pNextLayer) {
++			ret = _CopyScreenLayer(pCurSL, pCurSLPriv->pNextLayer);
++			if (ret != E_RET_SUCCESS)
++				goto done;
++
++			ret = _CombScreenLayers(pCurSL, pCurSLPriv->pNextLayer);
++			if (ret != E_RET_SUCCESS)
++				goto done;
++			pCurSL = pCurSLPriv->pNextLayer;
++			pCurSLPriv = (ScreenLayerPriv *)pCurSL->pPriv;
++		}
++	}
++
++	ret = _UpdateFramebuffer(pCurSL);
++
++	pthread_mutex_unlock(&SLmutex);
++done:
++	return ret;
++}
++
++SLRetCode SetScreenLayer(ScreenLayer *pSL, SetMethodType eType, void *setData)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++
++	switch (eType) {
++	case E_SET_ALPHA:
++	{
++		MethodAlphaData *data = (MethodAlphaData *)setData;
++		pSLPriv->alphaEnable = data->enable;
++		pSLPriv->alpha = data->alpha;
++		break;
++	}
++	case E_SET_COLORKEY:
++	{
++		MethodColorKeyData *data = (MethodColorKeyData *)setData;
++		pSLPriv->keyColorEnable = data->enable;
++		pSLPriv->keyColor = data->keyColor;
++		break;
++	}
++	case E_ENABLE_LAYER:
++		pSLPriv->layerEnable = *((u8 *)setData);
++		break;
++	default:
++		ret = E_RET_NOSUCH_METHODTYPE;
++	}
++	return ret;
++}
++
++#ifdef __cplusplus
++}
++#endif
++
+diff --git a/screenlayer/ScreenLayer.h b/screenlayer/ScreenLayer.h
+new file mode 100644
+index 0000000..cdb9c72
+--- /dev/null
++++ b/screenlayer/ScreenLayer.h
+@@ -0,0 +1,99 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++#ifndef __SCREENLAYER_H__
++#define __SCREENLAYER_H__
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++/* data type */
++#define u8 		unsigned char
++#define u16 		unsigned short
++#define u32 		unsigned int
++#define s32 		int
++
++typedef enum {
++	E_RET_SUCCESS = 0,
++	E_RET_DEV_FAIL,
++	E_RET_WRONG_FMT,
++	E_RET_MEM_ALOC_FAIL,
++	E_RET_MMAP_FAIL,
++	E_RET_PRIMARY_ERR,
++	E_RET_RECT_OVERFLOW,
++	E_RET_BUFIDX_ERR,
++	E_RET_TASK_SETUP_ERR,
++	E_RET_TASK_RUN_ERR,
++	E_RET_FLIP_ERR,
++	E_RET_NOSUCH_METHODTYPE,
++	E_RET_DESTORY_PRI_WITH_SUBSL,
++} SLRetCode;
++
++typedef enum {
++	E_SET_ALPHA,
++	E_SET_COLORKEY,
++	E_ENABLE_LAYER,
++} SetMethodType;
++
++typedef struct {
++	u8	enable;
++	u32	alpha;
++} MethodAlphaData;
++
++typedef struct {
++	u8	enable;
++	u32	keyColor;
++} MethodColorKeyData;
++
++typedef struct {
++	u16		left;
++	u16		top;
++	u32		right;
++	u32		bottom;
++} SLRect;
++
++typedef struct {
++	SLRect 		screenRect;
++	u32 		fmt;
++	u32		bufSize;
++	void 		** bufVaddr;
++	dma_addr_t 	* bufPaddr;
++	void	 	* pPrimary;
++	char		fbdev[32];
++	void 		* pPriv;
++} ScreenLayer;
++
++typedef struct {
++	u32		srcWidth;
++	u32		srcHeight;
++	u32		srcFmt;
++	SLRect		srcRect;
++	SLRect		destRect;
++	u32		destRot;
++	dma_addr_t 	srcPaddr;
++} LoadParam;
++
++/* APIs */
++SLRetCode CreateScreenLayer(ScreenLayer *pSL, u8 nBufNum);
++SLRetCode LoadScreenLayer(ScreenLayer *pSL, LoadParam *pParam, u8 nBufIdx);
++SLRetCode FlipScreenLayerBuf(ScreenLayer *pSL, u8 nBufIdx);
++SLRetCode UpdateScreenLayer(ScreenLayer *pSL);
++SLRetCode SetScreenLayer(ScreenLayer *pSL, SetMethodType eType, void *setData);
++SLRetCode DestoryScreenLayer(ScreenLayer *pSL);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+-- 
+1.8.0
+

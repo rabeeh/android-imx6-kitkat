@@ -1,0 +1,126 @@
+From fe77d94f36a5f66da5f03ae48847abd435ba7a78 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Thu, 12 Apr 2012 17:00:21 +0800
+Subject: [PATCH 264/486] ENGR00180407 add adjusting main display resolution
+ dynamically.
+
+add code in framebuffer to support it.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libgralloc_wrapper/framebuffer.cpp | 47 +++++++++++++++++++++++++++++-----
+ mx6/libgralloc_wrapper/gralloc.cpp     |  1 +
+ 2 files changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 69535ec..4bf040a 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -66,6 +66,7 @@ struct fb_context_t {
+     framebuffer_device_t  device;
+     int mainDisp_fd;
+     private_module_t* priv_m;
++    int isMainDisp;
+ };
+ 
+ static int nr_framebuffers;
+@@ -220,12 +221,44 @@ static int set_graphics_fb_mode(int fb, struct configParam* param)
+     char temp_name[256];
+     char fb_mode[256];
+     const char *disp_mode = NULL;
++    char* start_index = 0;
+     int fd_mode = 0;
+     int size=0;
+     int n = 0;
+ 
+-    if(fb == 0 || param == NULL) {
+-        LOGE("<%s,%d> invalide parameter", __FUNCTION__, __LINE__);
++    if(param == NULL) {
++        /*
++         * file /data/misc/display.conf format:
++         * mode=S1920:x1080p-60
++         * colordepth=32
++         * usage: change fb display mode.
++        */
++        int fb_misc = open("/data/misc/display.conf", O_RDWR, 0);
++        if(fb_misc > 0) {
++            memset(fb_mode, 0, sizeof(fb_mode));
++            size = read(fb_misc, fb_mode, sizeof(fb_mode));
++            if(size > 0) {
++                disp_mode = fb_mode;
++                while(*disp_mode != '\0') {
++                    if(*disp_mode == '\n') {
++                        disp_mode++;
++                        n = disp_mode - start_index;
++                        *(char*)disp_mode = '\0';
++                        memset(temp_name, 0, sizeof(temp_name));
++			sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
++			fd_mode = open(temp_name,O_RDWR, 0);
++			if(fd_mode < 0) {
++			    LOGI("Error %d! Cannot open %s", fd_mode, temp_name);
++			    return -1;
++			}
++                        write(fd_mode, start_index + 1, n);
++                        break;
++                    }
++                    if(*disp_mode == '=') start_index = (char*)disp_mode;
++                    disp_mode++;
++                }
++            }
++        }
+         return 0;
+     }
+ 
+@@ -540,7 +573,8 @@ static int fb_close(struct hw_device_t *dev)
+     if (ctx) {
+         if (ctx->priv_m != NULL) {
+             unMapFrameBuffer(ctx, ctx->priv_m);
+-            free(ctx->priv_m);
++            if(!ctx->isMainDisp)
++                free(ctx->priv_m);
+         }
+         free(ctx);
+     }
+@@ -624,7 +658,6 @@ int fb_device_open(hw_module_t const* module, const char* name,
+     char value[PROPERTY_VALUE_MAX];
+     if (!strncmp(name, GRALLOC_HARDWARE_FB, 2)) {
+         framebuffer_device_t *fbdev;
+-
+         nr_framebuffers = NUM_BUFFERS;
+         property_get("ro.product.device", value, "");
+         if (0 == strcmp(value, "imx50_rdp")) {
+@@ -653,8 +686,9 @@ int fb_device_open(hw_module_t const* module, const char* name,
+                 fb_device_init(m, dev);
+             }
+ 
+-            dev->priv_m = NULL;
+-            dev->mainDisp_fd = 0;
++            dev->priv_m = m;
++            dev->mainDisp_fd = m->framebuffer->fd;
++            dev->isMainDisp = 1;
+             fslwatermark_sem_open();
+         } else {
+             private_module_t* orig_m = (private_module_t*)module;
+@@ -670,6 +704,7 @@ int fb_device_open(hw_module_t const* module, const char* name,
+             gra_m->perform = fb_perform;
+             dev->priv_m = priv_m;
+             dev->mainDisp_fd = orig_m->framebuffer->fd;
++            dev->isMainDisp = 0;
+         }
+ 
+         *device = &dev->device.common;
+diff --git a/mx6/libgralloc_wrapper/gralloc.cpp b/mx6/libgralloc_wrapper/gralloc.cpp
+index 39ec399..10a67bf 100755
+--- a/mx6/libgralloc_wrapper/gralloc.cpp
++++ b/mx6/libgralloc_wrapper/gralloc.cpp
+@@ -147,6 +147,7 @@ static int gralloc_close(struct hw_device_t *dev)
+         private_module_t* m = reinterpret_cast<private_module_t*>(ctx->device.common.module);
+         if(m && m->gpu_device){
+            gralloc_close((struct hw_device_t *)m->gpu_device);
++           m->gpu_device = NULL;
+         }
+ 
+         free(ctx);
+-- 
+1.8.0
+

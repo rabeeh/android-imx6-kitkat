@@ -1,0 +1,642 @@
+From cd179737aa29ebc2dbc8de1a57427de2e58a1b2a Mon Sep 17 00:00:00 2001
+From: Liu Ying <b17645@freescale.com>
+Date: Tue, 8 Sep 2009 17:14:19 +0800
+Subject: [PATCH 118/435] ENGR00116149 V4l2 overlay:DP local alpha blending
+ with BG as graphics plane
+
+Support IPUv3 DP local alpha blending unit test with BG as graphics plane.
+
+Signed-off-by: Liu Ying <b17645@freescale.com>
+---
+ test/mxc_v4l2_test/mxc_v4l2_overlay.c | 380 +++++++++++++++++++++-------------
+ 1 file changed, 241 insertions(+), 139 deletions(-)
+
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_overlay.c b/test/mxc_v4l2_test/mxc_v4l2_overlay.c
+index a198cc3..5e53775 100644
+--- a/test/mxc_v4l2_test/mxc_v4l2_overlay.c
++++ b/test/mxc_v4l2_test/mxc_v4l2_overlay.c
+@@ -88,10 +88,12 @@ int g_capture_mode = 0;
+ int g_alpha_mode = 0;
+ char *alpha_buf0 = NULL;
+ char *alpha_buf1 = NULL;
++int alpha_fb_w = 0, alpha_fb_h = 0;
+ unsigned long loc_alpha_phy_addr0;
+ unsigned long loc_alpha_phy_addr1;
+ int alpha_buf_size = 0;
+ int ctrl_c_rev = 0;
++int g_fd_fb_fg = 0;
+ 
+ void ctrl_c_handler(int signum, siginfo_t *info, void *myact)
+ {
+@@ -109,7 +111,7 @@ void fill_alpha_buffer(char *alpha_buf, int left, int top,
+ 	for (y = top; y < bottom; y++) {
+ 		for (x = left; x < right; x++) {
+ 			pPointAlphaValue = (char *)(alpha_buf +
+-					    g_display_width * y + x);
++					    alpha_fb_w * y + x);
+ 			*pPointAlphaValue = alpha_val;
+ 		}
+ 	}
+@@ -120,76 +122,81 @@ mxc_v4l_overlay_test(int timeout)
+ {
+         int i;
+         int overlay = 1;
++        int retval = 0;
+         struct v4l2_control ctl;
+-	char fb_device_2[100] = "/dev/fb2";
+-	int fd_fb_2 = 0;
++	char fb_device_0[100] = "/dev/fb0";
++	int fd_graphic_fb = 0;
++	struct fb_var_screeninfo fb0_var;
+ 	struct mxcfb_loc_alpha l_alpha;
+ 
++	if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0) {
++		printf("VIDIOC_OVERLAY start failed\n");
++		retval = TFAIL;
++		goto out1;
++	}
++
+ 	if (g_alpha_mode) {
+-		/* The window shows graphics and video planes. */
+-		fill_alpha_buffer(alpha_buf0, 0, 0,
+-			  g_display_width, g_display_height, 0x80);
++		if (g_overlay) {
++			fd_graphic_fb = g_fd_fb_fg;
++
++			alpha_fb_w = g_display_width;
++			alpha_fb_h = g_display_height;
++		} else {
++			if ((fd_graphic_fb = open(fb_device_0, O_RDWR)) < 0) {
++				printf("Unable to open frame buffer 0\n");
++				retval = TFAIL;
++				goto out2;
++			}
+ 
+-		fill_alpha_buffer(alpha_buf1, 0, 0,
+-			  g_display_width, g_display_height, 0x80);
+-	}
++			if (ioctl(fd_graphic_fb, FBIOGET_VSCREENINFO, &fb0_var) < 0) {
++				printf("Get frame buffer0 var info failed\n");
+ 
+-        if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0)
+-        {
+-                printf("VIDIOC_OVERLAY start failed\n");
+-		return TFAIL;
+-        }
++				retval = TFAIL;
++				goto out2;
++			}
+ 
+-	if (g_alpha_mode) {
+-		if ((fd_fb_2 = open(fb_device_2, O_RDWR)) < 0) {
+-			printf("Unable to open frame buffer 2\n");
+-			return TFAIL;
++			alpha_fb_w = fb0_var.xres;
++			alpha_fb_h = fb0_var.yres;
+ 		}
+ 
+-		if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
++		/* The window shows graphics and video planes. */
++		fill_alpha_buffer(alpha_buf0, 0, 0,
++			  alpha_fb_w, alpha_fb_h, 0x80);
++
++		fill_alpha_buffer(alpha_buf1, 0, 0,
++			  alpha_fb_w, alpha_fb_h, 0x80);
++
++		if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
+ 			printf("Set local alpha buf failed\n");
+-			close(fd_fb_2);
+-			return TFAIL;
++			retval = TFAIL;
++			goto out2;
+ 		}
+ 
+ 		sleep(5);
+ 
+-		if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
++		if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
+ 			printf("Set local alpha buf failed\n");
+-			close(fd_fb_2);
+-			return TFAIL;
++			retval = TFAIL;
++			goto out2;
+ 		}
+-	}
+-
+-        for (i = 0; i < 3 ; i++) {
+-                // flash a frame
+-                ctl.id = V4L2_CID_PRIVATE_BASE + 1;
+-                if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctl) < 0)
+-                {
+-                        printf("set ctl failed\n");
+-			return TFAIL;
+-                }
+-	            sleep(1);
+-        }
+ 
+-	if (g_alpha_mode) {
+ 		while (ctrl_c_rev == 0) {
+ 			/*
+ 			 * The middle quarter window shows
+ 			 * video plane only.
+ 			 */
+ 			fill_alpha_buffer(alpha_buf0,
+-					  g_display_width/4,
+-					  g_display_height/4,
+-					  3*g_display_width/4,
+-					  3*g_display_height/4,
++					  alpha_fb_w/4,
++					  alpha_fb_h/4,
++					  3*alpha_fb_w/4,
++					  3*alpha_fb_h/4,
+ 					  0x00);
+ 			sleep(5);
+ 
+-			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
++			if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
+ 				printf("Set local alpha buf failed\n");
+-				close(fd_fb_2);
+-				return TFAIL;
++				retval = TFAIL;
++				goto out2;
+ 			}
+ 
+ 			/*
+@@ -197,17 +204,17 @@ mxc_v4l_overlay_test(int timeout)
+ 			 * graphics plane only.
+ 			 */
+ 			fill_alpha_buffer(alpha_buf1,
+-					  g_display_width/4,
+-					  g_display_height/4,
+-					  3*g_display_width/4,
+-					  3*g_display_height/4,
++					  alpha_fb_w/4,
++					  alpha_fb_h/4,
++					  3*alpha_fb_w/4,
++					  3*alpha_fb_h/4,
+ 					  0xFF);
+ 			sleep(5);
+ 
+-			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
++			if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
+ 				printf("Set local alpha buf failed\n");
+-				close(fd_fb_2);
+-				return TFAIL;
++				retval = TFAIL;
++				goto out2;
+ 			}
+ 
+ 			/*
+@@ -215,17 +222,17 @@ mxc_v4l_overlay_test(int timeout)
+ 			 * graphics and video planes.
+ 			 */
+ 			fill_alpha_buffer(alpha_buf0,
+-					  g_display_width/4,
+-					  g_display_height/4,
+-					  3*g_display_width/4,
+-					  3*g_display_height/4,
++					  alpha_fb_w/4,
++					  alpha_fb_h/4,
++					  3*alpha_fb_w/4,
++					  3*alpha_fb_h/4,
+ 					  0x80);
+ 			sleep(5);
+ 
+-			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
++			if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
+ 				printf("Set local alpha buf failed\n");
+-				close(fd_fb_2);
+-				return TFAIL;
++				retval = TFAIL;
++				goto out2;
+ 			}
+ 
+ 			/*
+@@ -233,17 +240,17 @@ mxc_v4l_overlay_test(int timeout)
+ 			 * video plane only.
+ 			 */
+ 			fill_alpha_buffer(alpha_buf1,
+-					  g_display_width/4,
+-					  g_display_height/4,
+-					  3*g_display_width/4,
+-					  3*g_display_height/4,
++					  alpha_fb_w/4,
++					  alpha_fb_h/4,
++					  3*alpha_fb_w/4,
++					  3*alpha_fb_h/4,
+ 					  0x00);
+ 			sleep(5);
+ 
+-			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
++			if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
+ 				printf("Set local alpha buf failed\n");
+-				close(fd_fb_2);
+-				return TFAIL;
++				retval = TFAIL;
++				goto out2;
+ 			}
+ 
+ 			/*
+@@ -251,17 +258,17 @@ mxc_v4l_overlay_test(int timeout)
+ 			 * graphics plane only.
+ 			 */
+ 			fill_alpha_buffer(alpha_buf0,
+-					  g_display_width/4,
+-					  g_display_height/4,
+-					  3*g_display_width/4,
+-					  3*g_display_height/4,
++					  alpha_fb_w/4,
++					  alpha_fb_h/4,
++					  3*alpha_fb_w/4,
++					  3*alpha_fb_h/4,
+ 					  0xFF);
+ 			sleep(5);
+ 
+-			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
++			if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr0) < 0) {
+ 				printf("Set local alpha buf failed\n");
+-				close(fd_fb_2);
+-				return TFAIL;
++				retval = TFAIL;
++				goto out2;
+ 			}
+ 
+ 			/*
+@@ -269,22 +276,34 @@ mxc_v4l_overlay_test(int timeout)
+ 			 * graphics and video planes.
+ 			 */
+ 			fill_alpha_buffer(alpha_buf1,
+-					  g_display_width/4,
+-					  g_display_height/4,
+-					  3*g_display_width/4,
+-					  3*g_display_height/4,
++					  alpha_fb_w/4,
++					  alpha_fb_h/4,
++					  3*alpha_fb_w/4,
++					  3*alpha_fb_h/4,
+ 					  0x80);
+ 			sleep(5);
+ 
+-			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
++			if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALP_BUF, &loc_alpha_phy_addr1) < 0) {
+ 				printf("Set local alpha buf failed\n");
+-				close(fd_fb_2);
+-				return TFAIL;
++				retval = TFAIL;
++				goto out2;
+ 			}
+ 		}
+-		goto out;
++		goto out2;
+ 	}
+ 
++        for (i = 0; i < 3 ; i++) {
++                // flash a frame
++                ctl.id = V4L2_CID_PRIVATE_BASE + 1;
++                if (ioctl(fd_v4l, VIDIOC_S_CTRL, &ctl) < 0)
++                {
++                        printf("set ctl failed\n");
++			retval = TFAIL;
++			goto out2;
++                }
++	            sleep(1);
++        }
++
+         if (g_camera_color == 1) {
+                 ctl.id = V4L2_CID_BRIGHTNESS;
+                 for (i = 0; i < 0xff; i+=0x20) {
+@@ -333,14 +352,16 @@ mxc_v4l_overlay_test(int timeout)
+         else {
+ 		        sleep(timeout);
+         }
+-out:
++
++out2:
+         overlay = 0;
+         if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0)
+         {
+                 printf("VIDIOC_OVERLAY stop failed\n");
+-		return TFAIL;
++		retval = TFAIL;
++		goto out1;
+         }
+-
++out1:
+ 	if (g_alpha_mode) {
+ 		munmap((void *)alpha_buf0, alpha_buf_size);
+ 		munmap((void *)alpha_buf1, alpha_buf_size);
+@@ -354,15 +375,24 @@ out:
+ 		l_alpha.enable = 0;
+ 		l_alpha.alpha_phy_addr0 = 0;
+ 		l_alpha.alpha_phy_addr1 = 0;
+-		if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALPHA, &l_alpha) < 0) {
++		if (ioctl(fd_graphic_fb, MXCFB_SET_LOC_ALPHA, &l_alpha) < 0) {
+ 			printf("Set local alpha failed\n");
+-			close(fd_fb_2);
+-			return TFAIL;
++			retval = TFAIL;
++			goto out0;
++		}
++out0:
++		if (!g_overlay) {
++			if (ioctl(g_fd_fb_fg, FBIOBLANK, FB_BLANK_POWERDOWN) < 0) {
++				printf("Unblank overlay frame buffer failed\n");
++				close(g_fd_fb_fg);
++				return TFAIL;
++			}
++			close(g_fd_fb_fg);
+ 		}
+-		close(fd_fb_2);
+ 	}
+ 
+-	return 0;
++	close(fd_graphic_fb);
++	return retval;
+ }
+ 
+ int
+@@ -529,10 +559,10 @@ main(int argc, char **argv)
+         struct v4l2_format fmt;
+         struct v4l2_framebuffer fb_v4l2;
+         char fb_device_0[100] = "/dev/fb0";
+-        char fb_device_2[100] = "/dev/fb2";
+-        int fd_fb_0 = 0, fd_fb_2 = 0;
+-        struct fb_fix_screeninfo fb0_fix;
+-        struct fb_var_screeninfo fb0_var, fb2_var;
++        char *fb_device_fg;
++        int fd_fb_0 = 0;
++        struct fb_fix_screeninfo fb0_fix, fb_fg_fix;
++        struct fb_var_screeninfo fb0_var, fb_fg_var;
+         struct mxcfb_color_key color_key;
+         struct mxcfb_gbl_alpha g_alpha;
+         struct mxcfb_loc_alpha l_alpha;
+@@ -553,11 +583,6 @@ main(int argc, char **argv)
+                 return TFAIL;
+         }
+ 
+-	if (!g_overlay && g_alpha_mode) {
+-                printf("Do not support DP local alpha blending on BG\n");
+-                return TFAIL;
+-        }
+-
+         if ((fd_v4l = open(v4l_device, O_RDWR, 0)) < 0) {
+                 printf("Unable to open %s\n", v4l_device);
+                 return TFAIL;
+@@ -590,21 +615,115 @@ main(int argc, char **argv)
+                 return TFAIL;
+         }
+ 
+-	if ((fd_fb_2 = open(fb_device_2, O_RDWR)) < 0) {
+-		printf("Unable to open frame buffer 2\n");
++	fb_device_fg = "/dev/fb1";
++	if ((g_fd_fb_fg = open(fb_device_fg, O_RDWR)) < 0) {
++		printf("Unable to open frame buffer 1\n");
++		close(fd_fb_0);
++		return TFAIL;
++	}
++
++	if (ioctl(g_fd_fb_fg, FBIOGET_FSCREENINFO, &fb_fg_fix) < 0) {
++		printf("Get fix of fb1 failed\n");
++		close(g_fd_fb_fg);
++		close(fd_fb_0);
+ 		return TFAIL;
+ 	}
+ 
++	if (strcmp(fb_fg_fix.id, "DISP3 FG") != 0) {
++		close(g_fd_fb_fg);
++		fb_device_fg = "/dev/fb2";
++		if ((g_fd_fb_fg = open(fb_device_fg, O_RDWR)) < 0) {
++			printf("Unable to open frame buffer 2\n");
++			close(fd_fb_0);
++			return TFAIL;
++		}
++
++		if (ioctl(g_fd_fb_fg, FBIOGET_FSCREENINFO, &fb_fg_fix) < 0) {
++			printf("Get fix of fb2 failed\n");
++			close(g_fd_fb_fg);
++			close(fd_fb_0);
++			return TFAIL;
++		}
++		if (strcmp(fb_fg_fix.id, "DISP3 FG") != 0) {
++			printf("Cannot find overlay frame buffer\n");
++			close(g_fd_fb_fg);
++			close(fd_fb_0);
++			return TFAIL;
++		}
++	}
++
+         if (!g_overlay) {
+ 	        g_alpha.alpha = 255;
+ 	        g_alpha.enable = 1;
+ 	        if (ioctl(fd_fb_0, MXCFB_SET_GBL_ALPHA, &g_alpha) < 0) {
+ 			printf("Set global alpha failed\n");
+-			close(fd_fb_2);
+ 			close(fd_fb_0);
++			close(g_fd_fb_fg);
+                         return TFAIL;
+ 	        }
+ 
++		if (g_alpha_mode) {
++			l_alpha.enable = 1;
++			l_alpha.alpha_phy_addr0 = 0;
++			l_alpha.alpha_phy_addr1 = 0;
++			if (ioctl(fd_fb_0, MXCFB_SET_LOC_ALPHA,
++				  &l_alpha) < 0) {
++				printf("Set local alpha failed\n");
++				close(fd_fb_0);
++				close(g_fd_fb_fg);
++				return TFAIL;
++			}
++			loc_alpha_phy_addr0 =
++				(unsigned long)(l_alpha.alpha_phy_addr0);
++			loc_alpha_phy_addr1 =
++				(unsigned long)(l_alpha.alpha_phy_addr1);
++
++			alpha_buf_size = fb0_var.xres * fb0_var.yres;
++
++			alpha_buf0 = (char *)mmap(0, alpha_buf_size,
++						 PROT_READ | PROT_WRITE,
++						 MAP_SHARED, fd_fb_0,
++						 loc_alpha_phy_addr0);
++			if ((int)alpha_buf0 == -1) {
++				printf("\nError: failed to map alpha buffer 0"
++				       " to memory.\n");
++				close(fd_fb_0);
++				close(g_fd_fb_fg);
++				return TFAIL;
++			}
++			alpha_buf1 = (char *)mmap(0, alpha_buf_size,
++						 PROT_READ | PROT_WRITE,
++						 MAP_SHARED, fd_fb_0,
++						 loc_alpha_phy_addr1);
++			if ((int)alpha_buf1 == -1) {
++				printf("\nError: failed to map alpha buffer 1"
++				       " to memory.\n");
++				munmap((void *)alpha_buf0, alpha_buf_size);
++				close(fd_fb_0);
++				close(g_fd_fb_fg);
++				return TFAIL;
++			}
++
++			fb_fg_var.xres = fb0_var.xres;
++			fb_fg_var.yres = fb0_var.yres;
++			fb_fg_var.xres_virtual = fb0_var.xres;
++			fb_fg_var.yres_virtual = fb0_var.yres*2;
++			if (ioctl(g_fd_fb_fg, FBIOPUT_VSCREENINFO,
++				  &fb_fg_var) < 0) {
++				printf("Put overlay frame buffer var info failed\n");
++				close(fd_fb_0);
++				close(g_fd_fb_fg);
++				return TFAIL;
++			}
++
++			if (ioctl(g_fd_fb_fg, FBIOBLANK, FB_BLANK_UNBLANK) < 0) {
++				printf("Unblank overlay frame buffer failed\n");
++				close(fd_fb_0);
++				close(g_fd_fb_fg);
++				return TFAIL;
++			}
++		}
++
+ 		fb_v4l2.fmt.width = fb0_var.xres;
+ 		fb_v4l2.fmt.height = fb0_var.yres;
+ 
+@@ -624,20 +743,12 @@ main(int argc, char **argv)
+                 fb_v4l2.flags = V4L2_FBUF_FLAG_PRIMARY;
+                 fb_v4l2.base = (void *) fb0_fix.smem_start;
+         } else {
+-		l_alpha.enable = 0;
+-		if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALPHA, &l_alpha) < 0) {
+-			printf("Set local alpha failed\n");
+-			close(fd_fb_2);
+-			close(fd_fb_0);
+-			return TFAIL;
+-		}
+-
+ 	        g_alpha.alpha = 0;
+ 	        g_alpha.enable = 1;
+ 	        if (ioctl(fd_fb_0, MXCFB_SET_GBL_ALPHA, &g_alpha) < 0) {
+ 			printf("Set global alpha failed\n");
+-			close(fd_fb_2);
+ 			close(fd_fb_0);
++			close(g_fd_fb_fg);
+                         return TFAIL;
+ 	        }
+ 
+@@ -645,36 +756,28 @@ main(int argc, char **argv)
+ 	        color_key.enable = 0;
+ 	        if (ioctl(fd_fb_0, MXCFB_SET_CLR_KEY, &color_key) < 0) {
+ 			printf("Set color key failed\n");
+-			close(fd_fb_2);
+                         close(fd_fb_0);
++			close(g_fd_fb_fg);
+                         return TFAIL;
+ 	        }
+ 
+ 		if (g_alpha_mode) {
+-			if (ioctl(fd_fb_2, FBIOGET_VSCREENINFO,
+-				  &fb2_var) < 0) {
+-				printf("Get var of fb2 failed\n");
+-				close(fd_fb_2);
+-				close(fd_fb_0);
+-				return TFAIL;
+-			}
+-
+-			fb2_var.xres = g_display_width;
+-			fb2_var.yres = g_display_height;
+-			fb2_var.xres_virtual = g_display_width;
+-			fb2_var.yres_virtual = g_display_height*2;
+-			if (ioctl(fd_fb_2, FBIOPUT_VSCREENINFO,
+-				  &fb2_var) < 0) {
+-				printf("Put var of fb2 failed\n");
+-				close(fd_fb_2);
++			fb_fg_var.xres = g_display_width;
++			fb_fg_var.yres = g_display_height;
++			fb_fg_var.xres_virtual = g_display_width;
++			fb_fg_var.yres_virtual = g_display_height*2;
++			if (ioctl(g_fd_fb_fg, FBIOPUT_VSCREENINFO,
++				  &fb_fg_var) < 0) {
++				printf("Put var of overlay fb failed\n");
++				close(g_fd_fb_fg);
+ 				close(fd_fb_0);
+ 				return TFAIL;
+ 			}
+ 
+-			if (ioctl(fd_fb_2, FBIOGET_VSCREENINFO,
+-				  &fb2_var) < 0) {
+-				printf("Get var of fb2 failed\n");
+-				close(fd_fb_2);
++			if (ioctl(g_fd_fb_fg, FBIOGET_VSCREENINFO,
++				  &fb_fg_var) < 0) {
++				printf("Get var of overlay fb failed\n");
++				close(g_fd_fb_fg);
+ 				close(fd_fb_0);
+ 				return TFAIL;
+ 			}
+@@ -682,10 +785,10 @@ main(int argc, char **argv)
+ 			l_alpha.enable = 1;
+ 			l_alpha.alpha_phy_addr0 = 0;
+ 			l_alpha.alpha_phy_addr1 = 0;
+-			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALPHA,
++			if (ioctl(g_fd_fb_fg, MXCFB_SET_LOC_ALPHA,
+ 				  &l_alpha) < 0) {
+ 				printf("Set local alpha failed\n");
+-				close(fd_fb_2);
++				close(g_fd_fb_fg);
+ 				close(fd_fb_0);
+ 				return TFAIL;
+ 			}
+@@ -694,28 +797,28 @@ main(int argc, char **argv)
+ 			loc_alpha_phy_addr1 =
+ 				(unsigned long)(l_alpha.alpha_phy_addr1);
+ 
+-			alpha_buf_size = fb2_var.xres * fb2_var.yres;
++			alpha_buf_size = fb_fg_var.xres * fb_fg_var.yres;
+ 
+ 			alpha_buf0 = (char *)mmap(0, alpha_buf_size,
+ 						 PROT_READ | PROT_WRITE,
+-						 MAP_SHARED, fd_fb_2,
++						 MAP_SHARED, g_fd_fb_fg,
+ 						 loc_alpha_phy_addr0);
+ 			if ((int)alpha_buf0 == -1) {
+ 				printf("\nError: failed to map alpha buffer 0"
+ 				       " to memory.\n");
+-				close(fd_fb_2);
++				close(g_fd_fb_fg);
+ 				close(fd_fb_0);
+ 				return TFAIL;
+ 			}
+ 			alpha_buf1 = (char *)mmap(0, alpha_buf_size,
+ 						 PROT_READ | PROT_WRITE,
+-						 MAP_SHARED, fd_fb_2,
++						 MAP_SHARED, g_fd_fb_fg,
+ 						 loc_alpha_phy_addr1);
+ 			if ((int)alpha_buf1 == -1) {
+ 				printf("\nError: failed to map alpha buffer 1"
+ 				       " to memory.\n");
+ 				munmap((void *)alpha_buf0, alpha_buf_size);
+-				close(fd_fb_2);
++				close(g_fd_fb_fg);
+ 				close(fd_fb_0);
+ 				return TFAIL;
+ 			}
+@@ -723,15 +826,14 @@ main(int argc, char **argv)
+ 
+                 if (ioctl(fd_v4l, VIDIOC_G_FBUF, &fb_v4l2) < 0) {
+                         printf("Get framebuffer failed\n");
+-			close(fd_fb_2);
+ 			close(fd_fb_0);
++			close(g_fd_fb_fg);
+                         return TFAIL;
+                 }
+                 fb_v4l2.flags = V4L2_FBUF_FLAG_OVERLAY;
+         }
+ 
+ 	close(fd_fb_0);
+-	close(fd_fb_2);
+ 
+         if (ioctl(fd_v4l, VIDIOC_S_FBUF, &fb_v4l2) < 0)
+         {
+-- 
+1.8.0
+

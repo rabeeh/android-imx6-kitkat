@@ -1,0 +1,2996 @@
+From 1d0253958337aa1bf5d46598271575008bcb3307 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Wed, 9 Dec 2009 16:18:30 +0800
+Subject: [PATCH 004/486] Enable ALSA module for HAL
+
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ libaudio/Android.mk            |   61 --
+ libaudio/AudioHardwareALSA.cpp | 1726 ----------------------------------------
+ libaudio/AudioHardwareALSA.h   |  324 --------
+ libaudio/NOTICE                |  191 -----
+ libaudio/acoustics_default.cpp |   85 --
+ modules/alsa/Android.mk        |   28 +
+ modules/alsa/alsa_imx51.cpp    |  509 ++++++++++++
+ 7 files changed, 537 insertions(+), 2387 deletions(-)
+ delete mode 100644 libaudio/Android.mk
+ delete mode 100755 libaudio/AudioHardwareALSA.cpp
+ delete mode 100644 libaudio/AudioHardwareALSA.h
+ delete mode 100644 libaudio/MODULE_LICENSE_APACHE2
+ delete mode 100644 libaudio/NOTICE
+ delete mode 100644 libaudio/acoustics_default.cpp
+ create mode 100644 modules/alsa/Android.mk
+ create mode 100644 modules/alsa/alsa_imx51.cpp
+
+diff --git a/libaudio/Android.mk b/libaudio/Android.mk
+deleted file mode 100644
+index 9a171dc..0000000
+--- a/libaudio/Android.mk
++++ /dev/null
+@@ -1,61 +0,0 @@
+-# hardware/libaudio-alsa/Android.mk
+-#
+-# Copyright 2008 Wind River Systems
+-#
+-
+-ifeq ($(strip $(BOARD_USES_ALSA_AUDIO)),true)
+-
+-  LOCAL_PATH := $(call my-dir)
+-
+-  include $(CLEAR_VARS)
+-
+-  LOCAL_ARM_MODE := arm
+-  LOCAL_CFLAGS := -D_POSIX_SOURCE
+-  LOCAL_WHOLE_STATIC_LIBRARIES := libasound
+-
+-  ifneq ($(ALSA_DEFAULT_SAMPLE_RATE),)
+-    LOCAL_CFLAGS += -DALSA_DEFAULT_SAMPLE_RATE=$(ALSA_DEFAULT_SAMPLE_RATE)
+-  endif
+-
+-  ifeq ($(strip $(BOARD_HAVE_FM_ROUTING)),true)
+-    LOCAL_CFLAGS += -DFM_ROUTE_SUPPORT
+-  endif
+-
+-  LOCAL_C_INCLUDES += external/alsa-lib/include
+-
+-  LOCAL_SRC_FILES := AudioHardwareALSA.cpp
+-
+-  LOCAL_MODULE := libaudio
+-
+-  LOCAL_STATIC_LIBRARIES += libaudiointerface
+-
+-  LOCAL_SHARED_LIBRARIES := \
+-    libcutils \
+-    libutils \
+-    libmedia \
+-    libhardware \
+-    libhardware_legacy \
+-    libdl \
+-    libc
+-
+-  include $(BUILD_SHARED_LIBRARY)
+-
+-  include $(CLEAR_VARS)
+-
+-  LOCAL_PRELINK_MODULE := false
+-
+-  LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-
+-  LOCAL_CFLAGS := -D_POSIX_SOURCE
+-
+-  LOCAL_C_INCLUDES += external/alsa-lib/include
+-
+-  LOCAL_SRC_FILES:= acoustics_default.cpp
+-
+-  LOCAL_SHARED_LIBRARIES := liblog
+-
+-  LOCAL_MODULE:= acoustics.default
+-
+-  include $(BUILD_SHARED_LIBRARY)
+-
+-endif
+diff --git a/libaudio/AudioHardwareALSA.cpp b/libaudio/AudioHardwareALSA.cpp
+deleted file mode 100755
+index f140129..0000000
+--- a/libaudio/AudioHardwareALSA.cpp
++++ /dev/null
+@@ -1,1726 +0,0 @@
+-/* AudioHardwareALSA.cpp
+- **
+- ** Copyright 2008-2009 Wind River Systems
+- **
+- ** Licensed under the Apache License, Version 2.0 (the "License");
+- ** you may not use this file except in compliance with the License.
+- ** You may obtain a copy of the License at
+- **
+- **     http://www.apache.org/licenses/LICENSE-2.0
+- **
+- ** Unless required by applicable law or agreed to in writing, software
+- ** distributed under the License is distributed on an "AS IS" BASIS,
+- ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- ** See the License for the specific language governing permissions and
+- ** limitations under the License.
+- */
+-
+-#include <errno.h>
+-#include <stdarg.h>
+-#include <sys/stat.h>
+-#include <fcntl.h>
+-#include <stdlib.h>
+-#include <unistd.h>
+-#include <dlfcn.h>
+-
+-#define LOG_TAG "AudioHardwareALSA"
+-#define LOG_NDEBUG 0
+-
+-#include <utils/Log.h>
+-#include <utils/String8.h>
+-
+-#include <cutils/properties.h>
+-#include <media/AudioRecord.h>
+-#include <hardware_legacy/power.h>
+-
+-#include "AudioHardwareALSA.h"
+-
+-#undef DISABLE_HARWARE_RESAMPLING
+-
+-#ifndef ALSA_DEFAULT_SAMPLE_RATE
+-#define ALSA_DEFAULT_SAMPLE_RATE 44100 // in Hz
+-#endif
+-
+-#define SND_MIXER_VOL_RANGE_MIN  (0)
+-#define SND_MIXER_VOL_RANGE_MAX  (100)
+-
+-#define ALSA_NAME_MAX 128
+-
+-#define ALSA_STRCAT(x,y) \
+-    if (strlen(x) + strlen(y) < ALSA_NAME_MAX) \
+-        strcat(x, y);
+-
+-extern "C"
+-{
+-    //
+-    // Make sure this prototype is consistent with what's in
+-    // external/libasound/alsa-lib-1.0.16/src/pcm/pcm_null.c!
+-    //
+-    extern int snd_pcm_null_open(snd_pcm_t **pcmp,
+-                                 const char *name,
+-                                 snd_pcm_stream_t stream,
+-                                 int mode);
+-
+-    //
+-    // Function for dlsym() to look up for creating a new AudioHardwareInterface.
+-    //
+-    android::AudioHardwareInterface *createAudioHardware(void) {
+-        return new android::AudioHardwareALSA();
+-    }
+-}         // extern "C"
+-
+-namespace android
+-{
+-
+-typedef AudioSystem::audio_routes audio_routes;
+-
+-#define ROUTE_ALL            AudioSystem::ROUTE_ALL
+-#define ROUTE_EARPIECE       AudioSystem::ROUTE_EARPIECE
+-#define ROUTE_SPEAKER        AudioSystem::ROUTE_SPEAKER
+-#define ROUTE_BLUETOOTH_SCO  AudioSystem::ROUTE_BLUETOOTH_SCO
+-#define ROUTE_HEADSET        AudioSystem::ROUTE_HEADSET
+-#define ROUTE_BLUETOOTH_A2DP AudioSystem::ROUTE_BLUETOOTH_A2DP
+-#ifdef FM_ROUTE_SUPPORT
+-#define ROUTE_FM             AudioSystem::ROUTE_FM
+-#endif
+-
+-// ----------------------------------------------------------------------------
+-
+-static const int DEFAULT_SAMPLE_RATE = ALSA_DEFAULT_SAMPLE_RATE;
+-
+-static const char _nullALSADeviceName[] = "NULL_Device";
+-
+-static void ALSAErrorHandler(const char *file,
+-                             int line,
+-                             const char *function,
+-                             int err,
+-                             const char *fmt,
+-                             ...)
+-{
+-    char buf[BUFSIZ];
+-    va_list arg;
+-    int l;
+-
+-    va_start(arg, fmt);
+-    l = snprintf(buf, BUFSIZ, "%s:%i:(%s) ", file, line, function);
+-    vsnprintf(buf + l, BUFSIZ - l, fmt, arg);
+-    buf[BUFSIZ-1] = '\0';
+-    LOG(LOG_ERROR, "ALSALib", buf);
+-    va_end(arg);
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-/* The following table(s) need to match in order of the route bits
+- */
+-static const char *deviceSuffix[] = {
+-    /* ROUTE_EARPIECE       */ "_Earpiece",
+-    /* ROUTE_SPEAKER        */ "_Speaker",
+-    /* ROUTE_BLUETOOTH_SCO  */ "_Bluetooth",
+-    /* ROUTE_HEADSET        */ "_Headset",
+-    /* ROUTE_BLUETOOTH_A2DP */ "_Bluetooth-A2DP",
+-#ifdef FM_ROUTE_SUPPORT
+-    /* ROUTE_FM             */ "_FM",
+-#endif
+-};
+-
+-static const int deviceSuffixLen = (sizeof(deviceSuffix) / sizeof(char *));
+-
+-struct mixer_info_t;
+-
+-struct alsa_properties_t
+-{
+-    const audio_routes  routes;
+-    const char         *propName;
+-    const char         *propDefault;
+-    mixer_info_t       *mInfo;
+-};
+-
+-static alsa_properties_t
+-mixerMasterProp[SND_PCM_STREAM_LAST+1] = {
+-    { ROUTE_ALL, "alsa.mixer.playback.master",  "PCM",     NULL},
+-    { ROUTE_ALL, "alsa.mixer.capture.master",   "Capture", NULL}
+-};
+-
+-static alsa_properties_t
+-mixerProp[][SND_PCM_STREAM_LAST+1] = {
+-    {
+-        {ROUTE_EARPIECE,       "alsa.mixer.playback.earpiece",       "Earpiece", NULL},
+-        {ROUTE_EARPIECE,       "alsa.mixer.capture.earpiece",        "Capture",  NULL}
+-    },
+-    {
+-        {ROUTE_SPEAKER,        "alsa.mixer.playback.speaker",        "Speaker", NULL},
+-        {ROUTE_SPEAKER,        "alsa.mixer.capture.speaker",         "",        NULL}
+-    },
+-    {
+-        {ROUTE_BLUETOOTH_SCO,  "alsa.mixer.playback.bluetooth.sco",  "Bluetooth",         NULL},
+-        {ROUTE_BLUETOOTH_SCO,  "alsa.mixer.capture.bluetooth.sco",   "Bluetooth Capture", NULL}
+-    },
+-    {
+-        {ROUTE_HEADSET,        "alsa.mixer.playback.headset",        "Headphone", NULL},
+-        {ROUTE_HEADSET,        "alsa.mixer.capture.headset",         "Capture",   NULL}
+-    },
+-    {
+-        {ROUTE_BLUETOOTH_A2DP, "alsa.mixer.playback.bluetooth.a2dp", "Bluetooth A2DP",         NULL},
+-        {ROUTE_BLUETOOTH_A2DP, "alsa.mixer.capture.bluetooth.a2dp",  "Bluetooth A2DP Capture", NULL}
+-    },
+-#ifdef FM_ROUTE_SUPPORT
+-    {
+-        {ROUTE_FM,             "alsa.mixer.playback.fm",             "FM", NULL},
+-        {ROUTE_FM,             "alsa.mixer.capture.fm",              "",   NULL}
+-    },
+-#endif
+-    {
+-        {static_cast<audio_routes>(0), NULL, NULL, NULL},
+-        {static_cast<audio_routes>(0), NULL, NULL, NULL}
+-    }
+-};
+-
+-// ----------------------------------------------------------------------------
+-
+-AudioHardwareALSA::AudioHardwareALSA() :
+-    mOutput(0),
+-    mInput(0),
+-    mAcousticDevice(0)
+-{
+-    snd_lib_error_set_handler(&ALSAErrorHandler);
+-    mMixer = new ALSAMixer;
+-
+-    hw_module_t *module;
+-    int err = hw_get_module(ACOUSTICS_HARDWARE_MODULE_ID,
+-            (hw_module_t const**)&module);
+-
+-    if (err == 0) {
+-        hw_device_t* device;
+-        err = module->methods->open(module, ACOUSTICS_HARDWARE_NAME, &device);
+-        if (err == 0) {
+-            mAcousticDevice = (acoustic_device_t *)device;
+-        }
+-    }
+-}
+-
+-AudioHardwareALSA::~AudioHardwareALSA()
+-{
+-    if (mOutput) delete mOutput;
+-    if (mInput) delete mInput;
+-    if (mMixer) delete mMixer;
+-    if (mAcousticDevice)
+-        mAcousticDevice->common.close(&mAcousticDevice->common);
+-}
+-
+-status_t AudioHardwareALSA::initCheck()
+-{
+-    if (mMixer && mMixer->isValid())
+-        return NO_ERROR;
+-    else
+-        return NO_INIT;
+-}
+-
+-status_t AudioHardwareALSA::setVoiceVolume(float volume)
+-{
+-    // The voice volume is used by the VOICE_CALL audio stream.
+-    if (mMixer)
+-        return mMixer->setVolume(ROUTE_EARPIECE, volume);
+-    else
+-        return INVALID_OPERATION;
+-}
+-
+-status_t AudioHardwareALSA::setMasterVolume(float volume)
+-{
+-    if (mMixer)
+-        return mMixer->setMasterVolume(volume);
+-    else
+-        return INVALID_OPERATION;
+-}
+-
+-// non-default implementation
+-size_t AudioHardwareALSA::getInputBufferSize(uint32_t sampleRate, int format, int channelCount)
+-{
+-    /*comment for Mp3 recording*/
+- /*
+-    if (!((sampleRate == 8000) || (sampleRate == 16000)))  {
+-        LOGW("getInputBufferSize bad sampling rate: %d", sampleRate);
+-        return 0;
+-    }
+-  */
+-    if (format != AudioSystem::PCM_16_BIT) {
+-        LOGW("getInputBufferSize bad format: %d", format);
+-        return 0;
+-    }
+-    if (channelCount != 1) {
+-        LOGW("getInputBufferSize bad channel count: %d", channelCount);
+-        return 0;
+-    }
+-
+-    return 320;
+-}
+-
+-AudioStreamOut *
+-AudioHardwareALSA::openOutputStream(uint32_t devices,
+-				    int format,
+-                                    int channelCount,
+-                                    uint32_t sampleRate,
+-                                    status_t *status)
+-{
+-    AutoMutex lock(mLock);
+-
+-    // only one output stream allowed
+-    if (mOutput) {
+-        *status = ALREADY_EXISTS;
+-        return 0;
+-    }
+-
+-    AudioStreamOutALSA *out = new AudioStreamOutALSA(this);
+-
+-    *status = out->set(format, channelCount, sampleRate);
+-
+-    if (*status == NO_ERROR) {
+-        mOutput = out;
+-        // Some information is expected to be available immediately after
+-        // the device is open.
+-        *status = mOutput->setDevice(mMode, mRoutes[mMode]);
+-    }
+-    else {
+-        delete out;
+-    }
+-
+-    return mOutput;
+-}
+-
+-status_t AudioHardwareALSA::setInputStream(uint32_t devices,
+-				    int format,
+-                                    int channelCount,
+-                                    uint32_t sampleRate)
+-{
+-    status_t ret;
+-
+-    if (! mOutput) {
+-       return NO_ERROR; /*no output stream exist*/
+-    }
+-
+-    LOGV("setInputStream format %d, channalCount %d, sampleRate %d ", format, channelCount, sampleRate);
+-
+-    ret = mOutput->getOutStreamParam();
+-    if(ret){
+-       LOGV("ERROR in get the OutputStream parameters");
+-       return NO_INIT;
+-     }
+-
+-    ret = mOutput->set(format, channelCount, sampleRate);
+-
+-    if(ret)
+-       LOGV("resetOutputStream set Error");
+-
+-     uint32_t routes = mRoutes[mMode];
+-
+-     ret = mOutput->setDevice(mMode, routes);
+-
+-    if(ret)
+-       LOGV("resetOutputStream setDevice Error");
+-
+-    return NO_ERROR;
+-}
+-
+-status_t AudioHardwareALSA::recoverOutputStream()
+-{
+-    LOGV("recoverOutputStream");
+-    status_t ret;
+-    if (! mOutput) {
+-        LOGV("recoverOutputStream set Error");
+-    return NO_ERROR; /*no output stream exist*/
+-    }
+-
+-   ret = mOutput->set((int)OutStreamParam[0], (int)OutStreamParam[1], OutStreamParam[2]);
+-
+-   if(ret)
+-     LOGV("recoverOutputStream set Error");
+-    uint32_t routes = mRoutes[mMode];
+-     ret = mOutput->setDevice(mMode, routes);
+-   if(ret)
+-    LOGV("recoverOutputStream setDevice Error");
+-
+-    return NO_ERROR;
+-}
+-
+-
+-AudioStreamIn *
+-AudioHardwareALSA::openInputStream(int      inputSource,
+-                                   int      format,
+-                                   int      channelCount,
+-                                   uint32_t sampleRate,
+-                                   status_t *status,
+-                                   AudioSystem::audio_in_acoustics acoustics)
+-{
+-    // check for valid input source
+-    if ((inputSource < AudioRecord::DEFAULT_INPUT) ||
+-        (inputSource >= AudioRecord::NUM_INPUT_SOURCES)) {
+-        return 0;
+-    }
+-
+-    AutoMutex lock(mLock);
+-
+-    // only one input stream allowed
+-    if (mInput) {
+-        *status = ALREADY_EXISTS;
+-        return 0;
+-    }
+-    //for the hardware limitation : only one ssi, so it has the set
+-    //the streamOut work in the same mode as streamIn
+-    if (mOutput){
+-         setInputStream(format,channelCount,sampleRate);
+-    }
+-
+-    AudioStreamInALSA *in = new AudioStreamInALSA(this, acoustics);
+-
+-    *status = in->set(format, channelCount, sampleRate);
+-    if (*status == NO_ERROR) {
+-        mInput = in;
+-        // Some information is expected to be available immediately after
+-        // the device is open.
+-        *status = mInput->setDevice(mMode, mRoutes[mMode]);
+-    }
+-    else {
+-        delete in;
+-    }
+-
+-    return mInput;
+-}
+-
+-status_t AudioHardwareALSA::doRouting()
+-{
+-    AutoMutex lock(mLock);
+-
+-    if (!mOutput)
+-        return NO_INIT;
+-
+-    return mOutput->setDevice(mMode, mRoutes[mMode]);
+-}
+-
+-status_t AudioHardwareALSA::setMicMute(bool state)
+-{
+-    if (mMixer)
+-        return mMixer->setCaptureMuteState(ROUTE_EARPIECE, state);
+-
+-    return NO_INIT;
+-}
+-
+-status_t AudioHardwareALSA::getMicMute(bool *state)
+-{
+-    if (mMixer)
+-        return mMixer->getCaptureMuteState(ROUTE_EARPIECE, state);
+-
+-    return NO_ERROR;
+-}
+-
+-status_t AudioHardwareALSA::dump(int fd, const Vector<String16>& args)
+-{
+-    return NO_ERROR;
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-ALSAStreamOps::ALSAStreamOps(AudioHardwareALSA *parent) :
+-    mParent(parent),
+-    mHandle(0),
+-    mHardwareParams(0),
+-    mSoftwareParams(0),
+-    mMode(-1),
+-    mDevice(0),
+-    mPowerLock(false)
+-{
+-    if (snd_pcm_hw_params_malloc(&mHardwareParams) < 0) {
+-        LOG_ALWAYS_FATAL("Failed to allocate ALSA hardware parameters!");
+-    }
+-
+-    if (snd_pcm_sw_params_malloc(&mSoftwareParams) < 0) {
+-        LOG_ALWAYS_FATAL("Failed to allocate ALSA software parameters!");
+-    }
+-}
+-
+-ALSAStreamOps::~ALSAStreamOps()
+-{
+-    AutoMutex lock(mLock);
+-
+-    close();
+-
+-    if (mHardwareParams)
+-        snd_pcm_hw_params_free(mHardwareParams);
+-
+-    if (mSoftwareParams)
+-        snd_pcm_sw_params_free(mSoftwareParams);
+-}
+-
+-status_t ALSAStreamOps::set(int      format,
+-                            int      channels,
+-                            uint32_t rate)
+-{
+-    if (channels > 0)
+-        mDefaults->channels = channels;
+-
+-    if (rate > 0)
+-        mDefaults->sampleRate = rate;
+-
+-    switch(format) {
+-      // format == 0
+-        case AudioSystem::DEFAULT:
+-            break;
+-
+-        case AudioSystem::PCM_16_BIT:
+-            mDefaults->format = SND_PCM_FORMAT_S16_LE;
+-            break;
+-
+-        case AudioSystem::PCM_8_BIT:
+-            mDefaults->format = SND_PCM_FORMAT_S8;
+-            break;
+-
+-        default:
+-            LOGE("Unknown PCM format %i. Forcing default", format);
+-            break;
+-    }
+-
+-    return NO_ERROR;
+-}
+-
+-uint32_t ALSAStreamOps::sampleRate() const
+-{
+-    unsigned int rate;
+-    int err;
+-
+-    if (!mHandle)
+-        return mDefaults->sampleRate;
+-
+-    return snd_pcm_hw_params_get_rate(mHardwareParams, &rate, 0) < 0
+-        ? 0 : static_cast<uint32_t>(rate);
+-}
+-
+-status_t ALSAStreamOps::sampleRate(uint32_t rate)
+-{
+-    const char *stream;
+-    unsigned int requestedRate;
+-    int err;
+-
+-    if (!mHandle)
+-        return NO_INIT;
+-
+-    stream = streamName();
+-    requestedRate = rate;
+-    err = snd_pcm_hw_params_set_rate_near(mHandle,
+-                                          mHardwareParams,
+-                                          &requestedRate,
+-                                          0);
+-
+-    if (err < 0) {
+-        LOGE("Unable to set %s sample rate to %u: %s",
+-            stream, rate, snd_strerror(err));
+-        return BAD_VALUE;
+-    }
+-    if (requestedRate != rate) {
+-        // Some devices have a fixed sample rate, and can not be changed.
+-        // This may cause resampling problems; i.e. PCM playback will be too
+-        // slow or fast.
+-        LOGW("Requested rate (%u HZ) does not match actual rate (%u HZ)",
+-            rate, requestedRate);
+-    }
+-    else {
+-        LOGV("Set %s sample rate to %u HZ", stream, requestedRate);
+-    }
+-    return NO_ERROR;
+-}
+-
+-//
+-// Return the number of bytes (not frames)
+-//
+-size_t ALSAStreamOps::bufferSize() const
+-{
+-    if (!mHandle)
+-        return NO_INIT;
+-
+-    snd_pcm_uframes_t bufferSize = 0;
+-    snd_pcm_uframes_t periodSize = 0;
+-    int err;
+-
+-    err = snd_pcm_get_params(mHandle, &bufferSize, &periodSize);
+-
+-    if (err < 0)
+-        return -1;
+-
+-    size_t bytes = static_cast<size_t>(snd_pcm_frames_to_bytes(mHandle, bufferSize));
+-
+-    // Not sure when this happened, but unfortunately it now
+-    // appears that the bufferSize must be reported as a
+-    // power of 2. This might be the fault of 3rd party
+-    // users.
+-    for (size_t i = 1; (bytes & ~i) != 0; i<<=1)
+-        bytes &= ~i;
+-
+-    return bytes;
+-}
+-
+-int ALSAStreamOps::format() const
+-{
+-    snd_pcm_format_t ALSAFormat;
+-    int pcmFormatBitWidth;
+-    int audioSystemFormat;
+-
+-    if (!mHandle)
+-        return -1;
+-
+-    if (snd_pcm_hw_params_get_format(mHardwareParams, &ALSAFormat) < 0) {
+-        return -1;
+-    }
+-
+-    pcmFormatBitWidth = snd_pcm_format_physical_width(ALSAFormat);
+-    audioSystemFormat = AudioSystem::DEFAULT;
+-    switch(pcmFormatBitWidth) {
+-        case 8:
+-            audioSystemFormat = AudioSystem::PCM_8_BIT;
+-            break;
+-
+-        case 16:
+-            audioSystemFormat = AudioSystem::PCM_16_BIT;
+-            break;
+-
+-        default:
+-            LOG_FATAL("Unknown AudioSystem bit width %i!", pcmFormatBitWidth);
+-    }
+-
+-    return audioSystemFormat;
+-}
+-
+-int ALSAStreamOps::channelCount() const
+-{
+-    if (!mHandle)
+-        return mDefaults->channels;
+-
+-    unsigned int val;
+-    int err;
+-
+-    err = snd_pcm_hw_params_get_channels(mHardwareParams, &val);
+-    if (err < 0) {
+-        LOGE("Unable to get device channel count: %s",
+-            snd_strerror(err));
+-        return mDefaults->channels;
+-    }
+-
+-    return val;
+-}
+-
+-status_t ALSAStreamOps::channelCount(int channels) {
+-    int err;
+-
+-    if (!mHandle)
+-        return NO_INIT;
+-
+-    err = snd_pcm_hw_params_set_channels(mHandle, mHardwareParams, channels);
+-    if (err < 0) {
+-        LOGE("Unable to set channel count to %i: %s",
+-            channels, snd_strerror(err));
+-        return BAD_VALUE;
+-    }
+-
+-    LOGV("Using %i %s for %s.",
+-        channels, channels == 1 ? "channel" : "channels", streamName());
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAStreamOps::open(int mode, uint32_t device)
+-{
+-    const char *stream = streamName();
+-    const char *devName = deviceName(mode, device);
+-
+-    int         err;
+-
+-    for(;;) {
+-        // The PCM stream is opened in blocking mode, per ALSA defaults.  The
+-        // AudioFlinger seems to assume blocking mode too, so asynchronous mode
+-        // should not be used.
+-        err = snd_pcm_open(&mHandle, devName, mDefaults->direction, 0);
+-        if (err == 0) break;
+-
+-        // See if there is a less specific name we can try.
+-        // Note: We are changing the contents of a const char * here.
+-        char *tail = strrchr(devName, '_');
+-        if (!tail) break;
+-        *tail = 0;
+-    }
+-
+-    if (err < 0) {
+-        // None of the Android defined audio devices exist. Open a generic one.
+-        devName = "default";
+-        err = snd_pcm_open(&mHandle, devName, mDefaults->direction, 0);
+-        if (err < 0) {
+-            // Last resort is the NULL device (i.e. the bit bucket).
+-            devName = _nullALSADeviceName;
+-            err = snd_pcm_open(&mHandle, devName, mDefaults->direction, 0);
+-        }
+-    }
+-
+-    mMode   = mode;
+-    mDevice = device;
+-
+-    LOGI("Initialized ALSA %s device %s", stream, devName);
+-    return err;
+-}
+-
+-void ALSAStreamOps::close()
+-{
+-    snd_pcm_t *handle = mHandle;
+-    mHandle = NULL;
+-
+-    if (handle)
+-        snd_pcm_close(handle);
+-}
+-
+-status_t ALSAStreamOps::setSoftwareParams()
+-{
+-    if (!mHandle)
+-        return NO_INIT;
+-
+-    int err;
+-
+-    // Get the current software parameters
+-    err = snd_pcm_sw_params_current(mHandle, mSoftwareParams);
+-    if (err < 0) {
+-        LOGE("Unable to get software parameters: %s", snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    snd_pcm_uframes_t bufferSize = 0;
+-    snd_pcm_uframes_t periodSize = 0;
+-    snd_pcm_uframes_t startThreshold, stopThreshold;
+-
+-    // Configure ALSA to start the transfer when the buffer is almost full.
+-    snd_pcm_get_params(mHandle, &bufferSize, &periodSize);
+-
+-    if (mDefaults->direction == SND_PCM_STREAM_PLAYBACK) {
+-        // For playback, configure ALSA to start the transfer when the
+-        // buffer is full.
+-        startThreshold = bufferSize - periodSize;
+-        stopThreshold = bufferSize;
+-    }
+-    else {
+-        // For recording, configure ALSA to start the transfer on the
+-        // first frame.
+-        startThreshold = 1;
+-        stopThreshold = bufferSize;
+-}
+-
+-    err = snd_pcm_sw_params_set_start_threshold(mHandle,
+-                                                mSoftwareParams,
+-                                                startThreshold);
+-    if (err < 0) {
+-        LOGE("Unable to set start threshold to %lu frames: %s",
+-            startThreshold, snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    err = snd_pcm_sw_params_set_stop_threshold(mHandle,
+-                                               mSoftwareParams,
+-                                               stopThreshold);
+-    if (err < 0) {
+-        LOGE("Unable to set stop threshold to %lu frames: %s",
+-            stopThreshold, snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    // Allow the transfer to start when at least periodSize samples can be
+-    // processed.
+-    err = snd_pcm_sw_params_set_avail_min(mHandle,
+-                                          mSoftwareParams,
+-                                          periodSize);
+-    if (err < 0) {
+-        LOGE("Unable to configure available minimum to %lu: %s",
+-            periodSize, snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    // Commit the software parameters back to the device.
+-    err = snd_pcm_sw_params(mHandle, mSoftwareParams);
+-    if (err < 0) {
+-        LOGE("Unable to configure software parameters: %s",
+-            snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAStreamOps::setPCMFormat(snd_pcm_format_t format)
+-{
+-    const char *formatDesc;
+-    const char *formatName;
+-    bool validFormat;
+-    int err;
+-
+-    // snd_pcm_format_description() and snd_pcm_format_name() do not perform
+-    // proper bounds checking.
+-    validFormat = (static_cast<int>(format) > SND_PCM_FORMAT_UNKNOWN) &&
+-        (static_cast<int>(format) <= SND_PCM_FORMAT_LAST);
+-    formatDesc = validFormat ?
+-        snd_pcm_format_description(format) : "Invalid Format";
+-    formatName = validFormat ?
+-        snd_pcm_format_name(format) : "UNKNOWN";
+-
+-    err = snd_pcm_hw_params_set_format(mHandle, mHardwareParams, format);
+-    if (err < 0) {
+-        LOGE("Unable to configure PCM format %s (%s): %s",
+-            formatName, formatDesc, snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    LOGV("Set %s PCM format to %s (%s)", streamName(), formatName, formatDesc);
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAStreamOps::setHardwareResample(bool resample)
+-{
+-    int err;
+-
+-    err = snd_pcm_hw_params_set_rate_resample(mHandle,
+-                                              mHardwareParams,
+-                                              static_cast<int>(resample));
+-    if (err < 0) {
+-        LOGE("Unable to %s hardware resampling: %s",
+-            resample ? "enable" : "disable",
+-            snd_strerror(err));
+-        return NO_INIT;
+-    }
+-    return NO_ERROR;
+-}
+-
+-const char *ALSAStreamOps::streamName()
+-{
+-    // Don't use snd_pcm_stream(mHandle), as the PCM stream may not be
+-    // opened yet.  In such case, snd_pcm_stream() will abort().
+-    return snd_pcm_stream_name(mDefaults->direction);
+-}
+-
+-//
+-// Set playback or capture PCM device.  It's possible to support audio output
+-// or input from multiple devices by using the ALSA plugins, but this is
+-// not supported for simplicity.
+-//
+-// The AudioHardwareALSA API does not allow one to set the input routing.
+-//
+-// If the "routes" value does not map to a valid device, the default playback
+-// device is used.
+-//
+-status_t ALSAStreamOps::setDevice(int mode, uint32_t device)
+-{
+-    // Close off previously opened device.
+-    // It would be nice to determine if the underlying device actually
+-    // changes, but we might be manipulating mixer settings (see asound.conf).
+-    //
+-    close();
+-
+-    const char *stream = streamName();
+-
+-    status_t    status = open (mode, device);
+-    int     err;
+-
+-    if (status != NO_ERROR)
+-        return status;
+-
+-    err = snd_pcm_hw_params_any(mHandle, mHardwareParams);
+-    if (err < 0) {
+-        LOGE("Unable to configure hardware: %s", snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    // Set the interleaved read and write format.
+-    err = snd_pcm_hw_params_set_access(mHandle, mHardwareParams,
+-                                       SND_PCM_ACCESS_RW_INTERLEAVED);
+-    if (err < 0) {
+-        LOGE("Unable to configure PCM read/write format: %s",
+-            snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    status = setPCMFormat(mDefaults->format);
+-
+-    //
+-    // Some devices do not have the default two channels.  Force an error to
+-    // prevent AudioMixer from crashing and taking the whole system down.
+-    //
+-    // Note that some devices will return an -EINVAL if the channel count
+-    // is queried before it has been set.  i.e. calling channelCount()
+-    // before channelCount(channels) may return -EINVAL.
+-    //
+-    status = channelCount(mDefaults->channels);
+-    if (status != NO_ERROR)
+-        return status;
+-
+-    // Don't check for failure; some devices do not support the default
+-    // sample rate.
+-    sampleRate(mDefaults->sampleRate);
+-
+-#ifdef DISABLE_HARWARE_RESAMPLING
+-    // Disable hardware resampling.
+-    status = setHardwareResample(false);
+-    if (status != NO_ERROR)
+-        return status;
+-#endif
+-
+-    snd_pcm_uframes_t bufferSize = mDefaults->bufferSize;
+-
+-    // Make sure we have at least the size we originally wanted
+-    err = snd_pcm_hw_params_set_buffer_size(mHandle, mHardwareParams, bufferSize);
+-    if (err < 0) {
+-        LOGE("Unable to set buffer size to %d:  %s",
+-             (int)bufferSize, snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    unsigned int latency = mDefaults->latency;
+-
+-    // Setup buffers for latency
+-    err = snd_pcm_hw_params_set_buffer_time_near (mHandle, mHardwareParams,
+-                                                  &latency, NULL);
+-    if (err < 0) {
+-        /* That didn't work, set the period instead */
+-        unsigned int periodTime = latency / 4;
+-        err = snd_pcm_hw_params_set_period_time_near (mHandle, mHardwareParams,
+-                                                      &periodTime, NULL);
+-        if (err < 0) {
+-            LOGE("Unable to set the period time for latency: %s", snd_strerror(err));
+-            return NO_INIT;
+-        }
+-        snd_pcm_uframes_t periodSize;
+-        err = snd_pcm_hw_params_get_period_size (mHardwareParams, &periodSize, NULL);
+-        if (err < 0) {
+-            LOGE("Unable to get the period size for latency: %s", snd_strerror(err));
+-            return NO_INIT;
+-        }
+-        bufferSize = periodSize * 4;
+-        if (bufferSize < mDefaults->bufferSize)
+-            bufferSize = mDefaults->bufferSize;
+-        err = snd_pcm_hw_params_set_buffer_size_near (mHandle, mHardwareParams, &bufferSize);
+-        if (err < 0) {
+-            LOGE("Unable to set the buffer size for latency: %s", snd_strerror(err));
+-            return NO_INIT;
+-        }
+-    } else {
+-        // OK, we got buffer time near what we expect. See what that did for bufferSize.
+-        err = snd_pcm_hw_params_get_buffer_size (mHardwareParams, &bufferSize);
+-        if (err < 0) {
+-            LOGE("Unable to get the buffer size for latency: %s", snd_strerror(err));
+-            return NO_INIT;
+-        }
+-        // Does set_buffer_time_near change the passed value? It should.
+-        err = snd_pcm_hw_params_get_buffer_time (mHardwareParams, &latency, NULL);
+-        if (err < 0) {
+-            LOGE("Unable to get the buffer time for latency: %s", snd_strerror(err));
+-            return NO_INIT;
+-        }
+-        unsigned int periodTime = latency / 4;
+-        err = snd_pcm_hw_params_set_period_time_near (mHandle, mHardwareParams,
+-                                                      &periodTime, NULL);
+-        if (err < 0) {
+-            LOGE("Unable to set the period time for latency: %s", snd_strerror(err));
+-            return NO_INIT;
+-        }
+-    }
+-
+-    LOGV("Buffer size: %d", (int)bufferSize);
+-    LOGV("Latency: %d", (int)latency);
+-
+-    mDefaults->bufferSize = bufferSize;
+-    mDefaults->latency = latency;
+-
+-    // Commit the hardware parameters back to the device.
+-    err = snd_pcm_hw_params(mHandle, mHardwareParams);
+-    if (err < 0) {
+-        LOGE("Unable to set hardware parameters: %s", snd_strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    status = setSoftwareParams();
+-
+-    return status;
+-}
+-
+-const char *ALSAStreamOps::deviceName(int mode, uint32_t device)
+-{
+-    static char devString[ALSA_NAME_MAX];
+-    int hasDevExt = 0;
+-
+-    strcpy (devString, mDefaults->devicePrefix);
+-
+-    for (int dev=0; device; dev++)
+-        if (device & (1 << dev)) {
+-            /* Don't go past the end of our list */
+-            if (dev >= deviceSuffixLen)
+-                break;
+-            ALSA_STRCAT (devString, deviceSuffix[dev]);
+-            device &= ~(1 << dev);
+-            hasDevExt = 1;
+-        }
+-
+-    if (hasDevExt)
+-        switch (mode) {
+-            case AudioSystem::MODE_NORMAL:
+-                ALSA_STRCAT (devString, "_normal");
+-                break;
+-            case AudioSystem::MODE_RINGTONE:
+-                ALSA_STRCAT (devString, "_ringtone");
+-                break;
+-            case AudioSystem::MODE_IN_CALL:
+-                ALSA_STRCAT (devString, "_incall");
+-                break;
+-        };
+-   switch(mDefaults->sampleRate){
+-    case 32000:
+-      ALSA_STRCAT (devString, "_32000");
+-      break;
+-    case 44100:
+-      ALSA_STRCAT (devString, "_44100");
+-      break;
+-    case 48000:
+-      ALSA_STRCAT (devString, "_48000");
+-      break;
+-      case 96000:
+-        ALSA_STRCAT (devString, "_96000");
+-      break;
+-    default :
+-    {
+-      if (mDefaults->sampleRate < 32000)
+-         {
+-            ALSA_STRCAT (devString, "_32000");
+-          }
+-      else if (mDefaults->sampleRate < 44100)
+-        {
+-          ALSA_STRCAT (devString, "_44100");
+-        }
+-      else if (mDefaults->sampleRate < 48000)
+-        {
+-          ALSA_STRCAT (devString, "_48000");
+-        }
+-      else
+-        {
+-          ALSA_STRCAT (devString, "_96000");
+-        }
+-      break;
+-    }
+-    }
+-
+-    return devString;
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-AudioStreamOutALSA::AudioStreamOutALSA(AudioHardwareALSA *parent) :
+-    ALSAStreamOps(parent)
+-{
+-    static StreamDefaults _defaults = {
+-        devicePrefix   : "AndroidPlayback",
+-        direction      : SND_PCM_STREAM_PLAYBACK,
+-        format         : SND_PCM_FORMAT_S16_LE,   // AudioSystem::PCM_16_BIT
+-        channels       : 2,
+-        sampleRate     : DEFAULT_SAMPLE_RATE,
+-        latency        : 250000,                  // Desired Delay in usec
+-        bufferSize     : 6144,                   // Desired Number of samples
+-        };
+-
+-    setStreamDefaults(&_defaults);
+-
+-    snd_pcm_uframes_t bufferSize = mDefaults->bufferSize;
+-
+-    // See comment in bufferSize() method.
+-    for (size_t i = 1; (bufferSize & ~i) != 0; i<<=1)
+-        bufferSize &= ~i;
+-
+-    mDefaults->bufferSize = bufferSize;
+-}
+-
+-AudioStreamOutALSA::~AudioStreamOutALSA()
+-{
+-    standby();
+-    mParent->mOutput = NULL;
+-}
+-
+-int AudioStreamOutALSA::channelCount() const
+-{
+-    int c = ALSAStreamOps::channelCount();
+-
+-    // AudioMixer will seg fault if it doesn't have two channels.
+-    LOGW_IF(c != 2,
+-        "AudioMixer expects two channels, but only %i found!", c);
+-    return c;
+-}
+-
+-status_t AudioStreamOutALSA::setVolume(float volume)
+-{
+-    if (!mParent->mMixer || !mDevice)
+-        return NO_INIT;
+-
+-    return mParent->mMixer->setVolume (mDevice, volume);
+-}
+-
+-ssize_t AudioStreamOutALSA::write(const void *buffer, size_t bytes)
+-{
+-    snd_pcm_sframes_t n;
+-    size_t            sent = 0;
+-    status_t          err;
+-
+-    AutoMutex lock(mLock);
+-
+-    if (!mPowerLock) {
+-        acquire_wake_lock (PARTIAL_WAKE_LOCK, "AudioOutLock");
+-        mPowerLock = true;
+-    }
+-
+-    if (!mHandle)
+-        ALSAStreamOps::setDevice(mMode, mDevice);
+-
+-    do {
+-        n = snd_pcm_writei(mHandle,
+-                           (char *)buffer + sent,
+-                           snd_pcm_bytes_to_frames(mHandle, bytes));
+-        if (n == -EBADFD) {
+-            // Somehow the stream is in a bad state. The driver probably
+-            // has a bug and snd_pcm_recover() doesn't seem to handle this.
+-            ALSAStreamOps::setDevice(mMode, mDevice);
+-        }
+-        else if (n < 0) {
+-            if (mHandle) {
+-                // snd_pcm_recover() will return 0 if successful in recovering from
+-                // an error, or -errno if the error was unrecoverable.
+-                n = snd_pcm_recover(mHandle, n, 1);
+-                if (n)
+-                    return static_cast<ssize_t>(n);
+-            }
+-        }
+-        else
+-            sent += static_cast<ssize_t>(snd_pcm_frames_to_bytes(mHandle, n));
+-
+-    } while (mHandle && sent < bytes);
+-
+-    return sent;
+-}
+-
+-status_t AudioStreamOutALSA::dump(int fd, const Vector<String16>& args)
+-{
+-    return NO_ERROR;
+-}
+-status_t AudioStreamOutALSA::getOutStreamParam()
+-{
+-    if(!mParent)
+-        return NO_INIT;
+-    if(!mParent->OutStreamParam)
+-        return NO_INIT;
+-    if(!(ALSAStreamOps::mDefaults))
+-        return NO_INIT;
+-    mParent->OutStreamParam[0] =  ALSAStreamOps::mDefaults->format;
+-    mParent->OutStreamParam[1] =  ALSAStreamOps::mDefaults->channels;
+-    mParent->OutStreamParam[2] =  ALSAStreamOps::mDefaults->sampleRate;
+-    return NO_ERROR;
+-}
+-
+-status_t AudioStreamOutALSA::setDevice(int mode, uint32_t newDevice)
+-{
+-    AutoMutex lock(mLock);
+-    return ALSAStreamOps::setDevice(mode, newDevice);
+-}
+-
+-status_t AudioStreamOutALSA::standby()
+-{
+-    AutoMutex lock(mLock);
+-
+-    if (mHandle) {
+-        snd_pcm_drain (mHandle);
+-        close();
+-    }
+-
+-    if (mPowerLock) {
+-        release_wake_lock ("AudioOutLock");
+-        mPowerLock = false;
+-    }
+-
+-    return NO_ERROR;
+-}
+-
+-#define USEC_TO_MSEC(x) ((x + 999) / 1000)
+-
+-uint32_t AudioStreamOutALSA::latency() const
+-{
+-    // Android wants latency in milliseconds.
+-    return USEC_TO_MSEC (mDefaults->latency);
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-AudioStreamInALSA::AudioStreamInALSA(AudioHardwareALSA *parent,
+-                                     AudioSystem::audio_in_acoustics acoustics) :
+-    ALSAStreamOps(parent),
+-    mAcoustics(acoustics)
+-{
+-    static StreamDefaults _defaults = {
+-        devicePrefix   : "AndroidRecord",
+-        direction      : SND_PCM_STREAM_CAPTURE,
+-        format         : SND_PCM_FORMAT_S16_LE,   // AudioSystem::PCM_16_BIT
+-        channels       : 1,
+-        sampleRate     : AudioRecord::DEFAULT_SAMPLE_RATE,
+-        latency        : 250000,                  // Desired Delay in usec
+-        bufferSize     : 3072,                   // Desired Number of samples
+-        };
+-
+-    setStreamDefaults(&_defaults);
+-}
+-
+-AudioStreamInALSA::~AudioStreamInALSA()
+-{
+-    standby();
+-    mParent->mInput = NULL;
+-    mParent->recoverOutputStream();
+-}
+-
+-status_t AudioStreamInALSA::setGain(float gain)
+-{
+-    if (mParent->mMixer)
+-        return mParent->mMixer->setMasterGain (gain);
+-    else
+-        return NO_INIT;
+-}
+-
+-ssize_t AudioStreamInALSA::read(void *buffer, ssize_t bytes)
+-{
+-    snd_pcm_sframes_t n, frames = snd_pcm_bytes_to_frames(mHandle, bytes);
+-    status_t          err;
+-
+-    AutoMutex lock(mLock);
+-
+-    if (!mPowerLock) {
+-        acquire_wake_lock (PARTIAL_WAKE_LOCK, "AudioInLock");
+-        mPowerLock = true;
+-    }
+-
+-    if (!mHandle)
+-        ALSAStreamOps::setDevice(mMode, mDevice);
+-
+-    n = snd_pcm_readi(mHandle, buffer, frames);
+-    if (n < frames) {
+-        if (mHandle) {
+-            if (n < 0)
+-                n = snd_pcm_recover(mHandle, n, 0);
+-            else
+-                n = snd_pcm_prepare(mHandle);
+-        }
+-        return static_cast<ssize_t>(n);
+-    }
+-
+-    if (mParent->mAcousticDevice &&
+-        mParent->mAcousticDevice->filter) {
+-        n = mParent->mAcousticDevice->filter(mHandle, buffer, frames);
+-        if (n < 0)
+-            return static_cast<ssize_t>(n);
+-    }
+-
+-    return static_cast<ssize_t>(snd_pcm_frames_to_bytes(mHandle, n));
+-}
+-
+-status_t AudioStreamInALSA::dump(int fd, const Vector<String16>& args)
+-{
+-    return NO_ERROR;
+-}
+-
+-status_t AudioStreamInALSA::setDevice(int mode, uint32_t newDevice)
+-{
+-    AutoMutex lock(mLock);
+-
+-    status_t status = ALSAStreamOps::setDevice(mode, newDevice);
+-
+-    if (status == NO_ERROR && mParent->mAcousticDevice)
+-        status = mParent->mAcousticDevice->set_acoustics(mHandle, mAcoustics);
+-
+-    return status;
+-}
+-
+-status_t AudioStreamInALSA::standby()
+-{
+-    AutoMutex lock(mLock);
+-
+-    close();
+-
+-    if (mPowerLock) {
+-        release_wake_lock ("AudioInLock");
+-        mPowerLock = false;
+-    }
+-
+-    return NO_ERROR;
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-struct mixer_info_t
+-{
+-    mixer_info_t() :
+-        elem(0),
+-        min(SND_MIXER_VOL_RANGE_MIN),
+-        max(SND_MIXER_VOL_RANGE_MAX),
+-        mute(false)
+-    {
+-    }
+-
+-    snd_mixer_elem_t *elem;
+-    long              min;
+-    long              max;
+-    long              volume;
+-    bool              mute;
+-    char              name[ALSA_NAME_MAX];
+-};
+-
+-static int initMixer (snd_mixer_t **mixer, const char *name)
+-{
+-    int err;
+-
+-    if ((err = snd_mixer_open(mixer, 0)) < 0) {
+-        LOGE("Unable to open mixer: %s", snd_strerror(err));
+-        return err;
+-    }
+-
+-    if ((err = snd_mixer_attach(*mixer, name)) < 0) {
+-        LOGE("Unable to attach mixer to device %s: %s",
+-            name, snd_strerror(err));
+-
+-        if ((err = snd_mixer_attach(*mixer, "hw:00")) < 0) {
+-            LOGE("Unable to attach mixer to device default: %s",
+-                snd_strerror(err));
+-
+-            snd_mixer_close (*mixer);
+-            *mixer = NULL;
+-            return err;
+-        }
+-    }
+-
+-    if ((err = snd_mixer_selem_register(*mixer, NULL, NULL)) < 0) {
+-        LOGE("Unable to register mixer elements: %s", snd_strerror(err));
+-        snd_mixer_close (*mixer);
+-        *mixer = NULL;
+-        return err;
+-    }
+-
+-    // Get the mixer controls from the kernel
+-    if ((err = snd_mixer_load(*mixer)) < 0) {
+-        LOGE("Unable to load mixer elements: %s", snd_strerror(err));
+-        snd_mixer_close (*mixer);
+-        *mixer = NULL;
+-        return err;
+-    }
+-
+-    return 0;
+-}
+-
+-typedef int (*hasVolume_t)(snd_mixer_elem_t*);
+-
+-static const hasVolume_t hasVolume[] = {
+-    snd_mixer_selem_has_playback_volume,
+-    snd_mixer_selem_has_capture_volume
+-};
+-
+-typedef int (*getVolumeRange_t)(snd_mixer_elem_t*, long int*, long int*);
+-
+-static const getVolumeRange_t getVolumeRange[] = {
+-    snd_mixer_selem_get_playback_volume_range,
+-    snd_mixer_selem_get_capture_volume_range
+-};
+-
+-typedef int (*setVolume_t)(snd_mixer_elem_t*, long int);
+-
+-static const setVolume_t setVol[] = {
+-    snd_mixer_selem_set_playback_volume_all,
+-    snd_mixer_selem_set_capture_volume_all
+-};
+-
+-ALSAMixer::ALSAMixer()
+-{
+-    int err;
+-
+-    initMixer (&mMixer[SND_PCM_STREAM_PLAYBACK], "AndroidPlayback");
+-    initMixer (&mMixer[SND_PCM_STREAM_CAPTURE], "AndroidRecord");
+-
+-    snd_mixer_selem_id_t *sid;
+-    snd_mixer_selem_id_alloca(&sid);
+-
+-    for (int i = 0; i <= SND_PCM_STREAM_LAST; i++) {
+-
+-        mixer_info_t *info = mixerMasterProp[i].mInfo = new mixer_info_t;
+-
+-        property_get (mixerMasterProp[i].propName,
+-                      info->name,
+-                      mixerMasterProp[i].propDefault);
+-
+-        for (snd_mixer_elem_t *elem = snd_mixer_first_elem(mMixer[i]);
+-             elem;
+-             elem = snd_mixer_elem_next(elem)) {
+-
+-            if (!snd_mixer_selem_is_active(elem))
+-                continue;
+-
+-            snd_mixer_selem_get_id(elem, sid);
+-
+-            // Find PCM playback volume control element.
+-            const char *elementName = snd_mixer_selem_id_get_name(sid);
+-
+-            if (info->elem == NULL &&
+-                strcmp(elementName, info->name) == 0 &&
+-                hasVolume[i] (elem)) {
+-
+-                info->elem = elem;
+-                getVolumeRange[i] (elem, &info->min, &info->max);
+-                info->volume = info->max;
+-                setVol[i] (elem, info->volume);
+-                if (i == SND_PCM_STREAM_PLAYBACK &&
+-                    snd_mixer_selem_has_playback_switch (elem))
+-                    snd_mixer_selem_set_playback_switch_all (elem, 1);
+-                break;
+-            }
+-        }
+-
+-        LOGV("Mixer: master '%s' %s.", info->name, info->elem ? "found" : "not found");
+-
+-        for (int j = 0; mixerProp[j][i].routes; j++) {
+-
+-            mixer_info_t *info = mixerProp[j][i].mInfo = new mixer_info_t;
+-
+-            property_get (mixerProp[j][i].propName,
+-                          info->name,
+-                          mixerProp[j][i].propDefault);
+-
+-            for (snd_mixer_elem_t *elem = snd_mixer_first_elem(mMixer[i]);
+-                 elem;
+-                 elem = snd_mixer_elem_next(elem)) {
+-
+-                if (!snd_mixer_selem_is_active(elem))
+-                    continue;
+-
+-                snd_mixer_selem_get_id(elem, sid);
+-
+-                // Find PCM playback volume control element.
+-                const char *elementName = snd_mixer_selem_id_get_name(sid);
+-
+-               if (info->elem == NULL &&
+-                    strcmp(elementName, info->name) == 0 &&
+-                    hasVolume[i] (elem)) {
+-
+-                    info->elem = elem;
+-                    getVolumeRange[i] (elem, &info->min, &info->max);
+-                    info->volume = info->max;
+-                    setVol[i] (elem, info->volume);
+-                    if (i == SND_PCM_STREAM_PLAYBACK &&
+-                        snd_mixer_selem_has_playback_switch (elem))
+-                        snd_mixer_selem_set_playback_switch_all (elem, 1);
+-                    break;
+-                }
+-            }
+-            LOGV("Mixer: route '%s' %s.", info->name, info->elem ? "found" : "not found");
+-        }
+-    }
+-    LOGV("mixer initialized.");
+-}
+-
+-ALSAMixer::~ALSAMixer()
+-{
+-    for (int i = 0; i <= SND_PCM_STREAM_LAST; i++) {
+-        if (mMixer[i]) snd_mixer_close (mMixer[i]);
+-        if (mixerMasterProp[i].mInfo) {
+-            delete mixerMasterProp[i].mInfo;
+-            mixerMasterProp[i].mInfo = NULL;
+-        }
+-        for (int j = 0; mixerProp[j][i].routes; j++) {
+-            if (mixerProp[j][i].mInfo) {
+-                delete mixerProp[j][i].mInfo;
+-                mixerProp[j][i].mInfo = NULL;
+-            }
+-        }
+-    }
+-    LOGV("mixer destroyed.");
+-}
+-
+-status_t ALSAMixer::setMasterVolume(float volume)
+-{
+-    mixer_info_t *info = mixerMasterProp[SND_PCM_STREAM_PLAYBACK].mInfo;
+-    if (!info || !info->elem) return INVALID_OPERATION;
+-
+-    long minVol = info->min;
+-    long maxVol = info->max;
+-
+-    // Make sure volume is between bounds.
+-    long vol = minVol + volume * (maxVol - minVol);
+-    if (vol > maxVol) vol = maxVol;
+-    if (vol < minVol) vol = minVol;
+-
+-    info->volume = vol;
+-    snd_mixer_selem_set_playback_volume_all (info->elem, vol);
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAMixer::setMasterGain(float gain)
+-{
+-    mixer_info_t *info = mixerMasterProp[SND_PCM_STREAM_CAPTURE].mInfo;
+-    if (!info || !info->elem) return INVALID_OPERATION;
+-
+-    long minVol = info->min;
+-    long maxVol = info->max;
+-
+-    // Make sure volume is between bounds.
+-    long vol = minVol + gain * (maxVol - minVol);
+-    if (vol > maxVol) vol = maxVol;
+-    if (vol < minVol) vol = minVol;
+-
+-    info->volume = vol;
+-    snd_mixer_selem_set_capture_volume_all (info->elem, vol);
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAMixer::setVolume(uint32_t device, float volume)
+-{
+-    for (int j = 0; mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes; j++)
+-        if (mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes & device) {
+-
+-            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_PLAYBACK].mInfo;
+-            if (!info || !info->elem) return INVALID_OPERATION;
+-
+-            long minVol = info->min;
+-            long maxVol = info->max;
+-
+-            // Make sure volume is between bounds.
+-            long vol = minVol + volume * (maxVol - minVol);
+-            if (vol > maxVol) vol = maxVol;
+-            if (vol < minVol) vol = minVol;
+-
+-            info->volume = vol;
+-            snd_mixer_selem_set_playback_volume_all (info->elem, vol);
+-        }
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAMixer::setGain(uint32_t device, float gain)
+-{
+-    for (int j = 0; mixerProp[j][SND_PCM_STREAM_CAPTURE].routes; j++)
+-        if (mixerProp[j][SND_PCM_STREAM_CAPTURE].routes & device) {
+-
+-            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_CAPTURE].mInfo;
+-            if (!info || !info->elem) return INVALID_OPERATION;
+-
+-            long minVol = info->min;
+-            long maxVol = info->max;
+-
+-            // Make sure volume is between bounds.
+-            long vol = minVol + gain * (maxVol - minVol);
+-            if (vol > maxVol) vol = maxVol;
+-            if (vol < minVol) vol = minVol;
+-
+-            info->volume = vol;
+-            snd_mixer_selem_set_capture_volume_all (info->elem, vol);
+-        }
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAMixer::setCaptureMuteState(uint32_t device, bool state)
+-{
+-    for (int j = 0; mixerProp[j][SND_PCM_STREAM_CAPTURE].routes; j++)
+-        if (mixerProp[j][SND_PCM_STREAM_CAPTURE].routes & device) {
+-
+-            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_CAPTURE].mInfo;
+-            if (!info || !info->elem) return INVALID_OPERATION;
+-
+-            if (snd_mixer_selem_has_capture_switch (info->elem)) {
+-
+-                int err = snd_mixer_selem_set_capture_switch_all (info->elem, static_cast<int>(!state));
+-                if (err < 0) {
+-                    LOGE("Unable to %s capture mixer switch %s",
+-                        state ? "enable" : "disable", info->name);
+-                    return INVALID_OPERATION;
+-                }
+-            }
+-
+-            info->mute = state;
+-        }
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAMixer::getCaptureMuteState(uint32_t device, bool *state)
+-{
+-    if (!state) return BAD_VALUE;
+-
+-    for (int j = 0; mixerProp[j][SND_PCM_STREAM_CAPTURE].routes; j++)
+-        if (mixerProp[j][SND_PCM_STREAM_CAPTURE].routes & device) {
+-
+-            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_CAPTURE].mInfo;
+-            if (!info || !info->elem) return INVALID_OPERATION;
+-
+-            *state = info->mute;
+-            return NO_ERROR;
+-        }
+-
+-    return BAD_VALUE;
+-}
+-
+-status_t ALSAMixer::setPlaybackMuteState(uint32_t device, bool state)
+-{
+-    for (int j = 0; mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes; j++)
+-        if (mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes & device) {
+-
+-            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_PLAYBACK].mInfo;
+-            if (!info || !info->elem) return INVALID_OPERATION;
+-
+-            if (snd_mixer_selem_has_playback_switch (info->elem)) {
+-
+-                int err = snd_mixer_selem_set_playback_switch_all (info->elem, static_cast<int>(!state));
+-                if (err < 0) {
+-                    LOGE("Unable to %s playback mixer switch %s",
+-                        state ? "enable" : "disable", info->name);
+-                    return INVALID_OPERATION;
+-                }
+-            }
+-
+-            info->mute = state;
+-        }
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAMixer::getPlaybackMuteState(uint32_t device, bool *state)
+-{
+-    if (!state) return BAD_VALUE;
+-
+-    for (int j = 0; mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes; j++)
+-        if (mixerProp[j][SND_PCM_STREAM_PLAYBACK].routes & device) {
+-
+-            mixer_info_t *info = mixerProp[j][SND_PCM_STREAM_PLAYBACK].mInfo;
+-            if (!info || !info->elem) return INVALID_OPERATION;
+-
+-            *state = info->mute;
+-            return NO_ERROR;
+-        }
+-
+-    return BAD_VALUE;
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-ALSAControl::ALSAControl(const char *device)
+-{
+-    snd_ctl_open(&mHandle, device, 0);
+-}
+-
+-ALSAControl::~ALSAControl()
+-{
+-    if (mHandle) snd_ctl_close(mHandle);
+-}
+-
+-status_t ALSAControl::get(const char *name, unsigned int &value, int index)
+-{
+-    if (!mHandle) return NO_INIT;
+-
+-    snd_ctl_elem_id_t *id;
+-    snd_ctl_elem_info_t *info;
+-    snd_ctl_elem_value_t *control;
+-
+-    snd_ctl_elem_id_alloca(&id);
+-    snd_ctl_elem_info_alloca(&info);
+-    snd_ctl_elem_value_alloca(&control);
+-
+-    snd_ctl_elem_id_set_name(id, name);
+-    snd_ctl_elem_info_set_id(info, id);
+-
+-    int ret = snd_ctl_elem_info(mHandle, info);
+-    if (ret < 0) return BAD_VALUE;
+-
+-    snd_ctl_elem_info_get_id(info, id);
+-    snd_ctl_elem_type_t type = snd_ctl_elem_info_get_type(info);
+-    unsigned int count = snd_ctl_elem_info_get_count(info);
+-    if ((unsigned int)index >= count) return BAD_VALUE;
+-
+-    snd_ctl_elem_value_set_id(control, id);
+-
+-    ret = snd_ctl_elem_read(mHandle, control);
+-    if (ret < 0) return BAD_VALUE;
+-
+-    switch (type) {
+-        case SND_CTL_ELEM_TYPE_BOOLEAN:
+-            value = snd_ctl_elem_value_get_boolean(control, index);
+-            break;
+-        case SND_CTL_ELEM_TYPE_INTEGER:
+-            value = snd_ctl_elem_value_get_integer(control, index);
+-            break;
+-        case SND_CTL_ELEM_TYPE_INTEGER64:
+-            value = snd_ctl_elem_value_get_integer64(control, index);
+-            break;
+-        case SND_CTL_ELEM_TYPE_ENUMERATED:
+-            value = snd_ctl_elem_value_get_enumerated(control, index);
+-            break;
+-        case SND_CTL_ELEM_TYPE_BYTES:
+-            value = snd_ctl_elem_value_get_byte(control, index);
+-            break;
+-        default:
+-            return BAD_VALUE;
+-    }
+-
+-    return NO_ERROR;
+-}
+-
+-status_t ALSAControl::set(const char *name, unsigned int value, int index)
+-{
+-    if (!mHandle) return NO_INIT;
+-
+-    snd_ctl_elem_id_t *id;
+-    snd_ctl_elem_info_t *info;
+-    snd_ctl_elem_value_t *control;
+-
+-    snd_ctl_elem_id_alloca(&id);
+-    snd_ctl_elem_info_alloca(&info);
+-    snd_ctl_elem_value_alloca(&control);
+-
+-    snd_ctl_elem_id_set_name(id, name);
+-    snd_ctl_elem_info_set_id(info, id);
+-
+-    int ret = snd_ctl_elem_info(mHandle, info);
+-    if (ret < 0) return BAD_VALUE;
+-
+-    snd_ctl_elem_info_get_id(info, id);
+-    snd_ctl_elem_type_t type = snd_ctl_elem_info_get_type(info);
+-    unsigned int count = snd_ctl_elem_info_get_count(info);
+-    if ((unsigned int)index >= count) return BAD_VALUE;
+-
+-    if (index == -1)
+-        index = 0; // Range over all of them
+-    else
+-        count = index + 1; // Just do the one specified
+-
+-    snd_ctl_elem_value_set_id(control, id);
+-
+-    for (unsigned int i = index; i < count; i++)
+-        switch (type) {
+-            case SND_CTL_ELEM_TYPE_BOOLEAN:
+-                snd_ctl_elem_value_set_boolean(control, i, value);
+-                break;
+-            case SND_CTL_ELEM_TYPE_INTEGER:
+-                snd_ctl_elem_value_set_integer(control, i, value);
+-                break;
+-            case SND_CTL_ELEM_TYPE_INTEGER64:
+-                snd_ctl_elem_value_set_integer64(control, i, value);
+-                break;
+-            case SND_CTL_ELEM_TYPE_ENUMERATED:
+-                snd_ctl_elem_value_set_enumerated(control, i, value);
+-                break;
+-            case SND_CTL_ELEM_TYPE_BYTES:
+-                snd_ctl_elem_value_set_byte(control, i, value);
+-                break;
+-            default:
+-                break;
+-        }
+-
+-    ret = snd_ctl_elem_write(mHandle, control);
+-    return (ret < 0) ? BAD_VALUE : NO_ERROR;
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-};        // namespace android
+diff --git a/libaudio/AudioHardwareALSA.h b/libaudio/AudioHardwareALSA.h
+deleted file mode 100644
+index 6af9831..0000000
+--- a/libaudio/AudioHardwareALSA.h
++++ /dev/null
+@@ -1,324 +0,0 @@
+-/* AudioHardwareALSA.h
+- **
+- ** Copyright 2008-2009, Wind River Systems
+- **
+- ** Licensed under the Apache License, Version 2.0 (the "License");
+- ** you may not use this file except in compliance with the License.
+- ** You may obtain a copy of the License at
+- **
+- **     http://www.apache.org/licenses/LICENSE-2.0
+- **
+- ** Unless required by applicable law or agreed to in writing, software
+- ** distributed under the License is distributed on an "AS IS" BASIS,
+- ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- ** See the License for the specific language governing permissions and
+- ** limitations under the License.
+- */
+-
+-#ifndef ANDROID_AUDIO_HARDWARE_ALSA_H
+-#define ANDROID_AUDIO_HARDWARE_ALSA_H
+-
+-#include <hardware_legacy/AudioHardwareBase.h>
+-
+-#include <alsa/asoundlib.h>
+-
+-#include <hardware/hardware.h>
+-
+-namespace android
+-{
+-    class AudioHardwareALSA;
+-
+-    /**
+-     * The id of acoustics module
+-     */
+-#define ACOUSTICS_HARDWARE_MODULE_ID "acoustics"
+-#define ACOUSTICS_HARDWARE_NAME "name"
+-
+-    struct acoustic_device_t {
+-        hw_device_t common;
+-
+-        /**
+-         * Set the provided acoustics for a particular ALSA pcm device.
+-         *
+-         * Returns: 0 on succes, error code on failure.
+-         */
+-        status_t (*set_acoustics)(snd_pcm_t *, AudioSystem::audio_in_acoustics);
+-
+-        /**
+-         * Read callback with PCM data so that filtering may be applied.
+-         *
+-         * Returns: frames filtered on success, error code on failure.
+-         */
+-        ssize_t (*filter)(snd_pcm_t *, void *, ssize_t);
+-    };
+-
+-    // ----------------------------------------------------------------------------
+-
+-    class ALSAMixer
+-    {
+-        public:
+-                                    ALSAMixer();
+-            virtual                ~ALSAMixer();
+-
+-            bool                    isValid() { return !!mMixer[SND_PCM_STREAM_PLAYBACK]; }
+-            status_t                setMasterVolume(float volume);
+-            status_t                setMasterGain(float gain);
+-
+-            status_t                setVolume(uint32_t device, float volume);
+-            status_t                setGain(uint32_t device, float gain);
+-
+-            status_t                setCaptureMuteState(uint32_t device, bool state);
+-            status_t                getCaptureMuteState(uint32_t device, bool *state);
+-            status_t                setPlaybackMuteState(uint32_t device, bool state);
+-            status_t                getPlaybackMuteState(uint32_t device, bool *state);
+-
+-        private:
+-            snd_mixer_t            *mMixer[SND_PCM_STREAM_LAST+1];
+-    };
+-
+-    class ALSAControl
+-    {
+-        public:
+-                                    ALSAControl(const char *device = "default");
+-            virtual                ~ALSAControl();
+-
+-            status_t                get(const char *name, unsigned int &value, int index = 0);
+-            status_t                set(const char *name, unsigned int value, int index = -1);
+-
+-        private:
+-            snd_ctl_t              *mHandle;
+-    };
+-
+-    class ALSAStreamOps
+-    {
+-        protected:
+-            friend class AudioStreamOutALSA;
+-            friend class AudioStreamInALSA;
+-
+-            struct StreamDefaults
+-            {
+-                const char *        devicePrefix;
+-                snd_pcm_stream_t    direction;       // playback or capture
+-                snd_pcm_format_t    format;
+-                int                 channels;
+-                uint32_t            sampleRate;
+-                unsigned int        latency;         // Delay in usec
+-                unsigned int        bufferSize;      // Size of sample buffer
+-            };
+-
+-                                    ALSAStreamOps(AudioHardwareALSA *parent);
+-            virtual                ~ALSAStreamOps();
+-
+-            status_t                set(int format,
+-                                        int channels,
+-                                        uint32_t rate);
+-            virtual uint32_t        sampleRate() const;
+-            status_t                sampleRate(uint32_t rate);
+-            virtual size_t          bufferSize() const;
+-            virtual int             format() const;
+-            virtual int             channelCount() const;
+-            status_t                channelCount(int channels);
+-
+-            status_t                open(int mode, uint32_t device);
+-            void                    close();
+-            status_t                setSoftwareParams();
+-            status_t                setPCMFormat(snd_pcm_format_t format);
+-            status_t                setHardwareResample(bool resample);
+-
+-            status_t                setDevice(int mode, uint32_t device);
+-
+-            const char             *streamName();
+-            const char             *deviceName(int mode, uint32_t device);
+-
+-            void                    setStreamDefaults(StreamDefaults *dev) {
+-                mDefaults = dev;
+-            }
+-
+-        private:
+-            AudioHardwareALSA      *mParent;
+-            snd_pcm_t              *mHandle;
+-            snd_pcm_hw_params_t    *mHardwareParams;
+-            snd_pcm_sw_params_t    *mSoftwareParams;
+-            int                     mMode;
+-            uint32_t                mDevice;
+-
+-            StreamDefaults         *mDefaults;
+-
+-            Mutex                   mLock;
+-            bool                    mPowerLock;
+-};
+-
+-    // ----------------------------------------------------------------------------
+-
+-    class AudioStreamOutALSA : public AudioStreamOut, public ALSAStreamOps
+-    {
+-        public:
+-                                    AudioStreamOutALSA(AudioHardwareALSA *parent);
+-            virtual                ~AudioStreamOutALSA();
+-
+-            status_t                set(int format          = 0,
+-                                        int channelCount    = 0,
+-                                        uint32_t sampleRate = 0) {
+-                return ALSAStreamOps::set(format, channelCount, sampleRate);
+-            }
+-
+-            virtual uint32_t        sampleRate() const
+-            {
+-                return ALSAStreamOps::sampleRate();
+-            }
+-
+-            virtual size_t          bufferSize() const
+-            {
+-                return ALSAStreamOps::bufferSize();
+-            }
+-
+-            virtual int             channelCount() const;
+-
+-            virtual int             format() const
+-            {
+-                return ALSAStreamOps::format();
+-            }
+-
+-            virtual uint32_t        latency() const;
+-
+-            virtual ssize_t         write(const void *buffer, size_t bytes);
+-            virtual status_t        dump(int fd, const Vector<String16>& args);
+-            status_t                getOutStreamParam();
+-
+-            status_t                setVolume(float volume);
+-
+-            virtual status_t        standby();
+-
+-        protected:
+-            friend class AudioHardwareALSA;
+-
+-            status_t                setDevice(int mode, uint32_t newDevice);
+-    };
+-
+-    class AudioStreamInALSA : public AudioStreamIn, public ALSAStreamOps
+-    {
+-        public:
+-                                    AudioStreamInALSA(AudioHardwareALSA *parent,
+-                                                      AudioSystem::audio_in_acoustics acoustics);
+-            virtual                ~AudioStreamInALSA();
+-
+-            status_t                set(int      format       = 0,
+-                                        int      channelCount = 0,
+-                                        uint32_t sampleRate   = 0) {
+-                return ALSAStreamOps::set(format, channelCount, sampleRate);
+-            }
+-
+-            virtual uint32_t        sampleRate() {
+-                return ALSAStreamOps::sampleRate();
+-            }
+-
+-            virtual size_t          bufferSize() const
+-            {
+-                return ALSAStreamOps::bufferSize();
+-            }
+-
+-            virtual int             channelCount() const
+-            {
+-                return ALSAStreamOps::channelCount();
+-            }
+-
+-            virtual int             format() const
+-            {
+-                return ALSAStreamOps::format();
+-            }
+-
+-            virtual ssize_t         read(void* buffer, ssize_t bytes);
+-            virtual status_t        dump(int fd, const Vector<String16>& args);
+-
+-            virtual status_t        setGain(float gain);
+-
+-            virtual status_t        standby();
+-
+-        protected:
+-            friend class AudioHardwareALSA;
+-
+-            status_t                setDevice(int mode, uint32_t newDevice);
+-
+-        private:
+-            AudioSystem::audio_in_acoustics mAcoustics;
+-    };
+-
+-    class AudioHardwareALSA : public AudioHardwareBase
+-    {
+-        public:
+-                                    AudioHardwareALSA();
+-            virtual                ~AudioHardwareALSA();
+-
+-            /**
+-             * check to see if the audio hardware interface has been initialized.
+-             * return status based on values defined in include/utils/Errors.h
+-             */
+-            virtual status_t        initCheck();
+-
+-            /** set the audio volume of a voice call. Range is between 0.0 and 1.0 */
+-            virtual status_t        setVoiceVolume(float volume);
+-
+-            /**
+-             * set the audio volume for all audio activities other than voice call.
+-             * Range between 0.0 and 1.0. If any value other than NO_ERROR is returned,
+-             * the software mixer will emulate this capability.
+-             */
+-            virtual status_t        setMasterVolume(float volume);
+-
+-            // mic mute
+-            virtual status_t        setMicMute(bool state);
+-            virtual status_t        getMicMute(bool* state);
+-
+-            virtual size_t getInputBufferSize(uint32_t sampleRate, int format, int channelCount);
+-            status_t        setInputStream(int format,
+-	    					int channelCount,
+-						uint32_t sampleRate);
+-            status_t        recoverOutputStream();
+-
+-            /** This method creates and opens the audio hardware output stream */
+-            virtual AudioStreamOut* openOutputStream(
+-	        uint32_t devices,
+-                int format=0,
+-                int channelCount=0,
+-                uint32_t sampleRate=0,
+-                status_t *status=0);
+-
+-            /** This method creates and opens the audio hardware input stream */
+-            virtual AudioStreamIn*  openInputStream(
+-	        uint32_t devices,
+-                int inputSource,
+-                int format,
+-                int channelCount,
+-                uint32_t sampleRate,
+-                status_t *status,
+-                AudioSystem::audio_in_acoustics acoustics);
+-
+-        protected:
+-            /**
+-             * doRouting actually initiates the routing. A call to setRouting
+-             * or setMode may result in a routing change. The generic logic calls
+-             * doRouting when required. If the device has any special requirements these
+-             * methods can be overriden.
+-             */
+-            virtual status_t    doRouting();
+-
+-            virtual status_t    dump(int fd, const Vector<String16>& args);
+-
+-            friend class AudioStreamOutALSA;
+-            friend class AudioStreamInALSA;
+-
+-            ALSAMixer          *mMixer;
+-            AudioStreamOutALSA *mOutput;
+-            AudioStreamInALSA  *mInput;
+-
+-            acoustic_device_t *mAcousticDevice;
+-
+-        private:
+-            Mutex               mLock;
+-            uint32_t            OutStreamParam[3];
+-    };
+-
+-    // ----------------------------------------------------------------------------
+-
+-};        // namespace android
+-#endif    // ANDROID_AUDIO_HARDWARE_ALSA_H
+diff --git a/libaudio/MODULE_LICENSE_APACHE2 b/libaudio/MODULE_LICENSE_APACHE2
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/libaudio/NOTICE b/libaudio/NOTICE
+deleted file mode 100644
+index ada44e1..0000000
+--- a/libaudio/NOTICE
++++ /dev/null
+@@ -1,191 +0,0 @@
+-
+-   Copyright (c) 2005-2008, The Android Open Source Project
+-   Copyright 2008 Wind River Systems
+-
+-   Licensed under the Apache License, Version 2.0 (the "License");
+-   you may not use this file except in compliance with the License.
+-
+-   Unless required by applicable law or agreed to in writing, software
+-   distributed under the License is distributed on an "AS IS" BASIS,
+-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-   See the License for the specific language governing permissions and
+-   limitations under the License.
+-
+-
+-                                 Apache License
+-                           Version 2.0, January 2004
+-                        http://www.apache.org/licenses/
+-
+-   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+-
+-   1. Definitions.
+-
+-      "License" shall mean the terms and conditions for use, reproduction,
+-      and distribution as defined by Sections 1 through 9 of this document.
+-
+-      "Licensor" shall mean the copyright owner or entity authorized by
+-      the copyright owner that is granting the License.
+-
+-      "Legal Entity" shall mean the union of the acting entity and all
+-      other entities that control, are controlled by, or are under common
+-      control with that entity. For the purposes of this definition,
+-      "control" means (i) the power, direct or indirect, to cause the
+-      direction or management of such entity, whether by contract or
+-      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+-      outstanding shares, or (iii) beneficial ownership of such entity.
+-
+-      "You" (or "Your") shall mean an individual or Legal Entity
+-      exercising permissions granted by this License.
+-
+-      "Source" form shall mean the preferred form for making modifications,
+-      including but not limited to software source code, documentation
+-      source, and configuration files.
+-
+-      "Object" form shall mean any form resulting from mechanical
+-      transformation or translation of a Source form, including but
+-      not limited to compiled object code, generated documentation,
+-      and conversions to other media types.
+-
+-      "Work" shall mean the work of authorship, whether in Source or
+-      Object form, made available under the License, as indicated by a
+-      copyright notice that is included in or attached to the work
+-      (an example is provided in the Appendix below).
+-
+-      "Derivative Works" shall mean any work, whether in Source or Object
+-      form, that is based on (or derived from) the Work and for which the
+-      editorial revisions, annotations, elaborations, or other modifications
+-      represent, as a whole, an original work of authorship. For the purposes
+-      of this License, Derivative Works shall not include works that remain
+-      separable from, or merely link (or bind by name) to the interfaces of,
+-      the Work and Derivative Works thereof.
+-
+-      "Contribution" shall mean any work of authorship, including
+-      the original version of the Work and any modifications or additions
+-      to that Work or Derivative Works thereof, that is intentionally
+-      submitted to Licensor for inclusion in the Work by the copyright owner
+-      or by an individual or Legal Entity authorized to submit on behalf of
+-      the copyright owner. For the purposes of this definition, "submitted"
+-      means any form of electronic, verbal, or written communication sent
+-      to the Licensor or its representatives, including but not limited to
+-      communication on electronic mailing lists, source code control systems,
+-      and issue tracking systems that are managed by, or on behalf of, the
+-      Licensor for the purpose of discussing and improving the Work, but
+-      excluding communication that is conspicuously marked or otherwise
+-      designated in writing by the copyright owner as "Not a Contribution."
+-
+-      "Contributor" shall mean Licensor and any individual or Legal Entity
+-      on behalf of whom a Contribution has been received by Licensor and
+-      subsequently incorporated within the Work.
+-
+-   2. Grant of Copyright License. Subject to the terms and conditions of
+-      this License, each Contributor hereby grants to You a perpetual,
+-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+-      copyright license to reproduce, prepare Derivative Works of,
+-      publicly display, publicly perform, sublicense, and distribute the
+-      Work and such Derivative Works in Source or Object form.
+-
+-   3. Grant of Patent License. Subject to the terms and conditions of
+-      this License, each Contributor hereby grants to You a perpetual,
+-      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+-      (except as stated in this section) patent license to make, have made,
+-      use, offer to sell, sell, import, and otherwise transfer the Work,
+-      where such license applies only to those patent claims licensable
+-      by such Contributor that are necessarily infringed by their
+-      Contribution(s) alone or by combination of their Contribution(s)
+-      with the Work to which such Contribution(s) was submitted. If You
+-      institute patent litigation against any entity (including a
+-      cross-claim or counterclaim in a lawsuit) alleging that the Work
+-      or a Contribution incorporated within the Work constitutes direct
+-      or contributory patent infringement, then any patent licenses
+-      granted to You under this License for that Work shall terminate
+-      as of the date such litigation is filed.
+-
+-   4. Redistribution. You may reproduce and distribute copies of the
+-      Work or Derivative Works thereof in any medium, with or without
+-      modifications, and in Source or Object form, provided that You
+-      meet the following conditions:
+-
+-      (a) You must give any other recipients of the Work or
+-          Derivative Works a copy of this License; and
+-
+-      (b) You must cause any modified files to carry prominent notices
+-          stating that You changed the files; and
+-
+-      (c) You must retain, in the Source form of any Derivative Works
+-          that You distribute, all copyright, patent, trademark, and
+-          attribution notices from the Source form of the Work,
+-          excluding those notices that do not pertain to any part of
+-          the Derivative Works; and
+-
+-      (d) If the Work includes a "NOTICE" text file as part of its
+-          distribution, then any Derivative Works that You distribute must
+-          include a readable copy of the attribution notices contained
+-          within such NOTICE file, excluding those notices that do not
+-          pertain to any part of the Derivative Works, in at least one
+-          of the following places: within a NOTICE text file distributed
+-          as part of the Derivative Works; within the Source form or
+-          documentation, if provided along with the Derivative Works; or,
+-          within a display generated by the Derivative Works, if and
+-          wherever such third-party notices normally appear. The contents
+-          of the NOTICE file are for informational purposes only and
+-          do not modify the License. You may add Your own attribution
+-          notices within Derivative Works that You distribute, alongside
+-          or as an addendum to the NOTICE text from the Work, provided
+-          that such additional attribution notices cannot be construed
+-          as modifying the License.
+-
+-      You may add Your own copyright statement to Your modifications and
+-      may provide additional or different license terms and conditions
+-      for use, reproduction, or distribution of Your modifications, or
+-      for any such Derivative Works as a whole, provided Your use,
+-      reproduction, and distribution of the Work otherwise complies with
+-      the conditions stated in this License.
+-
+-   5. Submission of Contributions. Unless You explicitly state otherwise,
+-      any Contribution intentionally submitted for inclusion in the Work
+-      by You to the Licensor shall be under the terms and conditions of
+-      this License, without any additional terms or conditions.
+-      Notwithstanding the above, nothing herein shall supersede or modify
+-      the terms of any separate license agreement you may have executed
+-      with Licensor regarding such Contributions.
+-
+-   6. Trademarks. This License does not grant permission to use the trade
+-      names, trademarks, service marks, or product names of the Licensor,
+-      except as required for reasonable and customary use in describing the
+-      origin of the Work and reproducing the content of the NOTICE file.
+-
+-   7. Disclaimer of Warranty. Unless required by applicable law or
+-      agreed to in writing, Licensor provides the Work (and each
+-      Contributor provides its Contributions) on an "AS IS" BASIS,
+-      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+-      implied, including, without limitation, any warranties or conditions
+-      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+-      PARTICULAR PURPOSE. You are solely responsible for determining the
+-      appropriateness of using or redistributing the Work and assume any
+-      risks associated with Your exercise of permissions under this License.
+-
+-   8. Limitation of Liability. In no event and under no legal theory,
+-      whether in tort (including negligence), contract, or otherwise,
+-      unless required by applicable law (such as deliberate and grossly
+-      negligent acts) or agreed to in writing, shall any Contributor be
+-      liable to You for damages, including any direct, indirect, special,
+-      incidental, or consequential damages of any character arising as a
+-      result of this License or out of the use or inability to use the
+-      Work (including but not limited to damages for loss of goodwill,
+-      work stoppage, computer failure or malfunction, or any and all
+-      other commercial damages or losses), even if such Contributor
+-      has been advised of the possibility of such damages.
+-
+-   9. Accepting Warranty or Additional Liability. While redistributing
+-      the Work or Derivative Works thereof, You may choose to offer,
+-      and charge a fee for, acceptance of support, warranty, indemnity,
+-      or other liability obligations and/or rights consistent with this
+-      License. However, in accepting such obligations, You may act only
+-      on Your own behalf and on Your sole responsibility, not on behalf
+-      of any other Contributor, and only if You agree to indemnify,
+-      defend, and hold each Contributor harmless for any liability
+-      incurred by, or claims asserted against, such Contributor by reason
+-      of your accepting any such warranty or additional liability.
+-
+-   END OF TERMS AND CONDITIONS
+-
+diff --git a/libaudio/acoustics_default.cpp b/libaudio/acoustics_default.cpp
+deleted file mode 100644
+index 91a169d..0000000
+--- a/libaudio/acoustics_default.cpp
++++ /dev/null
+@@ -1,85 +0,0 @@
+-/* acoustics_default.cpp
+- **
+- ** Copyright 2009 Wind River Systems
+- **
+- ** Licensed under the Apache License, Version 2.0 (the "License");
+- ** you may not use this file except in compliance with the License.
+- ** You may obtain a copy of the License at
+- **
+- **     http://www.apache.org/licenses/LICENSE-2.0
+- **
+- ** Unless required by applicable law or agreed to in writing, software
+- ** distributed under the License is distributed on an "AS IS" BASIS,
+- ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- ** See the License for the specific language governing permissions and
+- ** limitations under the License.
+- */
+-
+-
+-#define LOG_TAG "AudioHardwareALSA"
+-#include <utils/Log.h>
+-
+-#include "AudioHardwareALSA.h"
+-
+-namespace android
+-{
+-    static int s_device_open(const hw_module_t*, const char*, hw_device_t**);
+-    static int s_device_close (hw_device_t*);
+-    static status_t s_set_acoustics (snd_pcm_t *, AudioSystem::audio_in_acoustics);
+-    static ssize_t s_filter (snd_pcm_t *, void *, ssize_t);
+-
+-    static hw_module_methods_t s_module_methods = {
+-        open: s_device_open
+-    };
+-
+-    extern "C" const hw_module_t HAL_MODULE_INFO_SYM = {
+-            tag: HARDWARE_MODULE_TAG,
+-            version_major: 1,
+-            version_minor: 0,
+-            id: ACOUSTICS_HARDWARE_MODULE_ID,
+-            name: "ALSA acoustics module",
+-            author: "Wind River",
+-            methods: &s_module_methods,
+-            reserved: {}
+-    };
+-
+-    static int s_device_open(const hw_module_t* module,
+-                             const char* name,
+-                             hw_device_t** device)
+-    {
+-        acoustic_device_t *dev;
+-        dev = (acoustic_device_t *)malloc(sizeof(*dev));
+-        if (! dev) return -ENOMEM;
+-
+-        memset(dev, 0, sizeof(*dev));
+-
+-        /* initialize the procs */
+-        dev->common.tag = HARDWARE_DEVICE_TAG;
+-        dev->common.version = 0;
+-        dev->common.module = (hw_module_t *)module;
+-        dev->common.close = s_device_close;
+-        dev->set_acoustics = s_set_acoustics;
+-        dev->filter = s_filter;
+-
+-        *device = &dev->common;
+-        return 0;
+-    }
+-
+-    static int s_device_close (hw_device_t* device)
+-    {
+-        free(device);
+-        return 0;
+-    }
+-
+-    static status_t s_set_acoustics (snd_pcm_t *handle, AudioSystem::audio_in_acoustics acoustics)
+-    {
+-        LOGD("Acoustics set_acoustics stub called with %d.", (int)acoustics);
+-        return NO_ERROR;
+-    }
+-
+-    static ssize_t s_filter (snd_pcm_t *handle, void *buffer, ssize_t frames)
+-    {
+-        // Default acoustics doesn't apply any filtering
+-        return frames;
+-    }
+-}
+diff --git a/modules/alsa/Android.mk b/modules/alsa/Android.mk
+new file mode 100644
+index 0000000..2179ed3
+--- /dev/null
++++ b/modules/alsa/Android.mk
+@@ -0,0 +1,28 @@
++# This is the Freescale ALSA module for i.MX51
++
++ifeq ($(strip $(BOARD_USES_ALSA_AUDIO)),true)
++
++  LOCAL_PATH := $(call my-dir)
++
++  include $(CLEAR_VARS)
++
++  LOCAL_PRELINK_MODULE := false
++
++  LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
++
++  LOCAL_CFLAGS := -D_POSIX_SOURCE -Wno-multichar
++
++  LOCAL_C_INCLUDES += hardware/alsa_sound external/alsa-lib/include
++
++  LOCAL_SRC_FILES:= alsa_imx51.cpp
++
++  LOCAL_SHARED_LIBRARIES := \
++	libaudio \
++  	libasound \
++  	liblog
++
++  LOCAL_MODULE:= alsa.$(TARGET_PRODUCT)
++
++  include $(BUILD_SHARED_LIBRARY)
++
++endif
+diff --git a/modules/alsa/alsa_imx51.cpp b/modules/alsa/alsa_imx51.cpp
+new file mode 100644
+index 0000000..a343f84
+--- /dev/null
++++ b/modules/alsa/alsa_imx51.cpp
+@@ -0,0 +1,509 @@
++/* alsa_imx51.cpp
++ **
++ ** Copyright 2009 Freecale Semiconductor
++ **
++ ** Licensed under the Apache License, Version 2.0 (the "License");
++ ** you may not use this file except in compliance with the License.
++ ** You may obtain a copy of the License at
++ **
++ **     http://www.apache.org/licenses/LICENSE-2.0
++ **
++ ** Unless required by applicable law or agreed to in writing, software
++ ** distributed under the License is distributed on an "AS IS" BASIS,
++ ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ ** See the License for the specific language governing permissions and
++ ** limitations under the License.
++ */
++
++#define LOG_TAG "iMX51ALSA"
++#include <utils/Log.h>
++
++#include "AudioHardwareALSA.h"
++#include <media/AudioRecord.h>
++
++//#define BLUETOOTH_SCO_DEVICE "hw:0,1"
++//#define FM_TRANSMIT_DEVICE "hw:0,2"
++
++#ifndef ALSA_DEFAULT_SAMPLE_RATE
++#define ALSA_DEFAULT_SAMPLE_RATE 44100 // in Hz
++#endif
++
++#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
++
++namespace android
++{
++
++static int s_device_open(const hw_module_t*, const char*, hw_device_t**);
++static int s_device_close(hw_device_t*);
++static status_t s_init(alsa_device_t *, ALSAHandleList &);
++static status_t s_open(alsa_handle_t *, uint32_t, int);
++static status_t s_close(alsa_handle_t *);
++static status_t s_route(alsa_handle_t *, uint32_t, int);
++
++static hw_module_methods_t s_module_methods = {
++    open            : s_device_open
++};
++
++extern "C" const hw_module_t HAL_MODULE_INFO_SYM = {
++    tag             : HARDWARE_MODULE_TAG,
++    version_major   : 1,
++    version_minor   : 0,
++    id              : ALSA_HARDWARE_MODULE_ID,
++    name            : "i.MX51 ALSA module",
++    author          : "Freescale Semiconductor",
++    methods         : &s_module_methods,
++    dso             : 0,
++    reserved        : {0,},
++};
++
++static int s_device_open(const hw_module_t* module, const char* name,
++        hw_device_t** device)
++{
++    alsa_device_t *dev;
++    dev = (alsa_device_t *) malloc(sizeof(*dev));
++    if (!dev) return -ENOMEM;
++
++    memset(dev, 0, sizeof(*dev));
++
++    /* initialize the procs */
++    dev->common.tag = HARDWARE_DEVICE_TAG;
++    dev->common.version = 0;
++    dev->common.module = (hw_module_t *) module;
++    dev->common.close = s_device_close;
++    dev->init = s_init;
++    dev->open = s_open;
++    dev->close = s_close;
++    dev->route = s_route;
++
++    *device = &dev->common;
++
++    LOGD("i.MX51 ALSA module opened");
++
++    return 0;
++}
++
++static int s_device_close(hw_device_t* device)
++{
++    free(device);
++    return 0;
++}
++
++// ----------------------------------------------------------------------------
++
++static const int DEFAULT_SAMPLE_RATE = ALSA_DEFAULT_SAMPLE_RATE;
++
++static void setDefaultControls(uint32_t devices, int mode);
++
++typedef void (*AlsaControlSet)(uint32_t devices, int mode);
++
++#define IMX51_OUT_DEFAULT   (\
++        AudioSystem::DEVICE_OUT_EARPIECE | \
++        AudioSystem::DEVICE_OUT_SPEAKER | \
++        AudioSystem::DEVICE_OUT_WIRED_HEADSET | \
++        AudioSystem::DEVICE_OUT_WIRED_HEADPHONE | \
++        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP | \
++        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES | \
++        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER | \
++        AudioSystem::DEVICE_OUT_DEFAULT \
++	)
++
++#define IMX51_IN_DEFAULT    (\
++        AudioSystem::DEVICE_IN_ALL &\
++	~AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET \
++	)
++
++static alsa_handle_t _defaults[] = {
++    {
++        module      : 0,
++        devices     : IMX51_OUT_DEFAULT,
++        curDev      : 0,
++        curMode     : 0,
++        handle      : 0,
++        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
++        channels    : 2,
++        sampleRate  : DEFAULT_SAMPLE_RATE,
++        latency     : 200000, // Desired Delay in usec
++        bufferSize  : 6144, // Desired Number of samples
++        modPrivate  : (void *)&setDefaultControls,
++    },
++    {
++        module      : 0,
++        devices     : IMX51_IN_DEFAULT,
++        curDev      : 0,
++        curMode     : 0,
++        handle      : 0,
++        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
++        channels    : 1,
++        sampleRate  : AudioRecord::DEFAULT_SAMPLE_RATE,
++        latency     : 250000, // Desired Delay in usec
++        bufferSize  : 2048, // Desired Number of samples
++        modPrivate  : (void *)&setDefaultControls,
++    },
++};
++
++// ----------------------------------------------------------------------------
++
++const char *deviceName(alsa_handle_t *handle, uint32_t device, int mode)
++{
++    // i.mx51 only has one codec (alsa dev)
++    return "default";
++}
++
++snd_pcm_stream_t direction(alsa_handle_t *handle)
++{
++    return (handle->devices & AudioSystem::DEVICE_OUT_ALL) ? SND_PCM_STREAM_PLAYBACK
++            : SND_PCM_STREAM_CAPTURE;
++}
++
++const char *streamName(alsa_handle_t *handle)
++{
++    return snd_pcm_stream_name(direction(handle));
++}
++
++status_t setHardwareParams(alsa_handle_t *handle)
++{
++    snd_pcm_hw_params_t *hardwareParams;
++    status_t err;
++
++    snd_pcm_uframes_t bufferSize = handle->bufferSize;
++    unsigned int requestedRate = handle->sampleRate;
++    unsigned int latency = handle->latency;
++
++    // snd_pcm_format_description() and snd_pcm_format_name() do not perform
++    // proper bounds checking.
++    bool validFormat = (static_cast<int> (handle->format)
++            > SND_PCM_FORMAT_UNKNOWN) && (static_cast<int> (handle->format)
++            <= SND_PCM_FORMAT_LAST);
++    const char *formatDesc = validFormat ? snd_pcm_format_description(
++            handle->format) : "Invalid Format";
++    const char *formatName = validFormat ? snd_pcm_format_name(handle->format)
++            : "UNKNOWN";
++
++    if (snd_pcm_hw_params_malloc(&hardwareParams) < 0) {
++        LOG_ALWAYS_FATAL("Failed to allocate ALSA hardware parameters!");
++        return NO_INIT;
++    }
++
++    err = snd_pcm_hw_params_any(handle->handle, hardwareParams);
++    if (err < 0) {
++        LOGE("Unable to configure hardware: %s", snd_strerror(err));
++        goto done;
++    }
++
++    // Set the interleaved read and write format.
++    err = snd_pcm_hw_params_set_access(handle->handle, hardwareParams,
++            SND_PCM_ACCESS_RW_INTERLEAVED);
++    if (err < 0) {
++        LOGE("Unable to configure PCM read/write format: %s",
++                snd_strerror(err));
++        goto done;
++    }
++
++    err = snd_pcm_hw_params_set_format(handle->handle, hardwareParams,
++            handle->format);
++    if (err < 0) {
++        LOGE("Unable to configure PCM format %s (%s): %s",
++                formatName, formatDesc, snd_strerror(err));
++        goto done;
++    }
++
++    LOGV("Set %s PCM format to %s (%s)", streamName(), formatName, formatDesc);
++
++    err = snd_pcm_hw_params_set_channels(handle->handle, hardwareParams,
++            handle->channels);
++    if (err < 0) {
++        LOGE("Unable to set channel count to %i: %s",
++                handle->channels, snd_strerror(err));
++        goto done;
++    }
++
++    LOGV("Using %i %s for %s.", handle->channels,
++            handle->channels == 1 ? "channel" : "channels", streamName());
++
++    err = snd_pcm_hw_params_set_rate_near(handle->handle, hardwareParams,
++            &requestedRate, 0);
++
++    if (err < 0)
++        LOGE("Unable to set %s sample rate to %u: %s",
++                streamName(handle), handle->sampleRate, snd_strerror(err));
++    else if (requestedRate != handle->sampleRate)
++        // Some devices have a fixed sample rate, and can not be changed.
++        // This may cause resampling problems; i.e. PCM playback will be too
++        // slow or fast.
++        LOGW("Requested rate (%u HZ) does not match actual rate (%u HZ)",
++                handle->sampleRate, requestedRate);
++    else
++        LOGV("Set %s sample rate to %u HZ", stream, requestedRate);
++
++    // Make sure we have at least the size we originally wanted
++    err = snd_pcm_hw_params_set_buffer_size(handle->handle, hardwareParams,
++            bufferSize);
++    if (err < 0) {
++        LOGE("Unable to set buffer size to %d:  %s",
++                (int)bufferSize, snd_strerror(err));
++        goto done;
++    }
++
++    // Setup buffers for latency
++    err = snd_pcm_hw_params_set_buffer_time_near(handle->handle,
++            hardwareParams, &latency, NULL);
++    if (err < 0) {
++        /* That didn't work, set the period instead */
++        unsigned int periodTime = latency / 4;
++        err = snd_pcm_hw_params_set_period_time_near(handle->handle,
++                hardwareParams, &periodTime, NULL);
++        if (err < 0) {
++            LOGE("Unable to set the period time for latency: %s", snd_strerror(err));
++            goto done;
++        }
++        snd_pcm_uframes_t periodSize;
++        err = snd_pcm_hw_params_get_period_size(hardwareParams, &periodSize,
++                NULL);
++        if (err < 0) {
++            LOGE("Unable to get the period size for latency: %s", snd_strerror(err));
++            goto done;
++        }
++        bufferSize = periodSize * 4;
++        if (bufferSize < handle->bufferSize) bufferSize = handle->bufferSize;
++        err = snd_pcm_hw_params_set_buffer_size_near(handle->handle,
++                hardwareParams, &bufferSize);
++        if (err < 0) {
++            LOGE("Unable to set the buffer size for latency: %s", snd_strerror(err));
++            goto done;
++        }
++        LOGV("Setup buffers time near for latency failed %d", latency);
++    } else {
++        // OK, we got buffer time near what we expect. See what that did for bufferSize.
++        err = snd_pcm_hw_params_get_buffer_size(hardwareParams, &bufferSize);
++        if (err < 0) {
++            LOGE("Unable to get the buffer size for latency: %s", snd_strerror(err));
++            goto done;
++        }
++        // Does set_buffer_time_near change the passed value? It should.
++        err = snd_pcm_hw_params_get_buffer_time(hardwareParams, &latency, NULL);
++        if (err < 0) {
++            LOGE("Unable to get the buffer time for latency: %s", snd_strerror(err));
++            goto done;
++        }
++        unsigned int periodTime = latency / 4;
++        err = snd_pcm_hw_params_set_period_time_near(handle->handle,
++                hardwareParams, &periodTime, NULL);
++        if (err < 0) {
++            LOGE("Unable to set the period time for latency: %s", snd_strerror(err));
++            goto done;
++        }
++        LOGV("Setup buffers time near for latency ok %d", latency);
++    }
++
++    LOGV("Buffer size: %d", (int)bufferSize);
++    LOGV("Latency: %d", (int)latency);
++
++    handle->bufferSize = bufferSize;
++    handle->latency = latency;
++
++    // Commit the hardware parameters back to the device.
++    err = snd_pcm_hw_params(handle->handle, hardwareParams);
++    if (err < 0) LOGE("Unable to set hardware parameters: %s", snd_strerror(err));
++
++    done:
++    snd_pcm_hw_params_free(hardwareParams);
++
++    return err;
++}
++
++status_t setSoftwareParams(alsa_handle_t *handle)
++{
++    snd_pcm_sw_params_t * softwareParams;
++    int err;
++
++    snd_pcm_uframes_t bufferSize = 0;
++    snd_pcm_uframes_t periodSize = 0;
++    snd_pcm_uframes_t startThreshold, stopThreshold;
++
++    if (snd_pcm_sw_params_malloc(&softwareParams) < 0) {
++        LOG_ALWAYS_FATAL("Failed to allocate ALSA software parameters!");
++        return NO_INIT;
++    }
++
++    // Get the current software parameters
++    err = snd_pcm_sw_params_current(handle->handle, softwareParams);
++    if (err < 0) {
++        LOGE("Unable to get software parameters: %s", snd_strerror(err));
++        goto done;
++    }
++
++    // Configure ALSA to start the transfer when the buffer is almost full.
++    snd_pcm_get_params(handle->handle, &bufferSize, &periodSize);
++
++    if (handle->devices & AudioSystem::DEVICE_OUT_ALL) {
++        // For playback, configure ALSA to start the transfer when the
++        // buffer is full.
++        startThreshold = bufferSize - 1;
++        stopThreshold = bufferSize;
++    } else {
++        // For recording, configure ALSA to start the transfer on the
++        // first frame.
++        startThreshold = 1;
++        stopThreshold = bufferSize;
++    }
++
++    err = snd_pcm_sw_params_set_start_threshold(handle->handle, softwareParams,
++            startThreshold);
++    if (err < 0) {
++        LOGE("Unable to set start threshold to %lu frames: %s",
++                startThreshold, snd_strerror(err));
++        goto done;
++    }
++
++    err = snd_pcm_sw_params_set_stop_threshold(handle->handle, softwareParams,
++            stopThreshold);
++    if (err < 0) {
++        LOGE("Unable to set stop threshold to %lu frames: %s",
++                stopThreshold, snd_strerror(err));
++        goto done;
++    }
++
++    // Allow the transfer to start when at least periodSize samples can be
++    // processed.
++    err = snd_pcm_sw_params_set_avail_min(handle->handle, softwareParams,
++            periodSize);
++    if (err < 0) {
++        LOGE("Unable to configure available minimum to %lu: %s",
++                periodSize, snd_strerror(err));
++        goto done;
++    }
++
++    // Commit the software parameters back to the device.
++    err = snd_pcm_sw_params(handle->handle, softwareParams);
++    if (err < 0) LOGE("Unable to configure software parameters: %s",
++            snd_strerror(err));
++
++    done:
++    snd_pcm_sw_params_free(softwareParams);
++
++    return err;
++}
++
++void setDefaultControls(uint32_t devices, int mode)
++{
++    ALSAControl control("hw:00");
++
++    if (devices & AudioSystem::DEVICE_OUT_SPEAKER ||
++        devices & AudioSystem::DEVICE_OUT_EARPIECE) {
++        control.set("Speaker Function", "on"); // on
++    } else {
++        control.set("Speaker Function", "off"); // off
++    }
++
++#if 0
++    if (devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
++        devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE) {
++        control.set("Speader Function", 0); // on
++    } else {
++        control.set("Speader Function", 1); // on
++    }
++#endif
++}
++
++void setAlsaControls(alsa_handle_t *handle, uint32_t devices, int mode)
++{
++    AlsaControlSet set = (AlsaControlSet) handle->modPrivate;
++    set(devices, mode);
++}
++
++// ----------------------------------------------------------------------------
++
++static status_t s_init(alsa_device_t *module, ALSAHandleList &list)
++{
++    LOGD("Initializing devices for IMX51 ALSA module");
++
++    list.clear();
++
++    for (size_t i = 0; i < ARRAY_SIZE(_defaults); i++) {
++
++        snd_pcm_uframes_t bufferSize = _defaults[i].bufferSize;
++
++        for (size_t b = 1; (bufferSize & ~b) != 0; b <<= 1)
++            bufferSize &= ~b;
++
++        _defaults[i].module = module;
++        _defaults[i].bufferSize = bufferSize;
++
++        list.push_back(_defaults[i]);
++    }
++
++    return NO_ERROR;
++}
++
++static status_t s_open(alsa_handle_t *handle, uint32_t devices, int mode)
++{
++    // Close off previously opened device.
++    // It would be nice to determine if the underlying device actually
++    // changes, but we might be recovering from an error or manipulating
++    // mixer settings (see asound.conf).
++    //
++    s_close(handle);
++
++    LOGD("open called for devices %08x in mode %d...", devices, mode);
++
++    const char *stream = streamName(handle);
++    const char *devName = deviceName(handle, devices, mode);
++
++    // The PCM stream is opened in blocking mode, per ALSA defaults.  The
++    // AudioFlinger seems to assume blocking mode too, so asynchronous mode
++    // should not be used.
++    int err = snd_pcm_open(&handle->handle, devName, direction(handle), 0);
++
++    if (err < 0) {
++        LOGE("Failed to Initialize any ALSA %s device: %s", stream, strerror(err));
++        return NO_INIT;
++    }
++
++    err = setHardwareParams(handle);
++
++    if (err == NO_ERROR) err = setSoftwareParams(handle);
++
++    setAlsaControls(handle, devices, mode);
++
++    LOGI("Initialized ALSA %s device %s", stream, devName);
++
++    handle->curDev = devices;
++    handle->curMode = mode;
++
++    return err;
++}
++
++static status_t s_close(alsa_handle_t *handle)
++{
++    status_t err = NO_ERROR;
++    snd_pcm_t *h = handle->handle;
++    handle->handle = 0;
++    handle->curDev = 0;
++    handle->curMode = 0;
++    if (h) {
++        snd_pcm_drain(h);
++        err = snd_pcm_close(h);
++    }
++
++    return err;
++}
++
++static status_t s_route(alsa_handle_t *handle, uint32_t devices, int mode)
++{
++    status_t status = NO_ERROR;
++
++    LOGD("route called for devices %08x in mode %d...", devices, mode);
++
++    if (handle->handle && handle->curDev == devices && handle->curMode == mode)
++        ; // Nothing to do
++    else if (handle->handle && (handle->devices & devices))
++        setAlsaControls(handle, devices, mode);
++    else {
++        LOGE("Why are we routing to a device that isn't supported by this object?!?!?!?!");
++        status = s_open(handle, devices, mode);
++    }
++
++    return status;
++}
++
++}
+-- 
+1.8.0
+

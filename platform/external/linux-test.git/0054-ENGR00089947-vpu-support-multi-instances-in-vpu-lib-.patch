@@ -1,0 +1,314 @@
+From 31b9502661508350edfe242337f943903d3d79f5 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Mon, 10 Nov 2008 15:49:57 +0800
+Subject: [PATCH 054/435] ENGR00089947 vpu: support multi-instances in vpu
+ lib/driver
+
+vpu unit test application supported multi-instances in multi-threads with
+protection previously. However, it couldn't support multi-processes to decode
+and/or encode simultaneously and wasn't flexible.  Here, we move multi-instances
+support to vpu lib/driver, then vpu protection is transparent for application.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 13 -------------
+ test/mxc_vpu_test/enc.c      | 22 ----------------------
+ test/mxc_vpu_test/main.c     |  6 ------
+ test/mxc_vpu_test/vpu_test.h | 17 -----------------
+ 4 files changed, 58 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index fec7f95..de92eca 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -547,7 +547,6 @@ decoder_start(struct decode *dec)
+ 	if (rot_en || dering_en) {
+ 		rot_fb = &fb[rotid];
+ 
+-		lock(dec->cmdl);
+ 		/*
+ 		 * VPU is setting the rotation angle by counter-clockwise.
+ 		 * We convert it to clockwise, which is consistent with V4L2
+@@ -566,7 +565,6 @@ decoder_start(struct decode *dec)
+ 					fheight : fwidth;
+ 
+ 		vpu_DecGiveCommand(handle, SET_ROTATOR_STRIDE, &rot_stride);
+-		unlock(dec->cmdl);
+ 	}
+ 
+ 	if (deblock_en) {
+@@ -593,7 +591,6 @@ decoder_start(struct decode *dec)
+ 	gettimeofday(&total_start, NULL);
+ 
+ 	while (1) {
+-		lock(dec->cmdl);
+ 		
+ 		if (rot_en || dering_en) {
+ 			vpu_DecGiveCommand(handle, SET_ROTATOR_OUTPUT,
+@@ -617,7 +614,6 @@ decoder_start(struct decode *dec)
+ 						(void *)deblock_fb);
+ 			if (ret != RETCODE_SUCCESS) {
+ 				err_msg("Failed to set deblocking output\n");
+-				unlock(dec->cmdl);
+ 				return -1;
+ 			}
+ 		}
+@@ -626,7 +622,6 @@ decoder_start(struct decode *dec)
+ 		ret = vpu_DecStartOneFrame(handle, &decparam);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("DecStartOneFrame failed\n");
+-			unlock(dec->cmdl);
+ 			return -1;
+ 		}
+ 
+@@ -639,7 +634,6 @@ decoder_start(struct decode *dec)
+ 			
+ 			if (err < 0) {
+ 				err_msg("dec_fill_bsbuffer failed\n");
+-				unlock(dec->cmdl);
+ 				return -1;
+ 			}
+ 
+@@ -660,7 +654,6 @@ decoder_start(struct decode *dec)
+ 		tdec_time += (sec * 1000000) + usec;
+ 
+ 		ret = vpu_DecGetOutputInfo(handle, &outinfo);
+-		unlock(dec->cmdl);
+ 		dprintf(4, "frame_id = %d\n", (int)frame_id);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("vpu_DecGetOutputInfo failed Err code is %d\n"
+@@ -991,9 +984,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	bufinfo.avcSliceBufInfo.sliceSaveBuffer = dec->phy_slice_buf;
+ 	bufinfo.avcSliceBufInfo.sliceSaveBufferSize = SLICE_SAVE_SIZE;
+ 	
+-	lock(dec->cmdl);
+ 	ret = vpu_DecRegisterFrameBuffer(handle, fb, fbcount, stride, &bufinfo);
+-	unlock(dec->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+@@ -1029,11 +1020,9 @@ decoder_parse(struct decode *dec)
+ 	RetCode ret;
+ 
+ 	/* Parse bitstream and get width/height/framerate etc */
+-	lock(dec->cmdl);
+ 	vpu_DecSetEscSeqInit(handle, 1);
+ 	ret = vpu_DecGetInitialInfo(handle, &initinfo);
+ 	vpu_DecSetEscSeqInit(handle, 0);
+-	unlock(dec->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("vpu_DecGetInitialInfo failed %d\n", ret);
+ 		return -1;
+@@ -1213,9 +1202,7 @@ err1:
+ 		IOFreePhyMem(&ps_mem_desc);
+ 	}
+ 
+-	lock(cmdl);
+ 	vpu_DecClose(dec->handle);
+-	unlock(cmdl);
+ err:
+ 	IOFreeVirtMem(&mem_desc);
+ 	IOFreePhyMem(&mem_desc);
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index fd8f87a..210c403 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -100,9 +100,7 @@ encoder_fill_headers(struct encode *enc)
+ 	if (enc->cmdl->format == STD_MPEG4) {
+ 		if (!cpu_is_mx51()) {
+ 			enchdr_param.headerType = VOS_HEADER;
+-			lock(enc->cmdl);
+ 			vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+-			unlock(enc->cmdl);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+ 			vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+@@ -112,9 +110,7 @@ encoder_fill_headers(struct encode *enc)
+ #endif
+ 
+ 			enchdr_param.headerType = VIS_HEADER;
+-			lock(enc->cmdl);
+ 			vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+-			unlock(enc->cmdl);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+ 			vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+@@ -125,9 +121,7 @@ encoder_fill_headers(struct encode *enc)
+ 		}
+ 
+ 		enchdr_param.headerType = VOL_HEADER;
+-		lock(enc->cmdl);
+ 		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+-		unlock(enc->cmdl);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+ 		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+@@ -137,9 +131,7 @@ encoder_fill_headers(struct encode *enc)
+ #endif
+ 	} else if (enc->cmdl->format == STD_AVC) {
+ 		enchdr_param.headerType = SPS_RBSP;
+-		lock(enc->cmdl);
+ 		vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
+-		unlock(enc->cmdl);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+ 		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+@@ -148,9 +140,7 @@ encoder_fill_headers(struct encode *enc)
+ 			return -1;
+ #endif
+ 		enchdr_param.headerType = PPS_RBSP;
+-		lock(enc->cmdl);
+ 		vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
+-		unlock(enc->cmdl);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+ 		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+@@ -219,9 +209,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	/* Must be a multiple of 16 */
+ 	stride = (enc->picwidth + 15) & ~15;
+ 
+-	lock(enc->cmdl);
+ 	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, stride);
+-	unlock(enc->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+@@ -341,14 +329,11 @@ encoder_start(struct encode *enc)
+ 			enc->cmdl->iframe = 0;
+ 		}
+ 
+-		lock(enc->cmdl);
+-
+ 		gettimeofday(&tenc_begin, NULL);
+ 		ret = vpu_EncStartOneFrame(handle, &enc_param);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("vpu_EncStartOneFrame failed Err code:%d\n",
+ 									ret);
+-			unlock(enc->cmdl);
+ 			goto err2;
+ 		}
+ 		
+@@ -358,7 +343,6 @@ encoder_start(struct encode *enc)
+ 					virt_bsbuf_start, virt_bsbuf_end,
+ 					phy_bsbuf_start, STREAM_READ_SIZE);
+ 			if (ret < 0) {
+-				unlock(enc->cmdl);
+ 				goto err2;
+ 			}
+ #endif
+@@ -377,7 +361,6 @@ encoder_start(struct encode *enc)
+ 		tenc_time += (sec * 1000000) + usec;
+ 
+ 		ret = vpu_EncGetOutputInfo(handle, &outinfo);
+-		unlock(enc->cmdl);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("vpu_EncGetOutputInfo failed Err code: %d\n",
+ 									ret);
+@@ -463,11 +446,9 @@ encoder_configure(struct encode *enc)
+ 		search_pa.SearchRamSize = ram_size;
+ 	}
+ 
+-	lock(enc->cmdl);
+ 	ret = vpu_EncGiveCommand(handle, ENC_SET_SEARCHRAM_PARAM, &search_pa);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Encoder SET_SEARCHRAM_PARAM failed\n");
+-		unlock(enc->cmdl);
+ 		return -1;
+ 	}
+ 
+@@ -481,7 +462,6 @@ encoder_configure(struct encode *enc)
+ 	}
+ 
+ 	ret = vpu_EncGetInitialInfo(handle, &initinfo);
+-	unlock(enc->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Encoder GetInitialInfo failed\n");
+ 		return -1;
+@@ -514,13 +494,11 @@ encoder_close(struct encode *enc)
+ 	EncOutputInfo outinfo = {0};
+ 	RetCode ret;
+ 
+-	lock(enc->cmdl);
+ 	ret = vpu_EncClose(enc->handle);
+ 	if (ret == RETCODE_FRAME_NOT_COMPLETE) {
+ 		vpu_EncGetOutputInfo(enc->handle, &outinfo);
+ 		vpu_EncClose(enc->handle);
+ 	}
+-	unlock(enc->cmdl);
+ }
+ 
+ int
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index ee3a7d7..35ffccb 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -105,7 +105,6 @@ int quitflag;
+ static struct input_argument input_arg[4];
+ static int instance;
+ static int using_config_file;
+-static pthread_mutex_t fastmutex = PTHREAD_MUTEX_INITIALIZER;
+ 
+ int decode_test(void *arg);
+ int encode_test(void *arg);
+@@ -348,8 +347,6 @@ main(int argc, char *argv[])
+ 						ver.lib_release);
+ 
+ 	if (instance > 1) {
+-		pthread_mutex_init(&fastmutex, NULL);
+-		
+ 		for (i = 0; i < instance; i++) {
+ 			if (using_config_file == 0) {
+ 				get_arg(input_arg[i].line, &nargc, pargv);
+@@ -363,7 +360,6 @@ main(int argc, char *argv[])
+ 			if (check_params(&input_arg[i].cmd,
+ 						input_arg[i].mode) == 0) {
+ 				if (open_files(&input_arg[i].cmd) == 0) {
+-					input_arg[i].cmd.mutex = &fastmutex;
+ 					if (input_arg[i].mode == DECODE) {
+ 					     pthread_create(&input_arg[i].tid,
+ 						   NULL,
+@@ -418,8 +414,6 @@ main(int argc, char *argv[])
+ 				close_files(&input_arg[i].cmd);
+ 			}
+ 		}
+-
+-		pthread_mutex_destroy(&fastmutex);
+ 	}
+ 
+ 	IOSystemShutdown();
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index d636999..87b436e 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -134,7 +134,6 @@ struct cmd_line {
+ 	u16 port; /* udp port number */
+ 	u16 complete; /* wait for the requested buf to be filled completely */
+ 	int iframe;
+-	pthread_mutex_t *mutex;
+ };
+ 
+ struct decode {
+@@ -210,20 +209,4 @@ int decoder_parse(struct decode *dec);
+ int decoder_allocate_framebuffer(struct decode *dec);
+ void decoder_free_framebuffer(struct decode *dec);
+ 
+-static inline void
+-lock(struct cmd_line *cmdl)
+-{
+-	if (cmdl->mutex)
+-		pthread_mutex_lock(cmdl->mutex);
+-}
+-
+-static inline void
+-unlock(struct cmd_line *cmdl)
+-{
+-	if (cmdl->mutex) {
+-		pthread_mutex_unlock(cmdl->mutex);
+-		usleep(1);
+-	}
+-}
+-
+ #endif
+-- 
+1.8.0
+

@@ -1,0 +1,187 @@
+From 5e542fd2296ce99568b35a5f8bc9b4b625f05f6e Mon Sep 17 00:00:00 2001
+From: Nitin Garg <nitin.garg@freescale.com>
+Date: Wed, 14 Mar 2012 22:11:17 -0500
+Subject: [PATCH 254/486] ENGR00175845: GPS signal is weak and cannot locate
+ postion
+
+GPS HAL does not check for correct errno set by read, write,
+open, epoll_ctl functions. Fixes for all build warnings.
+Now the ingsvcd service does not fail to start when set as disabled.
+Also the GPS does not go to sleep, hence ignoring the gps messages
+when state is not STATE_STARTED.
+
+Signed-off-by: Nitin Garg <nitin.garg@freescale.com>
+---
+ libgps/athr_gps.c | 44 +++++++++++++++++++++++---------------------
+ 1 file changed, 23 insertions(+), 21 deletions(-)
+
+diff --git a/libgps/athr_gps.c b/libgps/athr_gps.c
+index fda3be0..fe0505b 100755
+--- a/libgps/athr_gps.c
++++ b/libgps/athr_gps.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 - 2011 Atheros Corporation. All rights reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -43,14 +43,14 @@
+ //#define  GPS_DEBUG
+ #undef	 GPS_DEBUG_TOKEN	/* print out NMEA tokens */
+ 
+-#define  DFR(...)   LOGD(__VA_ARGS__)
+-
+ #ifdef GPS_DEBUG
+ #  define  D(...)   LOGD(__VA_ARGS__)
+ #else
+ #  define  D(...)   ((void)0)
+ #endif
+ 
++#define  DFR(...)   D(__VA_ARGS__)
++
+ #define GPS_STATUS_CB(_cb, _s)    \
+   if ((_cb).status_cb) {          \
+     GpsStatus gps_status;         \
+@@ -150,7 +150,7 @@ static void gps_dev_init(int fd);
+ static void gps_dev_deinit(int fd);
+ static void gps_dev_start(int fd);
+ static void gps_dev_stop(int fd);
+-static void *gps_timer_thread( void*  arg );
++static void gps_timer_thread( void*  arg );
+ static int athr_gps_start();
+ 
+ /*****************************************************************/
+@@ -412,7 +412,7 @@ static int nmea_reader_get_timestamp(NmeaReader*  r, Token  tok, time_t *timesta
+ 
+ 	ttime = mktime( &tm );
+ 	*timestamp = ttime - r->utc_diff;
+-	D("nmea_reader_get_timestamp: %d, %d", ttime, *timestamp);
++	D("nmea_reader_get_timestamp: %d, %d", (int)ttime, (int)*timestamp);
+ 
+     return 0;
+ }
+@@ -1120,7 +1120,7 @@ epoll_register( int  epoll_fd, int  fd )
+     ev.data.fd = fd;
+     do {
+         ret = epoll_ctl( epoll_fd, EPOLL_CTL_ADD, fd, &ev );
+-    } while (ret < 0 && errno == EINTR);
++    } while (ret < 0);
+     return ret;
+ }
+ 
+@@ -1131,7 +1131,7 @@ epoll_deregister( int  epoll_fd, int  fd )
+     int  ret;
+     do {
+         ret = epoll_ctl( epoll_fd, EPOLL_CTL_DEL, fd, NULL );
+-    } while (ret < 0 && errno == EINTR);
++    } while (ret < 0);
+     return ret;
+ }
+ 
+@@ -1139,8 +1139,7 @@ epoll_deregister( int  epoll_fd, int  fd )
+  * when started, messages from the QEMU GPS daemon. these are simple NMEA sentences
+  * that must be parsed to be converted into GPS fixes sent to the framework
+  */
+-static void*
+-gps_state_thread( void*  arg )
++static void gps_state_thread( void*  arg )
+ {
+     GpsState*   state = (GpsState*) arg;
+     NmeaReader  *reader;
+@@ -1170,7 +1169,7 @@ gps_state_thread( void*  arg )
+ 
+         nevents = epoll_wait( epoll_fd, events, 2, -1 );
+         if (nevents < 0)
+-		{
++	{
+             if (errno != EINTR)
+                 LOGE("epoll_wait() unexpected error: %s", strerror(errno));
+             continue;
+@@ -1195,7 +1194,7 @@ gps_state_thread( void*  arg )
+                     do
+ 					{
+                         ret = read( fd, &cmd, 1 );
+-                    } while (ret < 0 && errno == EINTR);
++                    } while (ret < 0 && ((errno == EIO) || (errno == EINTR)));
+ 
+                     if (cmd == CMD_QUIT)
+ 					{
+@@ -1260,7 +1259,10 @@ gps_state_thread( void*  arg )
+ 							if (FD_ISSET(fd, &readfds))
+ 								ret = read( fd, buf, sizeof(buf) );
+                         // D("read buffer size: %d", ret);
+-                    } while (ret < 0 && errno == EINTR);
++                    } while (ret < 0 && ((errno == EIO) || (errno == EINTR)));
++
++		    if (state->init != STATE_START)
++			continue;
+ 
+                     if (ret > 0)
+                         for (nn = 0; nn < ret; nn++)
+@@ -1296,11 +1298,10 @@ Exit:
+ 
+     gps_dev_deinit(gps_fd);
+ 
+-    return NULL;
++    return;
+ }
+ 
+-static void*
+-gps_timer_thread( void*  arg )
++static void gps_timer_thread( void*  arg )
+ {
+ 	int need_sleep = 0;
+ 	int sleep_val = 0;
+@@ -1371,7 +1372,7 @@ gps_timer_thread( void*  arg )
+ 
+   DFR("gps timer thread destroyed");
+ 
+-  return NULL;
++  return;
+ 
+ }
+ 
+@@ -1381,7 +1382,7 @@ gps_state_init( GpsState*  state )
+     char   prop[PROPERTY_VALUE_MAX];
+     char   device[256];
+     int    ret;
+-    int    done = 0;
++    int    retry_count = 0;
+ 
+     struct sigevent tmr_event;
+ 
+@@ -1434,9 +1435,10 @@ gps_state_init( GpsState*  state )
+     }
+ 
+     do
+-	{
++     {
++        retry_count++;
+         state->fd = open( device, O_RDWR | O_NOCTTY | O_NONBLOCK);
+-    } while (state->fd < 0 && errno == EINTR);
++     } while ((retry_count < 100) && state->fd < 0 && ((errno == EIO) || (errno == EINTR)));
+ 
+     if (state->fd < 0)
+ 	{
+@@ -1662,7 +1664,7 @@ static int athr_gps_set_position_mode(GpsPositionMode mode, GpsPositionRecurrenc
+ 		//        return -1;
+ 	}
+ 
+-	if (!s->init || min_interval < 0) {
++	if (!s->init) {
+ 		D("%s: called with uninitialized state !!", __FUNCTION__);
+ 		//return -1;
+ 	}
+@@ -1746,7 +1748,7 @@ static void athr_gps_ni_respond(int notif_id, GpsUserResponseType user_response)
+ {
+     // D("%s: entered", __FUNCTION__);
+ 
+-    return 0;
++    return;
+ }
+ 
+ static const GpsNiInterface athrGpsNiInterface = {
+-- 
+1.8.0
+

@@ -1,0 +1,146 @@
+From 0798594a971f8986dde96d24cab40c472089eebc Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Fri, 16 Aug 2013 14:34:10 +0800
+Subject: [PATCH 465/486] ENGR00275516 [EVK_6SL]: support recorder for camera
+ 5640
+
+use nv12 format to record
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ mx6/libcamera/CameraBridge.cpp | 55 +++++++++++++++++++++++++++++++++++++++++-
+ mx6/libcamera/CameraBridge.h   |  7 +++++-
+ mx6/libcamera/OvDevice.cpp     |  8 +++++-
+ 3 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/mx6/libcamera/CameraBridge.cpp b/mx6/libcamera/CameraBridge.cpp
+index 9b57f5e..dfa2472 100644
+--- a/mx6/libcamera/CameraBridge.cpp
++++ b/mx6/libcamera/CameraBridge.cpp
+@@ -434,7 +434,11 @@ status_t CameraBridge::start()
+         return NO_INIT;
+     }
+ 
+-    int bufSize = mFrameProvider->getFrameSize();
++#ifdef EVK_6SL //driver provide yuyv, but h264enc need nv12
++    int bufSize = mFrameProvider->getFrameSize() * 3/4;
++#else
++	int bufSize = mFrameProvider->getFrameSize();
++#endif
+     int bufCnt  = mFrameProvider->getFrameCount();
+     if (mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
+         if (mPreviewMemory != NULL) {
+@@ -820,7 +824,11 @@ void CameraBridge::sendVideoFrame(CameraFrame *frame)
+         pMetaBuf->length    = frame->mSize;
+     }
+     else {
++#ifdef EVK_6SL
++		convertYUYVtoNV12SP((uint8_t *)frame->mVirtAddr, pVideoBuf, frame->mWidth, frame->mHeight);
++#else
+         memcpy(pVideoBuf, (void *)frame->mVirtAddr, mMetaDataBufsSize);
++#endif
+     }
+ 
+     if (mMetaDataBufsMap.indexOfKey((int)pVideoBuf) >= 0) {
+@@ -953,3 +961,48 @@ void CameraBridge::convertNV12toYUV420SP(uint8_t *inputBuffer,
+     }
+ }
+ 
++
++void CameraBridge::convertYUYVtoNV12SP(uint8_t *inputBuffer,
++                                         uint8_t *outputBuffer,
++                                         int      width,
++                                         int      height)
++{
++#define u32 unsigned int
++#define u8 unsigned char
++
++    u32 h,w;
++    u32 nHeight = height;
++    u32 nWidthDiv4  = width/4;
++
++    u8* pYSrcOffset = inputBuffer;
++    u8* pUSrcOffset = inputBuffer + 1;
++    u8* pVSrcOffset = inputBuffer + 3;
++
++    u32* pYDstOffset = (u32*)outputBuffer;
++    u32* pUVDstOffset = (u32*)(((u8*)(outputBuffer)) + width*height);
++
++
++    for(h=0; h<nHeight; h++) {
++       if(!( h & 0x1 )) {
++           for(w=0; w<nWidthDiv4; w++) {
++               *pYDstOffset = (((u32)(*(pYSrcOffset+0)))<<0)  +  (((u32)(*(pYSrcOffset+2)))<<8) + (((u32)(*(pYSrcOffset+4)))<<16) + (((u32)(*(pYSrcOffset+6)))<<24) ;
++               pYSrcOffset += 8;
++               pYDstOffset += 1;
++               //*pUVDstOffset = (((u32)(*(pUSrcOffset+0)))<<0)  + (((u32)(*(pVSrcOffset+0)))<<8) + (((u32)(*(pUSrcOffset+4)))<<16) + (((u32)(*(pVSrcOffset+4)))<<24) ;
++			   //maybe th encoder use VUVU planner
++               *pUVDstOffset = (((u32)(*(pVSrcOffset+0)))<<0)  + (((u32)(*(pUSrcOffset+0)))<<8) + (((u32)(*(pVSrcOffset+4)))<<16) + (((u32)(*(pUSrcOffset+4)))<<24) ;
++               pUSrcOffset += 8;
++               pVSrcOffset += 8;
++               pUVDstOffset += 1;
++           }
++       } else {
++           pUSrcOffset += nWidthDiv4*8;
++           pVSrcOffset += nWidthDiv4*8;
++           for(w=0; w<nWidthDiv4; w++) {
++               *pYDstOffset = (((u32)(*(pYSrcOffset+0)))<<0)  +  (((u32)(*(pYSrcOffset+2)))<<8) + (((u32)(*(pYSrcOffset+4)))<<16) + (((u32)(*(pYSrcOffset+6)))<<24) ;
++               pYSrcOffset += 8;
++               pYDstOffset += 1;
++           }
++       }
++    }
++}
+diff --git a/mx6/libcamera/CameraBridge.h b/mx6/libcamera/CameraBridge.h
+index de9ce55..69ed9bd 100644
+--- a/mx6/libcamera/CameraBridge.h
++++ b/mx6/libcamera/CameraBridge.h
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -100,6 +100,11 @@ private:
+                                        int      width,
+                                        int      height);
+ 
++	void         convertYUYVtoNV12SP(uint8_t *inputBuffer,
++                                       uint8_t *outputBuffer,
++                                       int      width,
++                                       int      height);
++
+ public:
+     class BridgeThread : public Thread {
+     public:
+diff --git a/mx6/libcamera/OvDevice.cpp b/mx6/libcamera/OvDevice.cpp
+index cf62695..2e7a91b 100644
+--- a/mx6/libcamera/OvDevice.cpp
++++ b/mx6/libcamera/OvDevice.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -115,7 +115,13 @@ status_t OvDevice::setPreviewStringFormat(PixelFormat format)
+     }
+ 
+     mParams.setPreviewFormat(pformat);
++
++#ifdef EVK_6SL //use nv12 to record
++	mParams.set(CameraParameters::KEY_VIDEO_FRAME_FORMAT, "yuv420sp");
++#else
+     mParams.set(CameraParameters::KEY_VIDEO_FRAME_FORMAT, pformat);
++#endif
++
+     return NO_ERROR;
+ }
+ 
+-- 
+1.8.0
+

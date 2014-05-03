@@ -1,0 +1,114 @@
+From 29248fc8c210e3e40294dfdd3beb8c8ce81cf15f Mon Sep 17 00:00:00 2001
+From: Fancy Fang <B47543@freescale.com>
+Date: Tue, 26 Nov 2013 13:43:37 +0800
+Subject: [PATCH 245/249] ENGR00289631 PXP: fix a multiple instances usage
+ error for pxp library
+
+When run pxp_test.out case repeatedly, about after 90 minutes later,
+Some error messages printed "pxp request channel err" and the test
+app exits. The reason is that no protection in pxp library to avoid
+multiple users to access global variable "active_open_nr" simutaneously.
+This may cause incorrect open()/close() device node. So I add a pthread
+spin lock to prevent this kind of issue.
+
+Signed-off-by: Fancy Fang <B47543@freescale.com>
+---
+ pxp/Makefile  |  3 ++-
+ pxp/pxp_lib.c | 14 ++++++++++++--
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/pxp/Makefile b/pxp/Makefile
+index d204c30..38a1926 100644
+--- a/pxp/Makefile
++++ b/pxp/Makefile
+@@ -8,6 +8,7 @@ OBJ = pxp_lib.o
+ 
+ LIBNAME = libpxp
+ SONAMEVERSION=0
++LFLAGS += -lpthread
+ 
+ ifeq ($(PLATFORM), $(findstring $(PLATFORM), $(INCLUDE_LIST)))
+ 
+@@ -28,7 +29,7 @@ endif
+ 	$(CC) -D$(PLATFORM) $(INCLUDE) -Wall -O2 -fPIC -c $^ -o $@
+ 
+ $(LIBNAME).so.$(SONAMEVERSION): $(OBJ)
+-	$(CC) -shared -nostartfiles -Wl,-soname,$@ $^ -o $@
++	$(CC) -shared -nostartfiles -Wl,-soname,$@ $(LFLAGS) $^ -o $@
+ 
+ $(LIBNAME).so: $(LIBNAME).so.$(SONAMEVERSION)
+ 	ln -s $< $@
+diff --git a/pxp/pxp_lib.c b/pxp/pxp_lib.c
+index 78e6b93..7b880f5 100644
+--- a/pxp/pxp_lib.c
++++ b/pxp/pxp_lib.c
+@@ -1,7 +1,7 @@
+ /*
+  * pxp_lib - a user space library for PxP
+  *
+- * Copyright (C) 2010 Freescale Semiconductor, Inc.
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  */
+ 
+ /*
+@@ -21,6 +21,7 @@
+ #include <sys/stat.h>
+ #include <fcntl.h>
+ #include <unistd.h>
++#include <pthread.h>
+ 
+ #include "pxp_lib.h"
+ 
+@@ -36,23 +37,28 @@ static int debug_level = DBG_ERR;
+ 
+ static int fd = -1;
+ static int active_open_nr;
++static pthread_spinlock_t lock;
+ 
+ int pxp_init(void)
+ {
++	pthread_spin_lock(&lock);
+ 	if (fd > 0) {
+ 		active_open_nr++;
++		pthread_spin_unlock(&lock);
+ 		return 0;
+ 	}
+ 
+ 	if (fd < 0) {
+ 		fd = open(PXP_DEVICE_NAME, O_RDWR, 0);
+ 		if (fd < 0) {
++			pthread_spin_unlock(&lock);
+ 			dbg(DBG_ERR, "open file error.\n");
+ 			return -1;
+ 		}
+ 	}
+ 
+ 	active_open_nr++;
++	pthread_spin_unlock(&lock);
+ 	return 0;
+ }
+ 
+@@ -112,8 +118,11 @@ int pxp_wait_for_completion(pxp_chan_handle_t *pxp_chan, int times)
+ 
+ void pxp_uninit(void)
+ {
+-	if (fd == -1)
++	pthread_spin_lock(&lock);
++	if (fd == -1) {
++		pthread_spin_unlock(&lock);
+ 		return;
++	}
+ 
+ 	if (active_open_nr > 1) {
+ 		active_open_nr--;
+@@ -124,6 +133,7 @@ void pxp_uninit(void)
+ 			fd = -1;
+ 		}
+ 	}
++	pthread_spin_unlock(&lock);
+ }
+ 
+ /*
+-- 
+1.8.0
+

@@ -1,0 +1,233 @@
+From ac1fe39a82e78bb93084d3d0e6b0cd3d4300a648 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Mon, 12 Apr 2010 17:24:01 -0400
+Subject: [PATCH 030/486] Add EPDC fb driver support. The main change are as
+ below: 1. EPDC FB buffer currently only support one
+ buffer size, which means buffer flip not be
+ supported. 2. Add partial update support. 3. Fix
+ the lock issue when fake the fb double buffer.
+ Signed-off-by: guoyin.chen
+ <guoyin.chen@freescale.com>
+
+---
+ libgralloc/Android.mk      |   5 ++
+ libgralloc/framebuffer.cpp | 112 ++++++++++++++++++++++++++++++++++++++++-----
+ libgralloc/gralloc.cpp     |   5 +-
+ 3 files changed, 110 insertions(+), 12 deletions(-)
+
+diff --git a/libgralloc/Android.mk b/libgralloc/Android.mk
+index cb5b980..4e83b09 100755
+--- a/libgralloc/Android.mk
++++ b/libgralloc/Android.mk
+@@ -31,4 +31,9 @@ LOCAL_SRC_FILES := 	\
+ 	
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\"
++
++ifeq ($(HAVE_FSL_EPDC_FB),true)
++LOCAL_CFLAGS += -DFSL_EPDC_FB
++endif
++
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index eb0e629..157b44e 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -56,8 +56,57 @@ enum {
+ 
+ struct fb_context_t {
+     framebuffer_device_t  device;
++    #ifdef FSL_EPDC_FB
++    //Partial udate feature
++    bool partial_update;
++    int partial_left;
++    int partial_top;
++    int partial_width;
++    int partial_height;
++    #endif
+ };
+ 
++#ifdef FSL_EPDC_FB
++__u32 marker_val = 1;
++static void update_to_display(int left, int top, int width, int height, int wave_mode, int wait_for_complete, int fb_dev)
++{
++	struct mxcfb_update_data upd_data;
++	int retval;
++
++	//upd_data.update_mode = UPDATE_MODE_FULL;
++    upd_data.update_mode = UPDATE_MODE_PARTIAL;
++	upd_data.waveform_mode = wave_mode;
++	upd_data.update_region.left = left;
++	upd_data.update_region.width = width;
++	upd_data.update_region.top = top;
++	upd_data.update_region.height = height;
++
++	if (wait_for_complete) {
++		/* Get unique marker value */
++		upd_data.update_marker = marker_val++;
++	} else {
++		upd_data.update_marker = 0;
++	}
++
++	retval = ioctl(fb_dev, MXCFB_SEND_UPDATE, &upd_data);
++	while (retval < 0) {
++		/* We have limited memory available for updates, so wait and
++		 * then try again after some updates have completed */
++		sleep(1);
++		retval = ioctl(fb_dev, MXCFB_SEND_UPDATE, &upd_data);
++        LOGI("MXCFB_SEND_UPDATE  retval = 0x%x try again maybe", retval);
++	}
++
++	if (wait_for_complete) {
++		/* Wait for update to complete */
++		retval = ioctl(fb_dev, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_data.update_marker);
++		if (retval < 0) {
++			LOGI("Wait for update complete failed.  Error = 0x%x", retval);
++		}
++	}
++}
++#endif
++
+ /*****************************************************************************/
+ 
+ static int fb_setSwapInterval(struct framebuffer_device_t* dev,
+@@ -75,13 +124,14 @@ static int fb_setUpdateRect(struct framebuffer_device_t* dev,
+ {
+     if (((w|h) <= 0) || ((l|t)<0))
+         return -EINVAL;
+-        
++#ifdef FSL_EPDC_FB
+     fb_context_t* ctx = (fb_context_t*)dev;
+-    private_module_t* m = reinterpret_cast<private_module_t*>(
+-            dev->common.module);
+-    m->info.reserved[0] = 0x54445055; // "UPDT";
+-    m->info.reserved[1] = (uint16_t)l | ((uint32_t)t << 16);
+-    m->info.reserved[2] = (uint16_t)(l+w) | ((uint32_t)(t+h) << 16);
++    ctx->partial_update = true;
++    ctx->partial_left = l;
++    ctx->partial_top = t;
++    ctx->partial_width = w;
++    ctx->partial_height = h;    
++#endif
+     return 0;
+ }
+ 
+@@ -95,7 +145,6 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+     private_handle_t const* hnd = reinterpret_cast<private_handle_t const*>(buffer);
+     private_module_t* m = reinterpret_cast<private_module_t*>(
+             dev->common.module);
+-    
+     if (m->currentBuffer) {
+         m->base.unlock(&m->base, m->currentBuffer);
+         m->currentBuffer = 0;
+@@ -116,8 +165,17 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+             return -errno;
+         }
+ 
+-        unsigned int ret;
+-        ioctl(m->framebuffer->fd, MXCFB_WAIT_FOR_VSYNC, &ret);
++        #ifdef FSL_EPDC_FB
++        if(ctx->partial_update) {
++            update_to_display(ctx->partial_left,ctx->partial_top,
++                              ctx->partial_width,ctx->partial_height,
++                              WAVEFORM_MODE_GC16,1,m->framebuffer->fd);
++            ctx->partial_update = false;
++        }
++        else{
++            update_to_display(0,0,m->info.xres,m->info.yres,WAVEFORM_MODE_GC16,1,m->framebuffer->fd);
++        }
++        #endif
+ 
+         m->currentBuffer = buffer;
+         
+@@ -139,7 +197,19 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+                 &buffer_vaddr);
+ 
+         memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
+-        
++
++        #ifdef FSL_EPDC_FB
++        if(ctx->partial_update) {
++            update_to_display(ctx->partial_left,ctx->partial_top,
++                              ctx->partial_width,ctx->partial_height,
++                              WAVEFORM_MODE_GC16,1,m->framebuffer->fd);
++            ctx->partial_update = false;
++        }
++        else{
++            update_to_display(0,0,m->info.xres,m->info.yres,WAVEFORM_MODE_GC16,1,m->framebuffer->fd);
++        }
++        #endif
++
+         m->base.unlock(&m->base, buffer); 
+         m->base.unlock(&m->base, m->framebuffer); 
+     }
+@@ -152,6 +222,7 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev)
+     glFinish();
+     return 0;
+ }
++
+ /*****************************************************************************/
+ 
+ int mapFrameBufferLocked(struct private_module_t* module)
+@@ -222,7 +293,14 @@ int mapFrameBufferLocked(struct private_module_t* module)
+      * Request NUM_BUFFERS screens (at lest 2 for page flipping)
+      */
+     info.yres_virtual = info.yres * NUM_BUFFERS;
+-
++    
++    #ifdef FSL_EPDC_FB
++    info.yres_virtual = info.yres;
++	info.bits_per_pixel = 16;
++	info.grayscale = 0;
++	info.yoffset = 0;
++	info.rotate = FB_ROTATE_UR;
++    #endif
+ 
+     uint32_t flags = PAGE_FLIP;
+     if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1) {
+@@ -242,6 +320,14 @@ int mapFrameBufferLocked(struct private_module_t* module)
+     if (ioctl(fd, FBIOGET_VSCREENINFO, &info) == -1)
+         return -errno;
+ 
++    #ifdef FSL_EPDC_FB
++	int auto_update_mode = AUTO_UPDATE_MODE_REGION_MODE;
++	int retval = ioctl(fd, MXCFB_SET_AUTO_UPDATE_MODE, &auto_update_mode);
++	if (retval < 0)
++	{
++		return -errno;
++	}
++    #endif
+     int refreshRate = 1000000000000000LLU /
+     (
+             uint64_t( info.upper_margin + info.lower_margin + info.yres )
+@@ -373,7 +459,11 @@ int fb_device_open(hw_module_t const* module, const char* name,
+         dev->device.common.close = fb_close;
+         dev->device.setSwapInterval = fb_setSwapInterval;
+         dev->device.post            = fb_post;
++        #ifndef FSL_EPDC_FB
+         dev->device.setUpdateRect = 0;
++        #else
++        dev->device.setUpdateRect = fb_setUpdateRect;
++        #endif
+         dev->device.compositionComplete = fb_compositionComplete;
+ 
+         private_module_t* m = (private_module_t*)module;
+diff --git a/libgralloc/gralloc.cpp b/libgralloc/gralloc.cpp
+index 29411db..418992a 100755
+--- a/libgralloc/gralloc.cpp
++++ b/libgralloc/gralloc.cpp
+@@ -136,7 +136,10 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev,
+         // we return a regular buffer which will be memcpy'ed to the main
+         // screen when post is called.
+         int newUsage = (usage & ~GRALLOC_USAGE_HW_FB) | GRALLOC_USAGE_HW_2D;
+-        return gralloc_alloc_buffer(dev, bufferSize, newUsage, pHandle);
++        pthread_mutex_unlock(&m->lock);
++        int ret = gralloc_alloc_buffer(dev, bufferSize, newUsage, pHandle);
++        pthread_mutex_lock(&m->lock);
++        return ret;
+     }
+ 
+     if (bufferMask >= ((1LU<<numBuffers)-1)) {
+-- 
+1.8.0
+

@@ -1,0 +1,177 @@
+From ceebc485ac7380d2764e12cba78929a8c37b60a5 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 20 Jul 2011 20:16:19 +0800
+Subject: [PATCH 230/435] ENGR00153370 mx6q: Enable vpu encoder unit test
+
+1) MPEG4/H263/H264 vpu encoder can be supported with the patch on mx6q,
+not including MJPG encoder yet.
+2) Only support encoding from YUV file, not involve encoding from camera.
+
+3) Remove STD_VP6 format in test since there is no VP6 HW in iMX6x VPU.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      |  1 +
+ test/mxc_vpu_test/enc.c      | 49 ++++++++++++++++++++++++++++++++++++--------
+ test/mxc_vpu_test/main.c     |  2 +-
+ test/mxc_vpu_test/utils.c    |  3 ---
+ test/mxc_vpu_test/vpu_test.h |  2 ++
+ 5 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 2cc86cb..f454872 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1373,6 +1373,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			}
+ 
+ 			for (i = 0; i < totalfb; i++) {
++				fb[i].myIndex = i;
+ 				if (dst_scheme == PATH_V4L2)
+ 					fb[i].bufY = disp->buffers[i]->offset;
+ 				else
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 96faabc..02cd118 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -342,6 +342,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		}
+ 		subSampBaseA = fb[fbcount + 1].bufY;
+ 		subSampBaseB = fb[fbcount + 2].bufY;
++		enc->fbcount += 2;
+ 	}
+ 
+ 	/* Must be a multiple of 16 */
+@@ -374,6 +375,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 			goto err1;
+ 		}
+ 
++		fb[src_fbid].myIndex = i;
+ 		fb[src_fbid].bufY = pfbpool[src_fbid]->addrY;
+ 		fb[src_fbid].bufCb = pfbpool[src_fbid]->addrCb;
+ 		fb[src_fbid].bufCr = pfbpool[src_fbid]->addrCr;
+@@ -490,6 +492,7 @@ encoder_start(struct encode *enc)
+ 				goto err2;
+ 			}
+ 
++			fb[src_fbid].myIndex = v4l2_buf.index;
+ 			fb[src_fbid].bufY = cap_buffers[v4l2_buf.index].offset;
+ 			fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size;
+ 			fb[src_fbid].bufCr = fb[src_fbid].bufCb +
+@@ -747,10 +750,14 @@ encoder_open(struct encode *enc)
+ 		enc->src_picheight = enc->cmdl->height;
+ 	}
+ 
+-	/* Please change encoded picture width and height per your needs
+-           it is same as source picture image normally */
+-	enc->enc_picwidth = enc->src_picwidth;
+-	enc->enc_picheight = enc->src_picheight;
++	/* enc_width and enc_height in command line means encoder output size */
++	if (enc->cmdl->enc_width && enc->cmdl->enc_height) {
++		enc->enc_picwidth = enc->cmdl->enc_width;
++		enc->enc_picheight = enc->cmdl->enc_height;
++	} else {
++		enc->enc_picwidth = enc->src_picwidth;
++		enc->enc_picheight = enc->src_picheight;
++	}
+ 
+ 	/* If rotation angle is 90 or 270, pic width and height are swapped */
+ 	if (enc->cmdl->rot_angle == 90 || enc->cmdl->rot_angle == 270) {
+@@ -781,6 +788,10 @@ encoder_open(struct encode *enc)
+ 	encop.userQpMinEnable = 0;
+ 	encop.userQpMaxEnable = 0;
+ 
++	encop.IntraCostWeight = 0;
++	encop.MEUseZeroPmv  = 0;
++	encop.MESearchRange = 0;
++
+ 	encop.userGamma = (Uint32)(0.75*32768);         /*  (0*32768 <= gamma <= 1*32768) */
+ 	encop.RcIntervalMode= 1;        /* 0:normal, 1:frame_level, 2:slice_level, 3: user defined Mb_level */
+ 	encop.MbInterval = 0;
+@@ -894,6 +905,7 @@ encoder_open(struct encode *enc)
+ 		encop.EncStdParam.mp4Param.mp4_hecEnable = 0;
+ 		encop.EncStdParam.mp4Param.mp4_verid = 2;
+ 	} else if ( enc->cmdl->format == STD_H263) {
++		encop.EncStdParam.h263Param.h263_annexIEnable = 0;
+ 		encop.EncStdParam.h263Param.h263_annexJEnable = 1;
+ 		encop.EncStdParam.h263Param.h263_annexKEnable = 0;
+ 		encop.EncStdParam.h263Param.h263_annexTEnable = 0;
+@@ -904,10 +916,31 @@ encoder_open(struct encode *enc)
+ 		encop.EncStdParam.avcParam.avc_deblkFilterOffsetBeta = 0;
+ 		encop.EncStdParam.avcParam.avc_chromaQpOffset = 10;
+ 		encop.EncStdParam.avcParam.avc_audEnable = 0;
+-		encop.EncStdParam.avcParam.avc_fmoEnable = 0;
+-		encop.EncStdParam.avcParam.avc_fmoType = 0;
+-		encop.EncStdParam.avcParam.avc_fmoSliceNum = 1;
+-		encop.EncStdParam.avcParam.avc_fmoSliceSaveBufSize = 32; /* FMO_SLICE_SAVE_BUF_SIZE */
++		if (cpu_is_mx6q()) {
++			encop.EncStdParam.avcParam.avc_frameCroppingFlag = 0;
++			encop.EncStdParam.avcParam.avc_frameCropLeft = 0;
++			encop.EncStdParam.avcParam.avc_frameCropRight = 0;
++			encop.EncStdParam.avcParam.avc_frameCropTop = 0;
++			encop.EncStdParam.avcParam.avc_frameCropBottom = 0;
++			if (enc->cmdl->rot_angle != 90 &&
++			    enc->cmdl->rot_angle != 270 &&
++			    enc->enc_picheight == 1080) {
++				/*
++				 * In case of AVC encoder, when we want to use
++				 * unaligned display width frameCroppingFlag
++				 * parameters should be adjusted to displayable
++				 * rectangle
++				 */
++				encop.EncStdParam.avcParam.avc_frameCroppingFlag = 1;
++				encop.EncStdParam.avcParam.avc_frameCropBottom = 8;
++			}
++
++		} else {
++			encop.EncStdParam.avcParam.avc_fmoEnable = 0;
++			encop.EncStdParam.avcParam.avc_fmoType = 0;
++			encop.EncStdParam.avcParam.avc_fmoSliceNum = 1;
++			encop.EncStdParam.avcParam.avc_fmoSliceSaveBufSize = 32; /* FMO_SLICE_SAVE_BUF_SIZE */
++		}
+ 	} else if (enc->cmdl->format == STD_MJPG) {
+ 		encop.EncStdParam.mjpgParam.mjpg_sourceFormat = 0; /* encConfig.mjpgChromaFormat */
+ 		encop.EncStdParam.mjpgParam.mjpg_restartInterval = 60;
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 9d6ae9e..0a23a2a 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -38,7 +38,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "  -x <output method> V4l2(0) or IPU lib(1) \n "\
+ 	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, \n "\
+ 	       "	4 - MPEG2, 5 - DIV3, 6 - RV, 7 - MJPG, \n "\
+-	       "        8 - AVS, 10 - VP6, 11 - VP8\n "\
++	       "        8 - AVS, 9 - VP8\n "\
+ 	       "	If no format specified, default is 0 (MPEG4) \n "\
+ 	       "  -l <mp4Class> 0 - MPEG4, 1 - DIVX 5.0 or higher, 2 - XVID, \n "\
+ 	       "        5 - DIVX4.0 \n "\
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index d9ca80f..ac81297 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -476,9 +476,6 @@ check_params(struct cmd_line *cmd, int op)
+ 	case STD_AVS:
+ 		info_msg("Format: STD_AVS\n");
+ 		break;
+-	case STD_VP6:
+-		info_msg("Format: STD_VP6\n");
+-		break;
+ 	case STD_VP8:
+ 		info_msg("Format: STD_VP8\n");
+ 		break;
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 2fcd1d2..aed09d5 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -155,6 +155,8 @@ struct cmd_line {
+ 	int dst_fd;
+ 	int width;
+ 	int height;
++	int enc_width;
++	int enc_height;
+ 	int loff;
+ 	int toff;
+ 	int format;
+-- 
+1.8.0
+

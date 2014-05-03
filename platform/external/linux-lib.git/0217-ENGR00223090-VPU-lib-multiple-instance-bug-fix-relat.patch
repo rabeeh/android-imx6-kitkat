@@ -1,0 +1,214 @@
+From 32682c614ea419c7fc988cec252ccc338b4f6aa3 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 5 Sep 2012 16:57:51 +0800
+Subject: [PATCH 217/249] ENGR00223090 VPU lib multiple instance bug fix
+ (related with ENGR00215039)
+
+VPU lib version 5.4.6
+
+Bug 1:
+Instance 0 was blocked in vpu_DecGetInitialInfo because sequence header
+in bs buffer was overwritten.
+
+Root cause:
+- vpu_GetVersionInfo API activated inst 0, but didn't update context to
+  registers (e.g. read pointer register). So inst 0 will reference
+  readptr of another inst in below case:
+  vpu_DecGetInitialInfo of inst 1 (update register with readptr of inst 1)
+  -> vpu_GetVersionInfo (swich to inst 0)
+  -> dec_fill_bsbuffer of inst 0 (reference register, but the
+  value was readptr of inst 1)
+
+- vpu_DecGetInitialInfo (inst 0) referenced read pointer of another inst,
+  so vpu_DecGetBitstreamBuffer returned a wrong size (much larger than
+  free space of bs buffer). dec_fill_bsbuffer filled the whole bs buffer
+  and wrapped around to fill the rest, thus overwrote the SPS. CnM still
+  has bug that FW can't quit seqinit if no SPS is found. So VPU was
+  blocked.
+
+Fix:
+  Use a reserved inst (MAX_NUM_INSTANCE) for
+  vpu_GetVersionInfo/vpu_SWReset
+
+Bug 2:
+vpu_DecOpen failed with RETCODE_NOT_INITIALIZED
+
+Root cause:
+vpu_DecOpen called isVpuInitialized when another inst called
+vpu_SWReset, which could reset BIT_CUR_PC
+
+Fix:
+  Protect isVpuInitialized with vpu_semap for
+  vpu_DecOpen/vpu_GetVersionInfo/vpu_EncOpen
+
+Other change:
+MAX_NUM_INSTANCE = 32 (instead of 8)
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_io.c   |  6 +-----
+ vpu/vpu_lib.c  | 33 ++++++++++++++++++++-------------
+ vpu/vpu_lib.h  |  4 ++--
+ vpu/vpu_util.c |  2 +-
+ 4 files changed, 24 insertions(+), 21 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index e58a2ef..eb248b3 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -72,8 +72,6 @@ static int vpu_active_num = 0;
+ unsigned int system_rev;
+ semaphore_t *vpu_semap;
+ vpu_mem_desc bit_work_addr;
+-vpu_mem_desc pic_para_addr;
+-vpu_mem_desc user_data_addr;
+ 
+ int _IOGetPhyMem(int which, vpu_mem_desc *buff);
+ 
+@@ -286,8 +284,6 @@ int IOSystemShutdown(void)
+ #else
+ 	IOFreeVirtMem(&bit_work_addr);
+ #endif
+-	IOFreeVirtMem(&pic_para_addr);
+-	IOFreeVirtMem(&user_data_addr);
+ 
+ 	if (munmap((void *)vpu_reg_base, BIT_REG_MARGIN) != 0)
+ 		err_msg("munmap failed\n");
+@@ -620,7 +616,7 @@ int IOPhyMemCheck(unsigned long phyaddr, const char *name)
+ 	}
+ 	/* borrow .size to pass back result. */
+ 	result = buff.size;
+-	dprintf(3, "memory phy: %s: %lx va:%lx %s phy memory",
++	dprintf(3, "memory phy: %s: %lx va:%lx %s phy memory\n",
+ 	     name, buff.phy_addr, buff.virt_uaddr, result ? "is" : "isn't");
+ #ifdef BUILD_FOR_ANDROID
+ 	if (result == false)
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index e07b942..ad72495 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -430,13 +430,14 @@ RetCode vpu_GetVersionInfo(vpu_versioninfo * verinfo)
+ 
+ 	ENTER_FUNC();
+ 
++	if (!LockVpu(vpu_semap))
++		return RETCODE_FAILURE_TIMEOUT;
++
+ 	if (!isVpuInitialized()) {
++		UnlockVpu(vpu_semap);
+ 		return RETCODE_NOT_INITIALIZED;
+ 	}
+ 
+-	if (!LockVpu(vpu_semap))
+-		return RETCODE_FAILURE_TIMEOUT;
+-
+ 	VpuWriteReg(RET_VER_NUM, 0);
+ 
+ 	BitIssueCommand(NULL, FIRMWARE_GET);
+@@ -516,10 +517,6 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 
+ 	ENTER_FUNC();
+ 
+-	if (!(cpu_is_mx6x() && pop->bitstreamFormat == STD_MJPG) && !isVpuInitialized()) {
+-		return RETCODE_NOT_INITIALIZED;
+-	}
+-
+ 	ret = CheckEncOpenParam(pop);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		return ret;
+@@ -528,6 +525,11 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
++	if (!(cpu_is_mx6x() && pop->bitstreamFormat == STD_MJPG) && !isVpuInitialized()) {
++		UnlockVpu(vpu_semap);
++		return RETCODE_NOT_INITIALIZED;
++	}
++
+ 	ret = GetCodecInstance(&pCodecInst);
+ 	if (ret == RETCODE_FAILURE) {
+ 		*pHandle = 0;
+@@ -659,6 +661,9 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	if (cpu_is_mx6x())
+ 		VpuWriteReg(GDI_WPROT_RGN_EN, 0);
+ 
++	info_msg("chromaInterleave %d, mapType %d, linear2TiledEnable %d\n",
++			pop->chromaInterleave, pop->mapType, pop->linear2TiledEnable);
++
+ 	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+@@ -2422,20 +2427,19 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 
+ 	ENTER_FUNC();
+ 
+-	if (!(cpu_is_mx6x() && pop->bitstreamFormat == STD_MJPG) && !isVpuInitialized())
+-		return RETCODE_NOT_INITIALIZED;
+-
+ 	ret = CheckDecOpenParam(pop);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		return ret;
+ 	}
+ 
+-	info_msg("bitstreamMode %d, chromaInterleave %d, mapType %d, tiled2LinearEnable %d\n",
+-			pop->bitstreamMode, pop->chromaInterleave, pop->mapType, pop->tiled2LinearEnable);
+-
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
++	if (!(cpu_is_mx6x() && pop->bitstreamFormat == STD_MJPG) && !isVpuInitialized()) {
++		UnlockVpu(vpu_semap);
++		return RETCODE_NOT_INITIALIZED;
++	}
++
+ 	ret = GetCodecInstance(&pCodecInst);
+ 	if (ret == RETCODE_FAILURE) {
+ 		*pHandle = 0;
+@@ -2616,6 +2620,9 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	pCodecInst->ctxRegs[CTX_BIT_FRAME_MEM_CTRL] =
+ 		    val | (pDecInfo->openParam.chromaInterleave << 2);
+ 
++	info_msg("bitstreamMode %d, chromaInterleave %d, mapType %d, tiled2LinearEnable %d\n",
++			pop->bitstreamMode, pop->chromaInterleave, pop->mapType, pop->tiled2LinearEnable);
++
+ 	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 66e98a5..6c6b898 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -50,7 +50,7 @@ typedef Uint32 VirtualAddress;
+ #define PRJ_CODA7541			0xF012
+ #define PRJ_CODA_960			0xF020
+ 
+-#define MAX_NUM_INSTANCE		8
++#define MAX_NUM_INSTANCE		32
+ 
+ #define DC_TABLE_INDEX0		    0
+ #define AC_TABLE_INDEX0		    1
+@@ -667,7 +667,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 5)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 6)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index e68161d..061eeeb 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -327,7 +327,7 @@ int SetDecWriteProtectRegions(CodecInst *inst)
+ 
+ void BitIssueCommand(CodecInst *pCodecInst, int cmd)
+ {
+-	int instIdx = 0, cdcMode = 0, auxMode = 0;
++	int instIdx = MAX_NUM_INSTANCE, cdcMode = 0, auxMode = 0;
+ 
+ 	LockVpuReg(vpu_semap);
+ 
+-- 
+1.8.0
+

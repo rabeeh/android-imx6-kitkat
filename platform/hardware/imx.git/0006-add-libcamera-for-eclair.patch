@@ -1,0 +1,626 @@
+From e8f0edad27af5ed174c896368137dbc2d3d50c9a Mon Sep 17 00:00:00 2001
+From: JasonHua <Jason.Hua@freescale.com>
+Date: Tue, 15 Dec 2009 17:42:31 +0800
+Subject: [PATCH 006/486] add libcamera for eclair
+
+Signed-off-by: Jason Hua <r65076@freescale.com>
+---
+ libcamera/Android.mk    |  50 ++++++++++++
+ libcamera/CameraHal.cpp | 213 ++++++++++++++++++++++++++----------------------
+ libcamera/CameraHal.h   |  55 +++++++------
+ 3 files changed, 195 insertions(+), 123 deletions(-)
+ create mode 100644 libcamera/Android.mk
+
+diff --git a/libcamera/Android.mk b/libcamera/Android.mk
+new file mode 100644
+index 0000000..f3fbbbc
+--- /dev/null
++++ b/libcamera/Android.mk
+@@ -0,0 +1,50 @@
++LOCAL_PATH:= $(call my-dir)
++
++include $(CLEAR_VARS)
++
++LOCAL_SRC_FILES:=               \
++    CameraHal.cpp
++
++LOCAL_CPPFLAGS += -DUSE_FSL_JPEG_ENC -DDUMP_CAPTURE_YUVxx -DCAPTURE_ONLY_TESTxx
++
++LOCAL_SHARED_LIBRARIES:= \
++    libui \
++    libutils \
++    libcutils \
++    libbinder \
++    libmedia \
++    libdl \
++    libc
++
++LOCAL_C_INCLUDES += \
++	kernel_imx/include \
++	frameworks/base/include/binder \
++	frameworks/base/include/ui \
++	frameworks/base/camera/libcameraservice
++
++ifeq ($(BOARD_CAMERA_NV12),true)
++    LOCAL_CPPFLAGS += -DRECORDING_FORMAT_NV12
++else
++    LOCAL_CPPFLAGS += -DRECORDING_FORMAT_YUV420
++endif
++
++ifeq ($(TARGET_BOARD_PLATFORM), imx51_3stack)
++    LOCAL_CPPFLAGS += -DIMX51_3STACK
++endif
++
++ifeq ($(HAVE_FSL_IMX_CODEC),true)
++LOCAL_SHARED_LIBRARIES += libfsl_jpeg_enc_arm11_elinux
++LOCAL_CPPFLAGS += -DUSE_FSL_JPEG_ENC -DDUMP_CAPTURE_YUVxx
++ifeq ($(PREBUILT_FSL_IMX_CODEC),true)	
++    LOCAL_C_INCLUDES += prebuilt/android-arm/fsl_imx_codec/ghdr	
++else
++    LOCAL_C_INCLUDES += external/fsl_imx_codec/fsl_mad_multimedia_codec/ghdr	
++endif
++endif	
++	
++LOCAL_MODULE:= libcamera
++
++LOCAL_CFLAGS += -fno-short-enums
++
++include $(BUILD_SHARED_LIBRARY)
++
+diff --git a/libcamera/CameraHal.cpp b/libcamera/CameraHal.cpp
+index b2e5683..d842037 100644
+--- a/libcamera/CameraHal.cpp
++++ b/libcamera/CameraHal.cpp
+@@ -32,19 +32,21 @@
+ 
+ #define FB_DEVICE               "/dev/graphics/fb0"
+ #define VIDEO_DEVICE        	"/dev/video0"
+-#define MIN_WIDTH           	208  
+-#define MIN_HEIGHT          	154 
++#define MIN_WIDTH           	176
++#define MIN_HEIGHT          	144
+ #define DISPLAY_WIDTH		480	//lcd width
+ #define DISPLAY_HEIGHT		640	//lcd height
+-#define PREVIEW_WIDTH	    	640	//default preview width
++#define PREVIEW_WIDTH	    	635	//default preview width
+ #define PREVIEW_HEIGHT	    	480	//default preview height
+ #define PREVIEW_FORMAT	    	"yuv422i"
+ #define PREVIEW_FRAMERATE   	30
+ #define PICTURE_WIDTH   	640 	//default picture width
+ #define PICTURE_HEIGHT  	480 	//default picture height
+ #define PICTURE_FROMAT		V4L2_PIX_FMT_YUV420	//default picture format
+-#define RECORDING_WIDTH   	352 	//default recording width
+-#define RECORDING_HEIGHT  	288 	//default recording height
++#define RECORDING_WIDTH_NORMAL  352 	//default recording width
++#define RECORDING_HEIGHT_NORMAL 288 	//default recording height
++#define RECORDING_WIDTH_LOW  	176 	//default recording width
++#define RECORDING_HEIGHT_LOW 	144 	//default recording height
+ #ifdef  RECORDING_FORMAT_NV12
+ #define RECORDING_FORMAT      	V4L2_PIX_FMT_NV12    //recording format
+ #else
+@@ -55,8 +57,8 @@
+ 
+ namespace android {
+ int CameraHal::camera_device = -1;
+-int CameraHal::g_sensor_width = PREVIEW_WIDTH;
+-int CameraHal::g_sensor_height = PREVIEW_HEIGHT;
++int CameraHal::g_sensor_width = 640;
++int CameraHal::g_sensor_height = 480;
+ int CameraHal::g_sensor_top = 0;
+ int CameraHal::g_sensor_left = 0;
+ int CameraHal::g_display_width = DISPLAY_WIDTH;
+@@ -68,6 +70,9 @@ int CameraHal::g_display_lcd = 0;
+ int CameraHal::g_capture_mode = 0;	//0:low resolution, 1:high resolution
+ int CameraHal::g_preview_width = PREVIEW_WIDTH;
+ int CameraHal::g_preview_height = PREVIEW_HEIGHT;
++int CameraHal::g_recording_width = RECORDING_WIDTH_NORMAL;
++int CameraHal::g_recording_height = RECORDING_HEIGHT_NORMAL;
++int CameraHal::g_recording_level = 1;	//1: CIF mode; 0: QCIF mode
+ 
+ //Camera Take Picture Parameter
+ int CameraHal::g_pic_width = PICTURE_WIDTH;
+@@ -100,19 +105,15 @@ CameraHal::CameraHal()
+                     doubledPreviewWidth(false),
+                     doubledPreviewHeight(false),
+                     mPreviewFrameSize(0),
+-                    mRawPictureCallback(0),
+-                    mJpegPictureCallback(0),
+ 		    mPreviewRunning(0),
+-                    mPictureCallbackCookie(0),
+-                    mPreviewCallback(0),
+-                    mPreviewCallbackCookie(0),
+ 		    mRecordFrameSize(0),
+-                    mRecordCallback(0),
+-                    mRecordCallbackCookie(0),
+ 		    mCurrentRecordFrame(0),
+ 		    mVideoHeap(0),
+-                    mAutoFocusCallback(0),
+-                    mAutoFocusCallbackCookie(0),
++                    mNotifyCb(0),
++                    mDataCb(0),
++                    mDataCbTimestamp(0),
++                    mCallbackCookie(0),
++                    mMsgEnabled(0),
+                     mCurrentPreviewFrame(0),
+ 		    nCameraBuffersQueued(0),
+ 		    mCameraOpened(0),
+@@ -343,10 +344,10 @@ int CameraHal::CameraRecordingConfig(int fd_v4l)
+ 
+         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	fmt.fmt.pix.pixelformat = RECORDING_FORMAT;
+-        fmt.fmt.pix.width = RECORDING_WIDTH;
+-        fmt.fmt.pix.height = RECORDING_HEIGHT;
++        fmt.fmt.pix.width = g_recording_width;
++        fmt.fmt.pix.height = g_recording_height;
+ 
+-	fmt.fmt.pix.bytesperline = RECORDING_WIDTH;
++	fmt.fmt.pix.bytesperline = g_recording_width;
+ 	fmt.fmt.pix.priv = 0;
+        	fmt.fmt.pix.sizeimage = 0;
+ 
+@@ -500,6 +501,35 @@ sp<IMemoryHeap> CameraHal::getRawHeap() const
+     return mRawHeap;
+ }
+ 
++void CameraHal::setCallbacks(notify_callback notify_cb,
++                                      data_callback data_cb,
++                                      data_callback_timestamp data_cb_timestamp,
++                                      void* user)
++{
++    Mutex::Autolock lock(mLock);
++    mNotifyCb = notify_cb;
++    mDataCb = data_cb;
++    mDataCbTimestamp = data_cb_timestamp;
++    mCallbackCookie = user;
++}
++
++void CameraHal::enableMsgType(int32_t msgType)
++{
++    Mutex::Autolock lock(mLock);
++    mMsgEnabled |= msgType;
++}
++
++void CameraHal::disableMsgType(int32_t msgType)
++{
++    Mutex::Autolock lock(mLock);
++    mMsgEnabled &= ~msgType;
++}
++
++bool CameraHal::msgTypeEnabled(int32_t msgType)
++{
++    Mutex::Autolock lock(mLock);
++    return (mMsgEnabled & msgType);
++}
+ 
+ // ---------------------------------------------------------------------------
+ 
+@@ -539,7 +569,7 @@ int CameraHal::recordThread()
+ 
+         //LOGD("recordThread: CurrentRecordFrame %d", mCurrentRecordFrame);
+        
+-	if(mRecordCallback){
++	if (mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) {
+         	int i;
+ 		nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+         	for(i = 0 ; i < videoBufferCount; i ++)
+@@ -556,7 +586,7 @@ int CameraHal::recordThread()
+ #endif
+                 		memcpy(mVideoBuffer[i]->pointer(),(void*)buffers[cfilledbuffer.index].start,mRecordFrameSize);
+                 		mVideoBufferUsing[i] = 1;
+-                		mRecordCallback(timeStamp, mVideoBuffer[i], mRecordCallbackCookie);
++				mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoBuffer[i], mCallbackCookie);
+                 		break;
+             		}else{
+                 		//LOGD("no Buffer can be used \n");
+@@ -605,15 +635,15 @@ status_t CameraHal::startPreview(preview_callback cb, void* user)
+     return NO_ERROR;
+ }
+ #else
+-status_t CameraHal::startPreview(preview_callback cb, void* user)
++status_t CameraHal::startPreview()
+ {
+     LOG_FUNCTION_NAME
+ 
+-    mPreviewCallback = cb;
+-    mPreviewCallbackCookie = user;
++    int width;
++    int height;
+ 
+     Mutex::Autolock lock(mLock);
+-    if (mPreviewThread != 0) {
++    if (mPreviewRunning != 0) {
+         // already running
+         return INVALID_OPERATION;
+     }
+@@ -637,14 +667,30 @@ if(mIsTakingPic == 0){
+     mParameters.getPreviewSize(&width, &height);
+     LOGI("Original Preview Width=%d Height=%d", width, height);
+ 
+-#ifdef IMX51_BBG
+-    mParameters.getPreviewSize(&g_preview_width, &g_preview_height);
+-    g_display_left = 15;
+-    g_display_top = (g_display_height - g_preview_height) / 2;
+-#else
+-    mParameters.getPreviewSize(&g_preview_height, &g_preview_width);
++    mParameters.getPreviewSize(&width, &height);
++    if( height < 288 ) {
++	g_recording_level = 0;
++	g_recording_width = RECORDING_WIDTH_LOW;
++	g_recording_height = RECORDING_HEIGHT_LOW;
++    } else {
++	g_recording_level = 1;
++	g_recording_width = RECORDING_WIDTH_NORMAL;
++	g_recording_height = RECORDING_HEIGHT_NORMAL;
++    }
++    LOGI("Recording width = %d, Recording height = %d", g_recording_width, g_recording_height);
++
++#ifdef IMX51_3STACK
++    //mParameters.getPreviewSize(&g_preview_height, &g_preview_width);
++    g_preview_height = PREVIEW_WIDTH;
++    g_preview_width = PREVIEW_HEIGHT;
+     g_display_top = 15;
+     g_display_left = (g_display_width - g_preview_width) / 2;
++#else
++    //mParameters.getPreviewSize(&g_preview_width, &g_preview_height);
++    g_preview_height = PREVIEW_HEIGHT;
++    g_preview_width = PREVIEW_WIDTH;
++    g_display_left = 45;
++    g_display_top = 0;
+ #endif
+ 
+     CameraPreviewConfig(camera_device);
+@@ -666,7 +712,7 @@ if(mIsTakingPic == 0){
+ 
+     previewStopped = false;
+     mPreviewRunning = true;
+-    mPreviewThread = new PreviewThread(this);
++
+     return NO_ERROR;
+ }
+ #endif
+@@ -711,7 +757,7 @@ void CameraHal::stopPreview()
+         previewStopped = true;
+     }
+ 
+-    if (mPreviewThread != 0) {
++    if (mPreviewRunning != 0) {
+ 
+         /* Turn off streaming */
+         int overlay = 0;
+@@ -721,27 +767,18 @@ void CameraHal::stopPreview()
+         }
+         LOGD("Turned off Viewfinder Mode\n");
+ 
+-if(mIsTakingPic == 0){
+-        CameraClose();
++        if(mIsTakingPic == 0){
++                CameraClose();
+ #ifdef DUMP_CAPTURE_YUV        
+-       fclose(capture_yuvFile);
+-       LOGD ("capture.yuv file closed!");
++               fclose(capture_yuvFile);
++               LOGD ("capture.yuv file closed!");
+ #endif
+-}
+-    }
++        }
+ 
+-    { // scope for the lock
+-        Mutex::Autolock lock(mLock);
+-        previewThread = mPreviewThread;
++        mPreviewRunning = 0;
+     }
+ 
+-    // don't hold the lock while waiting for the thread to quit
+-    if (previewThread != 0) {
+-        previewThread->requestExitAndWait();
+-    }
+ 
+-    Mutex::Autolock lock(mLock);
+-    mPreviewThread.clear();
+ 
+     singleton.clear();
+ }
+@@ -752,17 +789,15 @@ bool CameraHal::previewEnabled()
+     return (!previewStopped);
+ }
+ 
+-status_t CameraHal::startRecording(recording_callback cb, void* user)
++status_t CameraHal::startRecording()
+ {
+     LOG_FUNCTION_NAME 
+ 
+     if (mRecordThread != 0) {
++	LOGI("mRecordThread already exist!");
+         return INVALID_OPERATION;
+     }
+ 
+-    mRecordCallback = cb;
+-    mRecordCallbackCookie = user;
+-
+ #ifdef DUMP_CAPTURE_YUV
+     record_yuvFile = fopen("/sdcard/recording.yuv","wb");
+ #endif
+@@ -796,8 +831,7 @@ status_t CameraHal::startRecording(recording_callback cb, void* user)
+     mRecordFrameSize = fmt.fmt.pix.sizeimage;
+     LOGD("mRecordFrameSize = %d\n", mRecordFrameSize);
+ 
+-    if(mRecordCallback)
+-    {
++    if (mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) {
+         int i = 0;
+         LOGD("Clear the old memory ");
+         mVideoHeap.clear();
+@@ -878,9 +912,6 @@ void CameraHal::stopRecording()
+ 
+     Mutex::Autolock lock(mLock);
+     mRecordThread.clear();
+-
+-    mRecordCallback = NULL;
+-    mRecordCallbackCookie = NULL;
+ }
+ 
+ bool CameraHal::recordingEnabled()
+@@ -917,32 +948,26 @@ int CameraHal::autoFocusThread()
+ {
+     LOG_FUNCTION_NAME
+ 
+-    if (mAutoFocusCallback != NULL) {
+-        mAutoFocusCallback(true, mAutoFocusCallbackCookie);
+-        mAutoFocusCallback = NULL;
+-
+-    LOG_FUNCTION_NAME
++    if (mMsgEnabled & CAMERA_MSG_FOCUS)
++        mNotifyCb(CAMERA_MSG_FOCUS, true, 0, mCallbackCookie);
+ 
+-        return NO_ERROR;
+-    }
+     return UNKNOWN_ERROR;
+ }
+ 
+-status_t CameraHal::autoFocus(autofocus_callback af_cb,
+-                                       void *user)
++status_t CameraHal::autoFocus()
+ {
+     LOG_FUNCTION_NAME
+ 
+     Mutex::Autolock lock(mLock);
+ 
+-    if (mAutoFocusCallback != NULL) {
+-        return mAutoFocusCallback == af_cb ? NO_ERROR : INVALID_OPERATION;
+-    }
+-
+-    mAutoFocusCallback = af_cb;
+-    mAutoFocusCallbackCookie = user;
+     if (createThread(beginAutoFocusThread, this) == false)
+         return UNKNOWN_ERROR;
++
++    return NO_ERROR;
++}
++
++status_t CameraHal::cancelAutoFocus()
++{
+     return NO_ERROR;
+ }
+ 
+@@ -968,7 +993,10 @@ int CameraHal::pictureThread()
+     
+     LOG_FUNCTION_NAME
+ 
+-    if (mShutterCallback)
++    if (mMsgEnabled & CAMERA_MSG_SHUTTER) {
++	LOGI("CAMERA_MSG_SHUTTER");
++        mNotifyCb(CAMERA_MSG_SHUTTER, 0, 0, mCallbackCookie);
++    }
+ 
+     mParameters.setPictureSize(g_pic_width, g_pic_height);
+     mParameters.getPictureSize(&w, &h);
+@@ -1001,10 +1029,6 @@ int CameraHal::pictureThread()
+ 
+     LOGD("pictureThread: generated a picture");
+ 
+-    if (mJpegPictureCallback) {
+-        //LOGI("CameraHal::pictureThread buffer 0x%x,sizeimage %d",
+-        //    buf1,fmt.fmt.pix.sizeimage);      
+-
+ #ifdef DUMP_CAPTURE_YUV        
+        if(capture_yuvFile)
+        {
+@@ -1015,8 +1039,10 @@ int CameraHal::pictureThread()
+ 
+ #ifdef USE_FSL_JPEG_ENC
+         sp<MemoryBase> jpegMemBase = encodeImage((void*)buf1, fmt.fmt.pix.sizeimage);
+-        if (mJpegPictureCallback)
+-            mJpegPictureCallback(jpegMemBase, mPictureCallbackCookie);  
++        if (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE) {
++		LOGI("==========CAMERA_MSG_COMPRESSED_IMAGE");
++		mDataCb(CAMERA_MSG_COMPRESSED_IMAGE, jpegMemBase, mCallbackCookie);
++	}
+ 
+ #else
+         LOGI("CameraHal::pictureThread get default image");     
+@@ -1026,7 +1052,6 @@ int CameraHal::pictureThread()
+         if (mJpegPictureCallback)
+             mJpegPictureCallback(mem, mPictureCallbackCookie);
+ #endif
+-    }
+ 
+ exit0:
+     if (buf1)
+@@ -1035,10 +1060,7 @@ exit0:
+     return NO_ERROR;
+ }
+ 
+-status_t CameraHal::takePicture(shutter_callback shutter_cb,
+-                                         raw_callback raw_cb,
+-                                         jpeg_callback jpeg_cb,
+-                                         void* user)
++status_t CameraHal::takePicture()
+ {
+     LOG_FUNCTION_NAME
+ 
+@@ -1047,29 +1069,18 @@ status_t CameraHal::takePicture(shutter_callback shutter_cb,
+ 
+     stopPreview();
+ 
+-    mShutterCallback = shutter_cb;
+-    mRawPictureCallback = raw_cb;
+-    mJpegPictureCallback = jpeg_cb;
+-    mPictureCallbackCookie = user;
+     LOGD("Creating Picture Thread");
+     //##############################TODO use  thread
+-    //if (createThread(beginPictureThread, this) == false)
+-        //return -1;
+-
+-    pictureThread();
++    if (createThread(beginPictureThread, this) == false)
++        return -1;
+ 
+     return NO_ERROR;
+ }
+ 
+-status_t CameraHal::cancelPicture(bool cancel_shutter,
+-                                           bool cancel_raw,
+-                                           bool cancel_jpeg)
++status_t CameraHal::cancelPicture()
+ {
+     LOG_FUNCTION_NAME
+ 
+-    if (cancel_shutter) mShutterCallback = NULL;
+-    if (cancel_raw) mRawPictureCallback = NULL;
+-    if (cancel_jpeg) mJpegPictureCallback = NULL;
+     return NO_ERROR;
+ }
+ 
+@@ -1166,6 +1177,12 @@ CameraParameters CameraHal::getParameters() const
+     return params;
+ }
+ 
++status_t CameraHal::sendCommand(int32_t command, int32_t arg1,
++                                         int32_t arg2)
++{
++    return BAD_VALUE;
++}
++
+ void CameraHal::release()
+ {
+     LOG_FUNCTION_NAME
+diff --git a/libcamera/CameraHal.h b/libcamera/CameraHal.h
+index 239d637..14c0b4c 100644
+--- a/libcamera/CameraHal.h
++++ b/libcamera/CameraHal.h
+@@ -41,9 +41,8 @@
+ #include <sys/stat.h>
+ #include <utils/Log.h>
+ #include <utils/threads.h>
+-#include <utils/MemoryBase.h>
+-#include <utils/MemoryHeapBase.h>
+-#include <utils/threads.h>
++#include <binder/MemoryBase.h>
++#include <binder/MemoryHeapBase.h>
+ #include <ui/CameraHardwareInterface.h>
+ #include <ui/Overlay.h>
+ 
+@@ -65,28 +64,36 @@ public:
+     virtual sp<IMemoryHeap> getPreviewHeap() const;
+     virtual sp<IMemoryHeap> getRawHeap() const;
+ 
+-    virtual status_t    startPreview(preview_callback cb, void* user);
++    virtual void        setCallbacks(notify_callback notify_cb,
++                                     data_callback data_cb,
++                                     data_callback_timestamp data_cb_timestamp,
++                                     void* user);
++
++    virtual void        enableMsgType(int32_t msgType);
++    virtual void        disableMsgType(int32_t msgType);
++    virtual bool        msgTypeEnabled(int32_t msgType);
++
+     virtual bool        useOverlay() { return true; }
+     virtual status_t    setOverlay(const sp<Overlay> &overlay);
++
++    virtual status_t    startPreview();
+     virtual void        stopPreview();
+     virtual bool        previewEnabled();
+ 
+-    virtual status_t    startRecording(recording_callback cb, void* user);
++    virtual status_t    startRecording();
+     virtual void        stopRecording();
+     virtual bool        recordingEnabled();
+     virtual void        releaseRecordingFrame(const sp<IMemory>& mem);
+ 
+-    virtual status_t    autoFocus(autofocus_callback, void *user);
+-    virtual status_t    takePicture(shutter_callback,
+-                                    raw_callback,
+-                                    jpeg_callback,
+-                                    void* user);
+-    virtual status_t    cancelPicture(bool cancel_shutter,
+-                                      bool cancel_raw,
+-                                      bool cancel_jpeg);
++    virtual status_t    autoFocus();
++    virtual status_t    cancelAutoFocus();
++    virtual status_t    takePicture();
++    virtual status_t    cancelPicture();
+     virtual status_t    dump(int fd, const Vector<String16>& args) const;
+     virtual status_t    setParameters(const CameraParameters& params);
+     virtual CameraParameters  getParameters() const;
++    virtual status_t    sendCommand(int32_t command, int32_t arg1,
++                                    int32_t arg2);
+     virtual void release();
+ 
+     static sp<CameraHardwareInterface> createInstance();
+@@ -179,16 +186,16 @@ private:
+     bool                mPreviewRunning;
+     int                 mPreviewFrameSize;
+ 
+-    shutter_callback    mShutterCallback;
+-    raw_callback        mRawPictureCallback;
+-    jpeg_callback       mJpegPictureCallback;
+-    void                *mPictureCallbackCookie;
+-    
+     // protected by mLock
+     sp<Overlay>         mOverlay;
+     sp<PreviewThread>   mPreviewThread;
+-    preview_callback    mPreviewCallback;
+-    void                *mPreviewCallbackCookie;
++
++    notify_callback    mNotifyCb;
++    data_callback      mDataCb;
++    data_callback_timestamp mDataCbTimestamp;
++    void               *mCallbackCookie;
++
++    int32_t             mMsgEnabled;
+ 
+     bool                mCameraOpened;
+     bool                mIsTakingPic;;
+@@ -196,8 +203,6 @@ private:
+     sp<RecordThread>    mRecordThread;
+     int 		mRecordFrameSize;
+     bool                mRecordRunning;
+-    recording_callback  mRecordCallback;
+-    void                *mRecordCallbackCookie;
+     int                 mCurrentRecordFrame;
+     int 		nCameraBuffersQueued;
+    
+@@ -206,9 +211,6 @@ private:
+     sp<MemoryBase>      mVideoBuffer[videoBufferCount];
+     int   		mVideoBufferUsing[videoBufferCount];
+ 
+-    autofocus_callback  mAutoFocusCallback;
+-    void                *mAutoFocusCallbackCookie;
+-
+     // only used from PreviewThread
+     int                 mCurrentPreviewFrame;
+ 
+@@ -233,6 +235,9 @@ private:
+     static int g_display_lcd;
+     static int g_preview_width;
+     static int g_preview_height;
++    static int g_recording_width;
++    static int g_recording_height;
++    static int g_recording_level;
+ 
+     //used for taking picture
+     static int g_pic_width;
+-- 
+1.8.0
+

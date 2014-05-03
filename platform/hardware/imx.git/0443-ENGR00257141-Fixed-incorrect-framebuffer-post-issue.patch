@@ -1,0 +1,74 @@
+From 5ea5250ec3e251430a089452cc23881d81a6e59b Mon Sep 17 00:00:00 2001
+From: Xianzhong <b07117@freescale.com>
+Date: Thu, 4 Apr 2013 02:56:09 +0800
+Subject: [PATCH 443/486] ENGR00257141 Fixed incorrect framebuffer post issue
+
+Surfaceflinger will not call eglSwapBuffer to flip buffer
+when receive display blank signal,
+The same buffer will be posted and cause pan display failure as below:
+
+imx6.gralloc( 2360): FBIOPAN_DISPLAY failed: Invalid argument
+
+Signed-off-by: Xianzhong <b07117@freescale.com>
+---
+ mx6/hwcomposer/hwc_context.h   | 1 +
+ mx6/hwcomposer/hwc_display.cpp | 1 +
+ mx6/hwcomposer/hwcomposer.cpp  | 6 ++++--
+ 3 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/mx6/hwcomposer/hwc_context.h b/mx6/hwcomposer/hwc_context.h
+index 6100d64..73d72f2 100644
+--- a/mx6/hwcomposer/hwc_context.h
++++ b/mx6/hwcomposer/hwc_context.h
+@@ -66,6 +66,7 @@ typedef struct {
+     int yres;
+     int xdpi;
+     int ydpi;
++    int blank;
+ } displayInfo;
+ 
+ struct hwc_context_t {
+diff --git a/mx6/hwcomposer/hwc_display.cpp b/mx6/hwcomposer/hwc_display.cpp
+index 95c8949..c639d92 100644
+--- a/mx6/hwcomposer/hwc_display.cpp
++++ b/mx6/hwcomposer/hwc_display.cpp
+@@ -188,6 +188,7 @@ int hwc_get_framebuffer_info(displayInfo *pInfo)
+     pInfo->xdpi = 1000 * (info.xres * 25.4f) / info.width;
+     pInfo->ydpi = 1000 * (info.yres * 25.4f) / info.height;
+     pInfo->vsync_period  = 1000000000 / refreshRate;
++    pInfo->blank  = 1;
+ 
+     ALOGV("using\n"
+           "xres         = %d px\n"
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index e624f1d..4dc366c 100755
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -155,13 +155,13 @@ static int hwc_set(struct hwc_composer_device_1 *dev,
+         if(err) return err;
+     }
+ 
+-    if (primary_contents) {
++    if (primary_contents && ctx->mDispInfo[HWC_DISPLAY_PRIMARY].blank == 0) {
+         hwc_layer_1 *fbt = &primary_contents->hwLayers[primary_contents->numHwLayers - 1];
+         if(ctx->mFbDev[HWC_DISPLAY_PRIMARY] != NULL)
+         ctx->mFbDev[HWC_DISPLAY_PRIMARY]->post(ctx->mFbDev[HWC_DISPLAY_PRIMARY], fbt->handle);
+     }
+     
+-    if (external_contents) {
++    if (external_contents && ctx->mDispInfo[HWC_DISPLAY_EXTERNAL].blank == 0) {
+         hwc_layer_1 *fbt = &external_contents->hwLayers[external_contents->numHwLayers - 1];
+         if(ctx->mFbDev[HWC_DISPLAY_EXTERNAL] != NULL)
+         ctx->mFbDev[HWC_DISPLAY_EXTERNAL]->post(ctx->mFbDev[HWC_DISPLAY_EXTERNAL], fbt->handle);
+@@ -220,6 +220,8 @@ static int hwc_blank(struct hwc_composer_device_1 *dev, int disp, int blank)
+         ctx->m_viv_hwc->blank(ctx->m_viv_hwc, disp, blank);
+     }
+ 
++    ctx->mDispInfo[disp].blank = blank;
++
+     //HDMI need to keep unblank since audio need to be able to output
+     //through HDMI cable. Blank the HDMI will lost the HDMI clock
+     if (ctx->mDispInfo[disp].type !=  HWC_DISPLAY_HDMI) {
+-- 
+1.8.0
+

@@ -1,0 +1,142 @@
+From b293ad617884883e9d65d4e519bdd4d777989863 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Thu, 7 Mar 2013 15:31:27 +0800
+Subject: [PATCH 426/486] ENGR00242240 fix Video content freezes when do video
+ snapshot during recording.
+
+reason: capture stream thread handling jpeg encoding block the frame
+        which comes from driver.
+
+solution: capture stream thread should only receive one frame when appliction
+          requires it to do frame capture. And drops the following frames.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera2/CaptureStream.cpp  |  7 -------
+ mx6/libcamera2/RequestManager.cpp |  1 +
+ mx6/libcamera2/StreamAdapter.cpp  | 16 ++++++++++++++--
+ mx6/libcamera2/StreamAdapter.h    |  3 ++-
+ 4 files changed, 17 insertions(+), 10 deletions(-)
+
+diff --git a/mx6/libcamera2/CaptureStream.cpp b/mx6/libcamera2/CaptureStream.cpp
+index abfa4e2..e3de671 100755
+--- a/mx6/libcamera2/CaptureStream.cpp
++++ b/mx6/libcamera2/CaptureStream.cpp
+@@ -28,7 +28,6 @@ CaptureStream::CaptureStream(int id)
+     mVideoSnapShot = false;
+     mPhysMemAdapter = new PhysMemAdapter();
+     sem_init(&mRespondSem, 0, 0);
+-    mRequestStream = false;
+ }
+ 
+ CaptureStream::~CaptureStream()
+@@ -159,7 +158,6 @@ int CaptureStream::release()
+ 
+ void CaptureStream::applyRequest()
+ {
+-    mRequestStream = true;
+     sem_wait(&mRespondSem);
+ }
+ 
+@@ -167,10 +165,6 @@ int CaptureStream::processFrame(CameraFrame *frame)
+ {
+     status_t ret = NO_ERROR;
+ 
+-    if (mVideoSnapShot && !mRequestStream) {
+-        return ret;
+-    }
+-
+     StreamBuffer buffer;
+     ret = requestBuffer(&buffer);
+     if (ret != NO_ERROR) {
+@@ -194,7 +188,6 @@ int CaptureStream::processFrame(CameraFrame *frame)
+     }
+ 
+ exit_err:
+-    mRequestStream = false;
+     sem_post(&mRespondSem);
+ 
+     return ret;
+diff --git a/mx6/libcamera2/RequestManager.cpp b/mx6/libcamera2/RequestManager.cpp
+index 257a1c2..2f498d2 100755
+--- a/mx6/libcamera2/RequestManager.cpp
++++ b/mx6/libcamera2/RequestManager.cpp
+@@ -318,6 +318,7 @@ int RequestManager::tryRestartStreams(int requestType)
+             }
+         }
+ 
++        stream->enableReceiveFrame();
+         if (!stream->mStarted) {
+             res = stream->start();
+             if (res != NO_ERROR) {
+diff --git a/mx6/libcamera2/StreamAdapter.cpp b/mx6/libcamera2/StreamAdapter.cpp
+index 0442f2b..5dced50 100755
+--- a/mx6/libcamera2/StreamAdapter.cpp
++++ b/mx6/libcamera2/StreamAdapter.cpp
+@@ -19,7 +19,7 @@
+ 
+ StreamAdapter::StreamAdapter(int id)
+     : mPrepared(false), mStarted(false), mStreamId(id), mWidth(0), mHeight(0), mFormat(0), mUsage(0),
+-      mMaxProducerBuffers(0), mNativeWindow(NULL), mStreamState(STREAM_INVALID)
++      mMaxProducerBuffers(0), mNativeWindow(NULL), mStreamState(STREAM_INVALID), mReceiveFrame(true)
+ {
+     g2dHandle = NULL;
+     g2d_open(&g2dHandle);
+@@ -208,13 +208,25 @@ bool StreamAdapter::handleStream()
+     return shouldLive;
+ }
+ 
++void StreamAdapter::enableReceiveFrame()
++{
++    mReceiveFrame = true;
++}
++
+ void StreamAdapter::handleCameraFrame(CameraFrame *frame)
+ {
+     if (!frame || !frame->mBufHandle) {
+         FLOGI("%s invalid frame", __FUNCTION__);
+         return;
+     }
+-
++    //don't need receive camera frame.
++    if (!mReceiveFrame) {
++        return;
++    }
++    else if (mStreamId == STREAM_ID_JPEG) {
++        //captureStream should reveive one frame every time.
++        mReceiveFrame = false;
++    }
+     //the frame processed in StreamThread.
+     frame->addReference();
+     mThreadQueue.postMessage(new CMessage(STREAM_FRAME, (int)frame));
+diff --git a/mx6/libcamera2/StreamAdapter.h b/mx6/libcamera2/StreamAdapter.h
+index fd6f654..60d4de3 100755
+--- a/mx6/libcamera2/StreamAdapter.h
++++ b/mx6/libcamera2/StreamAdapter.h
+@@ -49,6 +49,7 @@ public:
+     virtual int release();
+     virtual int processFrame(CameraFrame *frame);
+     virtual void applyRequest();
++    void enableReceiveFrame();
+ 
+     void setDeviceAdapter(sp<DeviceAdapter>& device);
+     void setMetadaManager(sp<MetadaManager>& metaManager);
+@@ -121,6 +122,7 @@ protected:
+     mutable Mutex mMutexRespond;
+     mutable Condition mCondRespond;
+ 
++    bool mReceiveFrame;
+     // for debug.
+     bool mShowFps;
+     nsecs_t mTime1;
+@@ -181,7 +183,6 @@ private:
+     PhysMemAdapter *mPhysMemAdapter;
+     sp<JpegBuilder> mJpegBuilder;
+ 
+-    bool mRequestStream;
+     mutable sem_t mRespondSem;
+ };
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,414 @@
+From bc069f63f35076c1488208a64e3f72b6a7e7d87f Mon Sep 17 00:00:00 2001
+From: Liu Ying <b17645@freescale.com>
+Date: Mon, 13 Jul 2009 15:39:52 +0800
+Subject: [PATCH 114/435] ENGR00113878 v4l2 capture:Support DP alpha blending
+ unit test
+
+Add DP alpha blending feature with alpha value contained
+in separate channel for v4l2 overlay unit test.
+
+Signed-off-by: Liu Ying <b17645@freescale.com>
+(cherry picked from commit ad32bf141789509bf552e416c82cc62256e51ee8)
+---
+ test/mxc_v4l2_test/mxc_v4l2_overlay.c | 279 +++++++++++++++++++++++++---------
+ 1 file changed, 210 insertions(+), 69 deletions(-)
+
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_overlay.c b/test/mxc_v4l2_test/mxc_v4l2_overlay.c
+index ab83eb1..b606a6d 100644
+--- a/test/mxc_v4l2_test/mxc_v4l2_overlay.c
++++ b/test/mxc_v4l2_test/mxc_v4l2_overlay.c
+@@ -46,6 +46,7 @@ extern "C"{
+ #include <math.h>
+ #include <string.h>
+ #include <malloc.h>
++#include <signal.h>
+ 
+ #include <linux/mxcfb.h>
+ 
+@@ -84,6 +85,32 @@ int g_overlay = 0;
+ int g_camera_color = 0;
+ int g_camera_framerate = 30;
+ int g_capture_mode = 0;
++int g_alpha_mode = 0;
++char *alpha_buf = NULL;
++int alpha_buf_size = 0;
++int ctrl_c_rev = 0;
++
++void ctrl_c_handler(int signum, siginfo_t *info, void *myact)
++{
++	ctrl_c_rev = 1;
++	return;
++}
++
++/* fill in alpha value to a part of alpha buffer */
++void fill_alpha_buffer(char *alpha_buf, int left, int top,
++		       int right, int bottom, char alpha_val)
++{
++	char *pPointAlphaValue;
++	int x, y;
++
++	for (y = top; y < bottom; y++) {
++		for (x = left; x < right; x++) {
++			pPointAlphaValue = (char *)(alpha_buf +
++					    g_display_width * y + x);
++			*pPointAlphaValue = alpha_val;
++		}
++	}
++}
+ 
+ int
+ mxc_v4l_overlay_test(int timeout)
+@@ -92,6 +119,11 @@ mxc_v4l_overlay_test(int timeout)
+         int overlay = 1;
+         struct v4l2_control ctl;
+ 
++	/* The window shows graphics and video planes. */
++	if (g_alpha_mode)
++		fill_alpha_buffer(alpha_buf, 0, 0,
++			  g_display_width, g_display_height, 0x80);
++
+         if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0)
+         {
+                 printf("VIDIOC_OVERLAY start failed\n");
+@@ -109,6 +141,47 @@ mxc_v4l_overlay_test(int timeout)
+ 	            sleep(1);
+         }
+ 
++	if (g_alpha_mode) {
++		while (ctrl_c_rev == 0) {
++			/*
++			 * The middle quarter window shows
++			 * graphics and video planes.
++			 */
++			fill_alpha_buffer(alpha_buf,
++					  g_display_width/4,
++					  g_display_height/4,
++					  3*g_display_width/4,
++					  3*g_display_height/4,
++					  0x80);
++			sleep(5);
++
++			/*
++			 * The middle quarter window shows
++			 * video plane only.
++			 */
++			fill_alpha_buffer(alpha_buf,
++					  g_display_width/4,
++					  g_display_height/4,
++					  3*g_display_width/4,
++					  3*g_display_height/4,
++					  0x00);
++			sleep(5);
++
++			/*
++			 * The middle quarter window shows
++			 * video plane only.
++			 */
++			fill_alpha_buffer(alpha_buf,
++					  g_display_width/4,
++					  g_display_height/4,
++					  3*g_display_width/4,
++					  3*g_display_height/4,
++					  0xFF);
++			sleep(5);
++		}
++		goto out;
++	}
++
+         if (g_camera_color == 1) {
+                 ctl.id = V4L2_CID_BRIGHTNESS;
+                 for (i = 0; i < 0xff; i+=0x20) {
+@@ -157,13 +230,17 @@ mxc_v4l_overlay_test(int timeout)
+         else {
+ 		        sleep(timeout);
+         }
+-
++out:
+         overlay = 0;
+         if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0)
+         {
+                 printf("VIDIOC_OVERLAY stop failed\n");
+ 		return TFAIL;
+         }
++
++	if (g_alpha_mode)
++		munmap((void *)alpha_buf, alpha_buf_size);
++
+ 	return 0;
+ }
+ 
+@@ -294,6 +371,9 @@ int process_cmdline(int argc, char **argv)
+ 		else if (strcmp(argv[i], "-m") == 0) {
+ 			g_capture_mode = atoi(argv[++i]);
+ 		}
++		else if (strcmp(argv[i], "-a") == 0) {
++			g_alpha_mode = atoi(argv[++i]);
++		}
+                 else if (strcmp(argv[i], "-help") == 0) {
+                         printf("MXC Video4Linux overlay Device Test\n\n" \
+                                " -iw <input width>\n -ih <input height>\n" \
+@@ -305,6 +385,7 @@ int process_cmdline(int argc, char **argv)
+                                " -v <camera color> 1-brightness 2-saturation"
+                                " 3-red 4-blue 5-black balance\n"\
+ 			       " -m <capture mode> 0-low resolution 1-high resolution\n" \
++			       " -a <alpha mode> 0-global alpha blending 1-local alpha blending\n" \
+ 			       " -fr <frame rate> 30fps by default\n" \
+                                " -fg foreground mode when -fg specified,"
+                                " otherwise go to frame buffer\n");
+@@ -326,24 +407,37 @@ main(int argc, char **argv)
+ {
+         struct v4l2_format fmt;
+         struct v4l2_framebuffer fb_v4l2;
+-        char fb_device[100] = "/dev/fb0";
+-        int fd_fb = 0;
+-        struct fb_fix_screeninfo fix;
+-        struct fb_var_screeninfo var;
++        char fb_device_0[100] = "/dev/fb0";
++        char fb_device_2[100] = "/dev/fb2";
++        int fd_fb_0 = 0, fd_fb_2 = 0;
++        struct fb_fix_screeninfo fb0_fix;
++        struct fb_var_screeninfo fb0_var, fb2_var;
+         struct mxcfb_color_key color_key;
+-        struct mxcfb_gbl_alpha alpha;
+-        unsigned short * fb0;
+-        unsigned char * cur_fb8;
+-        unsigned short * cur_fb16;
+-        unsigned int * cur_fb32;
+-        __u32 screen_size;
+-        int h, w;
++        struct mxcfb_gbl_alpha g_alpha;
++        struct mxcfb_loc_alpha l_alpha;
++	unsigned long loc_alpha_phy_addr;
+ 	int ret = 0;
++	struct sigaction act;
++
++	/* for ctrl-c */
++	sigemptyset(&act.sa_mask);
++	act.sa_flags = SA_SIGINFO;
++	act.sa_sigaction = ctrl_c_handler;
++
++	if((ret = sigaction(SIGINT, &act, NULL)) < 0) {
++		printf("install sigal error\n");
++		return TFAIL;
++	}
+ 
+         if (process_cmdline(argc, argv) < 0) {
+                 return TFAIL;
+         }
+ 
++	if (!g_overlay && g_alpha_mode) {
++                printf("Do not support DP local alpha blending on BG\n");
++                return TFAIL;
++        }
++
+         if ((fd_v4l = open(v4l_device, O_RDWR, 0)) < 0) {
+                 printf("Unable to open %s\n", v4l_device);
+                 return TFAIL;
+@@ -362,100 +456,147 @@ main(int argc, char **argv)
+ 
+         memset(&fb_v4l2, 0, sizeof(fb_v4l2));
+ 
+-        if ((fd_fb = open(fb_device, O_RDWR )) < 0)	{
+-                printf("Unable to open frame buffer\n");
++        if ((fd_fb_0 = open(fb_device_0, O_RDWR )) < 0)	{
++		printf("Unable to open frame buffer 0\n");
+                 return TFAIL;
+         }
+ 
+-        if (ioctl(fd_fb, FBIOGET_VSCREENINFO, &var) < 0) {
+-                close(fd_fb);
++        if (ioctl(fd_fb_0, FBIOGET_VSCREENINFO, &fb0_var) < 0) {
++                close(fd_fb_0);
+                 return TFAIL;
+         }
+-        if (ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix) < 0) {
+-                close(fd_fb);
++        if (ioctl(fd_fb_0, FBIOGET_FSCREENINFO, &fb0_fix) < 0) {
++                close(fd_fb_0);
+                 return TFAIL;
+         }
+ 
++	if ((fd_fb_2 = open(fb_device_2, O_RDWR)) < 0) {
++		printf("Unable to open frame buffer 2\n");
++		return TFAIL;
++	}
++
+         if (!g_overlay) {
+-                fb_v4l2.fmt.width = var.xres;
+-                fb_v4l2.fmt.height = var.yres;
+-                if (var.bits_per_pixel == 32) {
++	        g_alpha.alpha = 255;
++	        g_alpha.enable = 1;
++	        if (ioctl(fd_fb_0, MXCFB_SET_GBL_ALPHA, &g_alpha) < 0) {
++			printf("Set global alpha failed\n");
++			close(fd_fb_2);
++			close(fd_fb_0);
++                        return TFAIL;
++	        }
++
++		fb_v4l2.fmt.width = fb0_var.xres;
++		fb_v4l2.fmt.height = fb0_var.yres;
++
++                if (fb0_var.bits_per_pixel == 32) {
+                         fb_v4l2.fmt.pixelformat = IPU_PIX_FMT_BGR32;
+                         fb_v4l2.fmt.bytesperline = 4 * fb_v4l2.fmt.width;
+                 }
+-                else if (var.bits_per_pixel == 24) {
++                else if (fb0_var.bits_per_pixel == 24) {
+                         fb_v4l2.fmt.pixelformat = IPU_PIX_FMT_BGR24;
+                         fb_v4l2.fmt.bytesperline = 3 * fb_v4l2.fmt.width;
+                 }
+-                else if (var.bits_per_pixel == 16) {
++                else if (fb0_var.bits_per_pixel == 16) {
+                         fb_v4l2.fmt.pixelformat = IPU_PIX_FMT_RGB565;
+                         fb_v4l2.fmt.bytesperline = 2 * fb_v4l2.fmt.width;
+                 }
+ 
+                 fb_v4l2.flags = V4L2_FBUF_FLAG_PRIMARY;
+-                fb_v4l2.base = (void *) fix.smem_start;
++                fb_v4l2.base = (void *) fb0_fix.smem_start;
+         } else {
++		l_alpha.enable = 0;
++		if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALPHA, &l_alpha) < 0) {
++			printf("Set local alpha failed\n");
++			close(fd_fb_2);
++			close(fd_fb_0);
++			return TFAIL;
++		}
+ 
+-	        alpha.alpha = 255;
+-	        alpha.enable = 1;
+-	        if ( ioctl(fd_fb, MXCFB_SET_GBL_ALPHA, &alpha) < 0) {
+-                        close(fd_fb);
++	        g_alpha.alpha = 0;
++	        g_alpha.enable = 1;
++	        if (ioctl(fd_fb_0, MXCFB_SET_GBL_ALPHA, &g_alpha) < 0) {
++			printf("Set global alpha failed\n");
++			close(fd_fb_2);
++			close(fd_fb_0);
+                         return TFAIL;
+ 	        }
+ 
+ 	        color_key.color_key = 0x00080808;
+-	        color_key.enable = 1;
+-	        if ( ioctl(fd_fb, MXCFB_SET_CLR_KEY, &color_key) < 0) {
+-                        close(fd_fb);
+-                        return TFAIL;
+-	        }
+-
+-	        screen_size = var.yres * fix.line_length;
+-
+-	        /* Map the device to memory*/
+-	        fb0 = (unsigned short *)mmap(0, screen_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_fb, 0);
+-	        if ((int)fb0 == -1)
+-	        {
+-	                printf("\nError: failed to map framebuffer device 0 to memory.\n");
+-                        close(fd_fb);
++	        color_key.enable = 0;
++	        if (ioctl(fd_fb_0, MXCFB_SET_CLR_KEY, &color_key) < 0) {
++			printf("Set color key failed\n");
++			close(fd_fb_2);
++                        close(fd_fb_0);
+                         return TFAIL;
+ 	        }
+ 
++		if (g_alpha_mode) {
++			if (ioctl(fd_fb_2, FBIOGET_VSCREENINFO,
++				  &fb2_var) < 0) {
++				printf("Get var of fb2 failed\n");
++				close(fd_fb_2);
++				close(fd_fb_0);
++				return TFAIL;
++			}
++
++			fb2_var.xres = g_display_width;
++			fb2_var.yres = g_display_height;
++			fb2_var.xres_virtual = g_display_width;
++			fb2_var.yres_virtual = g_display_height*2;
++			if (ioctl(fd_fb_2, FBIOPUT_VSCREENINFO,
++				  &fb2_var) < 0) {
++				printf("Put var of fb2 failed\n");
++				close(fd_fb_2);
++				close(fd_fb_0);
++				return TFAIL;
++			}
++
++			if (ioctl(fd_fb_2, FBIOGET_VSCREENINFO,
++				  &fb2_var) < 0) {
++				printf("Get var of fb2 failed\n");
++				close(fd_fb_2);
++				close(fd_fb_0);
++				return TFAIL;
++			}
++
++			l_alpha.enable = 1;
++			l_alpha.alpha_phy_addr = 0;
++			if (ioctl(fd_fb_2, MXCFB_SET_LOC_ALPHA,
++				  &l_alpha) < 0) {
++				printf("Set local alpha failed\n");
++				close(fd_fb_2);
++				close(fd_fb_0);
++				return TFAIL;
++			}
++			loc_alpha_phy_addr =
++				(unsigned long)(l_alpha.alpha_phy_addr);
++
++			alpha_buf_size = fb2_var.xres * fb2_var.yres;
++
++			alpha_buf = (char *)mmap(0, alpha_buf_size,
++						 PROT_READ | PROT_WRITE,
++						 MAP_SHARED, fd_fb_2,
++						 loc_alpha_phy_addr);
++			if ((int)alpha_buf == -1) {
++				printf("\nError: failed to map alpha buffer"
++				       " to memory.\n");
++				close(fd_fb_2);
++				close(fd_fb_0);
++				return TFAIL;
++			}
++		}
+ 
+-	        if (var.bits_per_pixel == 16) {
+-	                for (h = g_display_top; h < (g_display_height + g_display_top); h++) {
+-	                        cur_fb16 = (unsigned short *)((__u32)fb0 + h*fix.line_length);
+-	                        for (w = g_display_left; w < g_display_width + g_display_left; w++) {
+-	                                cur_fb16[w] = 0x0841;
+-	                        }
+-	                }
+-	        }
+-	        else if (var.bits_per_pixel == 24) {
+-	                for (h = g_display_top; h < (g_display_height + g_display_top); h++) {
+-	                        cur_fb8 = (unsigned char *)((__u32)fb0 + h*fix.line_length);
+-	                        for (w = g_display_left; w < g_display_width + g_display_left; w++) {
+-	                                *cur_fb8++ = 8;
+-	                                *cur_fb8++ = 8;
+-	                                *cur_fb8++ = 8;
+-	                        }
+-	                }
+-	        }
+-	        else if (var.bits_per_pixel == 32) {
+-	                for (h = g_display_top; h < (g_display_height + g_display_top); h++) {
+-	                        cur_fb32 = (unsigned int *)((__u32)fb0 + h*fix.line_length);
+-	                        for (w = g_display_left; w < g_display_width + g_display_left; w++) {
+-	                                cur_fb32[w] = 0x00080808;
+-	                        }
+-	                }
+-	        }
+                 if (ioctl(fd_v4l, VIDIOC_G_FBUF, &fb_v4l2) < 0) {
+                         printf("Get framebuffer failed\n");
++			close(fd_fb_2);
++			close(fd_fb_0);
+                         return TFAIL;
+                 }
+                 fb_v4l2.flags = V4L2_FBUF_FLAG_OVERLAY;
+         }
+ 
+-        close(fd_fb);
++	close(fd_fb_0);
++	close(fd_fb_2);
+ 
+         if (ioctl(fd_v4l, VIDIOC_S_FBUF, &fb_v4l2) < 0)
+         {
+-- 
+1.8.0
+

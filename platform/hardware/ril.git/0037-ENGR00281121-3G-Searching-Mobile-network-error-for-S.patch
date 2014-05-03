@@ -1,0 +1,444 @@
+From bf45960997f9b8c83e6378c279d6bf352386d5d5 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Tue, 22 Oct 2013 11:37:08 +0800
+Subject: [PATCH 37/38] ENGR00281121 3G: Searching Mobile network error for
+ SIM card
+
+Add function to handle RIL_REQUEST_QUERY_AVAILABLE_NETWORKS
+and RIL_REQUEST_SET_NETWORK_SELECTION_MANUAL, and
+RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC as the patch from
+https://groups.google.com/forum/#!msg/android-x86/
+zEPIfsQAuYg/QTDANlthKo0J
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ reference-ril/at_tok.c        |  23 ++++
+ reference-ril/at_tok.h        |   1 +
+ reference-ril/misc.c          |  58 ++++++++++
+ reference-ril/misc.h          |   7 ++
+ reference-ril/reference-ril.c | 256 +++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 341 insertions(+), 4 deletions(-)
+
+diff --git a/reference-ril/at_tok.c b/reference-ril/at_tok.c
+index 204a69e..8cc2161 100644
+--- a/reference-ril/at_tok.c
++++ b/reference-ril/at_tok.c
+@@ -14,12 +14,35 @@
+ ** See the License for the specific language governing permissions and
+ ** limitations under the License.
+ */
++/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
+ 
+ #include "at_tok.h"
+ #include <string.h>
+ #include <ctype.h>
+ #include <stdlib.h>
+ 
++
++/** *p_out returns count of given character (needle) in given string (p_in). */
++int at_tok_charcounter(char *p_in, char needle, int *p_out)
++{
++    char *p_cur = p_in;
++    int num_found = 0;
++
++    if (p_in == NULL)
++        return -1;
++
++    while (*p_cur != '\0') {
++        if (*p_cur == needle) {
++            num_found++;
++        }
++
++        p_cur++;
++    }
++
++    *p_out = num_found;
++    return 0;
++}
++
+ /**
+  * Starts tokenizing an AT response string
+  * returns -1 if this is not a valid response string, 0 on success.
+diff --git a/reference-ril/at_tok.h b/reference-ril/at_tok.h
+index a85ea63..42f3dc2 100644
+--- a/reference-ril/at_tok.h
++++ b/reference-ril/at_tok.h
+@@ -18,6 +18,7 @@
+ #ifndef AT_TOK_H
+ #define AT_TOK_H 1
+ 
++int at_tok_charcounter(char *p_in, char needle, int *p_out);
+ int at_tok_start(char **p_cur);
+ int at_tok_nextint(char **p_cur, int *p_out);
+ int at_tok_nexthexint(char **p_cur, int *p_out);
+diff --git a/reference-ril/misc.c b/reference-ril/misc.c
+index 652e08b..83d3a9d 100644
+--- a/reference-ril/misc.c
++++ b/reference-ril/misc.c
+@@ -26,6 +26,64 @@
+ #undef LOG_TAG
+ #define LOG_TAG "RILD"
+ #include <utils/Log.h>
++
++
++/**
++ * Very simple function that extract and returns whats between ElementBeginTag
++ * and ElementEndTag.
++ *
++ * Optional ppszRemainingDocument that can return a pointer to the remaining
++ * of the document to be "scanned". This can be used if subsequent
++ * scanning/searching is desired.
++ *
++ * This function is used to extract the parameters from the XML result
++ * returned by U3xx during a PDP Context setup, and used to parse the
++ * tuples of operators returned from AT+COPS.
++ *
++ *  const char* document        - Document to be scanned
++ *  const char* elementBeginTag - Begin tag to scan for, return whats
++ *                                between begin/end tags
++ *  const char* elementEndTag   - End tag to scan for, return whats
++ *                                between begin/end tags
++ *  char** remainingDocumen t   - Can return the a pointer to the remaining
++ *                                of pszDocument, this parameter is optional
++ *
++ *  return char* containing whats between begin/end tags, allocated on the
++ *               heap, need to free this.
++ *               return NULL if nothing is found.
++ */
++char *getFirstElementValue(const char *document,
++                           const char *elementBeginTag,
++                           const char *elementEndTag,
++                           char **remainingDocument)
++{
++    char *value = NULL;
++    char *start = NULL;
++    char *end = NULL;
++
++    if (document != NULL && elementBeginTag != NULL
++        && elementEndTag != NULL) {
++        start = strstr(document, elementBeginTag);
++        if (start != NULL) {
++            end = strstr(start, elementEndTag);
++            if (end != NULL) {
++                int n = strlen(elementBeginTag);
++                int m = end - (start + n);
++                value = (char *) malloc((m + 1) * sizeof(char));
++                strncpy(value, (start + n), m);
++                value[m] = (char) 0;
++
++                /* Optional, return a pointer to the remaining document,
++                   to be used when document contains many tags with same name. */
++                if (remainingDocument != NULL)
++                    *remainingDocument = end + strlen(elementEndTag);
++            }
++        }
++    }
++    return value;
++}
++
++
+ /** returns 1 if line starts with prefix, 0 if it does not */
+ int strStartsWith(const char *line, const char *prefix)
+ {
+diff --git a/reference-ril/misc.h b/reference-ril/misc.h
+index 22abb63..42d85ec 100644
+--- a/reference-ril/misc.h
++++ b/reference-ril/misc.h
+@@ -49,6 +49,13 @@ int binaryToString(const unsigned char *binary,
+                    char *string);
+ 
+ char char2nib(char c);
++
++
++char *getFirstElementValue(const char *document,
++                           const char *elementBeginTag,
++                           const char *elementEndTag,
++                           char **remainingDocument);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 67fd765..8307c1a 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -2988,6 +2988,246 @@ error:
+     goto finally;
+ }
+ 
++/**
++ * RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC
++ *
++ * Specify that the network should be selected automatically.
++ */
++void requestSetNetworkSelectionAutomatic(void *data, size_t datalen,
++                                         RIL_Token t)
++{
++    int err = 0;
++
++    err = at_send_command("AT+COPS=0", NULL);
++    if (err < 0)
++        goto error;
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
++    return;
++
++error:
++    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
++    return;
++}
++
++/**
++ * RIL_REQUEST_SET_NETWORK_SELECTION_MANUAL
++ *
++ * Manually select a specified network.
++ *
++ * The radio baseband/RIL implementation will try to camp on the manually
++ * selected network regardless of coverage, i.e. there is no fallback to
++ * automatic network selection.
++ */
++void requestSetNetworkSelectionManual(void *data, size_t datalen,
++                                      RIL_Token t)
++{
++    /*
++     * AT+COPS=[<mode>[,<format>[,<oper>[,<AcT>]]]]
++     *    <mode>   = 1 = Manual (<oper> field shall be present and AcT
++     *                   optionally)
++     *    <format> = 2 = Numeric <oper>, the number has structure:
++     *                   (country code digit 3)(country code digit 2)
++     *                   (country code digit 1)(network code digit 2)
++     *                   (network code digit 1)
++     */
++
++    int err = 0;
++    char *cmd = NULL;
++    ATResponse *atresponse = NULL;
++    const char *mccMnc = (const char *) data;
++
++    /* Check inparameter. */
++    if (mccMnc == NULL)
++        goto error;
++    /* Build and send command. */
++    asprintf(&cmd, "AT+COPS=1,2,\"%s\"", mccMnc);
++    err = at_send_command(cmd, &atresponse);
++    if (err < 0 || atresponse->success == 0)
++        goto error;
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
++finally:
++
++    at_response_free(atresponse);
++
++    if (cmd != NULL)
++        free(cmd);
++
++    return;
++
++error:
++    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
++    goto finally;
++}
++
++/*
++ * The parameters of the response to RIL_REQUEST_QUERY_AVAILABLE_NETWORKS are
++ * defined in ril.h
++ */
++#define QUERY_NW_NUM_PARAMS 4
++
++/**
++ * RIL_REQUEST_QUERY_AVAILABLE_NETWORKS
++ *
++ * Scans for available networks.
++ */
++void requestQueryAvailableNetworks(void *data, size_t datalen, RIL_Token t)
++{
++    /*
++     * AT+COPS=?
++     *   +COPS: [list of supported (<stat>,long alphanumeric <oper>
++     *           ,short alphanumeric <oper>,numeric <oper>[,<AcT>])s]
++     *          [,,(list of supported <mode>s),(list of supported <format>s)]
++     *
++     *   <stat>
++     *     0 = unknown
++     *     1 = available
++     *     2 = current
++     *     3 = forbidden
++     */
++
++    int err = 0;
++    ATResponse *atresponse = NULL;
++    const char *statusTable[] =
++    { "unknown", "available", "current", "forbidden" };
++    char **responseArray = NULL;
++    char *p;
++    int n = 0, i = 0, j = 0, numStoredNetworks = 0;
++    char *s = NULL;
++
++    err = at_send_command_multiline("AT+COPS=?", "+COPS:",
++                                                 &atresponse);
++    if (err < 0 ||
++        atresponse->success == 0 || atresponse->p_intermediates == NULL)
++        goto error;
++
++    p = atresponse->p_intermediates->line;
++
++    /* count number of '('. */
++    err = at_tok_charcounter(p, '(', &n);
++    if (err < 0) goto error;
++
++    /* Allocate array of strings, blocks of 4 strings. */
++    n = n / 3;
++    responseArray = alloca(n * QUERY_NW_NUM_PARAMS * sizeof(char *));
++
++    /* Loop and collect response information into the response array. */
++    for (i = 0; i < n; i++) {
++        int status = 0;
++        char *line = NULL;
++        char *longAlphaNumeric = NULL;
++        char *shortAlphaNumeric = NULL;
++        char *numeric = NULL;
++        char *remaining = NULL;
++        int continueOuterLoop = 0;
++
++        s = line = getFirstElementValue(p, "(", ")", &remaining);
++        p = remaining;
++
++        if (line == NULL) {
++            LOGE("Null pointer while parsing COPS response. This should not "
++                 "happen.");
++            goto error;
++        }
++        /* <stat> */
++        err = at_tok_nextint(&line, &status);
++        if (err < 0)
++            goto error;
++
++        /* long alphanumeric <oper> */
++        err = at_tok_nextstr(&line, &longAlphaNumeric);
++        if (err < 0)
++            goto error;
++
++        /* short alphanumeric <oper> */
++        err = at_tok_nextstr(&line, &shortAlphaNumeric);
++        if (err < 0)
++            goto error;
++
++        /* numeric <oper> */
++        err = at_tok_nextstr(&line, &numeric);
++        if (err < 0)
++            goto error;
++
++        /*
++         * The response of AT+COPS=? returns GSM networks and WCDMA networks as
++         * separate network search hits. The RIL API does not support network
++         * type parameter and the RIL must prevent duplicates.
++         */
++        for (j = numStoredNetworks - 1; j >= 0; j--)
++            if (strcmp(responseArray[j * QUERY_NW_NUM_PARAMS + 2],
++                       numeric) == 0) {
++                LOGI("%s(): Skipped storing duplicate operator: %s.",
++                     __func__, longAlphaNumeric);
++                continueOuterLoop = 1;
++                break;
++            }
++
++        if (continueOuterLoop) {
++            free(s);
++            s = NULL;
++            continue; /* Skip storing this duplicate operator */
++        }
++
++        responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 0] =
++            alloca(strlen(longAlphaNumeric) + 1);
++        strcpy(responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 0],
++                             longAlphaNumeric);
++
++        responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 1] =
++            alloca(strlen(shortAlphaNumeric) + 1);
++        strcpy(responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 1],
++                             shortAlphaNumeric);
++
++        responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 2] =
++            alloca(strlen(numeric) + 1);
++        strcpy(responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 2],
++               numeric);
++
++        /* Add status */
++        responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 3] =
++            alloca(strlen(statusTable[status]) + 1);
++        sprintf(responseArray[numStoredNetworks * QUERY_NW_NUM_PARAMS + 3],
++                "%s", statusTable[status]);
++
++        numStoredNetworks++;
++        free(s);
++        s = NULL;
++
++        /* bypass the mode and format list   */
++        s = line = getFirstElementValue(p, "(", ")", &remaining);
++        if (line == NULL) {
++            LOGE("Null pointer while parsing COPS response. This should not "
++                 "happen.");
++            break;
++        }
++        free(s);
++        s = NULL;
++
++        s = line = getFirstElementValue(p, "(", ")", &remaining);
++        if (line == NULL) {
++            LOGE("Null pointer while parsing COPS response. This should not "
++                 "happen.");
++            break;
++        }
++        free(s);
++        s = NULL;
++    }
++
++    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseArray, numStoredNetworks *
++                          QUERY_NW_NUM_PARAMS * sizeof(char *));
++
++finally:
++    at_response_free(atresponse);
++    return;
++
++error:
++    free(s);
++    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
++    goto finally;
++}
++
+ 
+ /*** Callback methods from the RIL library to us ***/
+ 
+@@ -3229,10 +3469,6 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
+             at_response_free(p_response);
+             break;
+ 
+-        case RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC:
+-            at_send_command("AT+COPS=0", NULL);
+-            break;
+-
+         case RIL_REQUEST_DATA_CALL_LIST:
+             requestDataCallList(data, datalen, t);
+             break;
+@@ -3421,6 +3657,18 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
+             requestSetCellInfoListRate(data, datalen, t);
+             break;
+ 
++        case RIL_REQUEST_SET_NETWORK_SELECTION_MANUAL:
++            requestSetNetworkSelectionManual(data, datalen, t);
++            break;
++
++        case RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC:
++            requestSetNetworkSelectionAutomatic(data, datalen, t);
++            break;
++
++        case RIL_REQUEST_QUERY_AVAILABLE_NETWORKS:
++            requestQueryAvailableNetworks(data, datalen, t);
++            break;
++
+         default:
+             RLOGD("Request not supported. Tech: %d",TECH(sMdmInfo));
+             RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
+-- 
+1.8.0
+

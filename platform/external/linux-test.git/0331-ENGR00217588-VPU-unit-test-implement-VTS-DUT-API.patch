@@ -1,0 +1,845 @@
+From c1399aeba9ae352ec76d8c6c47f4d0d30044ef58 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Thu, 19 Jul 2012 09:47:57 +0800
+Subject: [PATCH 331/435] ENGR00217588 VPU unit test: implement VTS DUT API
+
+Implement VTS DUT API to build lib_vpu_dut.so for VTS VPU testing
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/Makefile_dut     |  35 +++++++
+ test/mxc_vpu_test/dec.c            |  59 ++++++++++-
+ test/mxc_vpu_test/dut_api_vts.h    | 210 +++++++++++++++++++++++++++++++++++++
+ test/mxc_vpu_test/dut_probes_vts.h | 131 +++++++++++++++++++++++
+ test/mxc_vpu_test/main.c           | 158 ++++++++++++++++++++++++++++
+ test/mxc_vpu_test/utils.c          |  47 +++++++++
+ 6 files changed, 639 insertions(+), 1 deletion(-)
+ create mode 100644 test/mxc_vpu_test/Makefile_dut
+ create mode 100644 test/mxc_vpu_test/dut_api_vts.h
+ create mode 100644 test/mxc_vpu_test/dut_probes_vts.h
+
+diff --git a/test/mxc_vpu_test/Makefile_dut b/test/mxc_vpu_test/Makefile_dut
+new file mode 100644
+index 0000000..0410ba9
+--- /dev/null
++++ b/test/mxc_vpu_test/Makefile_dut
+@@ -0,0 +1,35 @@
++CC=$(CROSS_COMPILE)gcc
++LINK=$(CROSS_COMPILE)gcc
++
++OBJ = main.o \
++      dec.o \
++      enc.o \
++      capture.o \
++      display.o \
++      fb.o \
++      utils.o \
++      loopback.o \
++      transcode.o
++
++# list of platforms which want this test case
++INCLUDE_LIST:=IMX27ADS IMX51 IMX53 IMX6Q
++
++ifeq ($(PLATFORM),$(findstring $(PLATFORM),$(INCLUDE_LIST)))
++TARGET = lib_vpu_dut.so
++else
++TARGET =
++endif
++
++all: $(TARGET)
++
++$(TARGET): $(OBJ)
++	$(LINK) -lpthread -s -shared -fPIC -o $(TARGET) $(OBJ) ${LIBS} -lvpu -lipu -lrt -ldl
++
++%.o: %.c
++	$(CC) -D_FSL_VTS_ -DTGT_OS_ELINUX $(INC) -fPIC -Wall -O2 -c $^ -o $@
++
++.PHONY: clean
++clean:
++	rm -f $(TARGET) $(OBJ)
++
++include ../make.rules
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index de07634..a63f6c0 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -24,6 +24,10 @@
+ #include "vpu_test.h"
+ 
+ extern int quitflag;
++#ifdef _FSL_VTS_
++#include "dut_probes_vts.h"
++extern FuncProbeDut g_pfnVTSProbe;
++#endif
+ 
+ int vpu_v4l_performance_test;
+ 
+@@ -368,6 +372,9 @@ saveCropYuvImageHelper(struct decode *dec, u8 *buf, Rect cropRect)
+ 	int height = dec->picheight;
+ 	int rot_en = dec->cmdl->rot_en;
+ 	int rot_angle = dec->cmdl->rot_angle;
++#ifdef _FSL_VTS_
++	FRAME_COPY_INFO sFrmCpInfo;
++#endif
+ 
+ 	if (!buf) {
+ 		err_msg("buffer point should not be NULL.\n");
+@@ -390,11 +397,17 @@ saveCropYuvImageHelper(struct decode *dec, u8 *buf, Rect cropRect)
+ 	pCropYuv += width * cropRect.top;
+ 	pCropYuv += cropRect.left;
+ 
++#ifdef _FSL_VTS_
++	sFrmCpInfo.puchLumY = pCropYuv;
++	sFrmCpInfo.iFrmWidth = cropWidth;
++	sFrmCpInfo.iFrmHeight = cropHeight;
++	sFrmCpInfo.iBufStrideY = width;
++#else
+ 	for (i = 0; i < cropHeight; i++) {
+ 		fwriten(dec->cmdl->dst_fd, pCropYuv, cropWidth);
+ 		pCropYuv += width;
+ 	}
+-
++#endif
+ 	if (dec->cmdl->format == STD_MJPG && dec->mjpg_fmt == MODE400)
+ 		return;
+ 
+@@ -404,19 +417,31 @@ saveCropYuvImageHelper(struct decode *dec, u8 *buf, Rect cropRect)
+ 	pCropYuv += (width / 2) * (cropRect.top / 2);
+ 	pCropYuv += cropRect.left / 2;
+ 
++#ifdef _FSL_VTS_
++	sFrmCpInfo.puchChrU = pCropYuv;
++	sFrmCpInfo.iBufStrideUV = width >> 1;
++#else
+ 	for (i = 0; i < cropHeight; i++) {
+ 		fwriten(dec->cmdl->dst_fd, pCropYuv, cropWidth);
+ 		pCropYuv += width / 2;
+ 	}
++#endif
+ 
+ 	pCropYuv = buf + (width * height) * 5 / 4;
+ 	pCropYuv += (width / 2) * (cropRect.top / 2);
+ 	pCropYuv += cropRect.left / 2;
+ 
++#ifdef _FSL_VTS_
++	sFrmCpInfo.puchChrV = pCropYuv;
++#else
+ 	for (i = 0; i < cropHeight; i++) {
+ 		fwriten(dec->cmdl->dst_fd, pCropYuv, cropWidth);
+ 		pCropYuv += width / 2;
+ 	}
++#endif
++#ifdef _FSL_VTS_
++	g_pfnVTSProbe( E_OUTPUT_FRAME, &sFrmCpInfo );
++#endif
+ }
+ 
+ /*
+@@ -693,7 +718,22 @@ write_to_file(struct decode *dec, Rect cropRect, int index)
+ 	}
+ 
+ 	if ((chromaInterleave == 0 && cropping == 0) || dec->cmdl->format == STD_MJPG) {
++#ifdef _FSL_VTS_
++		FRAME_COPY_INFO sFrmCpInfo;
++		int iOffsetY = stride * height;
++		int iOffsetUV = iOffsetY >> 2;
++
++		sFrmCpInfo.puchLumY = buf;
++		sFrmCpInfo.puchChrU = buf + iOffsetY;
++		sFrmCpInfo.puchChrV = buf + iOffsetY + iOffsetUV;
++		sFrmCpInfo.iFrmWidth = stride;
++		sFrmCpInfo.iFrmHeight = height;
++		sFrmCpInfo.iBufStrideY = stride;
++		sFrmCpInfo.iBufStrideUV = stride >> 1;
++		g_pfnVTSProbe( E_OUTPUT_FRAME, &sFrmCpInfo );
++#else
+ 		fwriten(dec->cmdl->dst_fd, buf, img_size);
++#endif
+ 		goto out;
+ 	}
+ 
+@@ -726,7 +766,22 @@ write_to_file(struct decode *dec, Rect cropRect, int index)
+ 		}
+ 
+ 	} else {
++#ifdef _FSL_VTS_
++		FRAME_COPY_INFO sFrmCpInfo;
++		int iOffsetY = stride * height;
++		int iOffsetUV = iOffsetY >> 2;
++
++		sFrmCpInfo.puchLumY = pYuv0;
++		sFrmCpInfo.puchChrU = pYuv0 + iOffsetY;
++		sFrmCpInfo.puchChrV = pYuv0 + iOffsetUV;
++		sFrmCpInfo.iFrmWidth = stride;
++		sFrmCpInfo.iFrmHeight = height;
++		sFrmCpInfo.iBufStrideY = stride;
++		sFrmCpInfo.iBufStrideUV = stride >> 1;
++		g_pfnVTSProbe( E_OUTPUT_FRAME, &sFrmCpInfo );
++#else
+ 		fwriten(dec->cmdl->dst_fd, (u8 *)pYuv0, img_size);
++#endif
+ 	}
+ 
+ out:
+@@ -2163,9 +2218,11 @@ decode_test(void *arg)
+ 	if (ret)
+ 		goto err1;
+ 
++#ifndef _FSL_VTS_
+ 	/* Not set fps when doing performance test default */
+         if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test)
+                 dec->cmdl->fps = 30;
++#endif
+ 
+ 	/* start decoding */
+ 	ret = decoder_start(dec);
+diff --git a/test/mxc_vpu_test/dut_api_vts.h b/test/mxc_vpu_test/dut_api_vts.h
+new file mode 100644
+index 0000000..2f248ee
+--- /dev/null
++++ b/test/mxc_vpu_test/dut_api_vts.h
+@@ -0,0 +1,210 @@
++/*
++ ***********************************************************************
++ * Copyright 2005-2012 Freescale Semiconductor, Inc.
++ * All modifications are confidential and proprietary information
++ * of Freescale Semiconductor, Inc. ALL RIGHTS RESERVED.
++ ***********************************************************************
++ */
++
++/*****************************************************************************
++** dut_api_vts.h
++**
++** Use of Freescale code is governed by terms and conditions
++** stated in the accompanying licensing statement.
++**
++** Description: Implements structures used by DUTs
++**              and gives the VTS used APIs of DUTs.
++**
++** Author:
++**     Phil Chen   <b02249@freescale.com>
++**     Larry Lou   <b06557@freescale.com>
++**
++** Revision History:
++** -----------------
++** 1.0  11/01/2007  Larry Lou   create this file
++** 1.7  11/08/2007  Larry Lou	add macro DUT_API_HEADER_VERSION and API QueryAPIVersion_dut()
++** 1.8  03/18/2008  Larry Lou	update the DUT_API_HEADER_VERSION from ver1.7 to ver1.8
++** 2.0  10/31/2008  Larry Lou	update the wrapper API from 1.9 to 2.0
++*****************************************************************************/
++
++#ifndef _DUT_API_VTS_H_
++#define _DUT_API_VTS_H_
++
++#include "dut_probes_vts.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*****************************************************************************
++* <Macros>
++*****************************************************************************/
++/* DLL symbol export indicator for WinCE or Win32 DLL */
++#if defined(LIBDUTDEC_EXPORTS) && ( defined(TGT_OS_WINCE) || defined(TGT_OS_WIN32) )
++    #define DLL_EXPORTS __declspec(dllexport)
++#else
++    #define DLL_EXPORTS
++#endif
++
++/*
++** DUT header file version
++** DUT should output this version information by implementing the function QueryVersion_dut() in wrapper.
++** So, VTS framework can get this string to see if the DUT version matches VTS version.
++*/
++#define WRAPPER_API_VERSION 21  /* ver 2.1 */
++
++/*****************************************************************************
++ * <Typedefs>
++ *****************************************************************************/
++/*
++** return value of DUTs
++*/
++typedef enum
++{
++    E_DEC_INIT_OK_DUT = 0,   /* decoder is initialized successfully */
++    E_DEC_INIT_ERROR_DUT,    /* encounter errer during initializing */
++    E_DEC_FRAME_DUT,         /* finish outputting one or more frame */
++    E_DEC_FINISH_DUT,        /* finish decoding all the bitstream */
++    E_DEC_ALLOUT_DUT,        /* all decoded frames have been output */
++    E_DEC_ERROR_DUT,         /* encounter error during decoding */
++    E_DEC_REL_OK_DUT,        /* decoder is released successfully */
++    E_DEC_REL_ERROR_DUT,     /* encounter error during releasing */
++    E_GET_VER_OK_DUT,        /* query version successfully */
++    E_GET_VER_ERROR_DUT,     /* encounter error during querying version */
++} DEC_RETURN_DUT;
++
++/*
++** decoder type
++*/
++typedef enum
++{
++    E_DUT_TYPE_UNKNOWN = 0,     /* unknown decoder */
++    E_DUT_TYPE_DIVX,            /* DivX decoder */
++    E_DUT_TYPE_XVID,            /* XVID decoder (NOT SUPPORTED) */
++    E_DUT_TYPE_H263,            /* H.263 decoder (NOT SUPPORTED) */
++    E_DUT_TYPE_H264,            /* H.264 decoder */
++    E_DUT_TYPE_MPG2,            /* MPEG-2 decoder */
++    E_DUT_TYPE_MPG4,            /* MPEG-4 decoder */
++    E_DUT_TYPE_WMV9,            /* WMV9 decoder */
++    E_DUT_TYPE_RV89,            /* RealVideo decoder */
++    E_DUT_TYPE_MJPG,            /* MJPEG decoder */
++    E_DUT_TYPE_DIV3 = 10,       /* DivX 3.11 decoder */
++    E_DUT_TYPE_DIV4,            /* DivX 4 decoder */
++    E_DUT_TYPE_DX50,            /* DivX 5/6 decoder */
++    E_DUT_TYPE_RV20,            /* RV20 decoder */
++    E_DUT_TYPE_RV30,            /* RealVideo 8 decoder */
++    E_DUT_TYPE_RV40,            /* RealVideo 9/10 decoder */
++    E_DUT_TYPE_RVG2,            /* raw TCK format */
++    E_DUT_TYPE_WMV3,            /* VC-1 SP/MP decoder */
++    E_DUT_TYPE_WVC1,            /* VC-1 AP decoder */
++    E_DUT_TYPE_WMV1,            /* WMV 7 video */
++    E_DUT_TYPE_WMV2 = 20,       /* WMV 8 video */
++    E_DUT_TYPE_MAX
++} DUT_TYPE;
++
++/*
++* structure for DUT initialization
++* it is used as the second input parameter of VideoDecInit()
++*/
++typedef struct
++{
++    unsigned char * strInFile;  /* input file name */
++    unsigned char * strOutFile; /* output yuv file name */
++    unsigned int    uiWidth;    /* video frame width */
++    unsigned int    uiHeight;   /* video frame height */
++    FuncProbeDut    pfProbe;    /* VTS probe */
++    DUT_TYPE        eDutType;   /* DUT type */
++    long            iInputMode; /* stream input mode : 0 - streaming mode */
++                                /*                     1 - file-play mode */
++} DUT_INIT_CONTXT_2_1;
++
++/********************************************************************
++ *
++ * VideoDecInit_dut - Initialize the DUT
++ *
++ * Description:
++ *   Initialize the decoder, inlude allocating buffers, allocating and
++ *   initializing decoder object and so on.
++ *   This funtion is implemented by the DUT and invoked by VTS.
++ *
++ * Arguments:
++ *   _ppDecObj              [OUT]   pointer of decoder object pointer
++ *   _psInitContxt          [IN]    pointer of structure contain REF init infomation.
++ *
++ * Return:
++ *   E_DEC_INIT_OK_DUT      decoder is initialized successfully
++ *   E_DEC_INIT_ERROR_DUT   encounter errer during initializing
++ *
++ ********************************************************************/
++DEC_RETURN_DUT DLL_EXPORTS VideoDecInit( void ** _ppDecObj,
++                             void *  _psInitContxt );
++
++/********************************************************************
++ *
++ * VideoDecFrame_dut - decode and output one frame
++ *
++ * Description:
++ *   Decode bitstream and output one decoded frame before return.
++ *   This funtion is implemented by the DUT and invoked by VTS.
++ *
++ * Arguments:
++ *   _pDecObj               [IN/OUT]decoder object pointer
++ *   _pParam                [IN]    pointer of other parameters
++ *                                  (not use, but for the next version )
++ * Return:
++ *   E_DEC_FRAME_DUT        finish output one or more frame
++ *   E_DEC_FINISH_DUT       finish decoding all the bitstream
++ *   E_DED_ALLOUT_DUT       all decoded frames have been output
++ *   E_DEC_ERROR_DUT        encounter error during decoding
++ ********************************************************************/
++DEC_RETURN_DUT DLL_EXPORTS VideoDecRun( void * _pDecObj,
++                            void * _pParam );
++
++
++/********************************************************************
++ *
++ * VideoDecRelease_dut - release the DUT
++ *
++ * Description:
++ *   Release the allocated memory for the decoder under test,
++ *   and close file if any file is opened.
++ *   This funtion is implemented by the DUT and invoked by VTS.
++ *
++ * Arguments:
++ *   _pDecObj               [IN/OUT]pointer of decoder object
++ *
++ * Return:
++ *   E_DEC_REL_OK_DUT       decoder is released successfully
++ *   E_DEC_REL_ERROR_DUT    encounter error during releasing
++ *
++ ********************************************************************/
++DEC_RETURN_DUT DLL_EXPORTS VideoDecRelease( void * _pDecObj );
++
++
++/********************************************************************
++ *
++ * QueryVersion_dut - query the dut wrapper version
++ *
++ * Description:
++ *   Query the dut header version. It should copy DUT_API_HEADER_VERSION to
++ *   the array _auchVer[].
++ *   This funtion is implemented by the DUT and invoked by VTS.
++ *   Sample code: *_piAPIVersion = WRAPPER_API_VERSION;
++ *
++ * Arguments:
++ *   _piAPIVersion          [OUT]   pointer of the API version
++ *
++ * Return:
++ *   E_GET_VER_OK_DUT       query version successfully
++ *   E_GET_VER_ERROR_DUT    encounter error during querying version
++ *
++ ********************************************************************/
++void DLL_EXPORTS QueryAPIVersion( long * _piAPIVersion );
++
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _DUT_API_VTS_H_ */
++
+diff --git a/test/mxc_vpu_test/dut_probes_vts.h b/test/mxc_vpu_test/dut_probes_vts.h
+new file mode 100644
+index 0000000..c9f13c9
+--- /dev/null
++++ b/test/mxc_vpu_test/dut_probes_vts.h
+@@ -0,0 +1,131 @@
++/*
++ ***********************************************************************
++ * Copyright 2005-2012 Freescale Semiconductor, Inc.
++ * All modifications are confidential and proprietary information
++ * of Freescale Semiconductor, Inc. ALL RIGHTS RESERVED.
++ ***********************************************************************
++ */
++
++/*****************************************************************************
++** dut_probes_vts.h
++**
++** Use of Freescale code is governed by terms and conditions
++** stated in the accompanying licensing statement.
++**
++** Description: Implements structures and enumulations used by DUT
++**              when it invokes callback functions.
++**
++** Author:
++**     Phil Chen   <b02249@freescale.com>
++**     Larry Lou   <b06557@freescale.com>
++**
++** Revision History:
++** -----------------
++** 1.0  11/01/2007  Larry Lou   create this file
++** 1.1  03/17/2008  Larry Lou   modify the probe invoking mode
++** 1.2  07/14/2008  Larry Lou   add a new probe E_INPUT_BITSTREAM
++*****************************************************************************/
++
++#ifndef _DUT_PROBES_VTS_H_
++#define _DUT_PROBES_VTS_H_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*****************************************************************************
++ * <Typedefs>
++ *****************************************************************************/
++
++/*
++** Enumeration type to distinguish different probes
++*/
++typedef enum
++{
++    E_INPUT_LENGTH,     /* get length of an input bitstream unit */
++    E_INPUT_STARTTIME,  /* record start time of reading an input bitstream unit */
++    E_INPUT_ENDTIME,    /* record end time of reading an input bitstream unit */
++    E_OUTPUT_FRAME,     /* record get an output frame */
++    E_OUTPUT_STARTTIME, /* record start time of outputting an decoded frame */
++    E_OUTPUT_ENDTIME,   /* end time of outputting an decoded frame */
++    E_OPEN_BITSTREAM,   /* open bitstream */
++    E_CLOSE_BITSTREAM,  /* close bitstream */
++    E_READ_BITSTREAM,   /* get bitstream */
++    E_SEEK_BITSTREAM,   /* seek bitstream */
++    E_TELL_BITSTREAM,   /* get the read bytes of bitstream */
++    E_FEOF_BITSTREAM,   /* check the end of file */
++    E_GET_CHUNK,        /* get a chunk in file play mode */
++    E_GET_CHUNK_HDR,    /* get a chunk header in file play mode */
++    E_GET_STREAM_HDR,   /* get the stream header in file play mode */
++    E_SEND_SIGNAL,      /* send a signal to host */
++    E_DECFRM_START,     /* record start time of decoding one frame */
++    E_DECFRM_END,       /* record end time of decoding one frame */
++} PROBE_TYPE;
++
++/*
++** Structure used in probe for storing a frame [E_STORE_OUTPUT_FRAME]
++*/
++typedef struct
++{
++    unsigned char * puchLumY;     // Y component buffer pointer
++    unsigned char * puchChrU;     // U component buffer pointer
++    unsigned char * puchChrV;     // V component buffer pointer
++    long            iFrmWidth;    // Image width
++    long            iFrmHeight;   // Image height
++    long            iBufStrideY;  // Memory stride of Y component
++    long            iBufStrideUV; // Memory stride of UV component
++} FRAME_COPY_INFO;
++
++/*
++** Structure used in probe for read bitstream [E_READ_BITSTREAM]
++*/
++typedef struct
++{
++    int    hBitstream;          /* bitstream handle */
++    void * pBitstreamBuf;       /* bitstream buffer address of DUT */
++    long   iLength;             /* length of bitstream buffer */
++} DUT_STREAM_READ;
++
++/*
++** Structure used in probe for read bitstream [E_SEEK_BITSTREAM]
++*/
++typedef struct
++{
++    int    hBitstream;          /* bitstream handle */
++    long   iOffset;             /* number of bytes from iOrig */
++    int    iOrig;               /* Initial position */
++} DUT_STREAM_SEEK;
++
++/*
++** Structure used in probe for open bitstream [E_OPEN_BITSTREAM]
++*/
++typedef struct
++{
++    char * strBitstream;        /* bitstream name */
++    char * strMode;             /* open mode */
++} DUT_STREAM_OPEN;
++
++/*
++** Structure used in probe for read a packet
++** [E_READ_CHUNK/E_GET_CHUNK_HDR/E_GET_STREAM_HDR]
++*/
++typedef struct
++{
++    int    hBitstream;          /* bitstream handle */
++    void * pBitstreamBuf;       /* bitstream buffer address of DUT */
++} DUT_GET_PACKET;
++
++/*
++** Function type definition for all probes
++** input value:
++**       Para1:  Probe type
++**       Para2:  specific data structure pointer for a certain type
++*/
++typedef long ( * FuncProbeDut )( PROBE_TYPE, void * );
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _DUT_PROBES_VTS_H_ */
++
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 15163ed..92f0f24 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -448,7 +448,11 @@ signal_thread(void *arg)
+ }
+ 
+ int
++#ifdef _FSL_VTS_
++vputest_main(int argc, char *argv[])
++#else
+ main(int argc, char *argv[])
++#endif
+ {
+ 	int err, nargc, i, ret = 0;
+ 	char *pargv[32] = {0}, *dbg_env;
+@@ -471,10 +475,12 @@ main(int argc, char *argv[])
+ 	}
+ 
+ 	info_msg("VPU test program built on %s %s\n", __DATE__, __TIME__);
++#ifndef _FSL_VTS_
+ 	sigemptyset(&sigset);
+ 	sigaddset(&sigset, SIGINT);
+ 	pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+ 	pthread_create(&sigtid, NULL, (void *)&signal_thread, NULL);
++#endif
+ 
+ 	framebuf_init();
+ 
+@@ -576,3 +582,155 @@ usage:
+ 	return -1;
+ }
+ 
++#ifdef _FSL_VTS_
++#include "dut_api_vts.h"
++
++
++#define MAX_CMD_LINE_LEN    1024
++
++typedef struct _tagVideoDecoder
++{
++    unsigned char * strStream;          /* input video stream file */
++    int             iPicWidth;          /* frame width */
++    int             iPicHeight;         /* frame height */
++    DUT_TYPE        eDutType;           /* DUT type */
++    FuncProbeDut    pfnProbe;           /* VTS probe for DUT */
++} VDECODER;
++
++
++FuncProbeDut g_pfnVTSProbe = NULL;
++unsigned char *g_strInStream = NULL;
++
++
++DEC_RETURN_DUT VideoDecInit( void ** _ppDecObj, void *  _psInitContxt )
++{
++    DEC_RETURN_DUT eRetVal = E_DEC_INIT_OK_DUT;
++    DUT_INIT_CONTXT_2_1 * psInitContxt = _psInitContxt;
++    VDECODER * psDecObj = NULL;
++
++    do
++    {
++        psDecObj = malloc( sizeof(VDECODER) );
++        if ( NULL == psDecObj )
++        {
++            eRetVal = E_DEC_INIT_ERROR_DUT;
++            break;
++        }
++        *_ppDecObj = psDecObj;
++        psDecObj->pfnProbe   = psInitContxt->pfProbe;
++        psDecObj->strStream  = psInitContxt->strInFile;
++        psDecObj->iPicWidth  = (int)psInitContxt->uiWidth;
++        psDecObj->iPicHeight = (int)psInitContxt->uiHeight;
++        psDecObj->eDutType   = psInitContxt->eDutType;
++
++        g_pfnVTSProbe = psInitContxt->pfProbe;
++        g_strInStream = psInitContxt->strInFile;
++    } while (0);
++
++    return eRetVal;
++}
++
++DEC_RETURN_DUT VideoDecRun( void * _pDecObj, void * _pParam )
++{
++    VDECODER * psDecObj = (VDECODER *)_pDecObj;
++    char * strCmdLine = NULL;
++    char * argv[3];
++    int argc = 3;
++    int iDecID = 0;
++    int iMPEG4Class = 0;
++    DEC_RETURN_DUT eRetVal = E_DEC_ALLOUT_DUT;
++
++    do
++    {
++
++        strCmdLine = malloc( MAX_CMD_LINE_LEN );
++        if ( NULL == strCmdLine )
++        {
++            fprintf( stderr, "Failed to allocate memory for command line." );
++            eRetVal = E_DEC_ERROR_DUT;
++            break;
++        }
++
++        argv[0] = "./mxc_vpu_test.out";
++        argv[1] = "-D";
++        argv[2] = strCmdLine;
++
++        /* get decoder file name */
++        switch (psDecObj->eDutType)
++        {
++        case E_DUT_TYPE_H264:
++            iDecID = 2;
++            break;
++        case E_DUT_TYPE_DIV3:
++            iDecID = 5;
++            break;
++        case E_DUT_TYPE_MPG4:
++            iMPEG4Class = 0;
++            break;
++        case E_DUT_TYPE_DIVX:
++        case E_DUT_TYPE_DX50:
++            iMPEG4Class = 1;
++            break;
++        case E_DUT_TYPE_XVID:
++            iMPEG4Class = 2;
++            break;
++        case E_DUT_TYPE_DIV4:
++            iMPEG4Class = 5;
++            break;
++        case E_DUT_TYPE_MPG2:
++            iDecID = 4;
++            break;
++        case E_DUT_TYPE_RV20:
++        case E_DUT_TYPE_RV30:
++        case E_DUT_TYPE_RV40:
++        case E_DUT_TYPE_RV89:
++            iDecID = 6;
++            break;
++        case E_DUT_TYPE_WMV9:
++        case E_DUT_TYPE_WMV3:
++        case E_DUT_TYPE_WVC1:
++            iDecID = 3;
++            break;
++        default:
++            perror( "DUT type %d is not supported.\n" );
++            iDecID = -1;
++        }
++
++        if ( -1 == iDecID )
++        {
++            eRetVal = E_DEC_ERROR_DUT;
++            break;
++        }
++
++        /* run decoder */
++        sprintf( strCmdLine, "-i %s -f %d -l %d -o vts",
++                 psDecObj->strStream, iDecID, iMPEG4Class );
++
++        vputest_main(argc, argv);
++    } while (0);
++
++    if ( strCmdLine )
++    {
++        free( strCmdLine );
++    }
++
++    return eRetVal;
++}
++
++DEC_RETURN_DUT VideoDecRelease( void * _pDecObj )
++{
++    DEC_RETURN_DUT eRetVal = E_DEC_REL_OK_DUT;
++
++    if ( _pDecObj )
++    {
++        free( _pDecObj );
++    }
++
++    return eRetVal;
++}
++
++void QueryAPIVersion( long * _piAPIVersion )
++{
++    *_piAPIVersion = WRAPPER_API_VERSION;
++}
++#endif
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index 0f1ff9a..7db4ce2 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -27,6 +27,11 @@
+ #include "vpu_test.h"
+ 
+ extern int quitflag;
++#ifdef _FSL_VTS_
++#include "dut_probes_vts.h"
++extern FuncProbeDut g_pfnVTSProbe;
++extern unsigned char *g_strInStream;
++#endif
+ 
+ /* Our custom header */
+ struct nethdr {
+@@ -252,7 +257,22 @@ vpu_read(struct cmd_line *cmd, char *buf, int n)
+ 		return udp_recv(cmd, fd, buf, n);
+ 	}
+ 
++#ifdef _FSL_VTS_
++    if ( NULL != g_pfnVTSProbe )
++    {
++        DUT_STREAM_READ sFileRead;
++        sFileRead.hBitstream = fd;
++        sFileRead.pBitstreamBuf = buf;
++        sFileRead.iLength = n;
++        return g_pfnVTSProbe( E_READ_BITSTREAM, &sFileRead );
++    }
++    else
++    {
++        return 0;
++    }
++#else
+ 	return freadn(fd, buf, n);
++#endif
+ }
+ 
+ int
+@@ -366,12 +386,27 @@ int
+ open_files(struct cmd_line *cmd)
+ {
+ 	if (cmd->src_scheme == PATH_FILE) {
++#ifdef _FSL_VTS_
++    if ( NULL != g_pfnVTSProbe )
++    {
++        DUT_STREAM_OPEN sFileOpen;
++        sFileOpen.strBitstream = g_strInStream;
++        sFileOpen.strMode = "rb";
++        cmd->src_fd = NULL;
++        cmd->src_fd = g_pfnVTSProbe( E_OPEN_BITSTREAM, &sFileOpen );
++		if (NULL == cmd->src_fd ) {
++			perror("file open");
++			return -1;
++		}
++    }
++#else
+ 		cmd->src_fd = open(cmd->input, O_RDONLY, 0);
+ 		if (cmd->src_fd < 0) {
+ 			perror("file open");
+ 			return -1;
+ 		}
+ 		info_msg("Input file \"%s\" opened.\n", cmd->input);
++#endif
+ 	} else if (cmd->src_scheme == PATH_NET) {
+ 		/* open udp port for receive */
+ 		cmd->src_fd = udp_open(cmd);
+@@ -383,6 +418,7 @@ open_files(struct cmd_line *cmd)
+ 	}
+ 
+ 	if (cmd->dst_scheme == PATH_FILE) {
++#ifndef _FSL_VTS_
+ 		cmd->dst_fd = open(cmd->output, O_CREAT | O_RDWR | O_TRUNC,
+ 					S_IRWXU | S_IRWXG | S_IRWXO);
+ 		if (cmd->dst_fd < 0) {
+@@ -394,6 +430,7 @@ open_files(struct cmd_line *cmd)
+ 			return -1;
+ 		}
+ 		info_msg("Output file \"%s\" opened.\n", cmd->output);
++#endif
+ 	} else if (cmd->dst_scheme == PATH_NET) {
+ 		/* open udp port for send path */
+ 		cmd->dst_fd = udp_open(cmd);
+@@ -412,15 +449,25 @@ open_files(struct cmd_line *cmd)
+ void
+ close_files(struct cmd_line *cmd)
+ {
++#ifdef _FSL_VTS_
++    if ( NULL != g_pfnVTSProbe )
++    {
++        g_pfnVTSProbe( E_CLOSE_BITSTREAM, &cmd->src_fd );
++        cmd->src_fd = NULL;
++    }
++#else
+ 	if ((cmd->src_fd > 0)) {
+ 		close(cmd->src_fd);
+ 		cmd->src_fd = -1;
+ 	}
++#endif
+ 
++#ifndef _FSL_VTS_
+ 	if ((cmd->dst_fd > 0)) {
+ 		close(cmd->dst_fd);
+ 		cmd->dst_fd = -1;
+ 	}
++#endif
+ 
+ 	if (cmd->nbuf) {
+ 		free(cmd->nbuf);
+-- 
+1.8.0
+

@@ -1,0 +1,245 @@
+From a47e0f41e482e1dd38400ac63526ff61f09f3469 Mon Sep 17 00:00:00 2001
+From: Guoqing Jiang <b22156@freescale.com>
+Date: Thu, 11 Jun 2009 15:52:09 +0800
+Subject: [PATCH 097/435] ENGR00112874 Camera: Support MX25 enhancement
+ feature unit test
+
+Support MX25 enhancement feature unit test, include YUV and 1280*960 mode.
+
+Signed-off-by: Guoqing Jiang <b22156@freescale.com>
+---
+ test/mxc_v4l2_test/csi_v4l2_overlay.c | 168 ++++++++++++++++++++++++----------
+ test/mxc_v4l2_test/mxc_v4l2_still.c   |   1 +
+ 2 files changed, 123 insertions(+), 46 deletions(-)
+
+diff --git a/test/mxc_v4l2_test/csi_v4l2_overlay.c b/test/mxc_v4l2_test/csi_v4l2_overlay.c
+index 59caa52..f30590c 100644
+--- a/test/mxc_v4l2_test/csi_v4l2_overlay.c
++++ b/test/mxc_v4l2_test/csi_v4l2_overlay.c
+@@ -54,89 +54,165 @@ char v4l_device[100] = "/dev/video0";
+ int fd_v4l = 0;
+ int g_camera_framerate = 0;
+ int g_timeout = 3600;
++static int g_width = 640;
++static int g_height = 480;
++static int g_bpp = 16;
++static unsigned long g_pixelformat = V4L2_PIX_FMT_RGB565;
+ 
+-int mxc_v4l_overlay_setup(struct v4l2_format *fmt)
++int csi_v4l_overlay_setup(void)
+ {
+ 	struct v4l2_streamparm parm;
++	struct v4l2_format fmt;
++
++	fd_v4l = open(v4l_device, O_RDWR, 0);
++	if (fd_v4l < 0) {
++		printf("Unable to open %s\n", v4l_device);
++		goto err;
++	}
++	printf("open /dev/video0 succeed!\n");
++
++	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	if (ioctl(fd_v4l, VIDIOC_G_FMT, &fmt) < 0) {
++		printf("VIDIOC_G_FMT failed\n");
++		close(fd_v4l);
++		goto err;
++	}
+ 
+ 	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	parm.parm.capture.timeperframe.numerator = 1;
+ 	parm.parm.capture.timeperframe.denominator = g_camera_framerate;
+ 	parm.parm.capture.capturemode = 0;
+-
+ 	if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0) {
+ 		printf("VIDIOC_S_PARM failed\n");
+-		return TFAIL;
++		close(fd_v4l);
++		goto err;
+ 	}
+ 
+-	return TPASS;
+-}
+-
+-int process_cmdline(int argc, char **argv)
+-{
+-	int i;
+-
+-	for (i = 1; i < argc; i++) {
+-		if (strcmp(argv[i], "-help") == 0) {
+-			printf("MX25 Video4Linux overlay Device Test\n\n" \
+-				"./mxc_v4l2_overlay -t time\n");
+-		}
+-		else if (strcmp(argv[i], "-t") == 0) {
+-			g_timeout = atoi(argv[++i]);
+-		}
++	memset(&fmt, 0, sizeof(fmt));
++	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	fmt.fmt.pix.pixelformat = g_pixelformat;
++	fmt.fmt.pix.width = g_width;
++	fmt.fmt.pix.height = g_height;
++	fmt.fmt.pix.sizeimage = fmt.fmt.pix.width *
++				fmt.fmt.pix.height * g_bpp / 8;
++	fmt.fmt.pix.bytesperline = g_width * g_bpp / 8;
++	if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0) {
++		printf("VIDIOC_S_FMT failed\n");
++		close(fd_v4l);
++		goto err;
+ 	}
+ 
+-	return 0;
++	return fd_v4l;
++err:
++	return TFAIL;
+ }
+ 
+-int main(int argc, char **argv)
++int csi_v4l_overlay_test(int fd_v4l, int width, int height)
+ {
+-	struct v4l2_format fmt;
++	struct v4l2_framebuffer fb_v4l2;
++	struct fb_var_screeninfo var;
++	struct fb_fix_screeninfo fix;
+ 	char fb_device[100] = "/dev/fb0";
+ 	int fd_fb = 0;
+-	struct fb_fix_screeninfo fix;
+-	unsigned long fb0;
++	int overlay = 1;
+ 
+-	if (process_cmdline(argc, argv) < 0) {
+-		return TFAIL;
++	memset(&fb_v4l2, 0, sizeof(fb_v4l2));
++	if ((fd_fb = open(fb_device, O_RDWR )) < 0) {
++		printf("Unable to open frame buffer\n");
++		goto FAIL;
+ 	}
+-	if ((fd_v4l = open(v4l_device, O_RDWR, 0)) < 0) {
+-		printf("Unable to open %s\n", v4l_device);
+-		return TFAIL;
++
++	if (ioctl(fd_fb, FBIOGET_VSCREENINFO, &var) < 0) {
++		printf("FBIOGET_VSCREENINFO failed\n");
++		goto FAIL;
+ 	}
+-	printf("open %s succeed!\n", v4l_device);
+ 
+-	if ((fd_fb = open(fb_device, O_RDWR )) < 0) {
+-		printf("Unable to open frame buffer\n");
+-		return TFAIL;
++	/* currently only support 1280*960 mode and 640*480 mode*/
++	var.xres_virtual = width;
++	var.yres_virtual = height;
++	if (ioctl(fd_fb, FBIOPUT_VSCREENINFO, &var) < 0) {
++		printf("FBIOPUT_VSCREENINFO failed\n");
++		goto FAIL;
+ 	}
+ 
+ 	if (ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix) < 0) {
+-		close(fd_fb);
+-		printf("ioctl fb FBIOGET_FSCREENINFO failed!\n");
+-		return TFAIL;
++		printf("FBIOGET_FSCREENINFO failed\n");
++		goto FAIL;
+ 	}
+ 
+-	if (mxc_v4l_overlay_setup(&fmt) < 0) {
+-		printf("Setup overlay failed.\n");
+-		return TFAIL;
++	fb_v4l2.base = (void *)fix.smem_start;
++	if (ioctl(fd_v4l, VIDIOC_S_FBUF, &fb_v4l2) < 0)
++	{
++		printf("set framebuffer failed\n");
++		goto FAIL;
+ 	}
+ 
+-	fb0 = fix.smem_start;
+-	if (ioctl(fd_v4l, VIDIOC_OVERLAY, &fb0) < 0) {
++	if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0) {
+ 		printf("VIDIOC_OVERLAY start failed\n");
+-		return TFAIL;
++		goto FAIL;
+ 	}
++
+ 	sleep(g_timeout);
+ 
+-	fb0 = 0;
+-	if (ioctl(fd_v4l, VIDIOC_OVERLAY, &fb0) < 0) {
+-		printf("VIDIOC_OVERLAY start failed\n");
+-		return TFAIL;
++	overlay = 0;
++	if (ioctl(fd_v4l, VIDIOC_OVERLAY, &overlay) < 0) {
++		printf("VIDIOC_OVERLAY stop failed\n");
++		goto FAIL;
+ 	}
+ 
+ 	close(fd_fb);
+ 	close(fd_v4l);
++	return TPASS;
++FAIL:
++	close(fd_fb);
++	close(fd_v4l);
++	return TFAIL;
++}
++
++int main(int argc, char **argv)
++{
++	int i;
++
++	for (i = 1; i < argc; i++) {
++		if (strcmp(argv[i], "-help") == 0) {
++			printf("MX25 Video4Linux overlay Device Test\n"
++			"./csi_v4l2_overlay -t time "
++					    "-w width -h height -fr rate\n"
++			"Note: support 1280*960 and 640*480(default) mode\n"
++			"1280*960 mode can't support change rate\n"
++			"640*480 mode can support 30fps(default) and 15fps\n");
++			return 0;
++		} else if (strcmp(argv[i], "-w") == 0) {
++			g_width = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-h") == 0) {
++			g_height = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-fr") == 0) {
++			g_camera_framerate = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-t") == 0) {
++			g_timeout = atoi(argv[++i]);
++		} else {
++			printf("MX25 Video4Linux overlay Device Test\n"
++			"./csi_v4l2_overlay -t time "
++					    "-w width -h height -fr rate\n"
++			"Note: support 1280*960 and 640*480(default) mode\n"
++			"1280*960 mode can't support change rate\n"
++			"640*480 mode can support 30fps(default) and 15fps\n");
++			return 0;
++		}
++	}
+ 
+-	return 0;
++	fd_v4l = csi_v4l_overlay_setup();
++	if (fd_v4l < 0) {
++		printf("csi_v4l_overlay_setup failed\n");
++		return TFAIL;
++	}
++
++	i = csi_v4l_overlay_test(fd_v4l, g_width, g_height);
++	if (i < 0) {
++		printf("csi_v4l_overlay_test failed\n");
++		return TFAIL;
++	}
++
++	return TPASS;
+ }
++
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_still.c b/test/mxc_v4l2_test/mxc_v4l2_still.c
+index be2d9bd..7e7f7e2 100644
+--- a/test/mxc_v4l2_test/mxc_v4l2_still.c
++++ b/test/mxc_v4l2_test/mxc_v4l2_still.c
+@@ -60,6 +60,7 @@ void usage(void)
+ 		"-m    Capture mode, 0-low resolution(default), 1-high resolution \n"
+ 		"-fr   Capture frame rate, 30fps by default\n"
+                 "The output is saved in ./still.yuv\n"
++		"MX25(CSI) driver supports RGB565, YUV420 and UYVY\n"
+                 "MX27(eMMA) driver supports YUV420, YUYV and YUV444\n"
+                 "MXC(IPU) driver supports UYVY, YUV422P and YUV420\n\n"
+                 );
+-- 
+1.8.0
+

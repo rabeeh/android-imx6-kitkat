@@ -1,0 +1,76 @@
+From e2242031f17130e92f5e7dfdb65f4340e10eea39 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 22 Sep 2011 18:24:25 +0800
+Subject: [PATCH 159/249] ENGR00157371 vpu: Change mutex to timout mutex in
+ Android case
+
+pthread_mutex_lock_timeout_np() function with timeout is used
+since it has been supported on gingerbread.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/Android.mk |  1 +
+ vpu/vpu_util.c | 23 +++++++++++++++++++----
+ 2 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/vpu/Android.mk b/vpu/Android.mk
+index 2a32504..7dabec2 100755
+--- a/vpu/Android.mk
++++ b/vpu/Android.mk
+@@ -11,6 +11,7 @@ LOCAL_SRC_FILES := \
+ 	vpu_gdi.c
+ LOCAL_CFLAGS += -DBUILD_FOR_ANDROID -D$(BOARD_SOC_TYPE)
+ LOCAL_C_INCLUDES += $(LOCAL_PATH)
++LOCAL_SHARED_LIBRARIES := libutils libc
+ LOCAL_MODULE := libvpu
+ LOCAL_LD_FLAGS += -nostartfiles
+ LOCAL_PRELINK_MODULE := false
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index fba9434..7c98138 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -27,6 +27,12 @@
+ #include "vpu_io.h"
+ #include "vpu_debug.h"
+ 
++#ifdef BUILD_FOR_ANDROID
++#define LOG_TAG "vpulib"
++#include <utils/Log.h>
++#include <cutils/properties.h>
++#endif
++
+ #define MAX_VSIZE       8192
+ #define MAX_HSIZE       8192
+ 
+@@ -1165,15 +1171,24 @@ void semaphore_post(semaphore_t *semap, int mutex)
+ 
+ unsigned char semaphore_wait(semaphore_t *semap, int mutex)
+ {
+-#ifdef ANDROID
++	int ret = -1;
++
++#ifdef BUILD_FOR_ANDROID
++	unsigned int msec = mutex_timeout * 1000;
++
+ 	if (mutex == API_MUTEX)
+-		pthread_mutex_lock(&semap->api_lock);
++		ret = pthread_mutex_lock_timeout_np(&semap->api_lock, msec);
+ 	else if (mutex == REG_MUTEX)
+-		pthread_mutex_lock(&semap->reg_lock);
++		ret = pthread_mutex_lock_timeout_np(&semap->reg_lock, msec);
++	else
++		LOGE("Not supported mutex\n");
++	if (ret) {
++		LOGE("VPU mutex couldn't be locked,ret = %d\n", ret);
++		return false;
++	}
+ 	return true;
+ #else
+ 	struct timespec ts;
+-	int ret = 0;
+ 
+ 	ts.tv_sec = time(NULL) + mutex_timeout;
+ 	ts.tv_nsec = 0;
+-- 
+1.8.0
+

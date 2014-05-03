@@ -1,0 +1,247 @@
+From ac51aee574317cedf5324b04bc9a5e29ba2eb91f Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Wed, 18 Apr 2012 16:36:26 +0800
+Subject: [PATCH 263/486] ENGR00179411 boost the record volume for wm8962
+
+1. boost the record volume for wm8962
+2. support wm8962 in legacy audio hal
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/alsa_imx.cpp            | 61 ++++++++++++++++++++++++++++++++++++++++++++
+ alsa/tinyalsa_sabresd_revb.c | 52 ++++++++++++++++++++++++++++++++-----
+ 2 files changed, 106 insertions(+), 7 deletions(-)
+
+diff --git a/alsa/alsa_imx.cpp b/alsa/alsa_imx.cpp
+index 7b59b45..1990ad3 100755
+--- a/alsa/alsa_imx.cpp
++++ b/alsa/alsa_imx.cpp
+@@ -35,6 +35,7 @@
+ #define DEVICE_WM8958     3
+ #define DEVICE_HDMI       4
+ #define DEVICE_CS42888    5
++#define DEVICE_WM8962     6
+ 
+ #ifdef  BOARD_IS_SABRELITE
+ #define AUDIOCARD_DEVICE_SGTL5000_HIFI "HiFi sgtl5000-0"
+@@ -44,6 +45,7 @@
+ #define AUDIOCARD_DEVICE_HDMI "IMX HDMI TX mxc-hdmi-soc-0"
+ #define AUDIOCARD_DEVICE_SPDIF "IMX SPDIF mxc spdif-0"
+ #define AUDIOCARD_DEVICE_CS42888 "HiFi CS42888-0"
++#define AUDIOCARD_DEVICE_WM8962 "HiFi wm8962-0"
+ #else
+ 
+ #define AUDIOCARD_DEVICE_SGTL5000_HIFI "HiFi sgtl5000-0"
+@@ -53,6 +55,7 @@
+ #define AUDIOCARD_DEVICE_HDMI "IMX HDMI TX mxc-hdmi-soc-0"
+ #define AUDIOCARD_DEVICE_SPDIF "IMX SPDIF mxc-spdif-0"
+ #define AUDIOCARD_DEVICE_CS42888 "HiFi CS42888-0"
++#define AUDIOCARD_DEVICE_WM8962 "HiFi wm8962-0"
+ #endif
+ 
+ 
+@@ -75,6 +78,7 @@ char cs42888cardname[32];
+ char wm8958cardname_0[32];
+ char wm8958cardname_1[32];
+ char wm8958cardname_2[32];
++char wm8962cardname[32];
+ int  selecteddevice ;
+     
+ static hw_module_methods_t s_module_methods = {
+@@ -256,6 +260,7 @@ const char *deviceName(alsa_handle_t *alsa_handle, uint32_t device, int mode, in
+     bool havehdmidevice = false;
+     bool havewm8958device =false;
+     bool havecs42888device =false;
++    bool havewm8962device = false;
+ 
+     card = -1;
+     if (snd_card_next(&card) < 0 || card < 0) {
+@@ -332,6 +337,11 @@ const char *deviceName(alsa_handle_t *alsa_handle, uint32_t device, int mode, in
+                  else               sprintf(wm8958cardname_2, "hw:%d,%d", card, dev);
+                  havewm8958device =  true;
+             }
++            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8962)==0) {
++                 if(card_device==0) sprintf(wm8962cardname, "hw:0%d", card);
++                 else               sprintf(wm8962cardname, "hw:%d,%d", card, dev);
++                 havewm8962device =  true;
++            }
+             cardnum++;
+         }
+         snd_ctl_close(handle);
+@@ -377,7 +387,24 @@ const char *deviceName(alsa_handle_t *alsa_handle, uint32_t device, int mode, in
+         selecteddevice = DEVICE_CS42888;
+         alsa_handle->devName = AUDIOCARD_DEVICE_CS42888;
+         return cs42888cardname;
++    }else if(havewm8962device)
++    {
++        selecteddevice = DEVICE_WM8962;
++        alsa_handle->devName = AUDIOCARD_DEVICE_WM8962;
++        return wm8962cardname;
++    }else if(havehdmidevice)
++    {
++        selecteddevice = DEVICE_HDMI;
++        alsa_handle->devName = AUDIOCARD_DEVICE_HDMI;
++        return hdmicardname;
++    }else if(havespdifdevice)
++    {
++        selecteddevice = DEVICE_SPDIF;
++        alsa_handle->devName = AUDIOCARD_DEVICE_SPDIF;
++        return spdifcardname;
+     }
++
++
+     selecteddevice = DEVICE_DEFAULT;
+     alsa_handle->devName = "default";
+     return "default";
+@@ -670,6 +697,40 @@ void setDefaultControls(uint32_t devices, int mode, const char *cardname)
+ 
+     if(devices & IMX_OUT_CODEC_DEFAULT)
+     {
++        if(selecteddevice == DEVICE_WM8962)
++        {
++              if(devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
++                   devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE ){
++                 ctl->set("Speaker Switch", 0, -1);
++                 ctl->set("Headphone Switch", 1, -1);
++                 ctl->set("Headphone Volume", 127, -1);
++              }else {
++		 ctl->set("Headphone Switch", 0, -1);
++                 ctl->set("Speaker Switch", 1, -1);
++                 ctl->set("Speaker Volume", 127, -1);
++              }
++        }
++    }
++
++    if(devices & IMX_IN_CODEC_DEFAULT)
++    {
++        if(selecteddevice == DEVICE_WM8962)
++        {
++             if(devices & AudioSystem::DEVICE_IN_BUILTIN_MIC){
++                ctl->set("Capture Switch", 1, -1);
++                ctl->set("Capture Volume", 63, -1);
++                ctl->set("MIXINR IN3R Switch", 1, 0);
++                ctl->set("MIXINR IN3R Volume", 7, 0);
++                //ctl->set("INPGAR IN3R Switch", 1, 0);
++                //ctl->set("MIXINR PGA Switch", 1, 0);
++                //ctl->set("MIXINR PGA Volume", 7, 0);
++                ctl->set("Digital Capture Volume", 127, -1);
++             }
++        }
++    }
++
++    if(devices & IMX_OUT_CODEC_DEFAULT)
++    {
+         if(selecteddevice == DEVICE_WM8958)
+         {
+             ctl->set("AIF1DAC Mux", 0, 0); /* 0: AIF1DACDAT, 1: AIF3DACDAT */
+diff --git a/alsa/tinyalsa_sabresd_revb.c b/alsa/tinyalsa_sabresd_revb.c
+index 2506ef4..11ef9e3 100644
+--- a/alsa/tinyalsa_sabresd_revb.c
++++ b/alsa/tinyalsa_sabresd_revb.c
+@@ -48,9 +48,14 @@
+ #define MIXER_WM8962_CAPTURE_SWITCH                 "Capture Switch"
+ #define MIXER_WM8962_CAPTURE_VOLUME                 "Capture Volume"
+ 
+-#define MIXER_WM8962_INPGAR_IN3R                    "INPGAR IN3R Switch"
+-#define MIXER_WM8962_MIXINR_IN3R                    "MIXINR IN3R Switch"
++#define MIXER_WM8962_INPGAR_IN3R_SWITCH             "INPGAR IN3R Switch"
++#define MIXER_WM8962_MIXINR_IN3R_SWITCH             "MIXINR IN3R Switch"
++#define MIXER_WM8962_MIXINR_IN3R_VOLUME             "MIXINR IN3R Volume"
+ 
++#define MIXER_WM8962_MIXINR_PGA_SWITCH              "MIXINR PGA Switch"
++#define MIXER_WM8962_MIXINR_PGA_VOLUME              "MIXINR PGA Volume"
++
++#define MIXER_WM8962_DIGITAL_CAPTURE_VOLUME         "Digital Capture Volume"
+ /* ALSA cards for IMX, these must be defined according different board / kernel config*/
+ #define CARD_IMX_MAIN "wm8962-audio"
+ #define CARD_IMX_HDMI "imx-hdmi-soc"
+@@ -112,7 +117,7 @@ struct pcm_config pcm_config_mm_out = {
+ struct pcm_config pcm_config_mm_in = {
+     .channels = 2,
+     .rate = MM_FULL_POWER_SAMPLING_RATE,
+-    .period_size = SHORT_PERIOD_SIZE,
++    .period_size = SHORT_PERIOD_SIZE * 2,
+     .period_count = CAPTURE_PERIOD_COUNT,
+     .format = PCM_FORMAT_S16_LE,
+ };
+@@ -190,16 +195,32 @@ struct route_setting mm_main_mic_input[] = {
+     {
+         .ctl_name = MIXER_WM8962_CAPTURE_VOLUME,
+         .intval = 63,
++    },
++    {
++        .ctl_name = MIXER_WM8962_DIGITAL_CAPTURE_VOLUME,
++        .intval = 127,
+     },/*
+     {
+-        .ctl_name = MIXER_WM8962_INPGAR_IN3R,
++        .ctl_name = MIXER_WM8962_INPGAR_IN3R_SWITCH,
+         .intval = 1,
++    },
++    {
++        .ctl_name = MIXER_WM8962_MIXINR_PGA_SWITCH,
++        .intval = 1,
++    },
++    {
++        .ctl_name = MIXER_WM8962_MIXINR_PGA_VOLUME,
++        .intval = 7,
+     },*/
+     {
+-        .ctl_name = MIXER_WM8962_MIXINR_IN3R,
++        .ctl_name = MIXER_WM8962_MIXINR_IN3R_SWITCH,
+         .intval = 1,
+     },
+     {
++        .ctl_name = MIXER_WM8962_MIXINR_IN3R_VOLUME,
++        .intval = 7,
++    },
++    {
+         .ctl_name = NULL,
+     },
+ };
+@@ -220,16 +241,32 @@ struct route_setting mm_hs_mic_input[] = {
+     {
+         .ctl_name = MIXER_WM8962_CAPTURE_VOLUME,
+         .intval = 63,
++    },
++    {
++        .ctl_name = MIXER_WM8962_DIGITAL_CAPTURE_VOLUME,
++        .intval = 127,
+     },/*
+     {
+-        .ctl_name = MIXER_WM8962_INPGAR_IN3R,
++        .ctl_name = MIXER_WM8962_INPGAR_IN3R_SWITCH,
++        .intval = 1,
++    },
++    {
++        .ctl_name = MIXER_WM8962_MIXINR_PGA_SWITCH,
+         .intval = 1,
++    },
++    {
++        .ctl_name = MIXER_WM8962_MIXINR_PGA_VOLUME,
++        .intval = 7,
+     },*/
+     {
+-        .ctl_name = MIXER_WM8962_MIXINR_IN3R,
++        .ctl_name = MIXER_WM8962_MIXINR_IN3R_SWITCH,
+         .intval = 1,
+     },
+     {
++        .ctl_name = MIXER_WM8962_MIXINR_IN3R_VOLUME,
++        .intval = 7,
++    },
++    {
+         .ctl_name = NULL,
+     },
+ };
+@@ -595,6 +632,7 @@ static size_t get_input_buffer_size(uint32_t sample_rate, int format, int channe
+     size = (pcm_config_mm_in.period_size * sample_rate) / pcm_config_mm_in.rate;
+     size = ((size + 15) / 16) * 16;
+ 
++    LOGW("get_input_buffer_size size = %d, channel_count = %d",size,channel_count);
+     return size * channel_count * sizeof(short);
+ }
+ 
+-- 
+1.8.0
+

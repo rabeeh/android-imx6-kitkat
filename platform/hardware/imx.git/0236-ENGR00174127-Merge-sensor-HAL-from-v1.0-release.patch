@@ -1,0 +1,1370 @@
+From 5c1c3ed75748cfa507114ea391dc17af601e9c03 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <b03824@freescale.com>
+Date: Fri, 10 Feb 2012 09:14:03 +0800
+Subject: [PATCH 236/486] ENGR00174127 Merge sensor HAL from v1.0 release
+
+Merge mag3110 and mma8451 drivers from sensor team.
+The MPL3115 barometer sensor HAL is added.
+The SensorBase is restructured by moving all the
+sysfs controller from each sensor HAL derived class
+into the base class to make the code simple.
+
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ libsensors/AccelSensor.cpp      | 226 ++--------------------------------
+ libsensors/AccelSensor.h        |  41 +------
+ libsensors/Android.mk           |   5 +-
+ libsensors/InputEventReader.cpp |   2 +-
+ libsensors/InputEventReader.h   |   2 +-
+ libsensors/LightSensor.cpp      |   6 +-
+ libsensors/LightSensor.h        |   3 +-
+ libsensors/MagSensor.cpp        |  84 +------------
+ libsensors/MagSensor.h          |  22 +---
+ libsensors/PressSensor.cpp      |  65 ++++++++++
+ libsensors/PressSensor.h        |  43 +++++++
+ libsensors/SensorBase.cpp       | 260 +++++++++++++++++++++++++++++++++++++---
+ libsensors/SensorBase.h         |  55 ++++++---
+ libsensors/sensors.cpp          |  66 +++++++---
+ libsensors/sensors.h            |  38 +++---
+ 15 files changed, 496 insertions(+), 422 deletions(-)
+ create mode 100755 libsensors/PressSensor.cpp
+ create mode 100755 libsensors/PressSensor.h
+
+diff --git a/libsensors/AccelSensor.cpp b/libsensors/AccelSensor.cpp
+index 06f940c..e85bd5f 100755
+--- a/libsensors/AccelSensor.cpp
++++ b/libsensors/AccelSensor.cpp
+@@ -25,247 +25,37 @@
+ #include <sys/select.h>
+ #include <dlfcn.h>
+ #include <cutils/log.h>
++#include <cutils/properties.h>
+ 
+ #include "AccelSensor.h"
+ 
+ /*****************************************************************************/
+ AccelSensor::AccelSensor()
+-: SensorBase(NULL, NULL),
+-      mEnabled(0),
+-      mPendingMask(0),
+-      mInputReader(32),
+-      mMinPollDelay(0),
+-      mMaxPollDelay(0)
++: SensorBase(NULL, NULL)
+ {
+-#if defined(ACCELEROMETER_SENSOR_MMA8451)
+-    data_name = "mma8451";
+-#elif defined(ACCELEROMETER_SENSOR_MMA8450)
+-    data_name = "mma8450";
+-#else
+-#error you must define accelerometer properly
+-    data_name = NULL;
+-    data_fd = -1;
+-#endif
++    data_name = "mma845x";
+ 
+     if (data_name) {
+         data_fd = openInput(data_name);
+-        getPollFile(data_name);
+-    }
+-    memset(mPendingEvents, 0, sizeof(mPendingEvents));
++		sensorBaseGetSysfsPath(data_name);
++     }
++    memset(&mPendingEvents[Accelerometer], 0, sizeof(sensors_event_t));
+ 
+     mPendingEvents[Accelerometer].version = sizeof(sensors_event_t);
+     mPendingEvents[Accelerometer].sensor = ID_A;
+     mPendingEvents[Accelerometer].type = SENSOR_TYPE_ACCELEROMETER;
+     mPendingEvents[Accelerometer].acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
+ 
+-    // read the actual value of all sensors if they're enabled already
+-    struct input_absinfo absinfo;
+-    short flags = 0;
+-
+-    if (accel_is_sensor_enabled(SENSOR_TYPE_ACCELEROMETER))  {
+-        mEnabled |= 1<<Accelerometer;
+-        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_X), &absinfo)) {
+-            mPendingEvents[Accelerometer].acceleration.x = absinfo.value * CONVERT_A_X;
+-        }
+-        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_Y), &absinfo)) {
+-            mPendingEvents[Accelerometer].acceleration.y = absinfo.value * CONVERT_A_Y;
+-        }
+-        if (!ioctl(data_fd, EVIOCGABS(EVENT_TYPE_ACCEL_Z), &absinfo)) {
+-            mPendingEvents[Accelerometer].acceleration.z = absinfo.value * CONVERT_A_Z;
+-        }
+-    }
+ }
+ 
+ AccelSensor::~AccelSensor()
+ {
+ }
+ 
+-int AccelSensor::enable(int32_t handle, int en)
+-{
+-    int what = -1;
+-
+-    switch (handle) {
+-        case ID_A: what = Accelerometer; break;
+-    }
+-
+-    if (uint32_t(what) >= numSensors)
+-        return -EINVAL;
+-
+-    int newState  = en ? 1 : 0;
+-    int err = 0;
+-
+-    if ((uint32_t(newState)<<what) != (mEnabled & (1<<what))) {
+-        uint32_t sensor_type;
+-        switch (what) {
+-            case Accelerometer: sensor_type = SENSOR_TYPE_ACCELEROMETER;  break;
+-        }
+-        short flags = newState;
+-        if (en)
+-            err = accel_enable_sensor(sensor_type);
+-        else
+-            err = accel_disable_sensor(sensor_type);
+-
+-        LOGE_IF(err, "Could not change sensor state (%s)", strerror(-err));
+-        if (!err) {
+-            mEnabled &= ~(1<<what);
+-            mEnabled |= (uint32_t(flags)<<what);
+-        }
+-    }
+-    return err;
+-}
+-
+-int AccelSensor::getPollFile(const char* inputName)
+-{
+-    FILE *fd = NULL;
+-    const char *dirname = "/sys/class/input/";
+-    char sysfs_name[PATH_MAX], *endptr;
+-    char *filename = NULL, buf[32];
+-    DIR *dir;
+-    struct dirent *de;
+-    int n, path_len;
+-
+-    poll_sysfs_file_len = 0;
+-    dir = opendir(dirname);
+-    if(dir == NULL)
+-        return -1;
+-
+-    strcpy(sysfs_name, dirname);
+-    filename = sysfs_name + strlen(sysfs_name);
+-    while ((de = readdir(dir))) {
+-        if ((strlen(de->d_name) < 6) ||
+-            strncmp(de->d_name, "input", 5))
+-            continue;
+-
+-        strcpy(filename, de->d_name);
+-        strcat(filename, "/");
+-        path_len = strlen(sysfs_name);
+-        strcat(filename, "name");
+-        fd = fopen(sysfs_name, "r");
+-        if (fd) {
+-            memset(buf, 0, 32);
+-            n = fread(buf, 1, 32, fd);
+-            fclose(fd);
+-            if ((strlen(buf) >= strlen(inputName)) &&
+-                !strncmp(buf, inputName, strlen(inputName))) {
+-                /* Try to open /sys/class/input/input?/poll */
+-                filename = sysfs_name + path_len;
+-                strcpy(filename, "poll");
+-                fd = fopen(sysfs_name, "r+");
+-                if (fd) {
+-                    strcpy(poll_sysfs_file,sysfs_name);
+-                    poll_sysfs_file_len = strlen(poll_sysfs_file);
+-                    fclose(fd);
+-                    LOGD("Found %s\n", poll_sysfs_file);
+-
+-                    /* Get max poll delay time */
+-                    filename = sysfs_name + path_len;
+-                    strcpy(filename, "max");
+-                    fd = fopen(sysfs_name, "r");
+-                    if (fd) {
+-                        memset(buf, 0, 32);
+-                        n = fread(buf, 1, 6, fd);
+-                        if (n > 0)
+-                            mMaxPollDelay = strtol(buf, &endptr, 10);
+-                        fclose(fd);
+-                    }
+-
+-                    /* Get min poll delay time */
+-                    filename = sysfs_name + path_len;
+-                    strcpy(filename, "min");
+-                    fd = fopen(sysfs_name, "r");
+-                    if (fd) {
+-                        memset(buf, 0, 32);
+-                        n = fread(buf, 1, 6, fd);
+-                        if (n > 0)
+-                            mMinPollDelay = strtol(buf, &endptr, 10);
+-                        fclose(fd);
+-                    }
+-                    LOGD("mMinPollDelay %d, mMaxPollDelay %d\n",
+-                           mMinPollDelay, mMaxPollDelay);
+-
+-                    return 0;
+-                }
+-            }
+-        }
+-   }
+-
+-   return -1;
+-}
+-
+-int AccelSensor::setDelay(int32_t handle, int64_t ns)
+-{
+-    FILE *fd = NULL;
+-    int n, len, ms, ret = -1;
+-    char buf[6];
+-
+-    ms = ns / 1000 / 1000;
+-    LOGD("AccelSensor....setDelay, ms=%d\n", ms);
+-
+-    if (poll_sysfs_file_len &&
+-        (ms >= mMinPollDelay) &&
+-        (ms <= mMaxPollDelay)) {
+-       fd = fopen(poll_sysfs_file, "r+");
+-       if (fd) {
+-           len = 6;
+-           memset(buf, 0, len);
+-           snprintf(buf, len, "%d", ms);
+-           n = fwrite(buf, 1, len, fd);
+-           fclose(fd);
+-           ret = 0;
+-       }else
+-           LOGE("file %s open failure\n", poll_sysfs_file);
+-    }else
+-        LOGE("Error in setDelay %d ms\n", ms);
+-
+-    return ret;
+-}
+-
+-int AccelSensor::readEvents(sensors_event_t* data, int count)
+-{
+-
+-    if (count < 1)
+-        return -EINVAL;
+-
+-    ssize_t n = mInputReader.fill(data_fd);
+-    if (n < 0)
+-        return n;
+-
+-    int numEventReceived = 0;
+-    input_event const* event;
+-
+-    while (count && mInputReader.readEvent(&event)) {
+-        int type = event->type;
+-        if (type == EV_ABS) {
+-            processEvent(event->code, event->value);
+-            mInputReader.next();
+-        } else if (type == EV_SYN) {
+-            int64_t time = timevalToNano(event->time);
+-            for (int j=0 ; count && mPendingMask && j<numSensors ; j++) {
+-                if (mPendingMask & (1<<j)) {
+-                    mPendingMask &= ~(1<<j);
+-                    mPendingEvents[j].timestamp = time;
+-                    if (mEnabled & (1<<j)) {
+-                        *data++ = mPendingEvents[j];
+-                        count--;
+-                        numEventReceived++;
+-                    }
+-                }
+-            }
+-            if (!mPendingMask) {
+-                mInputReader.next();
+-            }
+-        } else {
+-            LOGE("AccelSensor: unknown event (type=%d, code=%d)",
+-                    type, event->code);
+-            mInputReader.next();
+-        }
+-    }
+-
+-    return numEventReceived;
+-}
+-
+ void AccelSensor::processEvent(int code, int value)
+ {
++    float temp_x = 0.0f, temp_y = 0.0f, raw_x_ev = 0.0f, raw_y_ev = 0.0f;
++
+     switch (code) {
+         case EVENT_TYPE_ACCEL_X:
+             mPendingMask |= 1<<Accelerometer;
+diff --git a/libsensors/AccelSensor.h b/libsensors/AccelSensor.h
+index 119325f..4402b2c 100755
+--- a/libsensors/AccelSensor.h
++++ b/libsensors/AccelSensor.h
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -29,48 +29,11 @@
+ 
+ /*****************************************************************************/
+ 
+-struct input_event;
+-
+ class AccelSensor : public SensorBase {
+ public:
+             AccelSensor();
+     virtual ~AccelSensor();
+-
+-    enum {
+-        Accelerometer   = 0,
+-        numSensors
+-    };
+-
+-    virtual int setDelay(int32_t handle, int64_t ns);
+-    virtual int enable(int32_t handle, int enabled);
+-    virtual int readEvents(sensors_event_t* data, int count);
+-    void processEvent(int code, int value);
+-
+-private:
+-    uint32_t mEnabled;
+-    uint32_t mPendingMask;
+-    InputEventCircularReader mInputReader;
+-    sensors_event_t mPendingEvents[numSensors];
+-    int mMinPollDelay;
+-    int mMaxPollDelay;
+-    char poll_sysfs_file[PATH_MAX];
+-    int poll_sysfs_file_len;
+-    int getPollFile(const char* inputName);
+-    static inline int accel_is_sensor_enabled(uint32_t sensor_type)
+-    {
+-        //dummy now......
+-        return 1;
+-    }
+-    static inline int accel_enable_sensor(uint32_t sensor_type)
+-    {
+-        //dummy now......
+-        return 0;
+-    }
+-    static inline int accel_disable_sensor(uint32_t sensor_type)
+-    {
+-       //dummy now......
+-       return 0;
+-    }
++    virtual void  processEvent(int code, int value);
+ };
+ 
+ /*****************************************************************************/
+diff --git a/libsensors/Android.mk b/libsensors/Android.mk
+index bfac299..7db222c 100755
+--- a/libsensors/Android.mk
++++ b/libsensors/Android.mk
+@@ -20,7 +20,7 @@ ifneq ($(TARGET_SIMULATOR),true)
+ # HAL module implemenation, not prelinked, and stored in
+ # hw/<SENSORS_HARDWARE_MODULE_ID>.<ro.product.board>.so
+ include $(CLEAR_VARS)
+-LOCAL_PRELINK_MODULE := true
++LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+ LOCAL_MODULE := sensors.freescale
+ LOCAL_MODULE_TAGS := eng
+@@ -40,7 +40,8 @@ LOCAL_SRC_FILES := 						\
+ 				LightSensor.cpp			\
+ 				AccelSensor.cpp			\
+ 				MagSensor.cpp			\
+-                                InputEventReader.cpp
++				PressSensor.cpp			\
++				InputEventReader.cpp
+ 
+ LOCAL_SHARED_LIBRARIES := liblog libcutils libdl
+ 
+diff --git a/libsensors/InputEventReader.cpp b/libsensors/InputEventReader.cpp
+index 726e015..15cec06 100755
+--- a/libsensors/InputEventReader.cpp
++++ b/libsensors/InputEventReader.cpp
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+diff --git a/libsensors/InputEventReader.h b/libsensors/InputEventReader.h
+index 9b7dc58..fcf77b3 100755
+--- a/libsensors/InputEventReader.h
++++ b/libsensors/InputEventReader.h
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+diff --git a/libsensors/LightSensor.cpp b/libsensors/LightSensor.cpp
+index 201b16d..55b5d51 100755
+--- a/libsensors/LightSensor.cpp
++++ b/libsensors/LightSensor.cpp
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -202,3 +202,7 @@ int LightSensor::readEvents(sensors_event_t* data, int count)
+ 
+     return numEventReceived;
+ }
++
++void LightSensor::processEvent(int code, int value)
++{
++}
+diff --git a/libsensors/LightSensor.h b/libsensors/LightSensor.h
+index 0edd171..16a8d4b 100755
+--- a/libsensors/LightSensor.h
++++ b/libsensors/LightSensor.h
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -49,6 +49,7 @@ public:
+     virtual bool hasPendingEvents() const;
+     virtual int setDelay(int32_t handle, int64_t ns);
+     virtual int enable(int32_t handle, int enabled);
++    virtual void processEvent(int code, int value);
+ 
+ private:
+     int mThresholdLux;
+diff --git a/libsensors/MagSensor.cpp b/libsensors/MagSensor.cpp
+index c217183..1090fd3 100755
+--- a/libsensors/MagSensor.cpp
++++ b/libsensors/MagSensor.cpp
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -35,13 +35,12 @@
+  * mag data and orientation data to the input device.
+  */
+ MagSensor::MagSensor()
+-: SensorBase(NULL, "eCompass"),
+-      mEnabled(0),
+-      mPendingMask(0),
+-      mInputReader(32)
++: SensorBase(NULL, "eCompass")
+ {
+-    memset(mPendingEvents, 0, sizeof(mPendingEvents));
+-
++    char * magSensorName = "mag3110";
++	sensorBaseGetSysfsPath(magSensorName);
++    memset(&mPendingEvents[MagneticField], 0, sizeof(sensors_event_t));
++    memset(&mPendingEvents[Orientation], 0, sizeof(sensors_event_t));
+     mPendingEvents[MagneticField].version = sizeof(sensors_event_t);
+     mPendingEvents[MagneticField].sensor = ID_M;
+     mPendingEvents[MagneticField].type = SENSOR_TYPE_MAGNETIC_FIELD;
+@@ -58,77 +57,6 @@ MagSensor::~MagSensor()
+ {
+ }
+ 
+-int MagSensor::enable(int32_t handle, int en)
+-{
+-    int what = -1;
+-    int flags = en ? 1 : 0;
+-
+-    switch (handle) {
+-        case ID_M: what = MagneticField; break;
+-        case ID_O: what = Orientation;   break;
+-    }
+-
+-    if (uint32_t(what) >= numSensors)
+-        return -EINVAL;
+-
+-    mEnabled &= ~(1<<what);
+-    mEnabled |= (uint32_t(flags)<<what);
+-
+-    return 0;
+-}
+-
+-int MagSensor::setDelay(int32_t handle, int64_t ns)
+-{
+-    /* Dummy now...This delay will be related to g-sensor and mag-sensor
+-       polling delay time. Fix me later */
+-    return 0;
+-}
+-
+-int MagSensor::readEvents(sensors_event_t* data, int count)
+-{
+-    if (count < 1)
+-        return -EINVAL;
+-
+-    ssize_t n = mInputReader.fill(data_fd);
+-    if (n < 0)
+-        return n;
+-
+-    int numEventReceived = 0;
+-    input_event const* event;
+-
+-    while (count && mInputReader.readEvent(&event)) {
+-        int type = event->type;
+-        if (type == EV_ABS) {
+-            processEvent(event->code, event->value);
+-            mInputReader.next();
+-        } else if (type == EV_SYN) {
+-            int64_t time = timevalToNano(event->time);
+-     
+-            for (int j=0 ; count && mPendingMask && j<numSensors ; j++) {
+-
+-                if (mPendingMask & (1<<j)) {
+-                    mPendingMask &= ~(1<<j);
+-                    mPendingEvents[j].timestamp = time;
+-                    if (mEnabled & (1<<j)) {
+-                        *data++ = mPendingEvents[j];
+-                        count--;
+-                        numEventReceived++;
+-                    }
+-                }
+-            }
+-            if (!mPendingMask) {
+-                mInputReader.next();
+-            }
+-        } else {
+-            LOGE("MagSensor: unknown event (type=%d, code=%d)",
+-                    type, event->code);
+-            mInputReader.next();
+-        }
+-    }
+-
+-    return numEventReceived;
+-}
+-
+ void MagSensor::processEvent(int code, int value)
+ {
+     switch (code) {
+diff --git a/libsensors/MagSensor.h b/libsensors/MagSensor.h
+index 0a582e2..e0666aa 100755
+--- a/libsensors/MagSensor.h
++++ b/libsensors/MagSensor.h
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -33,25 +33,9 @@ struct input_event;
+ 
+ class MagSensor : public SensorBase {
+ public:
+-            MagSensor();
++    MagSensor();
+     virtual ~MagSensor();
+-
+-    enum {
+-        MagneticField   = 0,
+-	Orientation = 1,
+-        numSensors
+-    };
+-
+-    virtual int setDelay(int32_t handle, int64_t ns);
+-    virtual int enable(int32_t handle, int enabled);
+-    virtual int readEvents(sensors_event_t* data, int count);
+-    void processEvent(int code, int value);
+-
+-private:
+-    uint32_t mEnabled;
+-    uint32_t mPendingMask;
+-    InputEventCircularReader mInputReader;
+-    sensors_event_t mPendingEvents[numSensors];
++    virtual void processEvent(int code, int value);
+ };
+ 
+ /*****************************************************************************/
+diff --git a/libsensors/PressSensor.cpp b/libsensors/PressSensor.cpp
+new file mode 100755
+index 0000000..5caec07
+--- /dev/null
++++ b/libsensors/PressSensor.cpp
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <fcntl.h>
++#include <errno.h>
++#include <math.h>
++#include <stdlib.h>
++#include <poll.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <sys/select.h>
++#include <dlfcn.h>
++#include <cutils/log.h>
++
++#include "PressSensor.h"
++
++PressSensor::PressSensor()
++:SensorBase(NULL, "mpl3115")
++{
++    char * magSensorName = "mpl3115";
++    sensorBaseGetSysfsPath(magSensorName);
++    memset(&mPendingEvents[Pressure], 0, sizeof(sensors_event_t));
++    memset(&mPendingEvents[Temperatury], 0, sizeof(sensors_event_t));
++
++    mPendingEvents[Pressure].version = sizeof(sensors_event_t);
++    mPendingEvents[Pressure].sensor = ID_P;
++    mPendingEvents[Pressure].type = SENSOR_TYPE_PRESSURE;
++
++    mPendingEvents[Temperatury].version = sizeof(sensors_event_t);
++    mPendingEvents[Temperatury].sensor = ID_T;
++    mPendingEvents[Temperatury].type = SENSOR_TYPE_TEMPERATURE;
++
++}
++
++PressSensor::~PressSensor()
++{
++}
++
++void PressSensor::processEvent(int code, int value)
++{
++    switch (code) {
++        case EVENT_TYPE_PRESSURE:
++            mPendingMask |= 1 << Pressure;
++            mPendingEvents[Pressure].pressure= value * CONVERT_PRESSURE;
++            break;
++		case EVENT_TYPE_TEMPERATURE:
++            mPendingMask |= 1<<Temperatury;
++            mPendingEvents[Temperatury].temperature= value * CONVERT_TEMPERATURE;
++            break;
++    }
++}
+diff --git a/libsensors/PressSensor.h b/libsensors/PressSensor.h
+new file mode 100755
+index 0000000..9617713
+--- /dev/null
++++ b/libsensors/PressSensor.h
+@@ -0,0 +1,43 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ANDROID_PRESS_SENSOR_H
++#define ANDROID_PRESS_SENSOR_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/cdefs.h>
++#include <sys/types.h>
++
++#include "sensors.h"
++#include "SensorBase.h"
++#include "InputEventReader.h"
++
++/*****************************************************************************/
++
++struct input_event;
++
++class PressSensor : public SensorBase {
++public:
++            PressSensor();
++    virtual ~PressSensor();
++    virtual void processEvent(int code, int value);
++};
++
++/*****************************************************************************/
++
++#endif  // ANDROID_PRESS_SENSOR_H
+diff --git a/libsensors/SensorBase.cpp b/libsensors/SensorBase.cpp
+index 0a2522c..5aba33e 100755
+--- a/libsensors/SensorBase.cpp
++++ b/libsensors/SensorBase.cpp
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -22,7 +22,7 @@
+ #include <unistd.h>
+ #include <dirent.h>
+ #include <sys/select.h>
+-
++#include <stdlib.h>
+ #include <cutils/log.h>
+ 
+ #include <linux/input.h>
+@@ -30,28 +30,37 @@
+ #include "SensorBase.h"
+ 
+ /*****************************************************************************/
++#define  SYSFS_ENABLE  	"enable"
++#define  SYSFS_POLL   	"poll"
++#define  SYSFS_POLL_MIN "min"
++#define  SYSFS_POLL_MAX	"max"
++int SensorBase::mUser[SENSORS_MAX] 	= {0};
++uint32_t SensorBase::mEnabled		= 0;
++uint32_t SensorBase::mPendingMask	= 0;
+ 
++sensors_event_t SensorBase::mPendingEvents[SensorBase::numSensors];
+ SensorBase::SensorBase(
+         const char* dev_name,
+         const char* data_name)
+     : dev_name(dev_name), data_name(data_name),
+-      dev_fd(-1), data_fd(-1)
++      dev_fd(-1), data_fd(-1),
++      mInputReader(64)
+ {
+-    if (data_name) {
++    if (data_name)
+         data_fd = openInput(data_name);
+-    }
+ }
+ 
+-SensorBase::~SensorBase() {
+-    if (data_fd >= 0) {
++SensorBase::~SensorBase()
++{
++    if (data_fd >= 0)
+         close(data_fd);
+-    }
+-    if (dev_fd >= 0) {
++
++    if (dev_fd >= 0)
+         close(dev_fd);
+-    }
+ }
+ 
+-int SensorBase::open_device() {
++int SensorBase::open_device()
++{
+     if (dev_fd<0 && dev_name) {
+         dev_fd = open(dev_name, O_RDONLY);
+         LOGE_IF(dev_fd<0, "Couldn't open %s (%s)", dev_name, strerror(errno));
+@@ -59,7 +68,8 @@ int SensorBase::open_device() {
+     return 0;
+ }
+ 
+-int SensorBase::close_device() {
++int SensorBase::close_device()
++{
+     if (dev_fd >= 0) {
+         close(dev_fd);
+         dev_fd = -1;
+@@ -67,31 +77,201 @@ int SensorBase::close_device() {
+     return 0;
+ }
+ 
+-int SensorBase::getFd() const {
++int SensorBase::write_sysfs(char * filename,char * buf,int size)
++{
++    int fd;
++    if(filename == NULL || buf == NULL || size <= 0 )
++        return -1;
++    fd = open(filename,O_WRONLY);
++    if(fd > 0){
++        write(fd,buf,size);
++        close(fd);
++    }
++    else
++        return -1;
++    return 0;
++}
++
++int SensorBase::read_sysfs(char * filename,char * buf,int size){
++    int fd;
++    int count = 0;
++    if(filename == NULL || buf == NULL || size <= 0)
++        return 0;
++    fd = open(filename,O_RDONLY);
++    if(fd > 0){
++        count = read(fd,buf,size);
++        close(fd);
++    } else {
++        LOGE("read sysfs file error\n");
++        return 0;
++    }
++    return count;
++}
++
++int SensorBase::sensorBaseEnable(int32_t handle,int enabled){
++    char buf[6];
++    int enable = (enabled ? 1 : 0);
++    int what = -1;
++    /*if the munber of  user > 1, do not disable sensor*/
++    switch (handle) {
++        case ID_A	: what = Accelerometer ;break;
++        case ID_M	: what = MagneticField; break;
++        case ID_O	: what = Orientation;   break;
++        case ID_GY 	: what = Gryo;   break;
++        case ID_L 	: what = Light;   break;
++        case ID_P  	: what = Pressure;   break;
++        case ID_T  	: what = Temperatury;   break;
++        case ID_PX 	: what = Proximity;   break;
++
++    }
++    if (uint32_t(what) >= numSensors)
++        return -EINVAL;
++
++    if(enable)
++        mUser[what]++;
++    else {
++        mUser[what]--;
++        if(mUser[what] < 0)
++            mUser[what] = 0;
++    }
++    if((enable && mUser[what] == 1) || (enable ==0  &&  mUser[what] == 0 )) {
++        snprintf(buf,sizeof(buf),"%d",enable);
++        write_sysfs(sysfs_enable,buf,strlen(buf));
++        mEnabled &= ~(1<<what);
++        mEnabled |= (uint32_t(enable)<<what);
++    }
++
++    LOGD("sensor %d , usr count %d\n",handle,mUser[handle]);
++    return 0;
++}
++
++int SensorBase::sensorBaseSetDelay(int32_t handle, int64_t ns){
++    char buf[6];
++    int ms;
++    ms = ns/1000/1000;
++    if(ms < mMinPollDelay)
++        ms = mMinPollDelay ;
++    else if(ms > mMaxPollDelay)
++        ms = mMaxPollDelay;
++    snprintf(buf,sizeof(buf),"%d",ms);
++    return write_sysfs(sysfs_poll,buf,strlen(buf));
++}
++
++int SensorBase::sensorBaseGetPollMin(){
++    char buf[64];
++    int size;
++    int pollmin;
++    size = read_sysfs(sysfs_poll_min,buf,sizeof(buf));
++    buf[size] = '\0';
++    pollmin = atoi(buf);
++    LOGD("%s ,%s",__FUNCTION__,buf);
++    return pollmin;
++}
++
++int SensorBase::sensorBaseGetPollMax(){
++    char buf[64];
++    int size;
++    int pollmax;
++    size = read_sysfs(sysfs_poll_max,buf,sizeof(buf));
++    buf[size] = '\0';
++    pollmax = atoi(buf);
++    LOGD("%s ,%s",__FUNCTION__,buf);
++    return pollmax; //default max is 200ms
++}
++
++int SensorBase::sensorBaseGetSysfsPath(const char* inputName)
++{
++    FILE *fd = NULL;
++    const char *dirname = "/sys/class/input/";
++    char sysfs_name[PATH_MAX], *endptr;
++    char *filename = NULL, buf[32];
++    DIR *dir;
++    struct dirent *de;
++    int n, path_len;
++    dir = opendir(dirname);
++    if(dir == NULL)
++        return -1;
++
++    strcpy(sysfs_name, dirname);
++    filename = sysfs_name + strlen(sysfs_name);
++    while ((de = readdir(dir))) {
++        if ((strlen(de->d_name) < 6) ||
++            strncmp(de->d_name, "input", 5))
++            continue;
++
++        strcpy(filename, de->d_name);
++        strcat(filename, "/");
++        path_len = strlen(sysfs_name);
++        strcat(filename, "name");
++        fd = fopen(sysfs_name, "r");
++        if (fd) {
++            memset(buf, 0, 32);
++            n = fread(buf, 1, 32, fd);
++            fclose(fd);
++            if ((strlen(buf) >= strlen(inputName)) &&
++                !strncmp(buf, inputName, strlen(inputName))) {
++                 sysfs_name[path_len] = '\0';
++                 snprintf(sysfs_enable, sizeof(sysfs_enable), "%s%s",sysfs_name,SYSFS_ENABLE);
++                 snprintf(sysfs_poll, sizeof(sysfs_poll), "%s%s",sysfs_name,SYSFS_POLL);
++                 snprintf(sysfs_poll_min, sizeof(sysfs_poll_min), "%s%s",sysfs_name, SYSFS_POLL_MIN);
++                 snprintf(sysfs_poll_max, sizeof(sysfs_poll_max), "%s%s",sysfs_name, SYSFS_POLL_MAX);
++                 mMinPollDelay = sensorBaseGetPollMin();
++                 mMaxPollDelay = sensorBaseGetPollMax();
++                 LOGD("%s path %s",inputName,sysfs_enable);
++                 LOGD("%s path %s",inputName,sysfs_poll);
++                 LOGD("%s path %s ,poll min delay %d",inputName,sysfs_poll_min,mMinPollDelay);
++                 LOGD("%s path %s ,poll max delay %d",inputName,sysfs_poll_max,mMaxPollDelay);
++                 return 0;
++            }
++        }
++    }
++
++    return -1;
++}
++
++int SensorBase::getFd() const
++{
+     if (!data_name) {
+         return dev_fd;
+     }
+     return data_fd;
+ }
+ 
+-int SensorBase::setDelay(int32_t handle, int64_t ns) {
++int SensorBase::enable(int32_t handle, int enabled)
++{
++    sensorBaseEnable(handle,enabled);
+     return 0;
+ }
+ 
+-bool SensorBase::hasPendingEvents() const {
++int SensorBase::setDelay(int32_t handle, int64_t ns)
++{
++    sensorBaseSetDelay(handle,ns);
++    return 0;
++}
++
++bool SensorBase::hasPendingEvents() const
++{
+     return false;
+ }
+ 
+-int64_t SensorBase::getTimestamp() {
++void processEvent(int code, int value)
++{
++}
++
++int64_t SensorBase::getTimestamp()
++{
+     struct timespec t;
+     t.tv_sec = t.tv_nsec = 0;
+     clock_gettime(CLOCK_MONOTONIC, &t);
+     return int64_t(t.tv_sec)*1000000000LL + t.tv_nsec;
+ }
+ 
+-int SensorBase::openInput(const char* inputName) {
++int SensorBase::openInput(const char* inputName)
++{
+     int fd = -1;
++    int input_id = -1;
+     const char *dirname = "/dev/input";
++    const char *inputsysfs = "/sys/class/input";
+     char devname[PATH_MAX];
+     char *filename;
+     DIR *dir;
+@@ -130,3 +310,49 @@ int SensorBase::openInput(const char* inputName) {
+     LOGE_IF(fd<0, "couldn't find '%s' input device", inputName);
+     return fd;
+ }
++
++int SensorBase::readEvents(sensors_event_t* data, int count)
++{
++    if (count < 1)
++        return -EINVAL;
++
++    ssize_t n = mInputReader.fill(data_fd);
++    if (n < 0)
++        return n;
++
++    int numEventReceived = 0;
++    input_event const* event;
++
++    while (count && mInputReader.readEvent(&event)) {
++        int type = event->type;
++        if (type == EV_ABS) {
++            processEvent(event->code, event->value);
++            mInputReader.next();
++        } else if (type == EV_SYN) {
++            int64_t time = timevalToNano(event->time);
++
++            for (int j=0 ; count && mPendingMask && j<numSensors ; j++) {
++
++                if (mPendingMask & (1<<j)) {
++                    mPendingMask &= ~(1<<j);
++                    mPendingEvents[j].timestamp = time;
++                    if (mEnabled & (1<<j)) {
++                        *data++ = mPendingEvents[j];
++                        count--;
++                        numEventReceived++;
++                    }
++                }
++            }
++            if (!mPendingMask) {
++                mInputReader.next();
++            }
++        } else {
++            LOGE("Sensor: unknown event (type=%d, code=%d)",
++                    type, event->code);
++            mInputReader.next();
++        }
++    }
++
++    return numEventReceived;
++}
++
+diff --git a/libsensors/SensorBase.h b/libsensors/SensorBase.h
+index da66548..e39609a 100755
+--- a/libsensors/SensorBase.h
++++ b/libsensors/SensorBase.h
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -22,21 +22,26 @@
+ #include <errno.h>
+ #include <sys/cdefs.h>
+ #include <sys/types.h>
++#include "InputEventReader.h"
++#include "sensors.h"
+ 
++#define SENSORS_MAX  20
+ 
+ /*****************************************************************************/
+-
+-struct sensors_event_t;
+-
+ class SensorBase {
+ protected:
+     const char* dev_name;
+     const char* data_name;
+-    char        input_name[PATH_MAX];
+-    int         dev_fd;
+-    int         data_fd;
+-
+-    int openInput(const char* inputName);
++    char   input_name[PATH_MAX];
++    char   sysfs_enable[PATH_MAX];
++    char   sysfs_poll[PATH_MAX];
++    char   sysfs_poll_min[PATH_MAX];
++    char   sysfs_poll_max[PATH_MAX];
++    int    dev_fd;
++    int    data_fd;
++    int    mMinPollDelay;
++    int    mMaxPollDelay;
++    int    openInput(const char* inputName);
+     static int64_t getTimestamp();
+ 
+ 
+@@ -46,19 +51,41 @@ protected:
+ 
+     int open_device();
+     int close_device();
++    int write_sysfs(char * filename,char * buf,int size);
++    int read_sysfs(char * filename,char * buf,int size);
++    int sensorBaseEnable(int32_t handle,int enabled);
++    int sensorBaseSetDelay(int32_t handle, int64_t ns);
++    int sensorBaseGetPollMin();
++    int sensorBaseGetPollMax();
++    int sensorBaseGetSysfsPath(const char* inputName);
++    InputEventCircularReader mInputReader;
+ 
+ public:
+-            SensorBase(
+-                    const char* dev_name,
+-                    const char* data_name);
++    static int mUser[SENSORS_MAX];
++    static const int    Accelerometer   = 0;
++    static const int	MagneticField   = 1;
++    static const int	Orientation = 2;
++    static const int	Gryo =	3;
++    static const int	Light  = 4;
++    static const int	Pressure = 5;
++    static const int	Temperatury = 6;
++    static const int	Proximity = 7;
++    static const int	numSensors = 8 ;
++    static uint32_t mEnabled;
++    static uint32_t mPendingMask;
++    static sensors_event_t mPendingEvents[numSensors];
++    SensorBase(
++               const char* dev_name,
++               const char* data_name);
+ 
+     virtual ~SensorBase();
+ 
+-    virtual int readEvents(sensors_event_t* data, int count) = 0;
++    virtual int readEvents(sensors_event_t* data, int count);
+     virtual bool hasPendingEvents() const;
+     virtual int getFd() const;
+     virtual int setDelay(int32_t handle, int64_t ns);
+-    virtual int enable(int32_t handle, int enabled) = 0;
++    virtual int enable(int32_t handle, int enabled) ;
++    virtual void processEvent(int code, int value) = 0;
+ };
+ 
+ /*****************************************************************************/
+diff --git a/libsensors/sensors.cpp b/libsensors/sensors.cpp
+index cc69a64..936c07b 100755
+--- a/libsensors/sensors.cpp
++++ b/libsensors/sensors.cpp
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011 Freescale Semiconductor Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -36,6 +36,8 @@
+ #include "LightSensor.h"
+ #include "AccelSensor.h"
+ #include "MagSensor.h"
++#include "PressSensor.h"
++
+ 
+ /*****************************************************************************/
+ 
+@@ -46,17 +48,20 @@
+ #define SENSORS_ACCELERATION     (1<<ID_A)
+ #define SENSORS_MAGNETIC_FIELD   (1<<ID_M)
+ #define SENSORS_ORIENTATION      (1<<ID_O)
+-#define SENSORS_LIGHT            (1<<ID_L)
+-#define SENSORS_PROXIMITY        (1<<ID_P)
+ #define SENSORS_GYROSCOPE        (1<<ID_GY)
++#define SENSORS_LIGHT            (1<<ID_L)
++#define SENSORS_PRESS            (1<<ID_P)
++#define SENSORS_TEMPERATURE	 (1<<ID_T)
++#define SENSORS_PROXIMITY        (1<<ID_PX)
+ 
+ #define SENSORS_ACCELERATION_HANDLE     0
+ #define SENSORS_MAGNETIC_FIELD_HANDLE   1
+ #define SENSORS_ORIENTATION_HANDLE      2
+-#define SENSORS_LIGHT_HANDLE            3
+-#define SENSORS_PROXIMITY_HANDLE        4
+-#define SENSORS_GYROSCOPE_HANDLE        5
+-
++#define SENSORS_GYROSCOPE_HANDLE        3
++#define SENSORS_LIGHT_HANDLE            4
++#define SENSORS_PRESSURE_HANDLE         5
++#define SENSORS_TEMPERATURE_HANDLE      6
++#define SENSORS_PROXIMITY_HANDLE        7
+ 
+ /*****************************************************************************/
+ 
+@@ -74,6 +79,14 @@ static const struct sensor_t sSensorList[] = {
+           "Freescale Semiconductor Inc.",
+           1, SENSORS_ORIENTATION_HANDLE,
+           SENSOR_TYPE_ORIENTATION, 360.0f, CONVERT_O, 0.50f, 100000, { } },
++        { "MPL3115 Pressure sensor",
++          "Freescale Semiconductor Inc.",
++          1, SENSORS_PRESSURE_HANDLE,
++          SENSOR_TYPE_PRESSURE, 1100.0f, CONVERT_PRESSURE, 0.35f, 0, { } },
++        { "MPL3115 Temperature sensor",
++          "Freescale Semiconductor Inc.",
++          1, SENSORS_TEMPERATURE_HANDLE,
++          SENSOR_TYPE_TEMPERATURE, 85.0f, CONVERT_TEMPERATURE, 0.35f, 0, { } },
+         { "ISL29023 Light sensor",
+           "Intersil",
+           1, SENSORS_LIGHT_HANDLE,
+@@ -120,9 +133,10 @@ struct sensors_poll_context_t {
+ 
+ private:
+     enum {
+-        light           = 0,
+-        accel           = 1,
+-        mag 		= 2,
++        accel           = 0,
++        mag 		= 1,
++        pressure        = 2,
++        light        	= 3,
+         numSensorDrivers,
+         numFds,
+     };
+@@ -142,6 +156,9 @@ private:
+                 return mag;
+             case ID_L:
+                 return light;
++            case ID_P:
++            case ID_T:
++                return pressure;
+         }
+         return -EINVAL;
+     }
+@@ -151,11 +168,6 @@ private:
+ 
+ sensors_poll_context_t::sensors_poll_context_t()
+ {
+-    mSensors[light] = new LightSensor();
+-    mPollFds[light].fd = mSensors[light]->getFd();
+-    mPollFds[light].events = POLLIN;
+-    mPollFds[light].revents = 0;
+-
+     mSensors[accel] = new AccelSensor();
+     mPollFds[accel].fd = mSensors[accel]->getFd();
+     mPollFds[accel].events = POLLIN;
+@@ -166,6 +178,16 @@ sensors_poll_context_t::sensors_poll_context_t()
+     mPollFds[mag].events = POLLIN;
+     mPollFds[mag].revents = 0;
+ 
++    mSensors[pressure] = new PressSensor();
++    mPollFds[pressure].fd = mSensors[pressure]->getFd();
++    mPollFds[pressure].events = POLLIN;
++    mPollFds[pressure].revents = 0;
++
++    mSensors[light] = new LightSensor();
++    mPollFds[light].fd = mSensors[light]->getFd();
++    mPollFds[light].events = POLLIN;
++    mPollFds[light].revents = 0;
++
+     int wakeFds[2];
+     int result = pipe(wakeFds);
+     LOGE_IF(result<0, "error creating wake pipe (%s)", strerror(errno));
+@@ -188,8 +210,15 @@ sensors_poll_context_t::~sensors_poll_context_t() {
+ 
+ int sensors_poll_context_t::activate(int handle, int enabled) {
+     int index = handleToDriver(handle);
++    int err = 0 ;
++
+     if (index < 0) return index;
+-    int err =  mSensors[index]->enable(handle, enabled);
++    if(handle == ID_O || handle ==  ID_M){
++        err = mSensors[accel]->enable(ID_A, enabled);
++        if(err)
++            return err;
++    }
++    err |=  mSensors[index]->enable(handle, enabled);
+     if (enabled && !err) {
+         const char wakeMessage(WAKE_MESSAGE);
+         int result = write(mWritePipeFd, &wakeMessage, 1);
+@@ -202,6 +231,9 @@ int sensors_poll_context_t::setDelay(int handle, int64_t ns) {
+ 
+     int index = handleToDriver(handle);
+     if (index < 0) return index;
++    if(handle == ID_O || handle ==  ID_M)
++        mSensors[accel]->setDelay(ID_A, ns);
++
+     return mSensors[index]->setDelay(handle, ns);
+ }
+ 
+@@ -215,7 +247,7 @@ int sensors_poll_context_t::pollEvents(sensors_event_t* data, int count)
+         for (int i=0 ; count && i<numSensorDrivers ; i++) {
+             SensorBase* const sensor(mSensors[i]);
+ 
+-	   if ((mPollFds[i].revents & POLLIN) || (sensor->hasPendingEvents())) {
++            if ((mPollFds[i].revents & POLLIN) || (sensor->hasPendingEvents())) {
+                 int nb = sensor->readEvents(data, count);
+                 if (nb < count) {
+                     // no more data for this sensor
+diff --git a/libsensors/sensors.h b/libsensors/sensors.h
+index 11fd986..9cb385b 100755
+--- a/libsensors/sensors.h
++++ b/libsensors/sensors.h
+@@ -1,6 +1,6 @@
+ /*
+- * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2011-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -37,9 +37,16 @@ __BEGIN_DECLS
+ #define ID_A  (0)
+ #define ID_M  (1)
+ #define ID_O  (2)
+-#define ID_L  (3)
+-#define ID_P  (4)
+-#define ID_GY (5)
++#define ID_GY (3)
++#define ID_L  (4)
++#define ID_P  (5)
++#define ID_T  (6)
++#define ID_PX (7)
++
++#define HWROTATION_0   (0)
++#define HWROTATION_90  (1)
++#define HWROTATION_180 (2)
++#define HWROTATION_270 (3)
+ 
+ /*****************************************************************************/
+ 
+@@ -64,13 +71,11 @@ __BEGIN_DECLS
+ 
+ #define EVENT_TYPE_LIGHT            ABS_MISC
+ 
+-#if defined(ACCELEROMETER_SENSOR_MMA8451)
+-  #define LSG                         (4096.0f) // 4096 LSG = 1G for MMA8451
+-#elif defined(ACCELEROMETER_SENSOR_MMA8450)
+-  #define LSG                         (1024.0f) // 1024 LSG = 1G for MMA8450
+-#else
+-  #define LSG                         (720.0f)
+-#endif
++#define EVENT_TYPE_PRESSURE	        ABS_PRESSURE
++
++#define EVENT_TYPE_TEMPERATURE		ABS_MISC
++
++#define LSG                         (0x4000) // 4096 LSG = 1G for MMA8451
+ 
+ // conversion of acceleration data to SI units (m/s^2)
+ #define RANGE_A                     (2*GRAVITY_EARTH)
+@@ -81,16 +86,21 @@ __BEGIN_DECLS
+ 
+ // conversion of magnetic data to uT units
+ #define CONVERT_M                   (1.0f/20.0f)
+-#define CONVERT_M_X                 (-CONVERT_M)
++#define CONVERT_M_X                 (CONVERT_M)
+ #define CONVERT_M_Y                 (CONVERT_M)
+-#define CONVERT_M_Z                 (-CONVERT_M)
++#define CONVERT_M_Z                 (CONVERT_M)
+ 
+ /* conversion of orientation data to degree units */
+ #define CONVERT_O                   (1.0f/100.0f)
+ #define CONVERT_O_Y                 (CONVERT_O)
+-#define CONVERT_O_P                 (-CONVERT_O)
++#define CONVERT_O_P                 (CONVERT_O)
+ #define CONVERT_O_R                 (CONVERT_O)
+ 
++#define CONVERT_PRESSURE            (1.0f/(4.0f*100)) // hpa
++
++#define CONVERT_TEMPERATURE		    (1.0f/16.0f)     //Celsius
++
++
+ #define SENSOR_STATE_MASK           (0x7FFF)
+ 
+ /*****************************************************************************/
+-- 
+1.8.0
+

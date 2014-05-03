@@ -1,0 +1,72 @@
+From 1a2de37d1aabffa019ad04a65b308e15524e110a Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Tue, 6 Nov 2012 14:36:31 +0800
+Subject: [PATCH 363/486] ENGR00230425 The recorded video shakes for 1080P
+ quality
+
+Buffer will be queued to v4l2 driver two times:
+    * one from display thread
+    * the other from encoder thread
+Add the buffer ref by 2 at capture thread. And the buffer will only
+be queued to v4l2 if both display window and recoder put the buffer ref.
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp         | 7 +++----
+ mx6/libcamera/V4l2CapDeviceBase.cpp | 2 +-
+ 2 files changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index f114071..f331197 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -1824,7 +1824,7 @@ Pic_out:
+             if(mCaptureRunning) {
+                 if(buf_index < mCaptureBufNum) {
+                     if(mCaptureDevice->DevQueue(buf_index) <0){
+-                        CAMERA_LOG_ERR("The Capture device queue buf error !!!!");
++                        CAMERA_LOG_ERR("The Capture device queue buf %d error !!!!", buf_index);
+                         return INVALID_OPERATION;
+                     }
+                     //CAMERA_LOG_RUNTIME("Return buffer %d to Capture Device", buf_index);
+@@ -1895,6 +1895,7 @@ Pic_out:
+                 mPreviewThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, bufIndex));
+ 
+                 if(mRecordRunning) {
++                    getBufferCount(&mCaptureBuffers[bufIndex]);
+                     mEncodeThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, bufIndex));
+                 }
+                 break;
+@@ -2128,15 +2129,13 @@ Pic_out:
+                 if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+                     nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+                     if (mDirectInput == true) {
+-	                memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
++	                    memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
+                             (void*)&mVideoBufferPhy[enc_index], sizeof(VIDEOFRAME_BUFFER_PHY));
+-                        getBufferCount(&mCaptureBuffers[enc_index]);
+                     } else {
+                         memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
+                                 (void*)EncBuf->virt_start, mPreviewFrameSize);
+                     }
+ 
+-                    getBufferCount(&mCaptureBuffers[enc_index]);
+                     mVideoBufferUsing[enc_index] = 1;
+                     mDataCbTimestamp(timeStamp, CAMERA_MSG_VIDEO_FRAME, mVideoMemory, enc_index, mCallbackCookie);
+                     break;
+diff --git a/mx6/libcamera/V4l2CapDeviceBase.cpp b/mx6/libcamera/V4l2CapDeviceBase.cpp
+index 34d9487..9d1bcee 100755
+--- a/mx6/libcamera/V4l2CapDeviceBase.cpp
++++ b/mx6/libcamera/V4l2CapDeviceBase.cpp
+@@ -657,7 +657,7 @@ namespace android{
+         cfilledbuffer.index = BufQueIdx;
+         ret = ioctl(mCameraDevice, VIDIOC_QBUF, &cfilledbuffer);
+         if (ret < 0) {
+-            CAMERA_LOG_ERR("Camera VIDIOC_DQBUF failure, ret=%d", ret);
++            CAMERA_LOG_ERR("Camera VIDIOC_QBUF failure, ret=%d", ret);
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+         }
+         mQueuedBufNum ++;
+-- 
+1.8.0
+

@@ -1,0 +1,128 @@
+From 15ad2dd35eb546226432dd2675662879096e817b Mon Sep 17 00:00:00 2001
+From: yes <yes>
+Date: Sat, 15 May 2010 05:13:00 +0800
+Subject: [PATCH 041/486] update frame buffer memory to 4k align for z430
+ copyblit
+
+---
+ libgralloc/framebuffer.cpp | 22 +++++++++++-----------
+ libgralloc/gralloc.cpp     |  4 ++--
+ libgralloc/gralloc_priv.h  |  3 +++
+ 3 files changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index 0e6d9e6..18d92b2 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -154,7 +154,7 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ 
+         m->base.lock(&m->base, buffer, 
+                 private_module_t::PRIV_USAGE_LOCKED_FOR_POST, 
+-                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL(m->info.yres), NULL);
++                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL_128(m->info.yres), NULL);
+ 
+         const size_t offset = hnd->base - m->framebuffer->base;
+         m->info.activate = FB_ACTIVATE_VBL;
+@@ -188,15 +188,15 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+         
+         m->base.lock(&m->base, m->framebuffer, 
+                 GRALLOC_USAGE_SW_WRITE_RARELY, 
+-                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL(m->info.yres),
++                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL_128(m->info.yres),
+                 &fb_vaddr);
+ 
+         m->base.lock(&m->base, buffer, 
+                 GRALLOC_USAGE_SW_READ_RARELY, 
+-                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL(m->info.yres),
++                0, 0, ALIGN_PIXEL(m->info.xres), ALIGN_PIXEL_128(m->info.yres),
+                 &buffer_vaddr);
+ 
+-        memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * ALIGN_PIXEL(m->info.yres));
++        memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * ALIGN_PIXEL_128(m->info.yres));
+ 
+         #ifdef FSL_EPDC_FB
+         if(ctx->partial_update) {
+@@ -292,11 +292,11 @@ int mapFrameBufferLocked(struct private_module_t* module)
+     /*
+      * Request NUM_BUFFERS screens (at lest 2 for page flipping)
+      */
+-    info.yres_virtual = ALIGN_PIXEL(info.yres) * NUM_BUFFERS;
++    info.yres_virtual = ALIGN_PIXEL_128(info.yres) * NUM_BUFFERS;
+ 	info.xres_virtual = ALIGN_PIXEL(info.xres);
+     
+     #ifdef FSL_EPDC_FB
+-    info.yres_virtual = ALIGN_PIXEL(info.yres);
++    info.yres_virtual = ALIGN_PIXEL_128(info.yres);
+ 	info.bits_per_pixel = 16;
+ 	info.grayscale = 0;
+ 	info.yoffset = 0;
+@@ -305,17 +305,17 @@ int mapFrameBufferLocked(struct private_module_t* module)
+ 
+     uint32_t flags = PAGE_FLIP;
+     if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1) {
+-        info.yres_virtual = ALIGN_PIXEL(info.yres);
++        info.yres_virtual = ALIGN_PIXEL_128(info.yres);
+         flags &= ~PAGE_FLIP;
+         LOGW("FBIOPUT_VSCREENINFO failed, page flipping not supported");
+     }
+ 
+-    if (info.yres_virtual < ALIGN_PIXEL(info.yres) * 2) {
++    if (info.yres_virtual < ALIGN_PIXEL_128(info.yres) * 2) {
+         // we need at least 2 for page-flipping
+-        info.yres_virtual = ALIGN_PIXEL(info.yres);
++        info.yres_virtual = ALIGN_PIXEL_128(info.yres);
+         flags &= ~PAGE_FLIP;
+         LOGW("page flipping not supported (yres_virtual=%d, requested=%d)",
+-                info.yres_virtual, ALIGN_PIXEL(info.yres)*2);
++                info.yres_virtual, ALIGN_PIXEL_128(info.yres)*2);
+     }
+ 
+     if (ioctl(fd, FBIOGET_VSCREENINFO, &info) == -1)
+@@ -406,7 +406,7 @@ int mapFrameBufferLocked(struct private_module_t* module)
+     module->framebuffer = new private_handle_t(dup(fd), fbSize,
+             private_handle_t::PRIV_FLAGS_USES_PMEM);
+ 
+-    module->numBuffers = info.yres_virtual / ALIGN_PIXEL(info.yres);
++    module->numBuffers = info.yres_virtual / ALIGN_PIXEL_128(info.yres);
+     module->bufferMask = 0;
+ 
+     void* vaddr = mmap(0, fbSize, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+diff --git a/libgralloc/gralloc.cpp b/libgralloc/gralloc.cpp
+index ea77f32..f65099e 100755
+--- a/libgralloc/gralloc.cpp
++++ b/libgralloc/gralloc.cpp
+@@ -130,7 +130,7 @@ static int gralloc_alloc_framebuffer_locked(alloc_device_t* dev,
+ 
+     const uint32_t bufferMask = m->bufferMask;
+     const uint32_t numBuffers = m->numBuffers;
+-    const size_t bufferSize = m->finfo.line_length * ALIGN_PIXEL(m->info.yres);
++    const size_t bufferSize = m->finfo.line_length * ALIGN_PIXEL_128(m->info.yres);
+     if (numBuffers == 1) {
+         // If we have only one buffer, we never use page-flipping. Instead,
+         // we return a regular buffer which will be memcpy'ed to the main
+@@ -432,7 +432,7 @@ static int gralloc_free(alloc_device_t* dev,
+         // free this buffer
+         private_module_t* m = reinterpret_cast<private_module_t*>(
+                 dev->common.module);
+-        const size_t bufferSize = m->finfo.line_length * ALIGN_PIXEL(m->info.yres);
++        const size_t bufferSize = m->finfo.line_length * ALIGN_PIXEL_128(m->info.yres);
+         int index = (hnd->base - m->framebuffer->base) / bufferSize;
+         m->bufferMask &= ~(1<<index); 
+     } else { 
+diff --git a/libgralloc/gralloc_priv.h b/libgralloc/gralloc_priv.h
+index f3c0ab5..3801907 100755
+--- a/libgralloc/gralloc_priv.h
++++ b/libgralloc/gralloc_priv.h
+@@ -30,6 +30,9 @@
+ #include <linux/fb.h>
+ 
+ #define  ALIGN_PIXEL(x)  ((x+ 31) & ~31)
++/** z430 core need 4k aligned memory, since xres has been 32 aligned, make yres
++    to 128 aligned will meet this request for all pixel format (RGB565,RGB888,etc.) */
++#define  ALIGN_PIXEL_128(x)  ((x+ 127) & ~127)
+ /*****************************************************************************/
+ 
+ struct private_module_t;
+-- 
+1.8.0
+

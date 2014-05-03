@@ -1,0 +1,925 @@
+From 929a9bb0ded5fdd7cf86de7804939d7a0c8057c8 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Fri, 29 Jun 2012 10:51:04 +0800
+Subject: [PATCH 300/486] ENGR00215353 remove the warning for camera hal
+
+Remove the non-used variable and warning
+Add -Werror into build option
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera/Android.mk     |   2 +
+ mx6/libcamera/CameraHal.cpp  | 230 ++++++++++++++++++++-----------------------
+ mx6/libcamera/CameraHal.h    |  50 +++-------
+ mx6/libcamera/Camera_utils.h |   1 -
+ 4 files changed, 124 insertions(+), 159 deletions(-)
+
+diff --git a/mx6/libcamera/Android.mk b/mx6/libcamera/Android.mk
+index f0e8f96..69aeebf 100755
+--- a/mx6/libcamera/Android.mk
++++ b/mx6/libcamera/Android.mk
+@@ -66,6 +66,8 @@ endif
+ #Define this for switch the Camera through V4L2 MXC IOCTL
+ #LOCAL_CPPFLAGS += -DV4L2_CAMERA_SWITCH
+ 
++LOCAL_CPPFLAGS += -Werror
++
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw	
+ LOCAL_MODULE:= camera.$(TARGET_BOARD_PLATFORM)
+ 
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 29b5345..6195acb 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -33,7 +33,15 @@
+ namespace android {
+ 
+     CameraHal::CameraHal(int cameraid)
+-        : mParameters(),
++        :
++        mCaptureRunning(0),
++        mExitCaptureThread(false),
++        mPreviewRunning(0),
++        mExitPreviewThread(false),
++        mExitPostProcessThread(false),
++        mExitEncodeThread(false),
++        mTakePictureInProcess(false),
++        mParameters(),
+         mCallbackCookie(NULL),
+         mNotifyCb(NULL),
+         mDataCb(NULL),
+@@ -53,10 +61,9 @@ namespace android {
+         mNativeWindow(NULL),
+         mMsgEnabled(0),
+         mPreviewMemory(NULL),
+-        mVideoMemory(NULL),
+         mVideoBufNume(VIDEO_OUTPUT_BUFFER_NUM),
++        mVideoMemory(NULL),
+         mPPbufNum(0),
+-        mPreviewRunning(0), mCaptureRunning(0),
+         mDefaultPreviewFormat(V4L2_PIX_FMT_NV12), //the optimized selected format, hard code
+         mPreviewFrameSize(0),
+         mTakePicFlag(false),
+@@ -64,8 +71,6 @@ namespace android {
+         mCaptureFrameSize(0),
+         mCaptureBufNum(0),
+         mEnqueuedBufs(0),
+-        isCaptureBufsAllocated(0),
+-        //isPreviewFinsh(0),
+         mRecordRunning(0),
+         mCurrentRecordFrame(0),
+         nCameraBuffersQueued(0),
+@@ -73,15 +78,14 @@ namespace android {
+         mTakePicBufQueNum(TAKE_PIC_QUE_BUF_NUM),
+         mCameraReady(false),
+         mCaptureDeviceOpen(false),
++        mIsCaptureBufsAllocated(0),
+         mPPDeviceNeed(false),
+-        bDirectInput(false),
+-        mCameraid(cameraid),
+         mPPDeviceNeedForPic(false),
+         mPowerLock(false),
+-        mPreviewRotate(CAMERA_PREVIEW_BACK_REF),
+-        mExitCaptureThread(false), mExitPreviewThread(false), 
+-        mExitPostProcessThread(false), mExitEncodeThread(false), mTakePictureInProcess(false)
+-    {
++        mDirectInput(false),
++        mCameraid(cameraid),
++        mPreviewRotate(CAMERA_PREVIEW_BACK_REF)
++   {
+         CAMERA_LOG_FUNC;
+         preInit();
+     }
+@@ -138,7 +142,7 @@ namespace android {
+         CAMERA_HAL_RET ret = CAMERA_HAL_ERR_NONE;
+         if (mCameraReady == false)
+             mPPDevice = postprocessdevice;
+-        else 
++        else
+             ret = CAMERA_HAL_ERR_BAD_ALREADY_RUN;
+         return ret;
+     }
+@@ -170,7 +174,7 @@ namespace android {
+             CAMERA_LOG_INFO("Disable PP device for Camera Post process");
+         }
+ 
+-        if ((ret = AolLocForInterBuf())<0)
++        if ((ret = AllocInterBuf())<0)
+             return ret;
+         if ((ret = InitCameraHalParam()) < 0)
+             return ret;
+@@ -188,7 +192,7 @@ namespace android {
+         return ;
+     }
+ 
+-    CAMERA_HAL_RET  CameraHal :: AolLocForInterBuf()
++    CAMERA_HAL_RET  CameraHal :: AllocInterBuf()
+     {
+         CAMERA_LOG_FUNC;
+         CAMERA_HAL_RET ret = CAMERA_HAL_ERR_NONE;
+@@ -240,7 +244,6 @@ namespace android {
+         CAMERA_LOG_FUNC;
+         CAMERA_HAL_RET ret = CAMERA_HAL_ERR_NONE;
+         pthread_mutex_init(&mPPIOParamMutex, NULL);
+-        pthread_mutex_init(&mOverlayMutex, NULL);
+ 
+         mPreviewRunning = false;
+         mCaptureRunning = false;
+@@ -281,7 +284,6 @@ namespace android {
+         mEncodeFrameThread->requestExitAndWait();
+         mTakePicThread->requestExitAndWait();
+         pthread_mutex_destroy(&mPPIOParamMutex);
+-        pthread_mutex_destroy(&mOverlayMutex);
+         return ret;
+     }
+ 
+@@ -660,7 +662,7 @@ namespace android {
+ 
+         const char *pFlashStr;
+         pFlashStr = params.get(CameraParameters::KEY_FLASH_MODE);
+-        if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_OFF) != 0 && strcmp(pFlashStr, CameraParameters::FLASH_MODE_AUTO) != 0 
++        if (strcmp(pFlashStr, CameraParameters::FLASH_MODE_OFF) != 0 && strcmp(pFlashStr, CameraParameters::FLASH_MODE_AUTO) != 0
+                 && strcmp(pFlashStr, CameraParameters::FLASH_MODE_ON) != 0 && strcmp(pFlashStr, CameraParameters::FLASH_MODE_RED_EYE) != 0
+                 && strcmp(pFlashStr, CameraParameters::FLASH_MODE_TORCH) != 0) {
+             CAMERA_LOG_ERR("The flash mode is not corrected");
+@@ -684,15 +686,15 @@ namespace android {
+     {
+         CAMERA_LOG_FUNC;
+         if(window == NULL) {
+-            isCaptureBufsAllocated = 0;
++            mIsCaptureBufsAllocated = 0;
+             CAMERA_LOG_INFO("PreviewWindow is null");
+         }
+         else {
+             CAMERA_LOG_ERR("PreviewWindow is valid");
+         }
+         mNativeWindow = window;
+-        if((mNativeWindow != NULL) && !isCaptureBufsAllocated && mCaptureBufNum) {
+-        //if((mNativeWindow != NULL) && !isCaptureBufsAllocated) {
++        if((mNativeWindow != NULL) && !mIsCaptureBufsAllocated && mCaptureBufNum) {
++        //if((mNativeWindow != NULL) && !mIsCaptureBufsAllocated) {
+             if(PrepareCaptureBufs() < 0) {
+                 CAMERA_LOG_ERR("PrepareCaptureBufs() error");
+                 return BAD_VALUE;
+@@ -715,19 +717,17 @@ namespace android {
+             CAMERA_LOG_ERR("the native window is null!");
+             return BAD_VALUE;
+         }
+- 
++
+         GraphicBufferMapper &mapper = GraphicBufferMapper::get();
+-        android_native_buffer_t *buf;
+-        private_handle_t *handle;
++        buffer_handle_t *handle;
+         for(unsigned int i = 0; i < mCaptureBufNum; i++) {
+             if(mCaptureBuffers[i].buf_state == WINDOW_BUFS_DEQUEUED) {
+-                buf = (android_native_buffer_t *)mCaptureBuffers[i].native_buf;
+-                if(mCaptureBuffers[i].virt_start != NULL) {
+-                    handle = (private_handle_t *)buf->handle;
+-                    mapper.unlock(handle);
+-                }
+-                if(buf != NULL) {
+-                    mNativeWindow->cancel_buffer(mNativeWindow, &buf->handle);
++                handle = (buffer_handle_t *)mCaptureBuffers[i].native_buf;
++                if(handle != NULL) {
++                    if(mCaptureBuffers[i].virt_start != NULL) {
++                        mapper.unlock(*handle);
++                    }
++                    mNativeWindow->cancel_buffer(mNativeWindow, handle);
+                 }
+             }
+             else
+@@ -754,10 +754,10 @@ namespace android {
+             return NO_ERROR;//BAD_VALUE;
+         }
+         status_t err = mNativeWindow->set_buffers_geometry(mNativeWindow,
+-                mCaptureDeviceCfg.width, mCaptureDeviceCfg.height, 
++                mCaptureDeviceCfg.width, mCaptureDeviceCfg.height,
+                 HAL_PIXEL_FORMAT_YCbCr_420_SP);//mCaptureDeviceCfg.fmt);
+         if(err != 0){
+-            CAMERA_LOG_ERR("native_window_set_buffers_geometry failed:%s(%d)", 
++            CAMERA_LOG_ERR("native_window_set_buffers_geometry failed:%s(%d)",
+                     strerror(-err), -err);
+             return err;
+         }
+@@ -788,7 +788,6 @@ namespace android {
+         void *pVaddr = NULL;
+         GraphicBufferMapper &mapper = GraphicBufferMapper::get();
+         for(i = 0; i < mCaptureBufNum; i++) {
+-            android_native_buffer_t *buf = NULL;
+             buffer_handle_t* buf_h = NULL;
+             pVaddr = NULL;
+             int stride;
+@@ -797,13 +796,11 @@ namespace android {
+                 CAMERA_LOG_ERR("dequeueBuffer failed: %s(%d)", strerror(-err), -err);
+                 return BAD_VALUE;
+             }
+-            buf = container_of(buf_h, ANativeWindowBuffer, handle);
+-            private_handle_t *handle = (private_handle_t *)buf->handle;
++            private_handle_t *handle = (private_handle_t *)(*buf_h);
+             mapper.lock(handle, GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN, bounds, &pVaddr);
+-
+             if((handle->phys == 0) || (handle->base == 0) || (handle->size == 0)) {
+                  CAMERA_LOG_ERR("%s: dequeue invalide Buffer, phys=%x, base=%x, size=%d", __FUNCTION__, handle->phys, handle->base, handle->size);
+-                 mNativeWindow->cancel_buffer(mNativeWindow, &buf->handle);
++                 mNativeWindow->cancel_buffer(mNativeWindow, buf_h);
+                  return BAD_VALUE;
+             }
+ 
+@@ -811,10 +808,10 @@ namespace android {
+             mCaptureBuffers[i].phy_offset = handle->phys;
+             //Calculate the buffer size, for GPU doesn't reply this value.
+             mCaptureBuffers[i].length =  mCaptureDeviceCfg.width * mCaptureDeviceCfg.height * 3 / 2;
+-            mCaptureBuffers[i].native_buf = (void *)buf;
++            mCaptureBuffers[i].native_buf = (void *)buf_h;
+             mCaptureBuffers[i].refCount = 0;
+             mCaptureBuffers[i].buf_state = WINDOW_BUFS_DEQUEUED;
+-            CAMERA_LOG_RUNTIME("mCaptureBuffers[%d]-phys=%x, base=%x, size=%d", i, mCaptureBuffers[i].phy_offset, mCaptureBuffers[i].virt_start, mCaptureBuffers[i].length);
++            CAMERA_LOG_RUNTIME("mCaptureBuffers[%d]-phys=%x, base=%p, size=%d", i, mCaptureBuffers[i].phy_offset, mCaptureBuffers[i].virt_start, mCaptureBuffers[i].length);
+         }
+ 
+         return NO_ERROR;
+@@ -840,17 +837,17 @@ namespace android {
+             CAMERA_LOG_RUNTIME("%s : preview thread already running", __func__);
+             mPreviewLock.unlock();
+             return NO_ERROR;//INVALID_OPERATION;
+-        }        
+-            
++        }
++
+         if ((ret == CameraHALStartPreview())<0) {
+             CAMERA_LOG_RUNTIME("%s : CameraHALStartPreview error", __func__);
+             mPreviewLock.unlock();
+-            return ret;            
++            return ret;
+         }
+ 
+         mPreviewRunning = true;
+         mPreviewLock.unlock();
+-        
++
+         mCaptureLock.lock();
+         if(mCaptureRunning) {
+             CAMERA_LOG_ERR("%s : preview thread already running", __func__);
+@@ -858,14 +855,14 @@ namespace android {
+             return NO_ERROR;
+         }
+         mCaptureRunning = true;
+-        mCaptureLock.unlock();                  
++        mCaptureLock.unlock();
+ 
+         if(mPPDeviceNeed) {
+-            //mPostProcessLock.lock(); 
++            //mPostProcessLock.lock();
+             //mPostProcessCondition.signal();
+-            //mPostProcessLock.unlock();            
++            //mPostProcessLock.unlock();
+         }
+-    
++
+         LockWakeLock();
+         return ret;
+     }
+@@ -899,7 +896,7 @@ namespace android {
+             if (!mPPDeviceNeed){
+                 if(mCaptureBufNum <= 0)
+                     CAMERA_LOG_INFO("mCaptureBuf not allocated yet, will register it later");
+-                
++
+                 for(i = 0 ; i < mCaptureBufNum; i ++) {
+                     mVideoBufferPhy[i].phy_offset = mCaptureBuffers[i].phy_offset;
+                     CAMERA_LOG_INFO("Camera HAL physic address: %x", mCaptureBuffers[i].phy_offset);
+@@ -924,7 +921,7 @@ namespace android {
+     status_t CameraHal::storeMetaDataInBuffers(bool enable)
+     {
+         CAMERA_LOG_FUNC;
+-        bDirectInput = enable;
++        mDirectInput = enable;
+         updateDirectInput(enable);
+         return NO_ERROR;
+     }
+@@ -962,9 +959,9 @@ namespace android {
+             mEncodeLock.unlock();
+             return ret;
+         }
+-        
+-           
+-        if (bDirectInput == true) {
++
++
++        if (mDirectInput == true) {
+             for(i = 0; i < mVideoBufNume; i++) {
+                 mVideoBufferUsing[i] = 0;
+             }
+@@ -979,8 +976,8 @@ namespace android {
+     void CameraHal::stopRecording()
+     {
+         CAMERA_LOG_FUNC;
+-        
+-        mEncodeLock.lock();        
++
++        mEncodeLock.lock();
+         if(mRecordRunning) {
+             mRecordRunning = false;
+             mEncodeThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_STOP, 0));
+@@ -998,7 +995,7 @@ namespace android {
+         index = ((size_t)mem - (size_t)mVideoMemory->data) / mPreviewFrameSize;
+         mVideoBufferUsing[index] = 0;
+ 
+-        if (bDirectInput == true) {
++        if (mDirectInput == true) {
+             if(mCaptureBuffers[index].refCount == 0) {
+                 CAMERA_LOG_ERR("warning:%s about to release mCaptureBuffers[%d].refcount=%d-", __FUNCTION__, index, mCaptureBuffers[index].refCount);
+                 return;
+@@ -1208,7 +1205,7 @@ namespace android {
+                 void *src = &mCaptureBuffers[DeQueBufIdx];
+                 memcpy(dest, src, mCaptureFrameSize);
+             }
+- 
++
+             mDataCb(CAMERA_MSG_RAW_IMAGE, RawMemBase, 0, NULL, mCallbackCookie);
+ 
+             RawMemBase->release(RawMemBase);
+@@ -1219,7 +1216,7 @@ namespace android {
+             if(mNotifyCb)
+                 mNotifyCb(CAMERA_MSG_RAW_IMAGE_NOTIFY, 0, 0, mCallbackCookie);
+         }
+- 
++
+         if (mJpegEncoder->DoEncode(Buf_input,&Buf_output,&JpegEncConf) < 0){
+             ret = UNKNOWN_ERROR;
+             goto Pic_out;
+@@ -1667,7 +1664,7 @@ Pic_out:
+     void CameraHal :: CameraHALStopThreads()
+     {
+         CAMERA_LOG_FUNC;
+-        
++
+         mCaptureLock.lock();
+         if(mCaptureRunning) {
+             CAMERA_LOG_INFO("%s :capture run", __FUNCTION__);
+@@ -1683,7 +1680,7 @@ Pic_out:
+         mCaptureLock.unlock();
+         CAMERA_LOG_INFO("%s :---------", __FUNCTION__);
+ 
+-        mPostProcessLock.lock(); 
++        mPostProcessLock.lock();
+         if(mPPDeviceNeed && mPreviewRunning) {
+             CAMERA_LOG_INFO("%s :postprocess run", __FUNCTION__);
+             mPostProcessThreadQueue.postStopMessage();
+@@ -1692,7 +1689,7 @@ Pic_out:
+             else
+                 CAMERA_LOG_INFO("Stop PostProcessThread in itself");
+         }
+-        mPostProcessLock.unlock(); 
++        mPostProcessLock.unlock();
+ 
+         mPreviewLock.lock();
+         if(mPreviewRunning) {
+@@ -1708,7 +1705,7 @@ Pic_out:
+         }
+         mPreviewLock.unlock();
+         CAMERA_LOG_INFO("%s :exit", __FUNCTION__);
+-        
++
+         return ;
+     }
+ 
+@@ -1733,7 +1730,7 @@ Pic_out:
+         //    mCaptureBufNum = PREVIEW_CAPTURE_BUFFER_NUM;
+         //}
+         unsigned int CaptureBufNum = mCaptureBufNum;
+-        
++
+         if(allocateBuffersFromNativeWindow() < 0) {
+             CAMERA_LOG_ERR("allocateBuffersFromNativeWindow error");
+             return BAD_VALUE;
+@@ -1754,13 +1751,13 @@ Pic_out:
+             return BAD_VALUE;
+         }
+         nCameraBuffersQueued = mCaptureBufNum;
+-        isCaptureBufsAllocated = 1;
++        mIsCaptureBufsAllocated = 1;
+ 
+         if((AllocateRecordVideoBuf())<0) {
+             CAMERA_LOG_INFO("%s: AllocateRecordVideoBuf error\n", __FUNCTION__);
+             return BAD_VALUE;
+         }
+- 
++
+         return NO_ERROR;
+     }
+ 
+@@ -1869,18 +1866,7 @@ Pic_out:
+         is_first_buffer = 1;
+         last_display_index = 0;
+ 
+-        //for(unsigned int i=0; i < mCaptureBufNum; i++) {
+-        //    mCaptureThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, i));
+-        //}
+-//        sem_init(&avab_dequeue_frame, 0, mCaptureBufNum);
+-//        sem_init(&avab_show_frame, 0, 0);
+-//        sem_init(&avab_enc_frame, 0, 0);
+-//		sem_init(&avab_enc_frame_finish, 0, 0);
+-		if(mPPDeviceNeed){
+-            sem_init(&avab_pp_in_frame, 0, 0);
+-            sem_init(&avab_pp_out_frame, 0, mPPbufNum);
+-        }
+-        return ret;
++       return ret;
+     }
+ 
+     status_t CameraHal ::CameraHALPreviewStart()
+@@ -1889,8 +1875,8 @@ Pic_out:
+         status_t ret = NO_ERROR;
+         if (mCaptureDevice->DevStart()<0)
+             return INVALID_OPERATION;
+-        
+-        isCaptureBufsAllocated = 1;
++
++        mIsCaptureBufsAllocated = 1;
+ 
+         unsigned int bufIndex = 0;
+         //skip 10 frames when doing preview
+@@ -1904,7 +1890,7 @@ Pic_out:
+         }
+         return ret;
+     }
+-    
++
+     status_t CameraHal::putBufferCount(DMA_BUFFER *pBuf)
+     {
+         if(pBuf == NULL)
+@@ -1933,23 +1919,23 @@ Pic_out:
+                     mCaptureThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, buf_index));
+                 }else {
+                     return INVALID_OPERATION;
+-                }                  
++                }
+             }else if(mPPDeviceNeed){
+                 mCaptureThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, 0));
+-            }//end elseif            
++            }//end elseif
+         }
+         return NO_ERROR;
+     }
+-    
++
+     void CameraHal ::getBufferCount(DMA_BUFFER *pBuf)
+     {
+         if(pBuf == NULL)
+             return;
+         Mutex::Autolock _l(pBuf->mBufferLock);
+-        pBuf->refCount ++;        
++        pBuf->refCount ++;
+     }
+ 
+-    int CameraHal ::captureframeThreadWrapper() 
++    int CameraHal ::captureframeThreadWrapper()
+     {
+         CAMERA_LOG_FUNC;
+         status_t ret = NO_ERROR;
+@@ -1970,15 +1956,15 @@ Pic_out:
+     int CameraHal ::captureframeThread()
+     {
+         //CAMERA_LOG_FUNC;
+-        
++
+         unsigned int bufIndex = -1;
+         status_t ret = NO_ERROR;
+         sp<CMessage> msg = mCaptureThreadQueue.waitMessage();
+         if(msg == 0) {
+             CAMERA_LOG_ERR("%s: get invalide message", __FUNCTION__);
+-            return BAD_VALUE;            
++            return BAD_VALUE;
+         }
+-                
++
+         switch(msg->what) {
+             case CMESSAGE_TYPE_NORMAL:
+ 
+@@ -1995,7 +1981,7 @@ Pic_out:
+                 if(!mPPDeviceNeed) {
+                     getBufferCount(&mCaptureBuffers[bufIndex]);
+                     mPreviewThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, bufIndex));
+-                    
++
+                     if(mRecordRunning) {
+                         mEncodeThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, bufIndex));
+                     }
+@@ -2024,7 +2010,7 @@ Pic_out:
+                 ret = INVALID_OPERATION;
+                 break;
+         }//end switch
+-        
++
+         return ret;
+     }
+ 
+@@ -2052,7 +2038,7 @@ Pic_out:
+         int PPInIdx = 0, PPoutIdx = 0;
+         DMA_BUFFER *PPInBuf, *PPoutBuf;
+         status_t ret = NO_ERROR;
+-        
++
+         sp<CMessage> msg = mPostProcessThreadQueue.waitMessage();
+         if(msg == 0) {
+             CAMERA_LOG_ERR("%s: get invalide message", __FUNCTION__);
+@@ -2063,7 +2049,7 @@ Pic_out:
+                 PPInIdx = msg->arg0;
+                 if(PPInIdx < 0 || (unsigned int)PPInIdx >= mCaptureBufNum) {
+                     CAMERA_LOG_ERR("%s: get invalide buffer index", __FUNCTION__);
+-                    return BAD_VALUE;  
++                    return BAD_VALUE;
+                 }
+                 PPInBuf = &mCaptureBuffers[PPInIdx];
+                 PPoutIdx = pp_out_head;
+@@ -2081,14 +2067,14 @@ Pic_out:
+ 
+                 getBufferCount(&mPPbuf[PPoutIdx]);
+                 mPreviewThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, PPoutIdx));
+-                
++
+                 if(mRecordRunning) {
+                     getBufferCount(&mPPbuf[PPoutIdx]);
+                     //CAMERA_LOG_INFO("%s: post encode message %d", __FUNCTION__, PPoutIdx);
+                     mEncodeThreadQueue.postMessage(new CMessage(CMESSAGE_TYPE_NORMAL, PPoutIdx));
+                 }
+ 
+-                ret = putBufferCount(PPInBuf);                       
++                ret = putBufferCount(PPInBuf);
+                 break;
+             case CMESSAGE_TYPE_STOP:
+                 CAMERA_LOG_INFO("%s: postprocess thread stop", __FUNCTION__);
+@@ -2110,7 +2096,7 @@ Pic_out:
+         return ret;
+     }
+ 
+-    void CameraHal::SearchBuffer(void *pNativeBuf, unsigned int *pIndex)
++    void CameraHal::SearchBuffer(void *pNativeBuf, int *pIndex)
+     {
+         //int index;
+         for(unsigned int i=0; i < mCaptureBufNum; i++){
+@@ -2123,7 +2109,7 @@ Pic_out:
+         *pIndex = -1;
+         return;
+     }
+-    
++
+     int CameraHal ::previewshowFrameThreadWrapper()
+     {
+         CAMERA_LOG_FUNC;
+@@ -2138,7 +2124,7 @@ Pic_out:
+                 CAMERA_LOG_ERR("%s: preview thread exit with exception", __FUNCTION__);
+                 mExitPreviewThread = 1;
+                 return ret;
+-            }            
++            }
+         }
+         return ret;
+     }
+@@ -2164,25 +2150,24 @@ Pic_out:
+                 }
+                 vflg = 0;
+             }
+-#endif                    
++#endif
+     }
+-   
++
+     int CameraHal ::previewshowFrameThread()
+     {
+         //CAMERA_LOG_FUNC;
+         status_t ret = NO_ERROR;
+         int display_index = -1;
+         DMA_BUFFER *pInBuf = NULL;
+-        android_native_buffer_t *buf = NULL;
+         buffer_handle_t *buf_h = NULL;
+-        unsigned int buf_index = -1;
++        int buf_index = -1;
+         int stride = 0, err = 0;
+ 
+         sp<CMessage> msg = mPreviewThreadQueue.waitMessage();
+         if(msg == 0) {
+             CAMERA_LOG_ERR("%s: get invalide message", __FUNCTION__);
+             mPreviewRunning = false;
+-            return BAD_VALUE;            
++            return BAD_VALUE;
+         }
+ 
+         switch(msg->what) {
+@@ -2193,14 +2178,14 @@ Pic_out:
+                     mPreviewRunning = false;
+                     mPreviewThreadQueue.clearMessage();
+                     sem_post(&mPreviewStoppedCondition);
+-                    return BAD_VALUE;  
++                    return BAD_VALUE;
+                 }
+                 if(!mPPDeviceNeed) {
+                     pInBuf = &mCaptureBuffers[display_index];
+                 }else {
+                     pInBuf = &mPPbuf[display_index];
+                 }
+-                
++
+                 if (mMsgEnabled & CAMERA_MSG_PREVIEW_FRAME) {
+                     //CAMERA_LOG_ERR("*******CAMERA_MSG_PREVIEW_FRAME*******");
+                     convertNV12toYUV420SP((uint8_t*)(pInBuf->virt_start),
+@@ -2208,10 +2193,10 @@ Pic_out:
+                     mDataCb(CAMERA_MSG_PREVIEW_FRAME, mPreviewMemory, preview_heap_buf_head, NULL, mCallbackCookie);
+                     preview_heap_buf_head ++;
+                     preview_heap_buf_head %= mPreviewHeapBufNum;
+-                }                
++                }
+ 
+                 if (mNativeWindow != 0) {
+-                    if (mNativeWindow->enqueue_buffer(mNativeWindow, &((android_native_buffer_t * )pInBuf->native_buf)->handle) < 0){
++                    if (mNativeWindow->enqueue_buffer(mNativeWindow, (buffer_handle_t * )pInBuf->native_buf) < 0){
+                         CAMERA_LOG_ERR("queueBuffer failed. May be bcos stream was not turned on yet.");
+                         mPreviewRunning = false;
+                         mPreviewThreadQueue.clearMessage();
+@@ -2240,12 +2225,11 @@ Pic_out:
+                     sem_post(&mPreviewStoppedCondition);
+                     return INVALID_OPERATION;
+                 }
+-                buf = container_of(buf_h, ANativeWindowBuffer, handle);
+ 
+-                SearchBuffer((void *)buf, &buf_index);
++                SearchBuffer((void *)buf_h, &buf_index);
+ 
+-                if(buf_index >= mCaptureBufNum || (buf_index < 0)) {
+-                    mNativeWindow->cancel_buffer(mNativeWindow, &buf->handle);
++                if(buf_index >= (int)mCaptureBufNum || (buf_index < 0)) {
++                    mNativeWindow->cancel_buffer(mNativeWindow, buf_h);
+                     CAMERA_LOG_ERR("dequeue invalide buffer!!!!");
+                     mPreviewRunning = false;
+                     mPreviewThreadQueue.clearMessage();
+@@ -2268,12 +2252,12 @@ Pic_out:
+             default:
+                 CAMERA_LOG_ERR("%s: wrong msg type %d", __FUNCTION__, msg->what);
+                 ret = INVALID_OPERATION;
+-                break;   
++                break;
+         }
+-        
++
+         return ret;
+     }
+-    
++
+     int CameraHal::encodeframeThreadWrapper()
+     {
+         //CAMERA_LOG_FUNC;
+@@ -2291,7 +2275,7 @@ Pic_out:
+         }
+         return ret;
+     }
+-    
++
+     int CameraHal::encodeframeThread()
+     {
+         //CAMERA_LOG_FUNC;
+@@ -2300,9 +2284,9 @@ Pic_out:
+         sp<CMessage> msg = mEncodeThreadQueue.waitMessage();
+         if(msg == 0) {
+             CAMERA_LOG_ERR("%s: get invalide message", __FUNCTION__);
+-            return BAD_VALUE;            
++            return BAD_VALUE;
+         }
+-            
++
+         switch(msg->what) {
+             case CMESSAGE_TYPE_NORMAL:
+                 enc_index = msg->arg0;
+@@ -2312,9 +2296,9 @@ Pic_out:
+                     mRecordRunning = false;
+                     mEncodeThreadQueue.clearMessage();
+                     sem_post(&mEncodeStoppedCondition);
+-                    return BAD_VALUE;  
++                    return BAD_VALUE;
+                 }
+-                
++
+                 struct timespec ts;
+                 DMA_BUFFER *EncBuf;
+                 if (!mPPDeviceNeed){
+@@ -2325,7 +2309,7 @@ Pic_out:
+ 
+                 if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+                     nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+-                    if (bDirectInput == true) {
++                    if (mDirectInput == true) {
+ 	                    memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
+                             (void*)&mVideoBufferPhy[enc_index], sizeof(VIDEOFRAME_BUFFER_PHY));
+                     } else {
+@@ -2348,14 +2332,14 @@ Pic_out:
+                 break;
+             case CMESSAGE_TYPE_QUITE:
+                 mExitEncodeThread = 1;
+-                break;                
++                break;
+ 
+             default:
+                 CAMERA_LOG_ERR("%s: wrong msg type %d", __FUNCTION__, msg->what);
+                 ret = INVALID_OPERATION;
+-                break;                   
++                break;
+         }
+-        
++
+         return ret;
+     }
+ 
+@@ -2385,9 +2369,9 @@ Pic_out:
+         //    mVideoBuffers[i] = new MemoryBase(mVideoHeap,
+         //            mPreviewFrameSize * i, mPreviewFrameSize);
+         //}
+-        
++
+         //Make sure the buffer been updated for direct input
+-        updateDirectInput(bDirectInput);
++        updateDirectInput(mDirectInput);
+         return ret;
+     }
+ 
+diff --git a/mx6/libcamera/CameraHal.h b/mx6/libcamera/CameraHal.h
+index 512b6dc..8e82557 100755
+--- a/mx6/libcamera/CameraHal.h
++++ b/mx6/libcamera/CameraHal.h
+@@ -92,7 +92,6 @@ namespace android {
+ 
+     class CameraHal {
+     public:
+-        //virtual sp<IMemoryHeap> getPreviewHeap() const;
+         virtual sp<IMemoryHeap> getRawHeap() const;
+ 
+         virtual status_t setPreviewWindow(struct preview_stream_ops *window);
+@@ -111,8 +110,6 @@ namespace android {
+         virtual bool        previewEnabled();
+ 
+ 		virtual status_t  storeMetaDataInBuffers(bool enable);
+-		//virtual int32_t getNumberOfVideoBuffers() const;
+-		//virtual sp<IMemory> getVideoBuffer(int32_t index) const;
+ 
+         virtual status_t    startRecording();
+         virtual void        stopRecording();
+@@ -135,7 +132,7 @@ namespace android {
+         CAMERA_HAL_RET setCaptureDevice(sp<CaptureDeviceInterface> capturedevice);
+         CAMERA_HAL_RET setPostProcessDevice(sp<PostProcessDeviceInterface> postprocessdevice);
+         CAMERA_HAL_RET setJpegEncoder(sp<JpegEncoderInterface>jpegencoder);
+-        CAMERA_HAL_RET  Init();
++        CAMERA_HAL_RET Init();
+         void  setPreviewRotate(CAMERA_PREVIEW_ROTATE previewRotate);
+ 
+         CameraHal(int cameraid);
+@@ -251,7 +248,7 @@ namespace android {
+         status_t OpenCaptureDevice();
+         void CloseCaptureDevice();
+ 
+-        CAMERA_HAL_RET AolLocForInterBuf();
++        CAMERA_HAL_RET AllocInterBuf();
+         void  FreeInterBuf();
+         CAMERA_HAL_RET InitCameraHalParam();
+         CAMERA_HAL_RET InitCameraBaseParam(CameraParameters *pParam);
+@@ -279,7 +276,6 @@ namespace android {
+ 
+         void CameraHALStopThreads();
+         void LockWakeLock();
+-
+         void UnLockWakeLock();
+ 
+         int autoFocusThread();
+@@ -295,13 +291,11 @@ namespace android {
+         int stringTodegree(char* cAttribute, unsigned int &degree, unsigned int &minute, unsigned int &second);
+ 
+         status_t allocateBuffersFromNativeWindow();
+-        void SearchBuffer(void *pNativeBuf, unsigned int *pIndex);
++        void SearchBuffer(void *pNativeBuf, int *pIndex);
+         status_t freeBuffersToNativeWindow();
+         status_t PrepareCaptureBufs();
+         status_t updateDirectInput(bool bDirect);
+ 
+-        volatile bool isCaptureBufsAllocated;
+-        //volatile bool isPreviewFinsh;
+         status_t convertStringToPreviewFormat(unsigned int *pFormat);
+         status_t convertPreviewFormatToString(char *pStr, int length, unsigned int format);
+         status_t putBufferCount(DMA_BUFFER *pBuf);
+@@ -313,29 +307,29 @@ namespace android {
+         CMessageQueue mPostProcessThreadQueue;
+         CMessageQueue mEncodeThreadQueue;
+ 
++        //For capture thread(queue/dequeue with v4l2 driver)
+         mutable Mutex mCaptureLock;
+-        mutable Condition mCaptureCondition;
+-        //mutable Condition mCaptureStoppedCondition;
+         mutable sem_t mCaptureStoppedCondition;
+         bool mCaptureRunning;
+         bool mExitCaptureThread;
++
++        //For preview thread(queue/dequeue with NativeWindow)
+         mutable Mutex mPreviewLock;
+-        mutable Condition mPreviewCondition;
+-        //mutable Condition mPreviewStoppedCondition;
+         mutable sem_t mPreviewStoppedCondition;
+         bool mPreviewRunning;
+         bool mExitPreviewThread;
++
++        //For post process thread(csc v4l2 buffer)
+         mutable Mutex mPostProcessLock;
+-        //mutable Condition mPostProcessCondition;
+         mutable sem_t mPostProcessStoppedCondition;
+-        //bool mPostProcessRunning;
+         bool mExitPostProcessThread;
++
++        //For video recording thread
+         mutable Mutex mEncodeLock;
+-        mutable Condition mEncodeCondition;
+-        //mutable Condition mEncodeStoppedCondition;
+         mutable sem_t mEncodeStoppedCondition;
+-        //bool mEncodeRunning;
+         bool mExitEncodeThread;
++
++        //For picture taking thread
+         mutable sem_t mTakingPicture;
+         bool mWaitForTakingPicture;
+         bool mTakePictureInProcess;
+@@ -373,16 +367,12 @@ namespace android {
+         struct capture_config_t mCaptureDeviceCfg;
+         DMA_BUFFER          mCaptureBuffers[PREVIEW_CAPTURE_BUFFER_NUM];
+ 
+-        //sp<MemoryHeapBase>  mPreviewHeap;
+         camera_memory_t* mPreviewMemory;
+-        //sp<MemoryBase>      mPreviewBuffers[PREVIEW_HEAP_BUF_NUM]; 
+ 
+         /* the buffer for recorder */
+         unsigned int        mVideoBufNume;
+         camera_memory_t* mVideoMemory;
+-        //sp<MemoryHeapBase>  mVideoHeap;
+-        //sp<MemoryBase>      mVideoBuffers[VIDEO_OUTPUT_BUFFER_NUM];
+-        volatile  int       mVideoBufferUsing[VIDEO_OUTPUT_BUFFER_NUM];
++        int       mVideoBufferUsing[VIDEO_OUTPUT_BUFFER_NUM];
+ 		VIDEOFRAME_BUFFER_PHY mVideoBufferPhy[VIDEO_OUTPUT_BUFFER_NUM];
+ 
+         DMA_BUFFER          mPPbuf[POST_PROCESS_BUFFER_NUM];
+@@ -390,7 +380,6 @@ namespace android {
+         pp_input_param_t    mPPInputParam;
+         pp_output_param_t   mPPOutputParam;
+ 
+-        //volatile bool       mPreviewRunning;
+         unsigned int        mDefaultPreviewFormat;
+         unsigned int 		mPreviewFrameSize;
+         unsigned int        mPreviewCapturedFormat;
+@@ -404,7 +393,6 @@ namespace android {
+         unsigned int        mPictureEncodeFormat;
+         unsigned int        mCaptureFrameSize;
+         unsigned int        mCaptureBufNum;
+-        //unsigned int        mCaptureBufsActual;
+         unsigned int        mEnqueuedBufs;
+ 
+         bool                mRecordRunning;
+@@ -417,12 +405,13 @@ namespace android {
+         char                mCameraSensorName[MAX_SENSOR_NAME];
+         bool mCameraReady;
+         bool mCaptureDeviceOpen;
++        bool mIsCaptureBufsAllocated;
+         bool mPPDeviceNeed;
+         bool mPPDeviceNeedForPic;
+         bool mPreviewStopped;
+         bool mRecordStopped;
+         bool mPowerLock;
+-        bool bDirectInput;
++        bool mDirectInput;
+         int mCameraid;
+ 
+         int error_status;
+@@ -436,15 +425,6 @@ namespace android {
+         unsigned int pp_out_head;
+         unsigned int buffer_index_maps[PREVIEW_CAPTURE_BUFFER_NUM];
+ 
+-        sem_t avab_show_frame;
+-        sem_t avab_dequeue_frame;
+-        sem_t avab_enc_frame;
+-        sem_t avab_enc_frame_finish;
+-        sem_t avab_pp_in_frame;
+-        sem_t avab_pp_out_frame;
+-
+-        pthread_mutex_t mOverlayMutex;
+-        pthread_mutex_t mMsgMutex;
+         pthread_mutex_t mPPIOParamMutex;
+         CAMERA_PREVIEW_ROTATE mPreviewRotate;
+ 
+diff --git a/mx6/libcamera/Camera_utils.h b/mx6/libcamera/Camera_utils.h
+index a21eb29..a95b9ea 100755
+--- a/mx6/libcamera/Camera_utils.h
++++ b/mx6/libcamera/Camera_utils.h
+@@ -27,7 +27,6 @@
+ #include <utils/Log.h>
+ #include <utils/threads.h>
+ 
+-
+ #ifdef CAMERA_HAL_DEBUG_LOG
+ #define CAMERA_LOG_RUNTIME(format, ...) LOGI((format), ## __VA_ARGS__)
+ #define CAMERA_LOG_FUNC LOGI("%s is excuting...",  __FUNCTION__)
+-- 
+1.8.0
+

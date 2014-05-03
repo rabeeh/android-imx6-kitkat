@@ -1,0 +1,489 @@
+From d0892ed674f934c2772f0c518e6f3552e39baa52 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Tue, 26 Jun 2012 10:16:46 +0800
+Subject: [PATCH 297/486] ENGR00215050 add action mode and refine
+ multi-display code.
+
+add action mode and refine multi-display code.
+xml tool used to replace file read and write
+to save primary display parameters.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libgralloc_wrapper/Android.mk       |  13 +-
+ mx6/libgralloc_wrapper/XmlTool.cpp      | 214 ++++++++++++++++++++++++++++++++
+ mx6/libgralloc_wrapper/display_mode.cpp |   8 +-
+ mx6/libgralloc_wrapper/framebuffer.cpp  | 121 +++++++-----------
+ 4 files changed, 276 insertions(+), 80 deletions(-)
+ create mode 100644 mx6/libgralloc_wrapper/XmlTool.cpp
+
+diff --git a/mx6/libgralloc_wrapper/Android.mk b/mx6/libgralloc_wrapper/Android.mk
+index 08c8e7a..087f497 100755
+--- a/mx6/libgralloc_wrapper/Android.mk
++++ b/mx6/libgralloc_wrapper/Android.mk
+@@ -21,7 +21,7 @@ ifeq ($(TARGET_HAVE_IMX_GRALLOC),true)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu libhardware libutils
++LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu libhardware libutils libfsl_xmltool
+ 
+ LOCAL_SRC_FILES := 	\
+ 	gralloc.cpp 	\
+@@ -31,6 +31,7 @@ LOCAL_SRC_FILES := 	\
+ 
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX
++LOCAL_C_INCLUDES = external/expat/lib
+ 
+ 
+ #ifeq ($(HAVE_FSL_EPDC_FB),true)
+@@ -45,3 +46,13 @@ LOCAL_MODULE_TAGS := eng
+ 
+ include $(BUILD_SHARED_LIBRARY)
+ endif
++
++
++####build xmltool lib######
++include $(CLEAR_VARS)
++LOCAL_SHARED_LIBRARIES := liblog libcutils libutils libexpat
++LOCAL_C_INCLUDES = external/expat/lib
++LOCAL_SRC_FILES := XmlTool.cpp
++LOCAL_MODULE := libfsl_xmltool
++LOCAL_MODULE_TAGS := optional
++include $(BUILD_SHARED_LIBRARY)
+diff --git a/mx6/libgralloc_wrapper/XmlTool.cpp b/mx6/libgralloc_wrapper/XmlTool.cpp
+new file mode 100644
+index 0000000..924a8bf
+--- /dev/null
++++ b/mx6/libgralloc_wrapper/XmlTool.cpp
+@@ -0,0 +1,214 @@
++
++/* Copyright (C) 2012 Freescale Semiconductor, Inc. */
++
++#include <hardware/XmlTool.h>
++
++namespace android {
++
++
++void XmlTool::handleStartElement(const XML_Char *name, const XML_Char **attrs)
++{
++    if(name == NULL) return;
++
++    if(!strcmp(name, "string")) {
++        mIsString = true;
++
++        if(mPrint) {
++            free(mPrint);
++            mPrint = NULL;
++        }
++
++        if(attrs[1] != NULL)
++            mPrint = strdup(attrs[1]);
++    }
++    else if(!strcmp(name, "boolean") || !strcmp(name, "int") ||
++            !strcmp(name, "long") || !strcmp(name, "float")) {
++        if(attrs[1] == NULL || attrs[3] == NULL){
++            return;
++        }
++
++        String8 name(attrs[1]);
++        String8 value(attrs[3]);
++        mContent.insert(name, value);
++    }
++}
++
++void XmlTool::handleEndElement(const XML_Char *name)
++{
++    if(mPrint) {
++        free(mPrint);
++        mPrint = NULL;
++    }
++    mIsString = false;
++}
++
++void XmlTool::handleDataElement(const XML_Char *s, int len)
++{
++    if(!mIsString) return;
++
++    if(s == NULL || mPrint == NULL) {
++        return;
++    }
++
++    String8 value(s, len);
++    String8 name(mPrint);
++    mContent.insert(name, value);
++}
++
++void XmlTool::startElementHandler(void *userData, const XML_Char *name, const XML_Char **atts)
++{
++    XmlTool* pXmlTool = (XmlTool*)userData;
++    return pXmlTool->handleStartElement(name, atts);
++}
++
++void XmlTool::endElementHandler(void *userData, const XML_Char *name)
++{
++    XmlTool* pXmlTool = (XmlTool*)userData;
++    return pXmlTool->handleEndElement(name);
++}
++
++void XmlTool::characterDataHandler(void *userData, const XML_Char *s, int len)
++{
++    XmlTool* pXmlTool = (XmlTool*)userData;
++    return pXmlTool->handleDataElement(s, len);
++}
++
++XmlTool::XmlTool(const char* file)
++    : mLoaded(false), mLock(), mParser(NULL),
++      mBuffer(NULL), mDepth(0),
++      mFileName(file), mFileHandle(NULL), mContent()
++{
++    LOGI("XmlTool()");
++    init();
++    loadAndParseFile();
++}
++
++void XmlTool::init()
++{
++    if(mFileName == NULL) {
++        LOGE("invalide file name");
++        return;
++    }
++
++    mFileHandle = fopen(mFileName, "r");
++    if(mFileHandle == NULL) {
++        LOGE("open %s failed", mFileName);
++        return;
++    }
++
++    mParser = XML_ParserCreate(NULL);
++    if(mParser == NULL)  {
++        LOGE("create parser failed");
++        return;
++    }
++
++    XML_SetElementHandler(mParser, startElementHandler, endElementHandler);
++    XML_SetCharacterDataHandler(mParser, characterDataHandler);
++    XML_SetUserData(mParser, (void*)this);
++}
++
++void XmlTool::loadAndParseFile()
++{
++    Mutex::Autolock _l(mLock);
++    if(mFileHandle == NULL || mParser == NULL){
++        LOGE("invalidate parameter in loadAndParseFile");
++        return;
++    }
++
++    mBuffer = (char*)malloc(BUFFSIZE);
++    if(mBuffer == NULL) {
++        LOGE("malloc buffer failed");
++        return;
++    }
++
++    mPrint = NULL;
++    mIsString = false;
++
++    while(1) {
++        int done;
++        int len;
++
++        len = fread(mBuffer, 1, BUFFSIZE, mFileHandle);
++        if(ferror(mFileHandle)) {
++            LOGE("read file error");
++            return;
++        }
++
++        done = feof(mFileHandle);
++        if(!XML_Parse(mParser, mBuffer, len, done)) {
++            LOGE("Parse error at line %d:/n%s", (int)XML_GetCurrentLineNumber(mParser),
++                         XML_ErrorString(XML_GetErrorCode(mParser)));
++            return;
++        }
++
++        if(done) break;
++    }
++
++    free(mBuffer);
++    mBuffer = NULL;
++    fclose(mFileHandle);
++    mFileHandle = NULL;
++    XML_ParserFree(mParser);
++    mParser = NULL;
++}
++
++String8 XmlTool::getString(const char* key, String8 defaultVal)
++{
++    const String8 nullValue;
++    String8 name(key);
++    String8 value = mContent.find(name);
++    if(value != nullValue) {
++        return value;//.string();
++    }
++    else {
++        return defaultVal;
++    }
++}
++
++int XmlTool::getInt(const char* key, int defaultVal)
++{
++    const String8 nullValue;
++    String8 name(key);
++    String8 value = mContent.find(name);
++    if(value != nullValue) {
++        int nvalue = atoi(value.string());
++        return nvalue;
++    }
++    else {
++        return defaultVal;
++    }
++}
++
++int XmlTool::getHex(const char* key, int defaultVal)
++{
++    const String8 nullValue;
++    String8 name(key);
++    String8 value = mContent.find(name);
++    if(value != nullValue) {
++        int nvalue = (int)strtoimax(value.string(), NULL, 16);
++        return nvalue;
++    }
++    else {
++        return defaultVal;
++    }
++}
++
++bool XmlTool::getBool(const char* key, bool defaultVal)
++{
++    const String8 nullValue;
++    String8 name(key);
++    String8 value = mContent.find(name);
++    if(value != nullValue) {
++        bool bvalue = 0;
++        if(!strcmp(value.string(), "true")) bvalue = 1;
++        if(!strcmp(value.string(), "fale")) bvalue = 0;
++
++        return bvalue;
++    }
++    else {
++        return defaultVal;
++    }
++}
++
++
++};
+diff --git a/mx6/libgralloc_wrapper/display_mode.cpp b/mx6/libgralloc_wrapper/display_mode.cpp
+index 91896e0..a759758 100644
+--- a/mx6/libgralloc_wrapper/display_mode.cpp
++++ b/mx6/libgralloc_wrapper/display_mode.cpp
+@@ -141,7 +141,7 @@ static int get_available_mode(int fbid, const char *mode_list)
+                                 disp_mode_count ++;
+                                 state = CHECK_NEXT_STATE;
+                                 p++;
+-                if(disp_mode_count >= sizeof(disp_class_list[fbid].disp_mode_list)/sizeof(disp_class_list[fbid].disp_mode_list[0])) goto check_mode_end;
++                if((unsigned int)disp_mode_count >= sizeof(disp_class_list[fbid].disp_mode_list)/sizeof(disp_class_list[fbid].disp_mode_list[0])) goto check_mode_end;
+                         }
+                         else p++;
+                         break;
+@@ -197,18 +197,18 @@ set_graphics_fb_mode_error:
+     return -1;
+ }
+ 
+-int isModeValid(int fb, char* pMode, int len)
++int isModeValid(int fb, const char* pMode, int len)
+ {
+     int err = 0;
+     int i;
+ 
+-        LOGW("----------isModeValid:pMode=%s, len=%d", pMode, len);
++    //LOGW("isModeValid:pMode=%s, len=%d", pMode, len);
+     err = read_graphics_fb_mode(fb);
+     if(err)
+         return 0;
+ 
+     for(i=0; i<disp_class_list[fb].disp_mode_length; i++) {
+-        LOGW("----------isModeValid:disp_mode_list[%d].mode=%s", i, disp_class_list[fb].disp_mode_list[i].mode);
++        //LOGW("isModeValid:disp_mode_list[%d].mode=%s", i, disp_class_list[fb].disp_mode_list[i].mode);
+         if(!strncmp(disp_class_list[fb].disp_mode_list[i].mode, pMode, len)) {
+             return 1;
+         }
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index e2a82b6..8e95f34 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -52,6 +52,7 @@
+ #include <hardware/DisplayCommand.h>
+ #include "gralloc_priv.h"
+ #include <utils/String8.h>
++#include <hardware/XmlTool.h>
+ /*****************************************************************************/
+ 
+ // numbers of buffers for page flipping
+@@ -74,6 +75,7 @@ struct fb_context_t {
+ };
+ 
+ static int nr_framebuffers;
++static XmlTool* g_xmltool = NULL;
+ 
+ sem_t * fslwatermark_sem_open()
+ {
+@@ -220,9 +222,9 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev)
+ }
+ 
+ /*****************************************************************************/
+-extern int isModeValid(int fb, char* pMode, int len);
++extern int isModeValid(int fb, const char* pMode, int len);
+ 
+-static int set_graphics_fb_mode(int fb, struct configParam* param)
++static int set_graphics_fb_mode(int fb, struct configParam* param, int *pColordepth)
+ {
+     char temp_name[256];
+     char fb_mode[256];
+@@ -232,83 +234,49 @@ static int set_graphics_fb_mode(int fb, struct configParam* param)
+     int size=0;
+     int n = 0;
+ 
+-    if(param == NULL) {
+-        /*
+-         * file /data/misc/display.conf format:
+-         * mode=S1920:x1080p-60
+-         * colordepth=32
+-         * usage: change fb display mode.
+-        */
+-        int fb_misc = open("/data/misc/display.conf", O_RDWR, 0);
+-        if(fb_misc > 0) {
+-            memset(fb_mode, 0, sizeof(fb_mode));
+-            size = read(fb_misc, fb_mode, sizeof(fb_mode));
+-            if(size > 0) {
+-                disp_mode = fb_mode;
+-                while(*disp_mode != '\0') {
+-                    if(*disp_mode == '\n') {
+-                        disp_mode++;
+-                        n = disp_mode - start_index;
+-                        *(char*)disp_mode = '\0';
+-
+-                        if(!isModeValid(fb, start_index + 1, n-1)) {
+-                            LOGI("Warning: display %d does not support len:%d, %s", fb, n-1, start_index + 1);
+-                            memset(fb_mode, 0, sizeof(fb_mode));
+-                            memset(temp_name, 0, sizeof(temp_name));
+-                            sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+-                            fd_mode = open(temp_name,O_RDWR, 0);
+-                            if(fd_mode < 0) {
+-                                LOGI("Error %d! Cannot open %s", fd_mode, temp_name);
+-                                return -1;
+-                            }
+-                            strncpy(fb_mode, "mode=", 5);
+-                            size = 5;
+-                            size += read(fd_mode, fb_mode+size, sizeof(fb_mode)-size);
+-                            LOGW("fb_mode is %s", fb_mode);
+-                            close(fd_mode);
+-
+-                            memset(temp_name, 0, sizeof(temp_name));
+-                            sprintf(temp_name, "/sys/class/graphics/fb%d/bits_per_pixel", fb);
+-                            fd_mode = open(temp_name, O_RDONLY, 0);
+-                            if(fd_mode < 0) {
+-                                LOGI("Error %d! Cannot open %s", fd_mode, temp_name);
+-                                return -1;
+-                            }
+-                            strncpy(fb_mode+size, "colordepth=", 11);
+-                            size += 11;
+-                            size += read(fd_mode, fb_mode+size, sizeof(fb_mode)-size);
+-                            LOGW("fb_mode is size=%d, %s", size, fb_mode);
+-                            close(fd_mode);
+-
+-                            close(fb_misc);
+-                            fb_misc = open("/data/misc/display.conf", O_RDWR | O_TRUNC, 0);
+-                            if(fb_misc < 0)
+-                                return -1;
+-                            write(fb_misc, fb_mode, size);
+-                            close(fb_misc);
+-                            return -1;
+-                        }//end !isModeValid
+-
+-                        memset(temp_name, 0, sizeof(temp_name));
+-			sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+-			fd_mode = open(temp_name,O_RDWR, 0);
+-			if(fd_mode < 0) {
+-			    LOGI("Error %d! Cannot open %s", fd_mode, temp_name);
+-			    return -1;
+-			}
+-                        write(fd_mode, start_index + 1, n);
+-                        close(fd_mode);
+-                        break;
+-                    }
+-                    if(*disp_mode == '=') start_index = (char*)disp_mode;
+-                    disp_mode++;
+-                }
++    //the primary display
++    if(fb == 0){
++        if(g_xmltool == NULL) {
++            g_xmltool = new XmlTool(FSL_SETTINGS_PREFERENCE);
++            if(g_xmltool == NULL) {
++                LOGE("Error: g_xmltool not created");
++                return -1;
+             }
+         }
+-        close(fb_misc);
++
++        *pColordepth = g_xmltool->getInt(FSL_PREFERENCE_COLORDEPTH, 0);
++        LOGI("colordepth is %d", *pColordepth);
++        String8 dispMode = g_xmltool->getString(FSL_PREFERENCE_MODE, String8("0"));
++        disp_mode = dispMode.string();
++        if(!isModeValid(fb, disp_mode, strlen(disp_mode))) {
++            LOGI("Warning: display %d does not support mode: %s", fb, disp_mode);
++            return -1;
++        }
++        LOGI("disp_mode is %s", disp_mode);
++        memset(temp_name, 0, sizeof(temp_name));
++        sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
++        fd_mode = open(temp_name,O_RDWR, 0);
++        if(fd_mode < 0) {
++            LOGI("Error %d! Cannot open %s", fd_mode, temp_name);
++            return -1;
++        }
++
++        memset(fb_mode, 0, sizeof(fb_mode));
++        strcpy(fb_mode, disp_mode);
++        fb_mode[strlen(disp_mode)] = '\n';
++
++        write(fd_mode, fb_mode, strlen(disp_mode) + 1);
++        close(fd_mode);
++        delete g_xmltool;
++        g_xmltool = NULL;
+         return 0;
+     }
+ 
++    if(param == NULL) {
++        LOGE("param should not NULL for added display");
++        return -1;
++    }
++    //other display goes here.
+     String8 str8_mode(param->mode);
+     disp_mode = str8_mode.string();
+     if(disp_mode == NULL) {
+@@ -355,11 +323,12 @@ static int mapFrameBufferWithParamLocked(struct private_module_t* module, struct
+     int i=0;
+     char name[64];
+     int dpy = 0;
++    int colordepth = 0;
+ 
+     if(param != NULL) {
+         dpy = param->displayId;
+     }
+-    set_graphics_fb_mode(dpy, param);
++    set_graphics_fb_mode(dpy, param, &colordepth);
+ 
+     while ((fd==-1) && device_template[i]) {
+         snprintf(name, 64, device_template[i], dpy);
+@@ -403,6 +372,8 @@ static int mapFrameBufferWithParamLocked(struct private_module_t* module, struct
+             LOGE("<%s,%d> the bpp or xres yres is 0", __FUNCTION__, __LINE__);
+             return -1;
+         }
++    } else if(colordepth == 16 || colordepth == 32) {
++        info.bits_per_pixel = colordepth;
+     }
+ 
+     info.reserved[0] = 0;
+-- 
+1.8.0
+

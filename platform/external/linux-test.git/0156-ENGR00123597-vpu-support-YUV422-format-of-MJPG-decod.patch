@@ -1,0 +1,220 @@
+From 8cb1dbd6eea1a39b9ba79d669e0c93c8be16fcb6 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 19 May 2010 13:04:18 +0800
+Subject: [PATCH 156/435] ENGR00123597 vpu: support YUV422 format of MJPG
+ decoder in unit test
+
+Support YUV422 format of MJPG decoder in unit test
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 19 ++++++++++++++-----
+ test/mxc_vpu_test/display.c  | 13 ++++++++++---
+ test/mxc_vpu_test/enc.c      |  4 ++--
+ test/mxc_vpu_test/fb.c       | 14 +++++++++-----
+ test/mxc_vpu_test/vpu_test.h | 13 +++++++++++--
+ 5 files changed, 46 insertions(+), 17 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 490e08e..06cb46b 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1245,7 +1245,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	FrameBuffer *fb;
+ 	struct frame_buf **pfbpool;
+ 	struct vpu_display *disp = NULL;
+-	int stride;
++	int stride, divX, divY;
+ 	vpu_mem_desc *mvcol_md = NULL;
+ 	Rect rotCrop;
+ 
+@@ -1291,8 +1291,8 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	    ((dst_scheme == PATH_V4L2) && deblock_en)) {
+ 
+ 		for (i = 0; i < totalfb; i++) {
+-			pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->stride,
+-						    dec->picheight);
++			pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++						    dec->stride, dec->picheight);
+ 			if (pfbpool[i] == NULL) {
+ 				totalfb = i;
+ 				goto err;
+@@ -1325,6 +1325,9 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			goto err;
+ 		}
+ 
++		divX = (dec->mjpg_fmt == MODE420 || dec->mjpg_fmt == MODE422) ? 2 : 1;
++		divY = (dec->mjpg_fmt == MODE420 || dec->mjpg_fmt == MODE224) ? 2 : 1;
++
+ 		if (deblock_en == 0) {
+ 			img_size = dec->stride * dec->picheight;
+ 
+@@ -1332,15 +1335,16 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 				mvcol_md = dec->mvcol_memdesc =
+ 					calloc(totalfb, sizeof(vpu_mem_desc));
+ 			}
++
+ 			for (i = 0; i < totalfb; i++) {
+ 				fb[i].bufY = disp->buffers[i]->offset;
+ 				fb[i].bufCb = fb[i].bufY + img_size;
+-				fb[i].bufCr = fb[i].bufCb + (img_size >> 2);
++				fb[i].bufCr = fb[i].bufCb + (img_size / divX / divY);
+ 				/* allocate MvCol buffer here */
+ 				if (cpu_is_mx37() || cpu_is_mx5x()) {
+ 					memset(&mvcol_md[i], 0,
+ 							sizeof(vpu_mem_desc));
+-					mvcol_md[i].size = img_size >> 2;
++					mvcol_md[i].size = img_size / divX / divY;
+ 					ret = IOGetPhyMem(&mvcol_md[i]);
+ 					if (ret) {
+ 						err_msg("buf alloc failed\n");
+@@ -1573,6 +1577,11 @@ decoder_parse(struct decode *dec)
+ 			info_msg("DIV3 Profile: %d Level: %d\n", initinfo.profile, initinfo.level);
+ 			break;
+ 
++		case STD_MJPG:
++			dec->mjpg_fmt = initinfo.mjpg_sourceFormat;
++			info_msg("MJPG SourceFormat: %d\n", initinfo.mjpg_sourceFormat);
++			break;
++
+ 		default:
+ 			break;
+ 		}
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 7d4fa65..cc46dba 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -307,9 +307,16 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 				fmt.fmt.pix.width, fmt.fmt.pix.height);
+ 
+ 	fmt.fmt.pix.field = V4L2_FIELD_ANY;
+-	if (dec->cmdl->chromaInterleave == 0)
+-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+-	else {
++	if (dec->cmdl->chromaInterleave == 0) {
++		if (dec->mjpg_fmt == MODE420)
++			fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
++		else if (dec->mjpg_fmt == MODE422)
++			fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV422P;
++		else {
++			err_msg(" Display cannot support this MJPG format\n");
++			goto err;
++		}
++	} else {
+ 		info_msg("Display: NV12\n");
+ 		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+ 	}
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 0c07321..4b2828d 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -303,7 +303,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	for (i = 0; i < fbcount; i++) {
+-		pfbpool[i] = framebuf_alloc(enc->cmdl->format, (enc->picwidth + 15) & ~15,  (enc->picheight + 15) & ~15);
++		pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420, (enc->picwidth + 15) & ~15,  (enc->picheight + 15) & ~15);
+ 		if (pfbpool[i] == NULL) {
+ 			fbcount = i;
+ 			goto err1;
+@@ -333,7 +333,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		}
+ 	} else {
+ 		/* Allocate a single frame buffer for source frame */
+-		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, enc->picwidth,
++		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, MODE420, enc->picwidth,
+ 						   enc->picheight);
+ 		if (pfbpool[src_fbid] == NULL) {
+ 			err_msg("failed to allocate single framebuf\n");
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index 8345a44..602edd6 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -63,19 +63,23 @@ void put_framebuf(struct frame_buf *fb)
+ 	fbarray[fb_index] = fb;
+ }
+ 
+-struct frame_buf *framebuf_alloc(int stdMode, int strideY, int height)
++struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height)
+ {
+ 	struct frame_buf *fb;
+ 	int err;
++	int divX, divY;
+ 
+ 	fb = get_framebuf();
+ 	if (fb == NULL)
+ 		return NULL;
+ 
++	divX = (format == MODE420 || format == MODE422) ? 2 : 1;
++	divY = (format == MODE420 || format == MODE224) ? 2 : 1;
++
+ 	memset(&(fb->desc), 0, sizeof(vpu_mem_desc));
+-	fb->desc.size = (strideY * height * 3 / 2);
++	fb->desc.size = (strideY * height  + strideY / divX * height / divY * 2);
+ 	if (cpu_is_mx37() || cpu_is_mx5x())
+-		fb->desc.size += strideY * height / 4;
++		fb->desc.size += strideY / divX * height / divY;
+ 
+ 	err = IOGetPhyMem(&fb->desc);
+ 	if (err) {
+@@ -86,12 +90,12 @@ struct frame_buf *framebuf_alloc(int stdMode, int strideY, int height)
+ 
+ 	fb->addrY = fb->desc.phy_addr;
+ 	fb->addrCb = fb->addrY + strideY * height;
+-	fb->addrCr = fb->addrCb + strideY / 2 * height / 2;
++	fb->addrCr = fb->addrCb + strideY / divX * height / divY;
+ 	if (cpu_is_mx37() || cpu_is_mx5x()) {
+ 		if (stdMode==STD_MJPG)
+ 			fb->mvColBuf = fb->addrCr;
+ 		else
+-			fb->mvColBuf = fb->addrCr + strideY / 2 * height / 2;
++			fb->mvColBuf = fb->addrCr + strideY / divX * height / divY;
+ 	}
+ 	fb->desc.virt_uaddr = IOGetVirtMem(&(fb->desc));
+ 	if (fb->desc.virt_uaddr <= 0) {
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 51bb293..8756759 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -73,6 +73,14 @@ typedef signed char s8;
+ #define SIZE_USER_BUF            0x1000
+ #define USER_DATA_INFO_OFFSET    8*17
+ 
++enum {
++    MODE420 = 0,
++    MODE422 = 1,
++    MODE224 = 2,
++    MODE444 = 3,
++    MODE400 = 4
++};
++
+ struct frame_buf {
+ 	int addrY;
+ 	int addrCb;
+@@ -153,6 +161,7 @@ struct decode {
+ 	int picwidth;
+ 	int picheight;
+ 	int stride;
++	int mjpg_fmt;
+ 	int fbcount;
+ 	int rot_buf_count;
+ 	int extrafb;
+@@ -207,7 +216,7 @@ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ 					struct rot rotation, Rect rotCrop);
+ int v4l_put_data(struct vpu_display *disp, int index, int field);
+ void v4l_display_close(struct vpu_display *disp);
+-struct frame_buf *framebuf_alloc(int stdMode, int strideY, int height);
++struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height);
+ void framebuf_free(struct frame_buf *fb);
+ 
+ int v4l_start_capturing(void);
+-- 
+1.8.0
+

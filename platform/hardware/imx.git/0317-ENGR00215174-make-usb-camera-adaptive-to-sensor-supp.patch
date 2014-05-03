@@ -1,0 +1,116 @@
+From 9ab6a8233d4cd88eb762cda194e8a4115a2b9d46 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Thu, 26 Jul 2012 16:14:07 +0800
+Subject: [PATCH 317/486] ENGR00215174 make usb camera adaptive to sensor
+ support format.
+
+make usb camera adaptive to sensor support format.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera/V4l2UVCDevice.cpp | 30 +++++++++++++++++++++---------
+ mx6/libcamera/V4l2UVCDevice.h   |  6 ++++--
+ 2 files changed, 25 insertions(+), 11 deletions(-)
+
+diff --git a/mx6/libcamera/V4l2UVCDevice.cpp b/mx6/libcamera/V4l2UVCDevice.cpp
+index 097915c..11dd0d5 100755
+--- a/mx6/libcamera/V4l2UVCDevice.cpp
++++ b/mx6/libcamera/V4l2UVCDevice.cpp
+@@ -52,9 +52,6 @@ V4l2UVCDevice::V4l2UVCDevice()
+     memset(mCaptureConfig, 0, sizeof(mCaptureConfig));
+ 
+     mEnableCSC = false;
+-    memset(mCscSupportFmt, 0, sizeof(mCscSupportFmt));
+-    //the format support in CSC.
+-    mCscSupportFmt[0] = v4l2_fourcc('N','V','1','2');
+     mSensorFmtCnt = 0;
+     mCscFmtCnt = 0;
+     mActualCscFmtCnt = 0;
+@@ -66,6 +63,8 @@ V4l2UVCDevice::V4l2UVCDevice()
+     mCscGroup[0].srcFormat = v4l2_fourcc('Y','U','Y','V');
+     mCscGroup[0].dstFormat = v4l2_fourcc('N','V','1','2');
+     mCscGroup[0].cscConvert = convertYUYUToNV12;
++    mCscGroup[0].isSensorSupport = false;
++    mCscGroup[0].isOverlapWithSensor = false;
+     mDoCsc = NULL;
+ }
+ 
+@@ -332,9 +331,10 @@ void V4l2UVCDevice::selectCscFunction(unsigned int format)
+     CAMERA_LOG_FUNC;
+     mDoCsc = NULL;
+     for(int i=0; i<MAX_CSC_SUPPORT_FMT; i++) {
+-        if(mCscGroup[i].dstFormat == format) {
++        if(mCscGroup[i].isSensorSupport == true && mCscGroup[i].isOverlapWithSensor == false &&
++                     mCscGroup[i].dstFormat == format) {
+             mDoCsc = &mCscGroup[i];
+-            CAMERA_LOG_RUNTIME("find the match mCscGroup[%d]", i);
++            CAMERA_LOG_RUNTIME("find the match mCscGroup[%d] CSC function", i);
+         }
+     }
+ }
+@@ -343,7 +343,8 @@ unsigned int V4l2UVCDevice::queryCscSourceFormat(unsigned int format)
+ {
+     CAMERA_LOG_FUNC;
+     for(int i=0; i<MAX_CSC_SUPPORT_FMT; i++) {
+-        if(mCscGroup[i].dstFormat == format) {
++        if(mCscGroup[i].isSensorSupport == true && mCscGroup[i].isOverlapWithSensor == false &&
++                     mCscGroup[i].dstFormat == format) {
+             CAMERA_LOG_RUNTIME("find the CSC source format=0x%x convert to dest format=0x%x",
+                          mCscGroup[i].srcFormat, mCscGroup[i].dstFormat);
+             return mCscGroup[i].srcFormat;
+@@ -375,14 +376,25 @@ unsigned int V4l2UVCDevice::countActualCscFmt()
+ 
+     unsigned int i, k;
+     unsigned int n = 0;
++
++    for(i=0; i < MAX_CSC_SUPPORT_FMT; i++) {
++        for(k=0; k < mSensorFmtCnt; k++) {
++            if(mCscGroup[i].srcFormat == mSensorSupportFmt[k]) {
++                mCscGroup[i].isSensorSupport = true;
++                break;
++            }
++        }
++    }
++
+     for(i=0; i < MAX_CSC_SUPPORT_FMT; i++) {
+         for(k=0; k < mSensorFmtCnt; k++) {
+-            if(mCscSupportFmt[i] == mSensorSupportFmt[k]) {
++            if(mCscGroup[i].isSensorSupport == true && mCscGroup[i].dstFormat == mSensorSupportFmt[k]) {
++                mCscGroup[i].isOverlapWithSensor = true;
+                 break;
+             }
+         }
+-        if(k == mSensorFmtCnt) {
+-            mActualCscFmt[n++] = mCscSupportFmt[i];
++        if(mCscGroup[i].isSensorSupport == true && mCscGroup[i].isOverlapWithSensor == false) {
++            mActualCscFmt[n++] = mCscGroup[i].dstFormat;
+         }
+     }
+ 
+diff --git a/mx6/libcamera/V4l2UVCDevice.h b/mx6/libcamera/V4l2UVCDevice.h
+index 2f95c89..9aea82a 100755
+--- a/mx6/libcamera/V4l2UVCDevice.h
++++ b/mx6/libcamera/V4l2UVCDevice.h
+@@ -31,6 +31,10 @@
+ namespace android{
+ 
+ struct CscConversion {
++    //if the srcFormat is support by sensor.
++    bool isSensorSupport;
++    //if the dstFormat is support by sensor.
++    bool isOverlapWithSensor;
+     int width;
+     int height;
+     int srcStride;
+@@ -79,8 +83,6 @@ private:
+ 
+     //for jpeg encoder support yuyv. this case, should not covert.
+     bool mEnableCSC;
+-    //stores csc support format.
+-    unsigned int mCscSupportFmt[MAX_CSC_SUPPORT_FMT];
+     //stores nedd csc format. 
+     struct CscConversion mCscGroup[MAX_CSC_SUPPORT_FMT];
+     struct CscConversion* mDoCsc;
+-- 
+1.8.0
+

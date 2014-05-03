@@ -1,0 +1,172 @@
+From c5b9f691ec16246e01094ff2eeb14222b4030ea6 Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Wed, 11 Sep 2013 12:51:51 +0800
+Subject: [PATCH 472/486] ENGR00276699: most resolution can't pass FOV test
+
+No need to set ANDROID_QUIRKS_METERING_CROP_REGION,
+Omit 1080p, 176x144, since they not work as crop and scale mode.
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ mx6/libcamera2/CaptureStream.cpp |  2 +-
+ mx6/libcamera2/MetadaManager.cpp |  8 ++++++++
+ mx6/libcamera2/Ov5640Csi.cpp     | 21 ++++++++++++++++-----
+ mx6/libcamera2/Ov5640Mipi.cpp    | 20 +++++++++++++++-----
+ mx6/libcamera2/Ov5642Csi.cpp     | 22 +++++++++++++++++-----
+ 5 files changed, 57 insertions(+), 16 deletions(-)
+
+diff --git a/mx6/libcamera2/CaptureStream.cpp b/mx6/libcamera2/CaptureStream.cpp
+index 9329cd3..64005e4 100755
+--- a/mx6/libcamera2/CaptureStream.cpp
++++ b/mx6/libcamera2/CaptureStream.cpp
+@@ -289,7 +289,7 @@ status_t CaptureStream::makeJpegImage(StreamBuffer *dstBuf, StreamBuffer *srcBuf
+                            mActualFormat);
+     }
+ 
+-    mJpegBuilder->prepareImage(dstBuf);
++    mJpegBuilder->prepareImage(srcBuf);
+     ret = mJpegBuilder->encodeImage(mainJpeg, thumbJpeg);
+     if (ret != NO_ERROR) {
+         FLOGE("%s encodeImage failed", __FUNCTION__);
+diff --git a/mx6/libcamera2/MetadaManager.cpp b/mx6/libcamera2/MetadaManager.cpp
+index 3d01e82..4d2508d 100755
+--- a/mx6/libcamera2/MetadaManager.cpp
++++ b/mx6/libcamera2/MetadaManager.cpp
+@@ -897,9 +897,17 @@ status_t MetadaManager::createStaticInfo(camera_metadata_t **info, bool sizeRequ
+     ADD_OR_SIZE(ANDROID_QUIRKS_USE_ZSL_FORMAT,
+             &quirkUseZslFormat, 1);
+ 
++	//ANDROID_QUIRKS_METERING_CROP_REGION will influence face dectect and FOV.
++	//Face dectect is not supported.
++	//If quirk is set, FOV will calculated by PreviewAspect, VideoAspect,
++	//arrayAspect(sensorAspect), stillAspect(pictureAspect) in the framework.
++	//If quirk not set, FOV will calculated by arrayAspect, stillAspect. It's just the camera work mode.
++	//So we not set ANDROID_QUIRKS_METERING_CROP_REGION to 1.
++#if 0
+     static const uint8_t quirkMeteringCropRegion = 1;
+     ADD_OR_SIZE(ANDROID_QUIRKS_METERING_CROP_REGION,
+             &quirkMeteringCropRegion, 1);
++#endif
+ 
+ 
+ #undef ADD_OR_SIZE
+diff --git a/mx6/libcamera2/Ov5640Csi.cpp b/mx6/libcamera2/Ov5640Csi.cpp
+index 92e48cb..29547ce 100755
+--- a/mx6/libcamera2/Ov5640Csi.cpp
++++ b/mx6/libcamera2/Ov5640Csi.cpp
+@@ -101,8 +101,15 @@ status_t Ov5640Csi::initSensorInfo(const CameraInfo& info)
+                     vid_frmval.discrete.numerator   = 1;
+                 }
+ 
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++                //If w/h ratio is not same with senserW/sensorH, framework assume that
++	        //first crop little width or little height, then scale.
++		//But 1920x1080, 176x144 not work in this mode.
++		if( !((vid_frmsize.discrete.width == 1920 && vid_frmsize.discrete.height == 1080) ||
++		      (vid_frmsize.discrete.width == 176 && vid_frmsize.discrete.height == 144))	){
++	                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
++	                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++		}
++
+ 
+                 if (vid_frmval.discrete.denominator /
+                     vid_frmval.discrete.numerator > 15) {
+@@ -137,9 +144,13 @@ status_t Ov5640Csi::initSensorInfo(const CameraInfo& info)
+ 
+     setMaxPictureResolutions();
+     FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
+-    mFocalLength = 3.42f;
+-    mPhysicalWidth = 3.673f;
+-    mPhysicalHeight = 2.738f;
++
++    mFocalLength = 3.37f;
++    mPhysicalWidth = 3.6288f;	//2592 x 1.4u
++    mPhysicalHeight = 2.7216f;  //1944 x 1.4u
++
++    FLOGI("ov5640Csi, mFocalLength:%f, mPhysicalWidth:%f, mPhysicalHeight %f",
++        mFocalLength, mPhysicalWidth, mPhysicalHeight);
+ 
+     return NO_ERROR;
+ }
+diff --git a/mx6/libcamera2/Ov5640Mipi.cpp b/mx6/libcamera2/Ov5640Mipi.cpp
+index b80a84e..091fa30 100755
+--- a/mx6/libcamera2/Ov5640Mipi.cpp
++++ b/mx6/libcamera2/Ov5640Mipi.cpp
+@@ -95,8 +95,14 @@ status_t Ov5640Mipi::initSensorInfo(const CameraInfo& info)
+                     vid_frmval.discrete.numerator   = 1;
+                 }
+ 
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++			//If w/h ratio is not same with senserW/sensorH, framework assume that
++			//first crop little width or little height, then scale.
++			//But 1920x1080, 176x144 not work in this mode.
++			if( !((vid_frmsize.discrete.width == 1920 && vid_frmsize.discrete.height == 1080) ||
++			      (vid_frmsize.discrete.width == 176 && vid_frmsize.discrete.height == 144))	){
++	                    mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
++	                    mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++			}
+ 
+                 if (vid_frmval.discrete.denominator /
+                     vid_frmval.discrete.numerator > 15) {
+@@ -131,9 +137,13 @@ status_t Ov5640Mipi::initSensorInfo(const CameraInfo& info)
+ 
+     setMaxPictureResolutions();
+     FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
+-    mFocalLength = 3.42f;
+-    mPhysicalWidth = 3.673f;
+-    mPhysicalHeight = 2.738f;
++
++    mFocalLength = 3.37f;
++    mPhysicalWidth = 3.6288f;	//2592 x 1.4u
++    mPhysicalHeight = 2.7216f;  //1944 x 1.4u
++
++    FLOGI("ov5640Mipi, mFocalLength:%f, mPhysicalWidth:%f, mPhysicalHeight %f",
++	mFocalLength, mPhysicalWidth, mPhysicalHeight);
+ 
+     return NO_ERROR;
+ }
+diff --git a/mx6/libcamera2/Ov5642Csi.cpp b/mx6/libcamera2/Ov5642Csi.cpp
+index 3a02dda..69ea429 100755
+--- a/mx6/libcamera2/Ov5642Csi.cpp
++++ b/mx6/libcamera2/Ov5642Csi.cpp
+@@ -94,8 +94,15 @@ status_t Ov5642Csi::initSensorInfo(const CameraInfo& info)
+                     vid_frmval.discrete.numerator   = 1;
+                 }
+ 
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++                //If w/h ratio is not same with senserW/sensorH, framework assume that
++		//first crop little width or little height, then scale.
++		//But 1920x1080, 176x144 not work in this mode.
++		if( !((vid_frmsize.discrete.width == 1920 && vid_frmsize.discrete.height == 1080) ||
++		      (vid_frmsize.discrete.width == 176 && vid_frmsize.discrete.height == 144))	){
++	            mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
++	            mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++		}
++
+ 
+                 if (vid_frmval.discrete.denominator /
+                     vid_frmval.discrete.numerator > 15) {
+@@ -130,9 +137,14 @@ status_t Ov5642Csi::initSensorInfo(const CameraInfo& info)
+ 
+     setMaxPictureResolutions();
+     FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
+-    mFocalLength = 3.34f;
+-    mPhysicalWidth = 3.673f;
+-    mPhysicalHeight = 2.738f;
++
++    mFocalLength = 3.37f;
++    mPhysicalWidth = 3.6288f;	//2592 x 1.4u
++    mPhysicalHeight = 2.7216f;  //1944 x 1.4u
++
++    FLOGI("ov5642Csi, mFocalLength:%f, mPhysicalWidth:%f, mPhysicalHeight %f",
++        mFocalLength, mPhysicalWidth, mPhysicalHeight);
++
+ 
+     return NO_ERROR;
+ }
+-- 
+1.8.0
+

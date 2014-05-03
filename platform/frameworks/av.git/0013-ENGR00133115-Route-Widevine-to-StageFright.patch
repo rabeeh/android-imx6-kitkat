@@ -1,0 +1,276 @@
+From ae6c2769b086eda10debe4f25e800048e4d72395 Mon Sep 17 00:00:00 2001
+From: Song Bing <b06498@freescale.com>
+Date: Wed, 16 Jan 2013 17:24:58 +0800
+Subject: [PATCH 13/50] ENGR00133115 Route Widevine to StageFright.
+
+Route Widevine to StageFright as OMX GM can't support HTTP Widevine DRM.
+
+Signed-off-by: Song Bing b06498@freescale.com
+---
+ media/libmediaplayerservice/MediaPlayerFactory.cpp | 143 +++++++++++++++++++--
+ media/libmediaplayerservice/MediaPlayerFactory.h   |   6 +-
+ media/libmediaplayerservice/MediaPlayerService.cpp |   2 +-
+ 3 files changed, 136 insertions(+), 15 deletions(-)
+
+diff --git a/media/libmediaplayerservice/MediaPlayerFactory.cpp b/media/libmediaplayerservice/MediaPlayerFactory.cpp
+index a819bff..48115bc 100644
+--- a/media/libmediaplayerservice/MediaPlayerFactory.cpp
++++ b/media/libmediaplayerservice/MediaPlayerFactory.cpp
+@@ -28,14 +28,20 @@
+ 
+ #include "MediaPlayerFactory.h"
+ 
+-#ifdef FSL_GM_PLAYER
+-#include <media/OMXPlayer.h>
+-#endif
+ #include "MidiFile.h"
+ #include "TestPlayerStub.h"
+ #include "StagefrightPlayer.h"
+ #include "nuplayer/NuPlayerDriver.h"
+ 
++#ifdef FSL_GM_PLAYER
++#include <dlfcn.h>
++#include "../libstagefright/include/AwesomePlayer.h"
++#include "../libstagefright/include/NuCachedSource2.h"
++#include "../libstagefright/include/WVMExtractor.h"
++#include <media/stagefright/DataSource.h>
++#include <media/OMXPlayer.h>
++#endif
++
+ namespace android {
+ 
+ Mutex MediaPlayerFactory::sLock;
+@@ -97,7 +103,7 @@ void MediaPlayerFactory::unregisterFactory(player_type type) {
+         IFactory* v = sFactoryMap.valueAt(i);           \
+         float thisScore;                                \
+         CHECK(v != NULL);                               \
+-        thisScore = v->scoreFactory(a, bestScore);      \
++        thisScore = v->scoreFactory(a);      \
+         if (thisScore > bestScore) {                    \
+             ret = sFactoryMap.keyAt(i);                 \
+             bestScore = thisScore;                      \
+@@ -111,20 +117,21 @@ void MediaPlayerFactory::unregisterFactory(player_type type) {
+     return ret;
+ 
+ player_type MediaPlayerFactory::getPlayerType(const sp<IMediaPlayer>& client,
+-                                              const char* url) {
+-    GET_PLAYER_TYPE_IMPL(client, url);
++                                              const char* url,
++                                              const KeyedVector<String8, String8> *headers) {
++    GET_PLAYER_TYPE_IMPL(client, url, bestScore, headers);
+ }
+ 
+ player_type MediaPlayerFactory::getPlayerType(const sp<IMediaPlayer>& client,
+                                               int fd,
+                                               int64_t offset,
+                                               int64_t length) {
+-    GET_PLAYER_TYPE_IMPL(client, fd, offset, length);
++    GET_PLAYER_TYPE_IMPL(client, fd, offset, length, bestScore);
+ }
+ 
+ player_type MediaPlayerFactory::getPlayerType(const sp<IMediaPlayer>& client,
+                                               const sp<IStreamSource> &source) {
+-    GET_PLAYER_TYPE_IMPL(client, source);
++    GET_PLAYER_TYPE_IMPL(client, source, bestScore);
+ }
+ 
+ #undef GET_PLAYER_TYPE_IMPL
+@@ -173,11 +180,111 @@ sp<MediaPlayerBase> MediaPlayerFactory::createPlayer(
+  *****************************************************************************/
+ 
+ #ifdef FSL_GM_PLAYER
++enum {
++    INCOGNITO           = 0x8000,
++};
++
++bool isWVM(const char* url,
++           const KeyedVector<String8, String8> *headers) {
++    sp<DataSource> dataSource;
++    String8 mUri;
++    KeyedVector<String8, String8> mUriHeaders;
++    sp<HTTPBase> mConnectingDataSource;
++    sp<NuCachedSource2> mCachedSource;
++    uint32_t mFlags;
++
++    mUri = url;
++
++    void *VendorLibHandle = NULL;
++    if (VendorLibHandle == NULL) {
++        VendorLibHandle = dlopen("libwvm.so", RTLD_NOW);
++    }
++
++    if (!VendorLibHandle) {
++        return false;
++    }
++
++    if (headers) {
++        mUriHeaders = *headers;
++
++        ssize_t index = mUriHeaders.indexOfKey(String8("x-hide-urls-from-log"));
++        if (index >= 0) {
++            // Browser is in "incognito" mode, suppress logging URLs.
++
++            // This isn't something that should be passed to the server.
++            mUriHeaders.removeItemsAt(index);
++
++            mFlags |= INCOGNITO;
++        }
++    }
++
++    if (!strncasecmp("http://", mUri.string(), 7)
++            || !strncasecmp("https://", mUri.string(), 8)) {
++        mConnectingDataSource = HTTPBase::Create(
++                (mFlags & INCOGNITO)
++                    ? HTTPBase::kFlagIncognito
++                    : 0);
++
++        String8 cacheConfig;
++        bool disconnectAtHighwatermark;
++        NuCachedSource2::RemoveCacheSpecificHeaders(
++                &mUriHeaders, &cacheConfig, &disconnectAtHighwatermark);
++
++        status_t err = mConnectingDataSource->connect(mUri, &mUriHeaders);
++
++        if (err != OK) {
++            mConnectingDataSource.clear();
++
++            ALOGI("mConnectingDataSource->connect() returned %d", err);
++            return false;
++        }
++
++        // The widevine extractor does its own caching.
++        mCachedSource = new NuCachedSource2(
++                mConnectingDataSource,
++                cacheConfig.isEmpty() ? NULL : cacheConfig.string(),
++                disconnectAtHighwatermark);
++
++        dataSource = mCachedSource;
++
++        mConnectingDataSource.clear();
++
++        // Removed prefill as we can't abort it.
++        //
++        // We're going to prefill the cache before trying to instantiate
++        // the extractor below, as the latter is an operation that otherwise
++        // could block on the datasource for a significant amount of time.
++        // During that time we'd be unable to abort the preparation phase
++        // without this prefill.
++
++    } else {
++        dataSource = DataSource::CreateFromURI(mUri.string(), &mUriHeaders);
++    }
++
++    if (dataSource == NULL) {
++        return false;
++    }
++
++    typedef WVMLoadableExtractor *(*SnifferFunc)(const sp<DataSource>&);
++    SnifferFunc snifferFunc =
++        (SnifferFunc) dlsym(VendorLibHandle,
++                "_ZN7android15IsWidevineMediaERKNS_2spINS_10DataSourceEEE");
++
++    if (snifferFunc) {
++        if ((*snifferFunc)(dataSource)) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ class OMXPlayerFactory : public MediaPlayerFactory::IFactory {
+     public:
+         virtual float scoreFactory(const sp<IMediaPlayer>& client,
+                 const char* url,
+-                float curScore) {
++                float curScore,
++                const KeyedVector<String8, String8> *headers) {
+             static const float kOurScore = 1.0;
+             static const char* const FILE_EXTS[] = {
+                 ".avi",
+@@ -222,6 +329,15 @@ class OMXPlayerFactory : public MediaPlayerFactory::IFactory {
+             if (kOurScore <= curScore)
+                 return 0.0;
+ 
++            if (!strncasecmp("widevine://", url, 11)) {
++                return 0.0;
++            }
++
++            if (!strncasecmp(url, "http://", 7)) { 
++                if (isWVM(url, headers))
++                return 0.0;
++            }
++
+             if (!strncasecmp(url, "http://", 7) \
+                     || !strncasecmp(url, "rtsp://", 7) \
+                     || !strncasecmp(url, "udp://", 6) \
+@@ -311,7 +427,8 @@ class NuPlayerFactory : public MediaPlayerFactory::IFactory {
+   public:
+     virtual float scoreFactory(const sp<IMediaPlayer>& client,
+                                const char* url,
+-                               float curScore) {
++                               float curScore,
++                               const KeyedVector<String8, String8> *headers) {
+         static const float kOurScore = 0.8;
+ 
+         if (kOurScore <= curScore)
+@@ -357,7 +474,8 @@ class SonivoxPlayerFactory : public MediaPlayerFactory::IFactory {
+   public:
+     virtual float scoreFactory(const sp<IMediaPlayer>& client,
+                                const char* url,
+-                               float curScore) {
++                               float curScore,
++                               const KeyedVector<String8, String8> *headers) {
+         static const float kOurScore = 0.4;
+         static const char* const FILE_EXTS[] = { ".mid",
+                                                  ".midi",
+@@ -426,7 +544,8 @@ class TestPlayerFactory : public MediaPlayerFactory::IFactory {
+   public:
+     virtual float scoreFactory(const sp<IMediaPlayer>& client,
+                                const char* url,
+-                               float curScore) {
++                               float curScore,
++                               const KeyedVector<String8, String8> *headers) {
+         if (TestPlayerStub::canBeUsed(url)) {
+             return 1.0;
+         }
+diff --git a/media/libmediaplayerservice/MediaPlayerFactory.h b/media/libmediaplayerservice/MediaPlayerFactory.h
+index fe8972b..a3836be 100644
+--- a/media/libmediaplayerservice/MediaPlayerFactory.h
++++ b/media/libmediaplayerservice/MediaPlayerFactory.h
+@@ -31,7 +31,8 @@ class MediaPlayerFactory {
+ 
+         virtual float scoreFactory(const sp<IMediaPlayer>& client,
+                                    const char* url,
+-                                   float curScore) { return 0.0; }
++                                   float curScore,
++                                   const KeyedVector<String8, String8> *headers = NULL) { return 0.0; }
+ 
+         virtual float scoreFactory(const sp<IMediaPlayer>& client,
+                                    int fd,
+@@ -50,7 +51,8 @@ class MediaPlayerFactory {
+                                     player_type type);
+     static void unregisterFactory(player_type type);
+     static player_type getPlayerType(const sp<IMediaPlayer>& client,
+-                                     const char* url);
++                                     const char* url,
++                                     const KeyedVector<String8, String8> *headers = NULL);
+     static player_type getPlayerType(const sp<IMediaPlayer>& client,
+                                      int fd,
+                                      int64_t offset,
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index 08ee7ed..a919d5d 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -658,7 +658,7 @@ status_t MediaPlayerService::Client::setDataSource(
+         close(fd);
+         return mStatus;
+     } else {
+-        player_type playerType = MediaPlayerFactory::getPlayerType(this, url);
++        player_type playerType = MediaPlayerFactory::getPlayerType(this, url, headers);
+         sp<MediaPlayerBase> p = setDataSource_pre(playerType);
+         if (p == NULL) {
+             return NO_INIT;
+-- 
+1.8.0
+

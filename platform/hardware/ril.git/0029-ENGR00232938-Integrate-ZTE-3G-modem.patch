@@ -1,0 +1,1227 @@
+From 550750bcc7e2a9cac6f1a252bd1a0402e135973b Mon Sep 17 00:00:00 2001
+From: Shi Wenjun <b42754@freescale.com>
+Date: Wed, 7 Nov 2012 18:50:14 +0800
+Subject: [PATCH 29/38] ENGR00232938 Integrate ZTE 3G modem.
+
+To let various modems choose its own libreference-ril.so. Need to
+identify modem in rild.c using methods in runtime_port.c. These
+methods are also shared in reference-ril/. So we make runtime-like
+thing as a shared lib.
+
+Change-Id: Ib86cecba95a4c919d672d6bb3929abeb059d6aed
+Signed-off-by: Shi Wenjun <b42754@freescale.com>
+---
+ include/runtime/runtime.h       |  21 ++
+ reference-ril/Android.mk        |   2 +-
+ reference-ril/atchannel.c       |   4 +-
+ reference-ril/misc.h            |   1 -
+ reference-ril/reference-ril.c   |  16 +-
+ reference-ril/runtime.h         |  20 --
+ reference-ril/runtime_port.c    | 443 -------------------------------------
+ rild/Android.mk                 |   3 +-
+ rild/rild.c                     |  41 +++-
+ runtime-ril-port/Android.mk     |  20 ++
+ runtime-ril-port/runtime_port.c | 476 ++++++++++++++++++++++++++++++++++++++++
+ 11 files changed, 574 insertions(+), 473 deletions(-)
+
+diff --git a/include/runtime/runtime.h b/include/runtime/runtime.h
+new file mode 100755
+index 0000000..9bda226
+--- /dev/null
++++ b/include/runtime/runtime.h
+@@ -0,0 +1,21 @@
++/*
++ * Copyright (C) 2011-2013 Freescale Semiconductor, Inc.
++ */
++
++#ifndef RUNTIME_H
++#define RUNTIME_H
++
++extern int start_uevent_monitor(void);
++extern const char *runtime_3g_port_device(void);
++extern const char *runtime_3g_port_data(void);
++extern int runtime_3g_port_type(void);
++enum {
++	HUAWEI_MODEM = 0,
++	AMAZON_MODEM,
++	ZTE_MODEM,
++	UNKNOWN_MODEM,
++};
++
++extern int current_modem_type;
++
++#endif
+diff --git a/reference-ril/Android.mk b/reference-ril/Android.mk
+index 2f6c41e..6b874a1 100644
+--- a/reference-ril/Android.mk
++++ b/reference-ril/Android.mk
+@@ -16,7 +16,7 @@ LOCAL_SRC_FILES:= \
+     at_tok.c
+ 
+ LOCAL_SHARED_LIBRARIES := \
+-    liblog libcutils libutils libril librilutils
++    liblog libcutils libutils libril librilutils libruntime-ril-port
+ 
+ # for asprinf
+ LOCAL_CFLAGS := -D_GNU_SOURCE
+diff --git a/reference-ril/atchannel.c b/reference-ril/atchannel.c
+index 4498c5e..a3159b8 100644
+--- a/reference-ril/atchannel.c
++++ b/reference-ril/atchannel.c
+@@ -14,7 +14,7 @@
+ ** See the License for the specific language governing permissions and
+ ** limitations under the License.
+ */
+-/* Copyright (C) 2011 Freescale Semiconductor,Inc. */
++/* Copyright (C) 2011-2013 Freescale Semiconductor, Inc. */
+ 
+ #include "atchannel.h"
+ #include "at_tok.h"
+@@ -34,7 +34,9 @@
+ #include <netinet/in.h>
+ #include <linux/if.h>
+ 
++#undef LOG_NDEBUG
+ #define LOG_NDEBUG 0
++#undef LOG_TAG
+ #define LOG_TAG "AT"
+ #include <utils/Log.h>
+ 
+diff --git a/reference-ril/misc.h b/reference-ril/misc.h
+index bf8051a..3c009ba 100644
+--- a/reference-ril/misc.h
++++ b/reference-ril/misc.h
+@@ -23,6 +23,5 @@
+ #define LOGD ALOGD
+ #endif
+ 
+-
+ /** returns 1 if line starts with prefix, 0 if it does not */
+ int strStartsWith(const char *line, const char *prefix);
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 6c4fd81..11b0a85 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -45,7 +45,7 @@
+ #define LOG_TAG "RIL"
+ #include <utils/Log.h>
+ 
+-#include "runtime.h"
++#include <runtime/runtime.h>
+ 
+ #define MAX_AT_RESPONSE 0x1000
+ 
+@@ -2790,9 +2790,20 @@ static void onCancel (RIL_Token t)
+ 
+ }
+ 
++#define REFERENCE_RIL_DEF_VERSION "android reference-ril 1.0"
++#define REFERENCE_RIL_HUAWEI_VERSION "HUAWEI reference-ril 1.0"
++#define REFERENCE_RIL_AMAZON_VERSION "AMAZON reference-ril 1.0"
+ static const char * getVersion(void)
+ {
+-    return "android reference-ril 1.0";
++	int modem_type;
++	modem_type = runtime_3g_port_type();
++
++	if (AMAZON_MODEM == modem_type)
++		return REFERENCE_RIL_AMAZON_VERSION;
++	else if (HUAWEI_MODEM == modem_type)
++		return REFERENCE_RIL_HUAWEI_VERSION;
++	else
++		return REFERENCE_RIL_DEF_VERSION;
+ }
+ 
+ static void
+@@ -3828,7 +3839,6 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
+     pthread_attr_t attr;
+ 
+     s_rilenv = env;
+-    start_uevent_monitor();
+ #ifdef HAVE_DATA_DEVICE
+     while ( -1 != (opt = getopt(argc, argv, "p:d:u:s:"))) {
+ #else
+diff --git a/reference-ril/runtime.h b/reference-ril/runtime.h
+deleted file mode 100644
+index 8e66d58..0000000
+--- a/reference-ril/runtime.h
++++ /dev/null
+@@ -1,20 +0,0 @@
+-/*
+- *   Copyright (C) 2011 Freescale Semiconductor, Inc. All Rights Reserved.
+- */
+-
+-#ifndef RUNTIME_H
+-#define RUNTIME_H
+-
+-extern int start_uevent_monitor(void);
+-extern const char *runtime_3g_port_device(void);
+-extern const char *runtime_3g_port_data(void);
+-
+-enum {
+-	HUAWEI_MODEM = 0,
+-	AMAZON_MODEM,
+-	UNKNOWN_MODEM,
+-};
+-
+-extern int current_modem_type;
+-
+-#endif
+diff --git a/reference-ril/runtime_port.c b/reference-ril/runtime_port.c
+deleted file mode 100644
+index 954df62..0000000
+--- a/reference-ril/runtime_port.c
++++ /dev/null
+@@ -1,443 +0,0 @@
+-/*
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *	http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/*
+- * Copyright 2011-2013 Freescale Semiconductor, Inc. All Rights Reserved.
+- */
+-
+-#include <stdio.h>
+-#include <string.h>
+-#include <stdlib.h>
+-#include <dirent.h>
+-#include <errno.h>
+-#include <fcntl.h>
+-#define LOG_TAG "RIL"
+-#include <utils/Log.h>
+-
+-#include <pthread.h>
+-#include <sys/types.h>
+-#include <sys/socket.h>
+-#include <sys/poll.h>
+-#include <linux/netlink.h>
+-
+-#include <signal.h>
+-#include <unistd.h>
+-#include "runtime.h"
+-#include "misc.h"
+-
+-int current_modem_type = UNKNOWN_MODEM;
+-
+-#define FAKE_PORT "/dev/ttyFAKEPort"
+-/* Rild need a fake port to pass continue init job,
+- * return a fake port make it runable.
+- * Or the system will enter 15s in early suspend.
+- */
+-
+-struct modem_3g_device {
+-	const char *idVendor;
+-	const char *idProduct;
+-	const char *deviceport;	/* sending AT command */
+-	const char *dataport;	/* sending 3g data */
+-	const char *name;
+-	const int   type;
+-};
+-
+-#define PATH_SIZE 1024
+-#define ARRAY_SIZE(a) (sizeof(a)/sizeof(a[0]))
+-static const char *USB_DIR_BASE = "/sys/bus/usb/devices/";
+-
+-static struct modem_3g_device modem_3g_device_table[] = {
+-	{
+-		.name		= "Huawei-EM770",
+-		.idVendor	= "12d1",
+-		.idProduct	= "1001",
+-		.deviceport	= "/dev/ttyUSB0",
+-		.dataport	= "/dev/ttyUSB0",
+-		.type		= HUAWEI_MODEM,
+-	},
+-	{
+-		.name		= "Huawei-EM770W",
+-		.idVendor	= "12d1",
+-		.idProduct	= "1404",
+-		.deviceport	= "/dev/ttyUSB2",
+-		.dataport	= "/dev/ttyUSB0",
+-		.type		= HUAWEI_MODEM,
+-	},
+-	{
+-		.name		= "Huawei-E180",
+-		.idVendor	= "12d1",
+-		.idProduct	= "1003",
+-		.deviceport	= "/dev/ttyUSB1",
+-		.dataport	= "/dev/ttyUSB0",
+-		.type		= HUAWEI_MODEM,
+-	},
+-	{
+-		.name		= "Huawei-EM750",
+-		.idVendor	= "12d1",
+-		.idProduct	= "1413",
+-		.deviceport	= "/dev/ttyUSB3",
+-		.dataport	= "/dev/ttyUSB0",
+-		.type		= HUAWEI_MODEM,
+-	},
+-	{
+-		.name		= "InnoComm-Amazon1",
+-		.idVendor	= "1519",
+-		.idProduct	= "1001",
+-		.deviceport	= "/dev/ttyACM3",
+-		.dataport	= "/dev/ttyACM0",
+-		.type		= AMAZON_MODEM,
+-	},
+-	{
+-		.name		= "InnoComm-Amazon1",
+-		.idVendor	= "1519",
+-		.idProduct	= "0020",
+-		.deviceport	= "/dev/ttyACM3",
+-		.dataport	= "/dev/ttyACM0",
+-		.type		= AMAZON_MODEM,
+-	}
+-};
+-
+-/* -------------------------------------------------------------- */
+-
+-#define DEBUG_UEVENT 0
+-#define UEVENT_PARAMS_MAX 32
+-
+-enum uevent_action { action_add, action_remove, action_change };
+-
+-struct uevent {
+-    char *path;
+-    enum uevent_action action;
+-    char *subsystem;
+-    char *param[UEVENT_PARAMS_MAX];
+-    unsigned int seqnum;
+-};
+-
+-static void dump_uevent(struct uevent *event);
+-
+-int readfile(char *path, char *content, size_t size)
+-{
+-	int ret;
+-	FILE *f;
+-	f = fopen(path, "r");
+-	if (f == NULL)
+-		return -1;
+-
+-	ret = fread(content, 1, size, f);
+-	fclose(f);
+-	return ret;
+-}
+-
+-int is_device_equal(struct modem_3g_device *device,
+-		     const char *idv, const char *idp)
+-{
+-	long pvid = 0xffff, ppid = 0xffff;
+-	long t_vid, t_pid;
+-	if (device == NULL)
+-		return 0;
+-	t_vid = strtol(device->idVendor, NULL, 16);
+-	t_pid = strtol(device->idProduct, NULL, 16);
+-	pvid = strtol(idv, NULL, 16);
+-	ppid = strtol(idp, NULL, 16);
+-
+-	return (t_vid == pvid && t_pid == ppid);
+-}
+-
+-struct modem_3g_device *
+-find_devices_in_table(const char *idvendor, const char *idproduct)
+-{
+-	int i;
+-	int size = ARRAY_SIZE(modem_3g_device_table);
+-	struct modem_3g_device *device;
+-
+-	for (i = 0; i < size; i++) {
+-		device = &modem_3g_device_table[i];
+-
+-		if (is_device_equal(device, idvendor, idproduct)) {
+-			LOGI("Runtime 3G port found matched device with "
+-			     "Name:%s idVendor:%s idProduct:%s",
+-			     device->name, device->idVendor, device->idProduct);
+-
+-			return device;
+-		}
+-	}
+-
+-	return NULL;
+-}
+-
+-struct modem_3g_device *find_matched_device(void)
+-{
+-	struct dirent *dent;
+-	DIR *usbdir;
+-	struct modem_3g_device *device = NULL;
+-	char *path, *path2;
+-	char idvendor[64];
+-	char idproduct[64];
+-	int ret, i;
+-
+-	path = malloc(PATH_SIZE);
+-	path2 = malloc(PATH_SIZE);
+-	if (!path || !path2)
+-		return NULL;
+-
+-	usbdir = opendir(USB_DIR_BASE);
+-	if (usbdir == NULL) {
+-		free(path);
+-		free(path2);
+-		return NULL;
+-	}
+-
+-	memset(path, 0, PATH_SIZE);
+-	memset(path2, 0, PATH_SIZE);
+-
+-	while ((dent = readdir(usbdir)) != NULL) {
+-		if (strcmp(dent->d_name, ".") == 0
+-		    || strcmp(dent->d_name, "..") == 0)
+-			continue;
+-		memset(idvendor, 0, sizeof(idvendor));
+-		memset(idproduct, 0, sizeof(idproduct));
+-		path = strcpy(path, USB_DIR_BASE);
+-		path = strcat(path, dent->d_name);
+-		strcpy(path2, path);
+-		path = strcat(path, "/idVendor");
+-		path2 = strcat(path2, "/idProduct");
+-
+-		ret = readfile(path, idvendor, 4);
+-		if (ret <= 0)
+-			continue;
+-		ret = readfile(path2, idproduct, 4);
+-		if (ret <= 0)
+-			continue;
+-		device = find_devices_in_table(idvendor, idproduct);
+-		if (device != NULL)
+-			goto out;
+-	}
+-
+-	if (device == NULL)
+-		LOGI("Runtime 3G can't find supported modem");
+-out:
+-	closedir(usbdir);
+-	free(path);
+-	free(path2);
+-
+-	return device;
+-}
+-
+-
+-const char *runtime_3g_port_device(void)
+-{
+-	struct modem_3g_device *device;
+-	device = find_matched_device();
+-	if (device == NULL)
+-		return FAKE_PORT;
+-
+-	/* Set gobal modem type. */
+-	current_modem_type = device->type;
+-
+-	LOGI("Current modem type = %d", current_modem_type);
+-
+-	return device->deviceport;
+-}
+-
+-const char *runtime_3g_port_data(void)
+-{
+-	struct modem_3g_device *device;
+-
+-	device = find_matched_device();
+-	if (device == NULL)
+-		return FAKE_PORT;
+-	return device->dataport;
+-}
+-
+-static void free_uevent(struct uevent *event)
+-{
+-    int i;
+-    free(event->path);
+-    free(event->subsystem);
+-    for (i = 0; i < UEVENT_PARAMS_MAX; i++) {
+-	    if (!event->param[i])
+-		    break;
+-	    free(event->param[i]);
+-    }
+-    free(event);
+-}
+-
+-static int dispatch_uevent(struct uevent *event)
+-{
+-	/* if it's a usb tty event in our table. make the rild reboot. */
+-	int i;
+-	int ret;
+-	for (i = 0; i < UEVENT_PARAMS_MAX; i++) {
+-		if (!event->param[i])
+-			break;
+-		if (strncmp(event->param[i], "PRODUCT=", 8) == 0) {
+-			char vbuf[5], pbuf[5];
+-			ret = sscanf(event->param[i],
+-				     "PRODUCT=%4s/%4s/", vbuf, pbuf);
+-			if (ret < 0)
+-				return -1;
+-			if (find_devices_in_table(vbuf, pbuf))
+-				alarm(1);
+-			/* Restart in 1 second, since USB usually have
+-			 * many devices, this avoid rild restart too
+-			 * many times. */
+-		}
+-	}
+-	return 0;
+-}
+-
+-int process_uevent_message(int sock)
+-{
+-	char buffer[64 * 1024];
+-	char *s = buffer, *p;
+-	char *end;
+-	int count, param_idx = 0, ret;
+-	struct uevent *event;
+-	count = recv(sock, buffer, sizeof(buffer), 0);
+-	if (count < 0) {
+-		LOGE("Error receiving uevent (%s)", strerror(errno));
+-		return -errno;
+-	}
+-	event = malloc(sizeof(struct uevent));
+-	if (!event) {
+-		LOGE("Error allcating memroy (%s)", strerror(errno));
+-		return -errno;
+-	}
+-	memset(event, 0, sizeof(struct uevent));
+-
+-	end = s + count;
+-
+-	for (p = s; *p != '@'; p++)
+-		;
+-	p++;
+-	event->path = strdup(p);
+-	s += strlen(s) + 1;
+-
+-	while (s < end) {
+-		if (!strncmp(s, "ACTION=", strlen("ACTION="))) {
+-			char *a = s + strlen("ACTION=");
+-			if (!strcmp(a, "add"))
+-				event->action = action_add;
+-			else if (!strcmp(a, "change"))
+-				event->action = action_change;
+-			else if (!strcmp(a, "remove"))
+-				event->action = action_remove;
+-		} else if (!strncmp(s, "SEQNUM=", strlen("SEQNUM=")))
+-			event->seqnum = atoi(s + strlen("SEQNUM="));
+-		else if (!strncmp(s, "SUBSYSTEM=", strlen("SUBSYSTEM=")))
+-			event->subsystem = strdup(s + strlen("SUBSYSTEM="));
+-		else
+-			event->param[param_idx++] = strdup(s);
+-		s += strlen(s) + 1;
+-	}
+-
+-	ret = dispatch_uevent(event);
+-#if DEBUG_UEVENT
+-	dump_uevent(event);
+-#endif
+-	free_uevent(event);
+-	return ret;
+-}
+-
+-static void dump_uevent(struct uevent *event)
+-{
+-    int i;
+-
+-    LOGD("[UEVENT] Sq: %u S: %s A: %d P: %s",
+-	      event->seqnum, event->subsystem, event->action, event->path);
+-    for (i = 0; i < UEVENT_PARAMS_MAX; i++) {
+-	    if (!event->param[i])
+-		    break;
+-	    LOGD("%s", event->param[i]);
+-    }
+-}
+-
+-void restart_rild(int p)
+-{
+-	LOGI("3G Modem changed,RILD will restart...");
+-	exit(-1);
+-}
+-
+-void *usb_tty_monitor_thread(void *arg)
+-{
+-	struct sockaddr_nl nladdr;
+-	struct pollfd pollfds[2];
+-	int uevent_sock;
+-	int ret, max = 0;
+-	int uevent_sz = 64 * 1024;
+-	int timeout = -1;
+-	struct sigaction timeoutsigact;
+-
+-	LOGI("3G modem monitor thread is start");
+-
+-	timeoutsigact.sa_handler = restart_rild;
+-	sigemptyset(&timeoutsigact.sa_mask);
+-	sigaddset(&timeoutsigact.sa_mask, SIGALRM);
+-	sigaction(SIGALRM, &timeoutsigact, 0);
+-
+-	memset(&nladdr, 0, sizeof(nladdr));
+-	nladdr.nl_family = AF_NETLINK;
+-	nladdr.nl_pid = getpid();
+-	nladdr.nl_groups = 0xffffffff;
+-
+-	uevent_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
+-	if (uevent_sock < 0) {
+-		LOGE(" Netlink socket faild, usb monitor exiting...");
+-		return NULL;
+-	}
+-
+-	if (setsockopt(uevent_sock, SOL_SOCKET, SO_RCVBUFFORCE, &uevent_sz,
+-		       sizeof(uevent_sz)) < 0) {
+-		LOGE("Unable to set uevent socket options: %s", strerror(errno));
+-		return NULL;
+-	}
+-
+-	if (bind(uevent_sock, (struct sockaddr *) &nladdr, sizeof(nladdr)) < 0) {
+-		   LOGE("Unable to bind uevent socket: %s", strerror(errno));
+-		   return NULL;
+-	}
+-	pollfds[0].fd = uevent_sock;
+-	pollfds[0].events = POLLIN;
+-
+-	ret = fcntl(uevent_sock,F_SETFL, O_NONBLOCK);
+-	if (ret < 0)
+-		LOGE("Error on fcntl:%s", strerror(errno));
+-
+-	while (1) {
+-		ret = poll(pollfds, 1, timeout);
+-
+-		switch (ret) {
+-		case 0:
+-			LOGD("poll timeout");
+-			continue;
+-		case -1:
+-			LOGD("poll error:%s", strerror(errno));
+-			break;
+-
+-		default:
+-			if (pollfds[0].revents & POLLIN)
+-				process_uevent_message(uevent_sock);
+-		}
+-	}
+-
+-	close(uevent_sock);
+-}
+-
+-int start_uevent_monitor(void)
+-{
+-	pthread_t pth_uevent_monitor;
+-	return pthread_create(&pth_uevent_monitor, NULL,
+-			      usb_tty_monitor_thread, NULL);
+-}
+-
+-
+diff --git a/rild/Android.mk b/rild/Android.mk
+index 1f616b1..f63e56b 100644
+--- a/rild/Android.mk
++++ b/rild/Android.mk
+@@ -11,7 +11,8 @@ LOCAL_SHARED_LIBRARIES := \
+ 	liblog \
+ 	libcutils \
+ 	libril \
+-	libdl
++	libdl  \
++	libruntime-ril-port
+ 
+ # temporary hack for broken vendor rils
+ LOCAL_WHOLE_STATIC_LIBRARIES := \
+diff --git a/rild/rild.c b/rild/rild.c
+index 70530c6..2ab2894 100644
+--- a/rild/rild.c
++++ b/rild/rild.c
+@@ -34,11 +34,14 @@
+ 
+ #include <private/android_filesystem_config.h>
+ #include "hardware/qemu_pipe.h"
++#include <runtime/runtime.h>
+ 
+ #define LIB_PATH_PROPERTY   "rild.libpath"
+ #define LIB_ARGS_PROPERTY   "rild.libargs"
+ #define MAX_LIB_ARGS        16
+-
++#define MAX_POLL_DEVICE_CNT 8
++#define REFERENCE_RIL_DEF_PATH "/system/lib/libreference-ril.so"
++#define REFERENCE_RIL_ZTE_PATH "/system/lib/libreference-ril-zte.so"
+ static void usage(const char *argv0)
+ {
+     fprintf(stderr, "Usage: %s -l <ril impl library> [-- <args for impl library>]\n", argv0);
+@@ -62,6 +65,7 @@ static struct RIL_Env s_rilEnv = {
+     RIL_onUnsolicitedResponse,
+     RIL_requestTimedCallback
+ };
++static int s_poll_device_cnt = 0;
+ 
+ extern void RIL_startEventLoop();
+ 
+@@ -106,7 +110,7 @@ int main(int argc, char **argv)
+     const RIL_RadioFunctions *funcs;
+     char libPath[PROPERTY_VALUE_MAX];
+     unsigned char hasLibArgs = 0;
+-
++    int modem_type = UNKNOWN_MODEM;
+     int i;
+ 
+     umask(S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
+@@ -123,6 +127,38 @@ int main(int argc, char **argv)
+         }
+     }
+ 
++    //Wait for device ready.
++    if (rilLibPath == NULL) {
++		while(UNKNOWN_MODEM == modem_type){
++		    modem_type = runtime_3g_port_type();
++		    ALOGD("Couldn't find proper modem, retrying...");
++		    s_poll_device_cnt++;
++		    if (s_poll_device_cnt > MAX_POLL_DEVICE_CNT){
++				/*
++				*Maybe no device right now, start to monitor
++				*hotplug event later.
++				*/
++				start_uevent_monitor();
++				goto done;
++		    }
++		    sleep(5);
++		}
++    }
++
++    start_uevent_monitor();
++
++    switch (modem_type){
++		case ZTE_MODEM:
++		rilLibPath = REFERENCE_RIL_ZTE_PATH;
++		break;
++
++		case HUAWEI_MODEM:
++		case AMAZON_MODEM:
++		default:
++		rilLibPath = REFERENCE_RIL_DEF_PATH;
++		break;
++    }
++
+     if (rilLibPath == NULL) {
+         if ( 0 == property_get(LIB_PATH_PROPERTY, libPath, NULL)) {
+             // No lib sepcified on the command line, and nothing set in props.
+@@ -271,7 +307,6 @@ OpenLib:
+ 
+     // Make sure there's a reasonable argv[0]
+     rilArgv[0] = argv[0];
+-
+     funcs = rilInit(&s_rilEnv, argc, rilArgv);
+ 
+     RIL_register(funcs);
+diff --git a/runtime-ril-port/Android.mk b/runtime-ril-port/Android.mk
+new file mode 100644
+index 0000000..ac0254b
+--- /dev/null
++++ b/runtime-ril-port/Android.mk
+@@ -0,0 +1,20 @@
++# Copyright 2006 The Android Open Source Project
++
++LOCAL_PATH:= $(call my-dir)
++include $(CLEAR_VARS)
++
++LOCAL_SRC_FILES:= \
++    runtime_port.c
++
++LOCAL_SHARED_LIBRARIES := \
++    libutils \
++    libcutils
++
++LOCAL_CFLAGS :=
++
++LOCAL_MODULE_TAGS := optional
++LOCAL_MODULE:= libruntime-ril-port
++
++LOCAL_LDLIBS += -lpthread
++
++include $(BUILD_SHARED_LIBRARY)
+diff --git a/runtime-ril-port/runtime_port.c b/runtime-ril-port/runtime_port.c
+new file mode 100755
+index 0000000..5da8d2d
+--- /dev/null
++++ b/runtime-ril-port/runtime_port.c
+@@ -0,0 +1,476 @@
++/*
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *	http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * Copyright 2011-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#define LOG_TAG "RIL"
++#include <utils/Log.h>
++
++#include <pthread.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/poll.h>
++#include <linux/netlink.h>
++
++#include <signal.h>
++#include <unistd.h>
++#include <runtime/runtime.h>
++
++int current_modem_type = UNKNOWN_MODEM;
++
++#define FAKE_PORT "/dev/ttyFAKEPort"
++/* Rild need a fake port to pass continue init job,
++ * return a fake port make it runable.
++ * Or the system will enter 15s in early suspend.
++ */
++
++struct modem_3g_device {
++	const char *idVendor;
++	const char *idProduct;
++	const char *deviceport;	/* sending AT command */
++	const char *dataport;	/* sending 3g data */
++	const char *name;
++	const int   type;
++};
++
++#define PATH_SIZE 1024
++#define ARRAY_SIZE(a) (sizeof(a)/sizeof(a[0]))
++static const char *USB_DIR_BASE = "/sys/bus/usb/devices/";
++
++static struct modem_3g_device modem_3g_device_table[] = {
++	{
++		.name		= "Huawei-EM770",
++		.idVendor	= "12d1",
++		.idProduct	= "1001",
++		.deviceport	= "/dev/ttyUSB0",
++		.dataport	= "/dev/ttyUSB0",
++		.type		= HUAWEI_MODEM,
++	},
++	{
++		.name		= "Huawei-EM770W",
++		.idVendor	= "12d1",
++		.idProduct	= "1404",
++		.deviceport	= "/dev/ttyUSB2",
++		.dataport	= "/dev/ttyUSB0",
++		.type		= HUAWEI_MODEM,
++	},
++	{
++		.name		= "Huawei-E180",
++		.idVendor	= "12d1",
++		.idProduct	= "1003",
++		.deviceport	= "/dev/ttyUSB1",
++		.dataport	= "/dev/ttyUSB0",
++		.type		= HUAWEI_MODEM,
++	},
++	{
++		.name		= "Huawei-EM750",
++		.idVendor	= "12d1",
++		.idProduct	= "1413",
++		.deviceport	= "/dev/ttyUSB3",
++		.dataport	= "/dev/ttyUSB0",
++		.type		= HUAWEI_MODEM,
++	},
++	{
++		.name		= "InnoComm-Amazon1",
++		.idVendor	= "1519",
++		.idProduct	= "1001",
++		.deviceport	= "/dev/ttyACM3",
++		.dataport	= "/dev/ttyACM0",
++		.type		= AMAZON_MODEM,
++	},
++	{
++		.name		= "InnoComm-Amazon1",
++		.idVendor	= "1519",
++		.idProduct	= "0020",
++		.deviceport	= "/dev/ttyACM3",
++		.dataport	= "/dev/ttyACM0",
++		.type		= AMAZON_MODEM,
++	},
++	{
++		.name		= "ZTE-MF220",
++		.idVendor	= "19d2",
++		.idProduct	= "0145",
++		.deviceport     = "/dev/ttyUSB2",
++		.dataport	= "/dev/ttyUSB4",
++		.type		= ZTE_MODEM,
++	},
++	{
++		.name		= "ZTE-MF210",
++		.idVendor	= "19d2",
++		.idProduct	= "0117",
++		.deviceport     = "/dev/ttyUSB1",
++		.dataport	= "/dev/ttyUSB2",
++		.type		= ZTE_MODEM,
++	},
++};
++
++/* -------------------------------------------------------------- */
++
++#define DEBUG_UEVENT 0
++#define UEVENT_PARAMS_MAX 32
++
++enum uevent_action { action_add, action_remove, action_change };
++
++struct uevent {
++    char *path;
++    enum uevent_action action;
++    char *subsystem;
++    char *param[UEVENT_PARAMS_MAX];
++    unsigned int seqnum;
++};
++
++static void dump_uevent(struct uevent *event);
++
++int readfile(char *path, char *content, size_t size)
++{
++	int ret;
++	FILE *f;
++	f = fopen(path, "r");
++	if (f == NULL)
++		return -1;
++
++	ret = fread(content, 1, size, f);
++	fclose(f);
++	return ret;
++}
++
++int is_device_equal(struct modem_3g_device *device,
++		     const char *idv, const char *idp)
++{
++	long pvid = 0xffff, ppid = 0xffff;
++	long t_vid, t_pid;
++	if (device == NULL)
++		return 0;
++	t_vid = strtol(device->idVendor, NULL, 16);
++	t_pid = strtol(device->idProduct, NULL, 16);
++	pvid = strtol(idv, NULL, 16);
++	ppid = strtol(idp, NULL, 16);
++
++	return (t_vid == pvid && t_pid == ppid);
++}
++
++struct modem_3g_device *
++find_devices_in_table(const char *idvendor, const char *idproduct)
++{
++	int i;
++	int size = ARRAY_SIZE(modem_3g_device_table);
++	struct modem_3g_device *device;
++
++	for (i = 0; i < size; i++) {
++		device = &modem_3g_device_table[i];
++
++		if (is_device_equal(device, idvendor, idproduct)) {
++			ALOGI("Runtime 3G port found matched device with "
++			     "Name:%s idVendor:%s idProduct:%s",
++			     device->name, device->idVendor, device->idProduct);
++
++			return device;
++		}
++	}
++
++	return NULL;
++}
++
++struct modem_3g_device *find_matched_device(void)
++{
++	struct dirent *dent;
++	DIR *usbdir;
++	struct modem_3g_device *device = NULL;
++	char *path, *path2;
++	char idvendor[64];
++	char idproduct[64];
++	int ret, i;
++
++	path = malloc(PATH_SIZE);
++	path2 = malloc(PATH_SIZE);
++	if (!path || !path2)
++		return NULL;
++
++	usbdir = opendir(USB_DIR_BASE);
++	if (usbdir == NULL) {
++		free(path);
++		free(path2);
++		return NULL;
++	}
++
++	memset(path, 0, PATH_SIZE);
++	memset(path2, 0, PATH_SIZE);
++
++	while ((dent = readdir(usbdir)) != NULL) {
++		if (strcmp(dent->d_name, ".") == 0
++		    || strcmp(dent->d_name, "..") == 0)
++			continue;
++		memset(idvendor, 0, sizeof(idvendor));
++		memset(idproduct, 0, sizeof(idproduct));
++		path = strcpy(path, USB_DIR_BASE);
++		path = strcat(path, dent->d_name);
++		strcpy(path2, path);
++		path = strcat(path, "/idVendor");
++		path2 = strcat(path2, "/idProduct");
++
++		ret = readfile(path, idvendor, 4);
++		if (ret <= 0)
++			continue;
++		ret = readfile(path2, idproduct, 4);
++		if (ret <= 0)
++			continue;
++		device = find_devices_in_table(idvendor, idproduct);
++		if (device != NULL)
++			goto out;
++	}
++
++	if (device == NULL)
++		ALOGI("Runtime 3G can't find supported modem");
++out:
++	closedir(usbdir);
++	free(path);
++	free(path2);
++
++	return device;
++}
++
++
++const char *runtime_3g_port_device(void)
++{
++	struct modem_3g_device *device;
++	device = find_matched_device();
++	if (device == NULL)
++		return FAKE_PORT;
++
++	/* Set gobal modem type. */
++	current_modem_type = device->type;
++
++	ALOGI("Current modem type = %d", current_modem_type);
++
++	return device->deviceport;
++}
++
++const char *runtime_3g_port_data(void)
++{
++	struct modem_3g_device *device;
++
++	device = find_matched_device();
++	if (device == NULL)
++		return FAKE_PORT;
++	return device->dataport;
++}
++
++int runtime_3g_port_type(void)
++{
++       struct modem_3g_device *device;
++       int type = UNKNOWN_MODEM;
++       if (UNKNOWN_MODEM == current_modem_type){
++               if (NULL != (device = find_matched_device())){
++                       /* Set gobal modem type. */
++                       type = device->type;
++               }
++       }else{
++               type = current_modem_type;
++       }
++
++       LOGI("Current modem type = %d", type);
++
++       return type;
++}
++
++static void free_uevent(struct uevent *event)
++{
++    int i;
++    free(event->path);
++    free(event->subsystem);
++    for (i = 0; i < UEVENT_PARAMS_MAX; i++) {
++	    if (!event->param[i])
++		    break;
++	    free(event->param[i]);
++    }
++    free(event);
++}
++
++static int dispatch_uevent(struct uevent *event)
++{
++	/* if it's a usb tty event in our table. make the rild reboot. */
++	int i;
++	int ret;
++	for (i = 0; i < UEVENT_PARAMS_MAX; i++) {
++		if (!event->param[i])
++			break;
++		if (strncmp(event->param[i], "PRODUCT=", 8) == 0) {
++			char vbuf[5], pbuf[5];
++			ret = sscanf(event->param[i],
++				     "PRODUCT=%4s/%4s/", vbuf, pbuf);
++			if (ret < 0)
++				return -1;
++			if (find_devices_in_table(vbuf, pbuf))
++				alarm(1);
++			/* Restart in 1 second, since USB usually have
++			 * many devices, this avoid rild restart too
++			 * many times. */
++		}
++	}
++	return 0;
++}
++
++int process_uevent_message(int sock)
++{
++	char buffer[64 * 1024];
++	char *s = buffer, *p;
++	char *end;
++	int count, param_idx = 0, ret;
++	struct uevent *event;
++	count = recv(sock, buffer, sizeof(buffer), 0);
++	if (count < 0) {
++		ALOGE("Error receiving uevent (%s)", strerror(errno));
++		return -errno;
++	}
++	event = malloc(sizeof(struct uevent));
++	if (!event) {
++		ALOGE("Error allcating memroy (%s)", strerror(errno));
++		return -errno;
++	}
++	memset(event, 0, sizeof(struct uevent));
++
++	end = s + count;
++
++	for (p = s; *p != '@'; p++)
++		;
++	p++;
++	event->path = strdup(p);
++	s += strlen(s) + 1;
++
++	while (s < end) {
++		if (!strncmp(s, "ACTION=", strlen("ACTION="))) {
++			char *a = s + strlen("ACTION=");
++			if (!strcmp(a, "add"))
++				event->action = action_add;
++			else if (!strcmp(a, "change"))
++				event->action = action_change;
++			else if (!strcmp(a, "remove"))
++				event->action = action_remove;
++		} else if (!strncmp(s, "SEQNUM=", strlen("SEQNUM=")))
++			event->seqnum = atoi(s + strlen("SEQNUM="));
++		else if (!strncmp(s, "SUBSYSTEM=", strlen("SUBSYSTEM=")))
++			event->subsystem = strdup(s + strlen("SUBSYSTEM="));
++		else
++			event->param[param_idx++] = strdup(s);
++		s += strlen(s) + 1;
++	}
++
++	ret = dispatch_uevent(event);
++#if DEBUG_UEVENT
++	dump_uevent(event);
++#endif
++	free_uevent(event);
++	return ret;
++}
++
++static void dump_uevent(struct uevent *event)
++{
++    int i;
++
++    ALOGD("[UEVENT] Sq: %u S: %s A: %d P: %s",
++	      event->seqnum, event->subsystem, event->action, event->path);
++    for (i = 0; i < UEVENT_PARAMS_MAX; i++) {
++	    if (!event->param[i])
++		    break;
++	    ALOGD("%s", event->param[i]);
++    }
++}
++
++void restart_rild(int p)
++{
++	ALOGI("3G Modem changed,RILD will restart...");
++	exit(-1);
++}
++
++void *usb_tty_monitor_thread(void *arg)
++{
++	struct sockaddr_nl nladdr;
++	struct pollfd pollfds[2];
++	int uevent_sock;
++	int ret, max = 0;
++	int uevent_sz = 64 * 1024;
++	int timeout = -1;
++	struct sigaction timeoutsigact;
++
++	ALOGI("3G modem monitor thread is start");
++
++	timeoutsigact.sa_handler = restart_rild;
++	sigemptyset(&timeoutsigact.sa_mask);
++	sigaddset(&timeoutsigact.sa_mask, SIGALRM);
++	sigaction(SIGALRM, &timeoutsigact, 0);
++
++	memset(&nladdr, 0, sizeof(nladdr));
++	nladdr.nl_family = AF_NETLINK;
++	nladdr.nl_pid = getpid();
++	nladdr.nl_groups = 0xffffffff;
++
++	uevent_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT);
++	if (uevent_sock < 0) {
++		ALOGE(" Netlink socket faild, usb monitor exiting...");
++		return NULL;
++	}
++
++	if (setsockopt(uevent_sock, SOL_SOCKET, SO_RCVBUFFORCE, &uevent_sz,
++		       sizeof(uevent_sz)) < 0) {
++		ALOGE("Unable to set uevent socket options: %s", strerror(errno));
++		return NULL;
++	}
++
++	if (bind(uevent_sock, (struct sockaddr *) &nladdr, sizeof(nladdr)) < 0) {
++		   ALOGE("Unable to bind uevent socket: %s", strerror(errno));
++		   return NULL;
++	}
++	pollfds[0].fd = uevent_sock;
++	pollfds[0].events = POLLIN;
++
++	ret = fcntl(uevent_sock,F_SETFL, O_NONBLOCK);
++	if (ret < 0)
++		ALOGE("Error on fcntl:%s", strerror(errno));
++
++	while (1) {
++		ret = poll(pollfds, 1, timeout);
++
++		switch (ret) {
++		case 0:
++			ALOGD("poll timeout");
++			continue;
++		case -1:
++			ALOGD("poll error:%s", strerror(errno));
++			break;
++
++		default:
++			if (pollfds[0].revents & POLLIN)
++				process_uevent_message(uevent_sock);
++		}
++	}
++
++	close(uevent_sock);
++}
++
++int start_uevent_monitor(void)
++{
++	pthread_t pth_uevent_monitor;
++	return pthread_create(&pth_uevent_monitor, NULL,
++			      usb_tty_monitor_thread, NULL);
++}
++
++
+-- 
+1.8.0
+

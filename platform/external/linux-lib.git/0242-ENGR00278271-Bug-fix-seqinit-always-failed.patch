@@ -1,0 +1,848 @@
+From 635819dcdfc240f363baebf8d5dbb5fafdd960ec Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Thu, 5 Sep 2013 12:56:19 +0800
+Subject: [PATCH 242/249] ENGR00278271 Bug fix: seqinit always failed
+
+VPU lib v5.4.18
+
+- Bug fix: seqinit always failed
+FSLARIK-338 [Decoder/DivX]: regression for DivX certification
+Seqinit always failed for a clip whose 1st sequence header
+is corrupted
+
+Root cause:
+ctxRegs[CTX_BIT_RD_PTR] was not synced to BIT_RD_PTR in error
+return case (eg. RET_DEC_SEQ_SUCCESS=0), so BIT_RD_PTR did not
+move if vpu_DecGetInitialInfo failed (corrupted sequence
+header). Next call to vpu_DecGetInitialInfo parsed from same seq
+header, and failed again.
+
+Solution:
+Sync ctxRegs[CTX_BIT_RD_PTR] in this case
+
+- corrected style of some code (indent, comment)
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c  | 321 +++++++++++++++++++++++++++++----------------------------
+ vpu/vpu_lib.h  |   4 +-
+ vpu/vpu_util.c | 156 ++++++++++++++--------------
+ vpu/vpu_util.h |  46 ++++-----
+ 4 files changed, 269 insertions(+), 258 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index b49070c..4ccd86f 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -31,10 +31,12 @@
+ #define IMAGE_ENDIAN			0
+ #define STREAM_ENDIAN			0
+ 
+-#define MAX_PIC_WIDTH           1920
+-#define MAX_PIC_HEIGHT          1088
+-// Alloc buffers of MAX resolution in seqinit,
+-// in the case of dynamic resolution change
++#define MAX_PIC_WIDTH			1920
++#define MAX_PIC_HEIGHT			1088
++/*
++ * Alloc buffers of MAX resolution in seqinit,
++ * in the case of dynamic resolution change
++ */
+ #define ALLOC_MAX_RESOLUTION
+ 
+ /* If a frame is started, pendingInst is set to the proper instance. */
+@@ -1294,7 +1296,7 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ }
+ 
+ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle,
+-				  PhysicalAddress * prdPrt,
++				  PhysicalAddress * prdPtr,
+ 				  PhysicalAddress * pwrPtr, Uint32 * size)
+ {
+ 	CodecInst *pCodecInst;
+@@ -1311,7 +1313,7 @@ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle,
+ 	if (ret != RETCODE_SUCCESS)
+ 		return ret;
+ 
+-	if (prdPrt == 0 || pwrPtr == 0 || size == 0) {
++	if (prdPtr == 0 || pwrPtr == 0 || size == 0) {
+ 		return RETCODE_INVALID_PARAM;
+ 	}
+ 
+@@ -1319,9 +1321,9 @@ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle,
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+-		*prdPrt = pEncInfo->streamRdPtr;
++		*prdPtr = pEncInfo->streamRdPtr;
+ 		*pwrPtr = VpuReadReg(MJPEG_BBC_WR_PTR_REG);
+-		*size = *pwrPtr - *prdPrt;
++		*size = *pwrPtr - *prdPtr;
+ 		return RETCODE_SUCCESS;
+ 	}
+ 
+@@ -1350,7 +1352,7 @@ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle,
+ 			return RETCODE_INVALID_PARAM;
+ 	}
+ 
+-	*prdPrt = rdPtr;
++	*prdPtr = rdPtr;
+ 	*pwrPtr = wrPtr;
+ 	*size = room;
+ 
+@@ -1424,7 +1426,7 @@ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size)
+ 	LockVpuReg(vpu_semap);
+ 	instIndex = (int)VpuReadReg(BIT_RUN_INDEX);
+ 	if (pCodecInst->instIndex == instIndex)
+-		VpuWriteReg(BIT_RD_PTR, wrPtr);
++		VpuWriteReg(BIT_RD_PTR, rdPtr);
+ 	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = rdPtr;
+ 	UnlockVpuReg(vpu_semap);
+ 
+@@ -2611,26 +2613,27 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 
+ #ifdef MEM_PROTECT
+ 	if (cpu_is_mx6x())
+-    {
+-        WriteMemProtectCfg *pCfg = NULL;
+-        pCfg = &pCodecInst->CodecInfo.decInfo.writeMemProtectCfg;
+-        // Temp buf
+-        pCfg->region[0].enable = 1;
+-        pCfg->region[0].is_secondary = 0;
+-        pCfg->region[0].start_address = bit_work_addr.phy_addr+CODE_BUF_SIZE;
+-        pCfg->region[0].end_address = bit_work_addr.phy_addr+CODE_BUF_SIZE+TEMP_BUF_SIZE;
+-        info_msg("Protection Region 0: Temp buf, start 0x%x, end 0x%x\n",
+-                pCfg->region[0].start_address,
+-                pCfg->region[0].end_address);
+-        // Context buf
+-        pCfg->region[1].enable = 1;
+-        pCfg->region[1].is_secondary = 0;
+-        pCfg->region[1].start_address = pCodecInst->contextBufMem.phy_addr;
+-        pCfg->region[1].end_address = pCodecInst->contextBufMem.phy_addr + pCodecInst->contextBufMem.size;
+-        info_msg("Protection Region 1: Context buf, start 0x%x, end 0x%x\n",
+-                pCfg->region[1].start_address,
+-                pCfg->region[1].end_address);
+-    }
++	{
++		WriteMemProtectCfg *pCfg = NULL;
++		pCfg = &pCodecInst->CodecInfo.decInfo.writeMemProtectCfg;
++		/* Temp buf */
++		pCfg->region[0].enable = 1;
++		pCfg->region[0].is_secondary = 0;
++		pCfg->region[0].start_address = bit_work_addr.phy_addr + CODE_BUF_SIZE;
++		pCfg->region[0].end_address = bit_work_addr.phy_addr + CODE_BUF_SIZE + TEMP_BUF_SIZE;
++		info_msg("Protection Region 0: Temp buf, start 0x%x, end 0x%x\n",
++				pCfg->region[0].start_address,
++				pCfg->region[0].end_address);
++		/* Context buf */
++		pCfg->region[1].enable = 1;
++		pCfg->region[1].is_secondary = 0;
++		pCfg->region[1].start_address = pCodecInst->contextBufMem.phy_addr;
++		pCfg->region[1].end_address = pCodecInst->contextBufMem.phy_addr
++			+ pCodecInst->contextBufMem.size;
++		info_msg("Protection Region 1: Context buf, start 0x%x, end 0x%x\n",
++				pCfg->region[1].start_address,
++				pCfg->region[1].end_address);
++	}
+ #endif
+ 
+ 	LockVpuReg(vpu_semap);
+@@ -2832,17 +2835,17 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		pDecInfo->initialInfoObtained = 1;
+ 		pDecInfo->jpgInfo.frameOffset = 0;
+ 
+-        if (pDecInfo->openParam.mjpg_thumbNailDecEnable == 1) {
+-            if((pDecInfo->jpgInfo.ThumbInfo.ThumbType != JFXX_JPG)
+-                    && (pDecInfo->jpgInfo.ThumbInfo.ThumbType != EXIF_JPG)) {
+-                info->mjpg_thumbNailEnable = 0;
+-                UnlockVpu(vpu_semap);
+-                return RETCODE_FAILURE;
+-            }
+-            else {
+-                info->mjpg_thumbNailEnable = 1;
+-            }
+-        }
++		if (pDecInfo->openParam.mjpg_thumbNailDecEnable == 1) {
++			if((pDecInfo->jpgInfo.ThumbInfo.ThumbType != JFXX_JPG)
++				&& (pDecInfo->jpgInfo.ThumbInfo.ThumbType != EXIF_JPG)) {
++				info->mjpg_thumbNailEnable = 0;
++				UnlockVpu(vpu_semap);
++				return RETCODE_FAILURE;
++			}
++			else {
++				info->mjpg_thumbNailEnable = 1;
++			}
++		}
+ 
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_SUCCESS;
+@@ -2857,10 +2860,9 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 
+ 	if (DecBitstreamBufEmpty(handle)) {
+ 		err_msg("rd 0x%lx, rd reg 0x%lx, wr 0x%lx, wr reg 0x%lx, idx %d, idx reg %ld\n",
+-			pCodecInst->ctxRegs[CTX_BIT_RD_PTR], VpuReadReg(BIT_RD_PTR),
+-			pCodecInst->ctxRegs[CTX_BIT_WR_PTR], VpuReadReg(BIT_WR_PTR),
+-			pCodecInst->instIndex, VpuReadReg(BIT_RUN_INDEX)
+-		       );
++				pCodecInst->ctxRegs[CTX_BIT_RD_PTR], VpuReadReg(BIT_RD_PTR),
++				pCodecInst->ctxRegs[CTX_BIT_WR_PTR], VpuReadReg(BIT_WR_PTR),
++				pCodecInst->instIndex, VpuReadReg(BIT_RUN_INDEX));
+ 
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+@@ -2953,18 +2955,22 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	}
+ 
++	/* Backup rd pointer to ctx */
++	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = VpuReadReg(BIT_RD_PTR);
++	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = VpuReadReg(BIT_BIT_STREAM_PARAM);
++
+ 	val = VpuReadReg(RET_DEC_SEQ_SUCCESS);
+ 
+ 	if (cpu_is_mx6x()) {
+ #ifdef MEM_PROTECT
+ 		if (val & (1 << 31)) {
+-            err_msg("access violation in vpu_DecGetInitialInfo\n");
+-            err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
+-                    VpuReadReg(BIT_CUR_PC),
+-                    VpuReadReg(GDI_WPROT_ERR_CLR),
+-                    VpuReadReg(GDI_WPROT_ERR_RSN),
+-                    VpuReadReg(GDI_WPROT_ERR_ADR));
+-            vpu_mx6_swreset(0);
++			err_msg("access violation in vpu_DecGetInitialInfo\n");
++			err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
++					VpuReadReg(BIT_CUR_PC),
++					VpuReadReg(GDI_WPROT_ERR_CLR),
++					VpuReadReg(GDI_WPROT_ERR_RSN),
++					VpuReadReg(GDI_WPROT_ERR_ADR));
++			vpu_mx6_swreset(0);
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_MEMORY_ACCESS_VIOLATION;
+ 		}
+@@ -3065,7 +3071,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		}
+ 
+ #ifdef ALLOC_MAX_RESOLUTION
+-        val = MAX_PIC_WIDTH * MAX_PIC_HEIGHT;
++		val = MAX_PIC_WIDTH * MAX_PIC_HEIGHT;
+ #else
+ 		val = info->picWidth * info->picHeight;
+ #endif
+@@ -3080,9 +3086,9 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 
+ 	if (!cpu_is_mx6x() && pCodecInst->codecMode == MJPG_DEC) {
+ 		info->mjpg_thumbNailEnable =
+-		    (VpuReadReg(RET_DEC_SEQ_JPG_THUMB_IND) & 0x01);
++			(VpuReadReg(RET_DEC_SEQ_JPG_THUMB_IND) & 0x01);
+ 		info->mjpg_sourceFormat =
+-		    (VpuReadReg(RET_DEC_SEQ_JPG_PARA) & 0x07);
++			(VpuReadReg(RET_DEC_SEQ_JPG_PARA) & 0x07);
+ 		if (pDecInfo->openParam.mjpg_thumbNailDecEnable == 1)
+ 			if (info->mjpg_thumbNailEnable == 0) {
+ 				UnlockVpu(vpu_semap);
+@@ -3115,10 +3121,6 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	else
+ 		info->streamInfoObtained = 0;
+ 
+-	/* Backup rd pointer to ctx */
+-	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = VpuReadReg(BIT_RD_PTR);
+-	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = VpuReadReg(BIT_BIT_STREAM_PARAM);
+-
+ 	UnlockVpu(vpu_semap);
+ 
+ 	pDecInfo->initialInfo = *info;
+@@ -3219,62 +3221,66 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 
+ #ifdef MEM_PROTECT
+ 	if (cpu_is_mx6x())
+-    {
+-        WriteMemProtectCfg *pCfg = NULL;
+-        Uint32 minFB = 0xFFFFFFFF, maxFB = 0;
+-        Uint32 minMV = 0xFFFFFFFF, maxMV = 0;
+-        int align;
+-        int picheight;
+-        pCfg = &pCodecInst->CodecInfo.decInfo.writeMemProtectCfg;
+-        // Frame buf
+-        if ((pDecInfo->openParam.bitstreamFormat == STD_MPEG2 ||
+-             pDecInfo->openParam.bitstreamFormat == STD_VC1 ||
+-             pDecInfo->openParam.bitstreamFormat == STD_AVC ||
+-             pDecInfo->openParam.bitstreamFormat == STD_VP8) && pDecInfo->initialInfo.interlace == 1) {
+-            align = 32;
+-        }
+-        else {
+-            align = 16;
+-        }
+-
+-        picheight = ((pDecInfo->initialInfo.picHeight + align - 1) & ~(align - 1));
+-        for (i = 0; i < num; i++) {
+-            info_msg("[%d] bufY 0x%x, bufCb 0x%x, bufCr 0x%x, bufMvCol 0x%x\n", i, bufArray[i].bufY, bufArray[i].bufCb, bufArray[i].bufCr, bufArray[i].bufMvCol);
+-            // Caution: Y/Cb/Cr is assumed to be contiguous
+-            // not for Tiled format
+-            if (minFB > bufArray[i].bufY) minFB = bufArray[i].bufY;
+-            if (maxFB < bufArray[i].bufY) maxFB = bufArray[i].bufY;
+-            if (minMV > bufArray[i].bufMvCol) minMV = bufArray[i].bufMvCol;
+-            if (maxMV < bufArray[i].bufMvCol) maxMV = bufArray[i].bufMvCol;
+-        }
+-        pCfg->region[2].enable = 1;
+-        pCfg->region[2].is_secondary = 0;
+-        pCfg->region[2].start_address = minFB;
+-        pCfg->region[2].end_address = maxFB+stride*picheight*3/2;
+-        info_msg("Protection Region 2: Frame buf, start 0x%x, end 0x%x\n",
+-                pCfg->region[2].start_address,
+-                pCfg->region[2].end_address);
+-        pCfg->region[3].enable = 1;
+-        pCfg->region[3].is_secondary = 0;
+-        pCfg->region[3].start_address = minMV;
+-        pCfg->region[3].end_address = maxMV+stride*picheight/4;
+-        info_msg("Protection Region 3: MvCol buf, start 0x%x, end 0x%x\n",
+-                pCfg->region[3].start_address,
+-                pCfg->region[3].end_address);
+-
+-        // AVC Slice save buf
+-        if (pCodecInst->codecMode == AVC_DEC) {
+-            pCfg->region[4].enable = 1;
+-            pCfg->region[4].is_secondary = 0;
+-            pCfg->region[4].start_address = pBufInfo->avcSliceBufInfo.bufferBase;
+-            pCfg->region[4].end_address = pBufInfo->avcSliceBufInfo.bufferBase + pBufInfo->avcSliceBufInfo.bufferSize;
+-            info_msg("Protection Region 4: AVC Slice save buf, start 0x%x, end 0x%x\n",
+-                    pCfg->region[4].start_address,
+-                    pCfg->region[4].end_address);
+-        }
+-
+-        // AVC Ps save buf (moved to temp buf by FW)
+-    }
++	{
++		WriteMemProtectCfg *pCfg = NULL;
++		Uint32 minFB = 0xFFFFFFFF, maxFB = 0;
++		Uint32 minMV = 0xFFFFFFFF, maxMV = 0;
++		int align;
++		int picheight;
++		pCfg = &pCodecInst->CodecInfo.decInfo.writeMemProtectCfg;
++		/* Frame buf */
++		if ((pDecInfo->openParam.bitstreamFormat == STD_MPEG2
++			|| pDecInfo->openParam.bitstreamFormat == STD_VC1
++			|| pDecInfo->openParam.bitstreamFormat == STD_AVC
++			|| pDecInfo->openParam.bitstreamFormat == STD_VP8)
++			&& pDecInfo->initialInfo.interlace == 1) {
++			align = 32;
++		}
++		else {
++			align = 16;
++		}
++
++		picheight = ((pDecInfo->initialInfo.picHeight + align - 1) & ~(align - 1));
++		for (i = 0; i < num; i++) {
++			info_msg("[%d] bufY 0x%x, bufCb 0x%x, bufCr 0x%x, bufMvCol 0x%x\n",
++				i, bufArray[i].bufY, bufArray[i].bufCb,
++				bufArray[i].bufCr, bufArray[i].bufMvCol);
++			/* Caution: Y/Cb/Cr is assumed to be contiguous */
++			/* not for Tiled format */
++			if (minFB > bufArray[i].bufY) minFB = bufArray[i].bufY;
++			if (maxFB < bufArray[i].bufY) maxFB = bufArray[i].bufY;
++			if (minMV > bufArray[i].bufMvCol) minMV = bufArray[i].bufMvCol;
++			if (maxMV < bufArray[i].bufMvCol) maxMV = bufArray[i].bufMvCol;
++		}
++		pCfg->region[2].enable = 1;
++		pCfg->region[2].is_secondary = 0;
++		pCfg->region[2].start_address = minFB;
++		pCfg->region[2].end_address = maxFB+stride*picheight*3/2;
++		info_msg("Protection Region 2: Frame buf, start 0x%x, end 0x%x\n",
++				pCfg->region[2].start_address,
++				pCfg->region[2].end_address);
++		pCfg->region[3].enable = 1;
++		pCfg->region[3].is_secondary = 0;
++		pCfg->region[3].start_address = minMV;
++		pCfg->region[3].end_address = maxMV+stride*picheight/4;
++		info_msg("Protection Region 3: MvCol buf, start 0x%x, end 0x%x\n",
++				pCfg->region[3].start_address,
++				pCfg->region[3].end_address);
++
++		/* AVC Slice save buf */
++		if (pCodecInst->codecMode == AVC_DEC) {
++			pCfg->region[4].enable = 1;
++			pCfg->region[4].is_secondary = 0;
++			pCfg->region[4].start_address = pBufInfo->avcSliceBufInfo.bufferBase;
++			pCfg->region[4].end_address = pBufInfo->avcSliceBufInfo.bufferBase
++				+ pBufInfo->avcSliceBufInfo.bufferSize;
++			info_msg("Protection Region 4: AVC Slice save buf, start 0x%x, end 0x%x\n",
++					pCfg->region[4].start_address,
++					pCfg->region[4].end_address);
++		}
++
++		/* AVC Ps save buf (moved to temp buf by FW) */
++	}
+ #endif
+ 
+ 	if (cpu_is_mx27()) {
+@@ -3380,19 +3386,20 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 			     1024));
+ 	}
+ 
+-    if (cpu_is_mx6x()) {
+-        // To align with mx5x
+-        if (pBufInfo->maxDecFrmInfo.maxMbNum == 0) {
+-            pBufInfo->maxDecFrmInfo.maxMbX = MAX_PIC_WIDTH/16;
+-            pBufInfo->maxDecFrmInfo.maxMbY = MAX_PIC_HEIGHT/16;
+-            pBufInfo->maxDecFrmInfo.maxMbNum = pBufInfo->maxDecFrmInfo.maxMbX * pBufInfo->maxDecFrmInfo.maxMbY;
+-        }
+-    }
++	if (cpu_is_mx6x()) {
++		/* To align with mx5x */
++		if (pBufInfo->maxDecFrmInfo.maxMbNum == 0) {
++			pBufInfo->maxDecFrmInfo.maxMbX = MAX_PIC_WIDTH/16;
++			pBufInfo->maxDecFrmInfo.maxMbY = MAX_PIC_HEIGHT/16;
++			pBufInfo->maxDecFrmInfo.maxMbNum = pBufInfo->maxDecFrmInfo.maxMbX
++				* pBufInfo->maxDecFrmInfo.maxMbY;
++		}
++	}
+ 
+-    VpuWriteReg(CMD_SET_FRAME_MAX_DEC_SIZE,
+-            (pBufInfo->maxDecFrmInfo.maxMbNum << 16 |
+-             pBufInfo->maxDecFrmInfo.maxMbX << 8 |
+-             pBufInfo->maxDecFrmInfo.maxMbY));
++	VpuWriteReg(CMD_SET_FRAME_MAX_DEC_SIZE,
++			(pBufInfo->maxDecFrmInfo.maxMbNum << 16 |
++			 pBufInfo->maxDecFrmInfo.maxMbX << 8 |
++			 pBufInfo->maxDecFrmInfo.maxMbY));
+ 
+ 	BitIssueCommand(pCodecInst, SET_FRAME_BUF);
+ 
+@@ -3400,12 +3407,12 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 
+ #ifdef MEM_PROTECT
+ 	if (cpu_is_mx6x() && VpuReadReg(RET_SET_FRAME_SUCCESS) & (1 << 31)) {
+-        err_msg("access violation in vpu_DecRegisterFrameBuffer\n");
+-        err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
+-                VpuReadReg(BIT_CUR_PC),
+-                VpuReadReg(GDI_WPROT_ERR_CLR),
+-                VpuReadReg(GDI_WPROT_ERR_RSN),
+-                VpuReadReg(GDI_WPROT_ERR_ADR));
++		err_msg("access violation in vpu_DecRegisterFrameBuffer\n");
++		err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
++				VpuReadReg(BIT_CUR_PC),
++				VpuReadReg(GDI_WPROT_ERR_CLR),
++				VpuReadReg(GDI_WPROT_ERR_RSN),
++				VpuReadReg(GDI_WPROT_ERR_ADR));
+ 		vpu_mx6_swreset(0);
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_MEMORY_ACCESS_VIOLATION;
+@@ -4169,13 +4176,13 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ #ifdef MEM_PROTECT
+ 		if (val & (1 << 31)) {
+ 			*ppendingInst = 0;
+-            err_msg("access violation in vpu_DecGetOutputInfo\n");
+-            err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
+-                    VpuReadReg(BIT_CUR_PC),
+-                    VpuReadReg(GDI_WPROT_ERR_CLR),
+-                    VpuReadReg(GDI_WPROT_ERR_RSN),
+-                    VpuReadReg(GDI_WPROT_ERR_ADR));
+-            vpu_mx6_swreset(0);
++			err_msg("access violation in vpu_DecGetOutputInfo\n");
++			err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
++					VpuReadReg(BIT_CUR_PC),
++					VpuReadReg(GDI_WPROT_ERR_CLR),
++					VpuReadReg(GDI_WPROT_ERR_RSN),
++					VpuReadReg(GDI_WPROT_ERR_ADR));
++			vpu_mx6_swreset(0);
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_MEMORY_ACCESS_VIOLATION;
+ 		}
+@@ -4201,18 +4208,20 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	info->decPicWidth = (val >> 16) & 0xFFFF;
+ 
+ 	if (cpu_is_mx6x()) {
+-        if(pCodecInst->codecMode == VC1_DEC || pCodecInst->codecMode == AVS_DEC || pCodecInst->codecMode == MP4_DEC) {
+-            info->frameStartPos = VpuReadReg(BIT_BYTE_POS_FRAME_START);
+-            info->frameEndPos = VpuReadReg(BIT_BYTE_POS_FRAME_END);
+-        } else {
+-            info->frameStartPos = pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
+-            info->frameEndPos = VpuReadReg(BIT_RD_PTR);
+-        }
+-        if (info->frameEndPos < info->frameStartPos) {
++		if(pCodecInst->codecMode == VC1_DEC
++			|| pCodecInst->codecMode == AVS_DEC
++			|| pCodecInst->codecMode == MP4_DEC) {
++			info->frameStartPos = VpuReadReg(BIT_BYTE_POS_FRAME_START);
++			info->frameEndPos = VpuReadReg(BIT_BYTE_POS_FRAME_END);
++		} else {
++			info->frameStartPos = pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
++			info->frameEndPos = VpuReadReg(BIT_RD_PTR);
++		}
++		if (info->frameEndPos < info->frameStartPos) {
+ 			info->consumedByte =
+-				    pDecInfo->streamBufEndAddr - info->frameStartPos;
++				pDecInfo->streamBufEndAddr - info->frameStartPos;
+ 			info->consumedByte +=
+-				    info->frameEndPos - pDecInfo->streamBufStartAddr;
++				info->frameEndPos - pDecInfo->streamBufStartAddr;
+ 		} else
+ 			info->consumedByte = info->frameEndPos - info->frameStartPos;
+ 	}
+@@ -4455,8 +4464,10 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	if (pCodecInst->codecMode == VC1_DEC && info->indexFrameDisplay != -3) {
+ 		if (pDecInfo->vc1BframeDisplayValid == 0) {
+ 			/* Check the pictype of displayed frame */
+-			if ((pDecInfo->decoded_pictype[info->indexFrameDisplay] == 3 && pDecInfo->initialInfo.profile != 2) ||
+-			    ((pDecInfo->decoded_pictype[info->indexFrameDisplay] >> 3) == 3 && pDecInfo->initialInfo.profile == 2)) {
++			if ((pDecInfo->decoded_pictype[info->indexFrameDisplay] == 3
++				&& pDecInfo->initialInfo.profile != 2)
++				|| ((pDecInfo->decoded_pictype[info->indexFrameDisplay] >> 3) == 3
++				&& pDecInfo->initialInfo.profile == 2)) {
+ 				/* clear buffer for not displayed B frame */
+ 				val = ~(1 << info->indexFrameDisplay);
+ 				val &= VpuReadReg(BIT_FRM_DIS_FLG);
+@@ -4587,9 +4598,9 @@ RetCode vpu_DecBitBufferFlush(DecHandle handle)
+ 		pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = pDecInfo->streamBufStartAddr;
+ 
+ 	if (!is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+-        BitIssueCommand(pCodecInst, DEC_BUF_FLUSH);
+-        while (VpuReadReg(BIT_BUSY_FLAG)) ;
+-    }
++		BitIssueCommand(pCodecInst, DEC_BUF_FLUSH);
++		while (VpuReadReg(BIT_BUSY_FLAG)) ;
++	}
+ 
+ 	pDecInfo->streamWrPtr = pDecInfo->streamBufStartAddr;
+ 
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 73872b0..ba6d390 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -684,7 +684,7 @@ static const SocInfo soc_info[] = {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 17)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 18)
+ 
+ extern unsigned int system_rev;
+ 
+@@ -724,7 +724,7 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ 				   int num, int frameBufStride, int sourceBufStride,
+ 				   PhysicalAddress subSampBaseA, PhysicalAddress subSampBaseB,
+ 				   EncExtBufInfo * pBufInfo);
+-RetCode vpu_EncGetBitstreamBuffer(EncHandle handle, PhysicalAddress * prdPrt,
++RetCode vpu_EncGetBitstreamBuffer(EncHandle handle, PhysicalAddress * prdPtr,
+ 				  PhysicalAddress * pwrPtr, Uint32 * size);
+ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size);
+ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param);
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 56fc7c9..1e15736 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -52,8 +52,8 @@ static int mutex_timeout;
+ 
+ // thumbnail
+ typedef enum {
+-    JPG_LITTLE_ENDIAN = 0,
+-    JPG_BIG_ENDIAN,
++	JPG_LITTLE_ENDIAN = 0,
++	JPG_BIG_ENDIAN,
+ } JpgEndianMode;
+ 
+ const char lendian[4] = {0x49, 0x49, 0x2A, 0x00};
+@@ -311,10 +311,10 @@ int SetDecWriteProtectRegions(CodecInst *inst)
+ 
+ 		regionEnable |= (enable << i);
+ 		regionEnable |= (isSecondary << (i + 6));
+-		VpuWriteReg(GDI_WPROT_RGN0_STA + 8*i, p->start_address         >> 12);	// round down
+-		VpuWriteReg(GDI_WPROT_RGN0_END + 8*i, (p->end_address + 0xFFF) >> 12);	// round up
++		VpuWriteReg(GDI_WPROT_RGN0_STA + 8*i, p->start_address         >> 12);	/* round down */
++		VpuWriteReg(GDI_WPROT_RGN0_END + 8*i, (p->end_address + 0xFFF) >> 12);	/* round up */
+ 	}
+-    VpuWriteReg(GDI_WPROT_RGN_EN, regionEnable);
++	VpuWriteReg(GDI_WPROT_RGN_EN, regionEnable);
+ 	return 1;
+ }
+ #endif
+@@ -344,13 +344,13 @@ void BitIssueCommand(CodecInst *pCodecInst, int cmd)
+ 		cdcMode = pCodecInst->codecMode;
+ 		auxMode = pCodecInst->codecModeAux;
+ 
+-        if (cpu_is_mx6x()) {
+-            VpuWriteReg(GDI_WPROT_ERR_CLR, 1);
+-            VpuWriteReg(GDI_WPROT_RGN_EN, 0);
++		if (cpu_is_mx6x()) {
++			VpuWriteReg(GDI_WPROT_ERR_CLR, 1);
++			VpuWriteReg(GDI_WPROT_RGN_EN, 0);
+ #ifdef MEM_PROTECT
+-            SetDecWriteProtectRegions(pCodecInst);
++			SetDecWriteProtectRegions(pCodecInst);
+ #endif
+-        }
++		}
+ 	}
+ 
+ 	VpuWriteReg(BIT_BUSY_FLAG, 0x1);
+@@ -2396,25 +2396,25 @@ static Uint32 tGetBits(DecInfo *pDecInfo, int endian, int byteCnt)
+ static void thumbRaw(DecInfo *pDecInfo, Uint8 pal[][3])
+ {
+ 	int i;
+-    int pixelCnt;
++	int pixelCnt;
+ 
+-    dprintf(4, "checking raw thumbnail\n");
++	dprintf(4, "checking raw thumbnail\n");
+ 
+-    if (pDecInfo->jpgInfo.ThumbInfo.ThumbType == JFXX_PAL) {
+-        for (i = 0; i < 256; i++) {
+-            pal[i][0] = get_bits(&pDecInfo->jpgInfo.gbc, 8);
+-            pal[i][1] = get_bits(&pDecInfo->jpgInfo.gbc, 8);
+-            pal[i][2] = get_bits(&pDecInfo->jpgInfo.gbc, 8);
+-        }
+-    }
++	if (pDecInfo->jpgInfo.ThumbInfo.ThumbType == JFXX_PAL) {
++		for (i = 0; i < 256; i++) {
++			pal[i][0] = get_bits(&pDecInfo->jpgInfo.gbc, 8);
++			pal[i][1] = get_bits(&pDecInfo->jpgInfo.gbc, 8);
++			pal[i][2] = get_bits(&pDecInfo->jpgInfo.gbc, 8);
++		}
++	}
+ 
+-    pixelCnt = pDecInfo->jpgInfo.picWidth
+-        * pDecInfo->jpgInfo.picHeight
+-        * (pDecInfo->jpgInfo.thumbInfo.MbSize/64);
++	pixelCnt = pDecInfo->jpgInfo.picWidth
++		* pDecInfo->jpgInfo.picHeight
++		* (pDecInfo->jpgInfo.thumbInfo.MbSize/64);
+ 
+-    for (i=0; i<pixelCnt; i++) {
+-        get_bits(&pDecInfo->jpgInfo.gbc, 8);
+-    }
++	for (i=0; i<pixelCnt; i++) {
++		get_bits(&pDecInfo->jpgInfo.gbc, 8);
++	}
+ }
+ 
+ int ParseJFIF(DecInfo *pDecInfo, int jfif, int length)
+@@ -2424,7 +2424,7 @@ int ParseJFIF(DecInfo *pDecInfo, int jfif, int length)
+ 	THUMB_INFO *pThumbInfo;
+ 	pThumbInfo = &(pDecInfo->jpgInfo.ThumbInfo);
+ 
+-    // if EXIF thumbnail contains JFIF APP0
++	/* if EXIF thumbnail contains JFIF APP0 */
+ 	if (pThumbInfo->ThumbType == EXIF_JPG)
+ 	{
+ 		if(jfif)
+@@ -2471,7 +2471,7 @@ int ParseJFIF(DecInfo *pDecInfo, int jfif, int length)
+ 		length -= 9;
+ 
+ 	}
+-	else							//JFXX
++	else /* JFXX */
+ 	{
+ 		exCode = get_bits(&pDecInfo->jpgInfo.gbc, 8);
+ 		length -= 1;
+@@ -2706,50 +2706,50 @@ int CheckThumbNail(DecInfo *pDecInfo)
+ 	}
+ 	else
+ 	{
+-        for (i = 0; i < 4; i++)
+-        {
+-            id = (Uint8) get_bits(&pDecInfo->jpgInfo.gbc, 8);
+-
+-            if (id != jfif[i])
+-                jfifFlag = false;
+-            if (id != jfxx[i])
+-                jfxxFlag = false;
+-            if (id != exif[i])
+-                exifFlag = false;
+-
+-        }
+-        get_bits(&pDecInfo->jpgInfo.gbc, 8);
+-        length -= 5;
+-
+-        if (exifFlag)
+-        {
+-            get_bits(&pDecInfo->jpgInfo.gbc, 8);
+-            length -= 1;
+-        }
+-        if (jfifFlag | jfxxFlag)	//JFIF
+-        {
+-            length = ParseJFIF(pDecInfo, jfifFlag, length);
+-
+-            if (pThumbInfo->ThumbType != EXIF_JPG)
+-            {
+-                if(pThumbInfo->ThumbType != JFXX_JPG)
+-                {
+-                    //RAW data
+-                    thumbRaw(pDecInfo, pThumbInfo->Pallette);
+-
+-                }
+-            }
+-
+-        }
+-        else if (exifFlag)			//EXIF
+-        {
+-            length = ParseEXIF(pDecInfo, length);
+-            if (length == -1)
+-                return 0;
+-        }
+-    }
+-
+-    return 1;
++		for (i = 0; i < 4; i++)
++		{
++			id = (Uint8) get_bits(&pDecInfo->jpgInfo.gbc, 8);
++
++			if (id != jfif[i])
++				jfifFlag = false;
++			if (id != jfxx[i])
++				jfxxFlag = false;
++			if (id != exif[i])
++				exifFlag = false;
++
++		}
++		get_bits(&pDecInfo->jpgInfo.gbc, 8);
++		length -= 5;
++
++		if (exifFlag)
++		{
++			get_bits(&pDecInfo->jpgInfo.gbc, 8);
++			length -= 1;
++		}
++		if (jfifFlag | jfxxFlag) /* JFIF */
++		{
++			length = ParseJFIF(pDecInfo, jfifFlag, length);
++
++			if (pThumbInfo->ThumbType != EXIF_JPG)
++			{
++				if(pThumbInfo->ThumbType != JFXX_JPG)
++				{
++					/* RAW data */
++					thumbRaw(pDecInfo, pThumbInfo->Pallette);
++
++				}
++			}
++
++		}
++		else if (exifFlag) /* EXIF */
++		{
++			length = ParseEXIF(pDecInfo, length);
++			if (length == -1)
++				return 0;
++		}
++	}
++
++	return 1;
+ 
+ }
+ 
+@@ -2873,15 +2873,15 @@ int JpegDecodeHeader(DecInfo *pDecInfo)
+ 		case EXIF_CODE:
+ 			if (pDecInfo->openParam.mjpg_thumbNailDecEnable == 1) {
+ 				CheckThumbNail(pDecInfo);
+-                dprintf(4, "ThumbType = %d\n", pDecInfo->jpgInfo.ThumbInfo.ThumbType);
++				dprintf(4, "ThumbType = %d\n", pDecInfo->jpgInfo.ThumbInfo.ThumbType);
+ 			}
+ 			else {
+-                if (!decode_app_header(jpg)) {
+-                    dprintf(4, "err in JFIF_CODE or EXIF_CODE\n");
+-                    ret = -1;
+-                    goto DONE_DEC_HEADER;
+-                }
+-            }
++				if (!decode_app_header(jpg)) {
++					dprintf(4, "err in JFIF_CODE or EXIF_CODE\n");
++					ret = -1;
++					goto DONE_DEC_HEADER;
++				}
++			}
+ 			break;
+ 		case DRI_Marker:
+ 			if (!decode_dri_header(jpg)) {
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 768c978..d6c5abe 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -173,20 +173,20 @@ enum {
+ enum {
+ 	Marker          = 0xFF,
+ 	FF_Marker       = 0x00,
+-	SOI_Marker      = 0xFFD8,           // Start of image
+-	EOI_Marker      = 0xFFD9,           // End of image
+-	JFIF_CODE       = 0xFFE0,           // Application
++	SOI_Marker      = 0xFFD8,           /* Start of image */
++	EOI_Marker      = 0xFFD9,           /* End of image */
++	JFIF_CODE       = 0xFFE0,           /* Application */
+ 	EXIF_CODE       = 0xFFE1,
+-	DRI_Marker      = 0xFFDD,           // Define restart interval
+-	RST_Marker      = 0xD,              // 0xD0 ~0xD7
+-	DQT_Marker      = 0xFFDB,           // Define quantization table(s)
+-	DHT_Marker      = 0xFFC4,           // Define Huffman table(s)
+-	SOF_Marker      = 0xFFC0,           // Start of frame : Baseline DCT
+-	SOS_Marker      = 0xFFDA,           // Start of scan
++	DRI_Marker      = 0xFFDD,           /* Define restart interval */
++	RST_Marker      = 0xD,              /* 0xD0 ~0xD7 */
++	DQT_Marker      = 0xFFDB,           /* Define quantization table(s) */
++	DHT_Marker      = 0xFFC4,           /* Define Huffman table(s) */
++	SOF_Marker      = 0xFFC0,           /* Start of frame : Baseline DCT */
++	SOS_Marker      = 0xFFDA,           /* Start of scan */
+ };
+ 
+-// JPEG thumbnail
+-enum{ //Exif
++/* JPEG thumbnail */
++enum{ /* Exif */
+ 	IMAGE_WIDTH		= 0x0100,
+ 	IMAGE_HEIGHT		= 0x0101,
+ 	BITS_PER_SAMPLE		= 0x0102,
+@@ -206,11 +206,11 @@ typedef struct{
+ }TAG;
+ 
+ enum {
+-    JFIF    	= 0,
+-    JFXX_JPG	= 1,
+-    JFXX_PAL  	= 2,
+-    JFXX_RAW 	= 3,
+-    EXIF_JPG	= 4
++	JFIF    	= 0,
++	JFXX_JPG	= 1,
++	JFXX_PAL  	= 2,
++	JFXX_RAW 	= 3,
++	EXIF_JPG	= 4
+ };
+ 
+ typedef struct {
+@@ -243,7 +243,7 @@ typedef struct {
+ 	EXIF_INFO	ExifInfo;
+ 	int  		ThumbType;
+ 
+-    int  		Version;
++	int  		Version;
+ 	Uint8 		Pallette[256][3];
+ } THUMB_INFO;
+ 
+@@ -306,14 +306,14 @@ typedef struct {
+ 
+ #ifdef MEM_PROTECT
+ typedef struct {
+-    int enable;
+-    int is_secondary;
+-    PhysicalAddress start_address;
+-    PhysicalAddress end_address;
++	int enable;
++	int is_secondary;
++	PhysicalAddress start_address;
++	PhysicalAddress end_address;
+ } WriteMemProtectRegion;
+ 
+ typedef struct {
+-    WriteMemProtectRegion region[6];
++	WriteMemProtectRegion region[6];
+ } WriteMemProtectCfg;
+ #endif
+ 
+@@ -443,7 +443,7 @@ typedef struct {
+ 	int iHorScaleMode;
+ 	int iVerScaleMode;
+ 
+-    // thumbnail
++	/* thumbnail */
+ 
+ 	THUMB_INFO	ThumbInfo;
+ 
+-- 
+1.8.0
+

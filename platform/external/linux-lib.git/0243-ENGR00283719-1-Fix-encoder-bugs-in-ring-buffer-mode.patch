@@ -1,0 +1,469 @@
+From ce6ff6e4a3711411ee9085355a6ab9ea3addb1f3 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Tue, 15 Oct 2013 17:23:02 +0800
+Subject: [PATCH 243/249] ENGR00283719-1 Fix encoder bugs in ring buffer mode
+
+VPU lib v5.4.19
+
+- Single instance bug:
+  1) MJPEG encoder always causes system hang
+  Root cause: did not enable VPU clock before accessing registers in
+  vpu_EncGetBitstreamBuffer()
+
+  2) MJPEG encoder output wrong
+
+- Multiple instances bug:
+  MJPEG encoder output wrong
+
+  Redesigned control flow
+  * read bs buffer only when JPU is blocked due to bs buffer full or
+    when picture encoding is done
+  * unblock JPU after reading bs buffer, and reset pointers to bs
+    buffer base addr
+  * handle MJPEG encoder interrupt status correctly in
+    vpu_WaitForInt()
+  * correct register accesses in multiple instances case
+
+- Use inProcess instead of BIT_RUN_INDEX to check running instance
+
+- Implemented write protection for MJPEG encoder
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c  | 185 ++++++++++++++++++++++++++++++++++++++++-----------------
+ vpu/vpu_lib.h  |   2 +-
+ vpu/vpu_util.h |   2 +
+ 3 files changed, 135 insertions(+), 54 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 4ccd86f..0e7644e 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -210,6 +210,21 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 				}
+ 			}
+ 			IOClkGateSet(false);
++		} else if (pCodecInst && (pCodecInst->codecMode == MJPG_ENC)) {
++			IOClkGateSet(true);
++			status = VpuReadReg(MJPEG_PIC_STATUS_REG);
++			wrPtr = VpuReadReg(MJPEG_BBC_WR_PTR_REG);
++			bbcEnd = VpuReadReg(MJPEG_BBC_END_ADDR_REG);
++
++			dprintf(4, "status 0x%lx, wrPtr 0x%lx, bbcEnd 0x%lx\n", status, wrPtr, bbcEnd);
++			if (status & 0x3) {
++				dprintf(4, "pic done\n");
++				ret = 0;
++			} else {
++				dprintf(4, "pic not done, wait\n");
++				ret = -1;
++			}
++			IOClkGateSet(false);
+ 		} else { /* VPU */
+ 			IOClkGateSet(true);
+ 			if (VpuReadReg(BIT_BUSY_FLAG)) {
+@@ -645,11 +660,8 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = pEncInfo->streamRdPtr;
+ 	pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = pEncInfo->streamBufStartAddr;
+ 
+-	if (instIdx == (int)VpuReadReg(BIT_RUN_INDEX)) {
+-		if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+-			VpuWriteReg(MJPEG_BBC_RD_PTR_REG, pEncInfo->streamRdPtr);
+-			VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pEncInfo->streamBufStartAddr);
+-		} else {
++	if (!is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
++		if (instIdx == (int)VpuReadReg(BIT_RUN_INDEX)) {
+ 			VpuWriteReg(BIT_RD_PTR, pEncInfo->streamRdPtr);
+ 			VpuWriteReg(BIT_WR_PTR, pEncInfo->streamBufStartAddr);
+ 		}
+@@ -713,8 +725,9 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	if (cpu_is_mx6x())
+ 		VpuWriteReg(GDI_WPROT_RGN_EN, 0);
+ 
+-	info_msg("chromaInterleave %d, mapType %d, linear2TiledEnable %d\n",
+-			pop->chromaInterleave, pop->mapType, pop->linear2TiledEnable);
++	info_msg("ringBufferEnable %d, chromaInterleave %d, mapType %d, linear2TiledEnable %d\n",
++			pop->ringBufferEnable, pop->chromaInterleave,
++			pop->mapType, pop->linear2TiledEnable);
+ 
+ 	UnlockVpu(vpu_semap);
+ 
+@@ -1320,16 +1333,32 @@ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle,
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
++	LockVpuReg(vpu_semap);
++
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+-		*prdPtr = pEncInfo->streamRdPtr;
+-		*pwrPtr = VpuReadReg(MJPEG_BBC_WR_PTR_REG);
+-		*size = *pwrPtr - *prdPtr;
++		if (!pEncInfo->ringBufferEnable) {
++			err_msg("Don't call %s in line buffer mode!\n", __func__);
++			UnlockVpuReg(vpu_semap);
++			return RETCODE_WRONG_CALL_SEQUENCE;
++		}
++
++		if (((VpuReadReg(MJPEG_PIC_STATUS_REG) & (1 << INT_JPU_BIT_BUF_FULL)) == 0)
++				&& pEncInfo->jpgInfo.inProcess) {
++			*prdPtr = *pwrPtr = pEncInfo->streamRdPtr;
++			*size = *pwrPtr - *prdPtr;
++		} else {
++			*prdPtr = pEncInfo->streamRdPtr;
++			*pwrPtr = (pEncInfo->jpgInfo.inProcess) ?
++				VpuReadReg(MJPEG_BBC_WR_PTR_REG) :
++				pCodecInst->ctxRegs[CTX_BIT_WR_PTR];
++			*size = *pwrPtr - *prdPtr;
++		}
++		UnlockVpuReg(vpu_semap);
+ 		return RETCODE_SUCCESS;
+ 	}
+ 
+ 	rdPtr = pEncInfo->streamRdPtr;
+ 
+-	LockVpuReg(vpu_semap);
+ 	/* Check current instance is in running or not, if not
+ 	   Get the pointer from back context regs */
+ 	instIndex = (int)VpuReadReg(BIT_RUN_INDEX);
+@@ -1380,17 +1409,40 @@ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size)
+ 	LockVpuReg(vpu_semap);
+ 	rdPtr = pEncInfo->streamRdPtr;
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
++		if (!pEncInfo->ringBufferEnable) {
++			err_msg("Don't call %s in line buffer mode!\n", __func__);
++			UnlockVpuReg(vpu_semap);
++			return RETCODE_WRONG_CALL_SEQUENCE;
++		}
++
+ 		rdPtr = pEncInfo->streamRdPtr;
+ 		rdPtr += size;
+-
+-		if (rdPtr == pEncInfo->streamBufEndAddr)
+-			rdPtr = pEncInfo->streamBufStartAddr;
+-
+-		pEncInfo->streamRdPtr = pEncInfo->streamBufStartAddr;
+-		VpuWriteReg(MJPEG_BBC_CUR_POS_REG, 0);
+-		VpuWriteReg(MJPEG_BBC_EXT_ADDR_REG, pEncInfo->streamBufStartAddr);
+-		VpuWriteReg(MJPEG_BBC_RD_PTR_REG, pEncInfo->streamBufStartAddr);
+-		VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pEncInfo->streamBufStartAddr);
++		wrPtr = pEncInfo->jpgInfo.inProcess ?
++			VpuReadReg(MJPEG_BBC_WR_PTR_REG) :
++			pCodecInst->ctxRegs[CTX_BIT_WR_PTR];
++
++		if (rdPtr < wrPtr) {
++			pEncInfo->streamRdPtr = rdPtr;
++			pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = rdPtr;
++			if (pEncInfo->jpgInfo.inProcess)
++				VpuWriteReg(MJPEG_BBC_RD_PTR_REG, rdPtr);
++		}
++		else if (rdPtr == wrPtr) {
++			if ((VpuReadReg(MJPEG_PIC_STATUS_REG) & (1 << INT_JPU_BIT_BUF_FULL))
++					|| !pEncInfo->jpgInfo.inProcess)
++			{
++				pEncInfo->streamRdPtr = pEncInfo->streamBufStartAddr;
++				pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = pEncInfo->streamBufStartAddr;
++				pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = pEncInfo->streamBufStartAddr;
++				if (pEncInfo->jpgInfo.inProcess) {
++					VpuWriteReg(MJPEG_BBC_CUR_POS_REG, 0);
++					VpuWriteReg(MJPEG_BBC_EXT_ADDR_REG, pEncInfo->streamBufStartAddr);
++					VpuWriteReg(MJPEG_BBC_RD_PTR_REG, pEncInfo->streamBufStartAddr);
++					VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pEncInfo->streamBufStartAddr);
++					VpuWriteReg(MJPEG_PIC_STATUS_REG, 1 << INT_JPU_BIT_BUF_FULL);
++				}
++			}
++		}
+ 
+ 		UnlockVpuReg(vpu_semap);
+ 		return RETCODE_SUCCESS;
+@@ -1545,6 +1597,15 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 		SetGDIRegs(&pEncInfo->sTiledInfo);
+ 
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
++		VpuWriteReg(GDI_WPROT_ERR_CLR, 1);
++		VpuWriteReg(GDI_WPROT_RGN_EN, 0);
++#ifdef MEM_PROTECT
++		VpuWriteReg(GDI_WPROT_ERR_RSN, 0);
++		VpuWriteReg(GDI_WPROT_RGN0_STA, pEncInfo->streamBufStartAddr >> 12);	/* round down */
++		VpuWriteReg(GDI_WPROT_RGN0_END, (pEncInfo->streamBufEndAddr + 0xFFF) >> 12);	/* round up */
++		VpuWriteReg(GDI_WPROT_RGN_EN, 1);
++#endif
++
+ 		VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG, pEncInfo->streamBufStartAddr);
+ 		VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pEncInfo->streamBufEndAddr);
+ 		VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pEncInfo->streamBufStartAddr);
+@@ -1646,6 +1707,7 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 		VpuWriteReg(MJPEG_PIC_START_REG, 1);
+ 
+ 		*ppendingInst = pCodecInst;
++		pEncInfo->jpgInfo.inProcess = 1;
+ 		return RETCODE_SUCCESS;
+ 	}
+ 
+@@ -1809,8 +1871,20 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 	}
+ 
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
++#ifdef MEM_PROTECT
++		if (VpuReadReg(GDI_WPROT_ERR_RSN)) {
++			err_msg("ERR_CLR: 0x%lx, ERR_RSN: 0x%lx, ERR_ADR: 0x%lx\n",
++					VpuReadReg(GDI_WPROT_ERR_CLR),
++					VpuReadReg(GDI_WPROT_ERR_RSN),
++					VpuReadReg(GDI_WPROT_ERR_ADR));
++			*ppendingInst = 0;
++			UnlockVpu(vpu_semap);
++			return RETCODE_MEMORY_ACCESS_VIOLATION;
++		}
++#endif
+ 		val = VpuReadReg(MJPEG_PIC_STATUS_REG);
+ 		if ((val & 0x4) >> 2) {
++			*ppendingInst = 0;
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_WRONG_CALL_SEQUENCE;
+ 		}
+@@ -1825,6 +1899,8 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 		info->picType = 0;
+ 		info->numOfSlices = 0;
+ 		*ppendingInst = 0;
++		pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = VpuReadReg(MJPEG_BBC_WR_PTR_REG);
++		pEncInfo->jpgInfo.inProcess = 0;
+ 
+ 		/* Workaround to reset JPU after each encoder: decoder may be blocked
+ 		 * after encoder randomly if not do reset. Fixme later */
+@@ -1835,6 +1911,7 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 	}
+ 
+ 	if (cpu_is_mx6x() && VpuReadReg(RET_ENC_PIC_SUCCESS) & (1 << 31)) {
++		*ppendingInst = 0;
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_MEMORY_ACCESS_VIOLATION;
+ 	}
+@@ -2621,7 +2698,7 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 		pCfg->region[0].is_secondary = 0;
+ 		pCfg->region[0].start_address = bit_work_addr.phy_addr + CODE_BUF_SIZE;
+ 		pCfg->region[0].end_address = bit_work_addr.phy_addr + CODE_BUF_SIZE + TEMP_BUF_SIZE;
+-		info_msg("Protection Region 0: Temp buf, start 0x%x, end 0x%x\n",
++		info_msg("Protection Region 0: Temp buf, start 0x%lx, end 0x%lx\n",
+ 				pCfg->region[0].start_address,
+ 				pCfg->region[0].end_address);
+ 		/* Context buf */
+@@ -2630,27 +2707,20 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 		pCfg->region[1].start_address = pCodecInst->contextBufMem.phy_addr;
+ 		pCfg->region[1].end_address = pCodecInst->contextBufMem.phy_addr
+ 			+ pCodecInst->contextBufMem.size;
+-		info_msg("Protection Region 1: Context buf, start 0x%x, end 0x%x\n",
++		info_msg("Protection Region 1: Context buf, start 0x%lx, end 0x%lx\n",
+ 				pCfg->region[1].start_address,
+ 				pCfg->region[1].end_address);
+ 	}
+ #endif
+ 
+ 	LockVpuReg(vpu_semap);
+-	if (instIdx == (int)VpuReadReg(BIT_RUN_INDEX)) {
+-		if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+-			VpuWriteReg(MJPEG_BBC_RD_PTR_REG,
+-					pDecInfo->streamBufStartAddr);
+-			VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pDecInfo->streamWrPtr);
+-			pDecInfo->jpgInfo.seqInited = 0;
+-			pDecInfo->jpgInfo.quitCodec = 0;
+-			pDecInfo->jpgInfo.rollBack = 0;
+-			VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG,
+-					pDecInfo->streamBufStartAddr);
+-			VpuWriteReg(MJPEG_BBC_END_ADDR_REG,
+-					pDecInfo->streamBufEndAddr);
+-			VpuWriteReg(MJPEG_BBC_STRM_CTRL_REG, 0);
+-		} else {
++
++	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
++		pDecInfo->jpgInfo.seqInited = 0;
++		pDecInfo->jpgInfo.quitCodec = 0;
++		pDecInfo->jpgInfo.rollBack = 0;
++	} else {
++		if (instIdx == (int)VpuReadReg(BIT_RUN_INDEX)) {
+ 			VpuWriteReg(BIT_RD_PTR, pDecInfo->streamBufStartAddr);
+ 			VpuWriteReg(BIT_WR_PTR, pDecInfo->streamWrPtr);
+ 			VpuWriteReg(BIT_FRM_DIS_FLG, 0);
+@@ -2791,7 +2861,9 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	CodecInst *pCodecInst;
+ 	DecInfo *pDecInfo;
+ 	Uint32 val, val2;
++#ifndef MEM_PROTECT
+ 	SetIramParam iramParam;
++#endif
+ 	RetCode ret;
+ 
+ 	ENTER_FUNC();
+@@ -2965,7 +3037,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ #ifdef MEM_PROTECT
+ 		if (val & (1 << 31)) {
+ 			err_msg("access violation in vpu_DecGetInitialInfo\n");
+-			err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
++			err_msg("PC: 0x%lx, ERR_CLR: 0x%lx, ERR_RSN: 0x%lx, ERR_ADR: 0x%lx\n",
+ 					VpuReadReg(BIT_CUR_PC),
+ 					VpuReadReg(GDI_WPROT_ERR_CLR),
+ 					VpuReadReg(GDI_WPROT_ERR_RSN),
+@@ -3128,6 +3200,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 
+ 	/* Set secondAXI IRAM */
+ 	if (!cpu_is_mx27()) {
++#ifndef MEM_PROTECT /* use temp buf via pri AXI to save a protection region */
+ #ifdef ALLOC_MAX_RESOLUTION
+ 		iramParam.width = (MAX_PIC_WIDTH + 15) & ~15;
+ 		iramParam.height = (MAX_PIC_HEIGHT + 15) & ~15;
+@@ -3137,7 +3210,6 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ #endif
+ 		iramParam.profile = info->profile;
+ 		iramParam.codecMode = pCodecInst->codecMode;
+-#ifndef MEM_PROTECT /* use temp buf via pri AXI to save a protection region */
+ 		SetDecSecondAXIIRAM(&pDecInfo->secAxiUse, &iramParam);
+ #endif
+ 	}
+@@ -3242,7 +3314,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 
+ 		picheight = ((pDecInfo->initialInfo.picHeight + align - 1) & ~(align - 1));
+ 		for (i = 0; i < num; i++) {
+-			info_msg("[%d] bufY 0x%x, bufCb 0x%x, bufCr 0x%x, bufMvCol 0x%x\n",
++			info_msg("[%d] bufY 0x%lx, bufCb 0x%lx, bufCr 0x%lx, bufMvCol 0x%lx\n",
+ 				i, bufArray[i].bufY, bufArray[i].bufCb,
+ 				bufArray[i].bufCr, bufArray[i].bufMvCol);
+ 			/* Caution: Y/Cb/Cr is assumed to be contiguous */
+@@ -3256,14 +3328,14 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 		pCfg->region[2].is_secondary = 0;
+ 		pCfg->region[2].start_address = minFB;
+ 		pCfg->region[2].end_address = maxFB+stride*picheight*3/2;
+-		info_msg("Protection Region 2: Frame buf, start 0x%x, end 0x%x\n",
++		info_msg("Protection Region 2: Frame buf, start 0x%lx, end 0x%lx\n",
+ 				pCfg->region[2].start_address,
+ 				pCfg->region[2].end_address);
+ 		pCfg->region[3].enable = 1;
+ 		pCfg->region[3].is_secondary = 0;
+ 		pCfg->region[3].start_address = minMV;
+ 		pCfg->region[3].end_address = maxMV+stride*picheight/4;
+-		info_msg("Protection Region 3: MvCol buf, start 0x%x, end 0x%x\n",
++		info_msg("Protection Region 3: MvCol buf, start 0x%lx, end 0x%lx\n",
+ 				pCfg->region[3].start_address,
+ 				pCfg->region[3].end_address);
+ 
+@@ -3274,7 +3346,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 			pCfg->region[4].start_address = pBufInfo->avcSliceBufInfo.bufferBase;
+ 			pCfg->region[4].end_address = pBufInfo->avcSliceBufInfo.bufferBase
+ 				+ pBufInfo->avcSliceBufInfo.bufferSize;
+-			info_msg("Protection Region 4: AVC Slice save buf, start 0x%x, end 0x%x\n",
++			info_msg("Protection Region 4: AVC Slice save buf, start 0x%lx, end 0x%lx\n",
+ 					pCfg->region[4].start_address,
+ 					pCfg->region[4].end_address);
+ 		}
+@@ -3408,7 +3480,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ #ifdef MEM_PROTECT
+ 	if (cpu_is_mx6x() && VpuReadReg(RET_SET_FRAME_SUCCESS) & (1 << 31)) {
+ 		err_msg("access violation in vpu_DecRegisterFrameBuffer\n");
+-		err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
++		err_msg("PC: 0x%lx, ERR_CLR: 0x%lx, ERR_RSN: 0x%lx, ERR_ADR: 0x%lx\n",
+ 				VpuReadReg(BIT_CUR_PC),
+ 				VpuReadReg(GDI_WPROT_ERR_CLR),
+ 				VpuReadReg(GDI_WPROT_ERR_RSN),
+@@ -3466,10 +3538,13 @@ RetCode vpu_DecGetBitstreamBuffer(DecHandle handle,
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+ 		int wroffset = 0;
+ 
+-		instIndex = (int)VpuReadReg(BIT_RUN_INDEX);
+-		rdPtr = (pCodecInst->instIndex == instIndex) ?
+-			VpuReadReg(MJPEG_BBC_RD_PTR_REG) :
+-			pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
++		if (pDecInfo->jpgInfo.inProcess) {
++			err_msg("Don't call %s in the middle of decoding!\n", __func__);
++			UnlockVpuReg(vpu_semap);
++			return RETCODE_WRONG_CALL_SEQUENCE;
++		}
++
++		rdPtr = pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
+ 
+ 		wroffset = wrPtr - pDecInfo->streamBufStartAddr;
+ 		if (wroffset < pDecInfo->jpgInfo.frameOffset)
+@@ -3546,10 +3621,13 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 	if (is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
+ 		wrOffset = wrPtr - pDecInfo->streamBufStartAddr;
+ 
+-		rdPtr = (pCodecInst->instIndex == instIndex) ?
+-			VpuReadReg(MJPEG_BBC_RD_PTR_REG) :
+-			pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
++		if (pDecInfo->jpgInfo.inProcess) {
++			err_msg("Don't call %s in the middle of decoding!\n", __func__);
++			UnlockVpuReg(vpu_semap);
++			return RETCODE_WRONG_CALL_SEQUENCE;
++		}
+ 
++		rdPtr = pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
+ 		if (size == 0) {
+ 			val = wrOffset / 256;
+ 			if (wrOffset % 256)
+@@ -3568,9 +3646,8 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 			if (wrPtr == pDecInfo->streamBufEndAddr)
+ 				wrPtr = pDecInfo->streamBufStartAddr;
+ 
+-			if (pCodecInst->instIndex == instIndex)
+-				VpuWriteReg(MJPEG_BBC_WR_PTR_REG, wrPtr);
+ 			pDecInfo->streamWrPtr = wrPtr;
++			pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = wrPtr;
+ 		}
+ 
+ 		if (wrOffset < pDecInfo->jpgInfo.frameOffset)
+@@ -3882,6 +3959,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 		VpuWriteReg(MJPEG_PIC_START_REG, 1);
+ 
+ 		*ppendingInst = pCodecInst;
++		pDecInfo->jpgInfo.inProcess = 1;
+ 		return RETCODE_SUCCESS;
+ 	}
+ 
+@@ -4162,6 +4240,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		vpu_mx6_hwreset();
+ 
+ 		*ppendingInst = 0;
++		pDecInfo->jpgInfo.inProcess = 0;
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_SUCCESS;
+ 	}
+@@ -4177,7 +4256,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		if (val & (1 << 31)) {
+ 			*ppendingInst = 0;
+ 			err_msg("access violation in vpu_DecGetOutputInfo\n");
+-			err_msg("PC: 0x%x, ERR_CLR: 0x%x, ERR_RSN: 0x%x, ERR_ADR: 0x%x\n",
++			err_msg("PC: 0x%lx, ERR_CLR: 0x%lx, ERR_RSN: 0x%lx, ERR_ADR: 0x%lx\n",
+ 					VpuReadReg(BIT_CUR_PC),
+ 					VpuReadReg(GDI_WPROT_ERR_CLR),
+ 					VpuReadReg(GDI_WPROT_ERR_RSN),
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index ba6d390..c790546 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -684,7 +684,7 @@ static const SocInfo soc_info[] = {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 18)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 19)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index d6c5abe..118c259 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -352,6 +352,7 @@ typedef struct {
+ 	Uint8 *pCInfoTab[5];
+ 	Uint8 *pQMatTab[4];
+ 
++	int inProcess;
+ } JpgEncInfo;
+ 
+ typedef struct {
+@@ -466,6 +467,7 @@ typedef struct {
+ 	int rollBack;
+ 	int wrappedHeader;
+ 	int header_status;
++	int inProcess;
+ } JpgDecInfo;
+ 
+ typedef struct {
+-- 
+1.8.0
+

@@ -1,0 +1,1546 @@
+From 88f42cf5d5acb058b798b622a72dd239cd2ff380 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Wed, 19 Sep 2012 18:16:20 +0800
+Subject: [PATCH 345/486] ENGR00225708 update audio HAL for jb
+
+1.Remove legacy hal
+2.Remove the usb mic support
+3.add conf file and only support primary output
+
+Change-Id: I34d03a16e9df5b1edc195068e8914c6fd2358d67
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/Android.mk        |   37 +-
+ alsa/alsa_imx.cpp      | 1045 ------------------------------------------------
+ alsa/audio_hardware.h  |    1 -
+ alsa/audio_policy.conf |   42 ++
+ alsa/config_usbaudio.h |    3 +-
+ alsa/imx_audio_hal.cpp |   16 +-
+ alsa/tinyalsa_hal.c    |  113 ++----
+ 7 files changed, 99 insertions(+), 1158 deletions(-)
+ delete mode 100755 alsa/alsa_imx.cpp
+ create mode 100644 alsa/audio_policy.conf
+
+diff --git a/alsa/Android.mk b/alsa/Android.mk
+index 4088a31..4210b9d 100755
+--- a/alsa/Android.mk
++++ b/alsa/Android.mk
+@@ -16,35 +16,7 @@
+ 
+ ifeq ($(strip $(BOARD_USES_ALSA_AUDIO)),true)
+ 
+-  LOCAL_PATH := $(call my-dir)
+-
+-  include $(CLEAR_VARS)
+-
+-  LOCAL_PRELINK_MODULE := true
+-
+-  LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-
+-  LOCAL_CFLAGS := -D_POSIX_SOURCE -Wno-multichar
+-
+-  LOCAL_C_INCLUDES += hardware/alsa_sound external/alsa-lib/include
+-
+-  LOCAL_SRC_FILES:= alsa_imx.cpp
+-
+-  LOCAL_SHARED_LIBRARIES := \
+-	libaudio \
+-  	libasound \
+-  	liblog   \
+-    libcutils
+-
+-  LOCAL_MODULE:= alsa.$(TARGET_BOARD_PLATFORM)
+-
+-  LOCAL_MODULE_TAGS := eng
+-
+-ifeq ($(TARGET_BOOTLOADER_BOARD_NAME),SABRELITE)
+-  LOCAL_CFLAGS += -DBOARD_IS_SABRELITE
+-endif
+-  include $(BUILD_SHARED_LIBRARY)
+-
++LOCAL_PATH := $(call my-dir)
+ 
+ include $(CLEAR_VARS)
+ LOCAL_MODULE := audio.primary.$(TARGET_BOARD_PLATFORM)
+@@ -66,4 +38,11 @@ LOCAL_SHARED_LIBRARIES := liblog libcutils libtinyalsa libaudioutils libdl
+ LOCAL_MODULE_TAGS := optional
+ include $(BUILD_SHARED_LIBRARY)
+ 
++include $(CLEAR_VARS)
++LOCAL_MODULE := audio_policy.conf
++LOCAL_MODULE_CLASS := ETC
++LOCAL_SRC_FILES := audio_policy.conf
++LOCAL_MODULE_TAGS := optional
++include $(BUILD_PREBUILT)
++
+ endif
+diff --git a/alsa/alsa_imx.cpp b/alsa/alsa_imx.cpp
+deleted file mode 100755
+index 2554fae..0000000
+--- a/alsa/alsa_imx.cpp
++++ /dev/null
+@@ -1,1045 +0,0 @@
+-/* alsa_imx.cpp
+- **
+- ** Licensed under the Apache License, Version 2.0 (the "License");
+- ** you may not use this file except in compliance with the License.
+- ** You may obtain a copy of the License at
+- **
+- **     http://www.apache.org/licenses/LICENSE-2.0
+- **
+- ** Unless required by applicable law or agreed to in writing, software
+- ** distributed under the License is distributed on an "AS IS" BASIS,
+- ** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- ** See the License for the specific language governing permissions and
+- ** limitations under the License.
+- */
+-
+-/* Copyright 2010-2012 Freescale Semiconductor, Inc. */
+-
+-#define LOG_TAG "iMXALSA"
+-#include <utils/Log.h>
+-
+-#include <AudioHardwareALSA.h>
+-#include <media/AudioRecord.h>
+-
+-#include <cutils/properties.h>
+-//#define BLUETOOTH_SCO_DEVICE "hw:0,1"
+-//#define FM_TRANSMIT_DEVICE "hw:0,2"
+-
+-#ifndef ALSA_DEFAULT_SAMPLE_RATE
+-#define ALSA_DEFAULT_SAMPLE_RATE 44100 // in Hz
+-#endif
+-
+-#define DEVICE_DEFAULT    0
+-#define DEVICE_SPDIF      1
+-#define DEVICE_SGTL5000   2
+-#define DEVICE_WM8958     3
+-#define DEVICE_HDMI       4
+-#define DEVICE_CS42888    5
+-#define DEVICE_WM8962     6
+-
+-#ifdef  BOARD_IS_SABRELITE
+-#define AUDIOCARD_DEVICE_SGTL5000_HIFI "HiFi sgtl5000-0"
+-#define AUDIOCARD_DEVICE_WM8958_HIFI "HiFi wm8994-aif1-0"
+-#define AUDIOCARD_DEVICE_WM8958_VOICE "WM8994 Voice WM8994 AIF2-1"
+-#define AUDIOCARD_DEVICE_WM8958_BT "WM8994 BT WM8994 AIF3-2"
+-#define AUDIOCARD_DEVICE_HDMI "IMX HDMI TX mxc-hdmi-soc-0"
+-#define AUDIOCARD_DEVICE_SPDIF "IMX SPDIF mxc spdif-0"
+-#define AUDIOCARD_DEVICE_CS42888 "HiFi CS42888-0"
+-#define AUDIOCARD_DEVICE_WM8962 "HiFi wm8962-0"
+-#else
+-
+-#define AUDIOCARD_DEVICE_SGTL5000_HIFI "HiFi sgtl5000-0"
+-#define AUDIOCARD_DEVICE_WM8958_HIFI "WM8994 HiFi WM8994 AIF1-0"
+-#define AUDIOCARD_DEVICE_WM8958_VOICE "WM8994 Voice WM8994 AIF2-1"
+-#define AUDIOCARD_DEVICE_WM8958_BT "WM8994 BT WM8994 AIF3-2"
+-#define AUDIOCARD_DEVICE_HDMI "IMX HDMI TX mxc-hdmi-soc-0"
+-#define AUDIOCARD_DEVICE_SPDIF "IMX SPDIF mxc-spdif-0"
+-#define AUDIOCARD_DEVICE_CS42888 "HiFi CS42888-0"
+-#define AUDIOCARD_DEVICE_WM8962 "HiFi wm8962-0"
+-#endif
+-
+-
+-#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
+-
+-namespace android_audio_legacy
+-{
+-
+-static int s_device_open(const hw_module_t*, const char*, hw_device_t**);
+-static int s_device_close(hw_device_t*);
+-static status_t s_init(alsa_device_t *, ALSAHandleList &);
+-static status_t s_open(alsa_handle_t *, uint32_t, int);
+-static status_t s_close(alsa_handle_t *);
+-static status_t s_route(alsa_handle_t *, uint32_t, int);
+-
+-char hdmicardname[32];
+-char spdifcardname[32];
+-char sgtlcardname[32];
+-char cs42888cardname[32];
+-char wm8958cardname_0[32];
+-char wm8958cardname_1[32];
+-char wm8958cardname_2[32];
+-char wm8962cardname[32];
+-int  selecteddevice ;
+-    
+-static hw_module_methods_t s_module_methods = {
+-    open            : s_device_open
+-};
+-
+-extern "C" hw_module_t HAL_MODULE_INFO_SYM = {
+-    tag             : HARDWARE_MODULE_TAG,
+-    version_major   : 1,
+-    version_minor   : 0,
+-    id              : ALSA_HARDWARE_MODULE_ID,
+-    name            : "i.MX ALSA module",
+-    author          : "Freescale Semiconductor",
+-    methods         : &s_module_methods,
+-    dso             : 0,
+-    reserved        : {0,},
+-};
+-
+-static int s_device_open(const hw_module_t* module, const char* name,
+-        hw_device_t** device)
+-{
+-    alsa_device_t *dev;
+-    dev = (alsa_device_t *) malloc(sizeof(*dev));
+-    if (!dev) return -ENOMEM;
+-
+-    memset(dev, 0, sizeof(*dev));
+-
+-    /* initialize the procs */
+-    dev->common.tag = HARDWARE_DEVICE_TAG;
+-    dev->common.version = 0;
+-    dev->common.module = (hw_module_t *) module;
+-    dev->common.close = s_device_close;
+-    dev->init = s_init;
+-    dev->open = s_open;
+-    dev->close = s_close;
+-    dev->route = s_route;
+-
+-    *device = &dev->common;
+-
+-    ALOGD("i.MX ALSA module opened");
+-
+-    return 0;
+-}
+-
+-static int s_device_close(hw_device_t* device)
+-{
+-    free(device);
+-    return 0;
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-static const int DEFAULT_SAMPLE_RATE = ALSA_DEFAULT_SAMPLE_RATE;
+-
+-static void setDefaultControls(uint32_t devices, int mode, const char *cardname);
+-
+-typedef void (*AlsaControlSet)(uint32_t devices, int mode, const char *cardname);
+-
+-#define IMX_OUT_CODEC_DEFAULT   (\
+-        AudioSystem::DEVICE_OUT_EARPIECE | \
+-        AudioSystem::DEVICE_OUT_SPEAKER | \
+-        AudioSystem::DEVICE_OUT_WIRED_HEADSET | \
+-        AudioSystem::DEVICE_OUT_WIRED_HEADPHONE | \
+-        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP | \
+-        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES | \
+-        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER | \
+-        AudioSystem::DEVICE_OUT_AUX_DIGITAL | \
+-        AudioSystem::DEVICE_OUT_DEFAULT \
+-    )
+-
+-#define IMX_BT_DEFAULT   (\
+-        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP | \
+-        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES | \
+-        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER \
+-    )
+-
+-#define IMX_OUT_SPDIF_DEFAULT   (\
+-        AudioSystem::DEVICE_OUT_AUX_DIGITAL  \
+-    )
+-
+-#define IMX_IN_CODEC_DEFAULT    (\
+-        AudioSystem::DEVICE_IN_ALL &\
+-    ~AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET \
+-    )
+-
+-static alsa_handle_t _defaults[] = {
+-    {
+-        module      : 0,
+-        devices     : IMX_OUT_CODEC_DEFAULT,
+-        curDev      : 0,
+-        curMode     : 0,
+-        handle      : 0,
+-        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
+-        channels    : 2,
+-        sampleRate  : DEFAULT_SAMPLE_RATE,
+-        latency     : 200000, // Desired Delay in usec
+-        bufferSize  : 2048, // Desired Number of samples
+-        modPrivate  : (void *)&setDefaultControls,
+-        mmap        : 0,
+-        devName     : 0,
+-        handle_1    : 0,
+-        handle_2    : 0,
+-    },
+-    {
+-        module      : 0,
+-        devices     : IMX_IN_CODEC_DEFAULT,
+-        curDev      : 0,
+-        curMode     : 0,
+-        handle      : 0,
+-        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
+-        channels    : 2,
+-        sampleRate  : DEFAULT_SAMPLE_RATE,
+-        latency     : 250000, // Desired Delay in usec
+-        bufferSize  : 6144, // Desired Number of samples
+-        modPrivate  : (void *)&setDefaultControls,
+-        mmap        : 0,
+-        devName     : 0,
+-        handle_1    : 0,
+-        handle_2    : 0,
+-    },
+-};
+-
+-static alsa_handle_t modem_handle = {
+-        module      : 0,
+-        devices     : IMX_OUT_CODEC_DEFAULT,
+-        curDev      : 0,
+-        curMode     : 0,
+-        handle      : 0,
+-        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
+-        channels    : 1,
+-        sampleRate  : 8000,
+-        latency     : 200000,
+-        bufferSize  : 2048,
+-        modPrivate  : 0,
+-        mmap        : 0,
+-        devName     : AUDIOCARD_DEVICE_WM8958_VOICE,
+-};
+-
+-static alsa_handle_t bt_handle = {
+-        module      : 0,
+-        devices     : IMX_BT_DEFAULT,
+-        curDev      : 0,
+-        curMode     : 0,
+-        handle      : 0,
+-        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
+-        channels    : 1,
+-        sampleRate  : 8000,
+-        latency     : 200000,
+-        bufferSize  : 2048,
+-        modPrivate  : 0,
+-        mmap        : 0,
+-        devName     : AUDIOCARD_DEVICE_WM8958_BT,
+-};
+-
+-
+-// ----------------------------------------------------------------------------
+-
+-snd_pcm_stream_t direction(alsa_handle_t *handle)
+-{
+-    return (handle->devices & AudioSystem::DEVICE_OUT_ALL) ? SND_PCM_STREAM_PLAYBACK
+-            : SND_PCM_STREAM_CAPTURE;
+-}
+-
+-//card_device =0, return the card name, card_device=1, return the card device name
+-const char *deviceName(alsa_handle_t *alsa_handle, uint32_t device, int mode, int card_device)
+-{
+-
+-    snd_ctl_t *handle;
+-    int card, err, dev, idx;
+-    snd_ctl_card_info_t *info;
+-    snd_pcm_info_t *pcminfo;
+-    snd_ctl_card_info_alloca(&info);
+-    snd_pcm_info_alloca(&pcminfo);
+-    int  cardnum = 0;
+-    char value[PROPERTY_VALUE_MAX];
+-    snd_pcm_stream_t stream = direction(alsa_handle);
+-    bool havespdifdevice = false;
+-    bool havesgtldevice = false;
+-    bool havehdmidevice = false;
+-    bool havewm8958device =false;
+-    bool havecs42888device =false;
+-    bool havewm8962device = false;
+-
+-    card = -1;
+-    if (snd_card_next(&card) < 0 || card < 0) {
+-        ALOGD("no soundcards found...");
+-        return "default";
+-    }
+-    ALOGD("**** List of %s Hardware Devices ****\n",
+-           snd_pcm_stream_name(stream));
+-    while (card >= 0) {
+-        char name[32];
+-        sprintf(name, "hw:%d", card);
+-        if ((err = snd_ctl_open(&handle, name, 0)) < 0) {
+-            ALOGD("control open (%i): %s", card, snd_strerror(err));
+-            goto next_card;
+-        }
+-        if ((err = snd_ctl_card_info(handle, info)) < 0) {
+-            ALOGD("control hardware info (%i): %s", card, snd_strerror(err));
+-            snd_ctl_close(handle);
+-            goto next_card;
+-        }
+-        dev = -1;
+-        while (1) {
+-            unsigned int count;
+-            if (snd_ctl_pcm_next_device(handle, &dev)<0)
+-                ALOGD("snd_ctl_pcm_next_device");
+-            if (dev < 0)
+-                break;
+-            snd_pcm_info_set_device(pcminfo, dev);
+-            snd_pcm_info_set_subdevice(pcminfo, 0);
+-            snd_pcm_info_set_stream(pcminfo, stream);
+-            if ((err = snd_ctl_pcm_info(handle, pcminfo)) < 0) {
+-                if (err != -ENOENT)
+-                    ALOGD("control digital audio info (%i): %s", card, snd_strerror(err));
+-                continue;
+-            }
+-            
+-            ALOGD("card %i: %s [%s], device %i: %s [%s]\n",
+-                card, snd_ctl_card_info_get_id(info), snd_ctl_card_info_get_name(info),
+-                dev,
+-                snd_pcm_info_get_id(pcminfo),
+-                snd_pcm_info_get_name(pcminfo));
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_SPDIF)==0) {
+-                 if(card_device==0)  sprintf(spdifcardname, "hw:0%d", card);
+-                 else                sprintf(spdifcardname, "hw:%d,%d", card, dev);
+-                 havespdifdevice =  true;
+-            }
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_HDMI)==0) {
+-                 if(card_device==0)  sprintf(hdmicardname, "hw:0%d", card);
+-                 else                sprintf(hdmicardname, "hw:%d,%d", card, dev);
+-                 havehdmidevice =  true;
+-            }
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_SGTL5000_HIFI)==0) {
+-                 if(card_device==0) sprintf(sgtlcardname, "hw:0%d", card);
+-                 else               sprintf(sgtlcardname, "hw:%d,%d", card, dev);
+-                 havesgtldevice =  true;
+-            }
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_CS42888)==0) {
+-                 if(card_device==0) sprintf(cs42888cardname, "hw:0%d", card);
+-                 else               sprintf(cs42888cardname, "hw:%d,%d", card, dev);
+-                 havecs42888device =  true;
+-            }
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8958_HIFI)==0) {
+-                 if(card_device==0) sprintf(wm8958cardname_0, "hw:0%d", card);
+-                 else               sprintf(wm8958cardname_0, "hw:%d,%d", card, dev);
+-                 havewm8958device =  true;
+-            }
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8958_VOICE)==0) {
+-                 if(card_device==0) sprintf(wm8958cardname_1, "hw:0%d", card);
+-                 else               sprintf(wm8958cardname_1, "hw:%d,%d", card, dev);
+-                 havewm8958device =  true;
+-            }
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8958_BT)==0) {
+-                 if(card_device==0) sprintf(wm8958cardname_2, "hw:0%d", card);
+-                 else               sprintf(wm8958cardname_2, "hw:%d,%d", card, dev);
+-                 havewm8958device =  true;
+-            }
+-            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8962)==0) {
+-                 if(card_device==0) sprintf(wm8962cardname, "hw:0%d", card);
+-                 else               sprintf(wm8962cardname, "hw:%d,%d", card, dev);
+-                 havewm8962device =  true;
+-            }
+-            cardnum++;
+-        }
+-        snd_ctl_close(handle);
+-    next_card:
+-
+-        if (snd_card_next(&card) < 0) {
+-            ALOGD("snd_card_next");
+-            break;
+-        }
+-    }
+-
+-    property_get("ro.HDMI_AUDIO_OUTPUT", value, "");
+-    if((device & AudioSystem::DEVICE_OUT_AUX_DIGITAL) && havehdmidevice && (strcmp(value, "1") == 0))
+-    {
+-        selecteddevice = DEVICE_HDMI;
+-        alsa_handle->devName = AUDIOCARD_DEVICE_HDMI;
+-        return hdmicardname;
+-
+-    }else if((device & AudioSystem::DEVICE_OUT_AUX_DIGITAL) && havespdifdevice && (strcmp(value, "1") == 0))
+-    {
+-        selecteddevice = DEVICE_SPDIF;
+-        alsa_handle->devName = AUDIOCARD_DEVICE_SPDIF;
+-        return spdifcardname;
+-
+-    }else if(havesgtldevice)
+-    {
+-        selecteddevice = DEVICE_SGTL5000;
+-        alsa_handle->devName = AUDIOCARD_DEVICE_SGTL5000_HIFI;
+-        return sgtlcardname;
+-    }else if(havewm8958device)
+-    {
+-        selecteddevice = DEVICE_WM8958;
+-        if(alsa_handle->devName && strcmp(alsa_handle->devName,AUDIOCARD_DEVICE_WM8958_VOICE)==0)
+-            return wm8958cardname_1;
+-        else if(alsa_handle->devName && strcmp(alsa_handle->devName,AUDIOCARD_DEVICE_WM8958_BT)==0)
+-            return wm8958cardname_2;
+-        else {
+-            alsa_handle->devName = AUDIOCARD_DEVICE_WM8958_HIFI;
+-            return wm8958cardname_0;
+-        }
+-    }else if(havecs42888device)
+-    {
+-        selecteddevice = DEVICE_CS42888;
+-        alsa_handle->devName = AUDIOCARD_DEVICE_CS42888;
+-        return cs42888cardname;
+-    }else if(havewm8962device)
+-    {
+-        selecteddevice = DEVICE_WM8962;
+-        alsa_handle->devName = AUDIOCARD_DEVICE_WM8962;
+-        return wm8962cardname;
+-    }else if(havehdmidevice)
+-    {
+-        selecteddevice = DEVICE_HDMI;
+-        alsa_handle->devName = AUDIOCARD_DEVICE_HDMI;
+-        return hdmicardname;
+-    }else if(havespdifdevice)
+-    {
+-        selecteddevice = DEVICE_SPDIF;
+-        alsa_handle->devName = AUDIOCARD_DEVICE_SPDIF;
+-        return spdifcardname;
+-    }
+-
+-
+-    selecteddevice = DEVICE_DEFAULT;
+-    alsa_handle->devName = "default";
+-    return "default";
+-}
+-
+-
+-
+-const char *streamName(alsa_handle_t *handle)
+-{
+-    return snd_pcm_stream_name(direction(handle));
+-}
+-
+-status_t setHardwareParams(alsa_handle_t *handle, int mmap)
+-{
+-    snd_pcm_hw_params_t *hardwareParams;
+-    status_t err;
+-    snd_pcm_access_mask_t *mask;
+-
+-    snd_pcm_uframes_t bufferSize = handle->bufferSize;
+-    unsigned int requestedRate = handle->sampleRate;
+-    unsigned int latency = handle->latency;
+-
+-    // snd_pcm_format_description() and snd_pcm_format_name() do not perform
+-    // proper bounds checking.
+-    bool validFormat = (static_cast<int> (handle->format)
+-            > SND_PCM_FORMAT_UNKNOWN) && (static_cast<int> (handle->format)
+-            <= SND_PCM_FORMAT_LAST);
+-    const char *formatDesc = validFormat ? snd_pcm_format_description(
+-            handle->format) : "Invalid Format";
+-    const char *formatName = validFormat ? snd_pcm_format_name(handle->format)
+-            : "UNKNOWN";
+-
+-    if (snd_pcm_hw_params_malloc(&hardwareParams) < 0) {
+-        LOG_ALWAYS_FATAL("Failed to allocate ALSA hardware parameters!");
+-        return NO_INIT;
+-    }
+-
+-    err = snd_pcm_hw_params_any(handle->handle, hardwareParams);
+-    if (err < 0) {
+-        ALOGE("Unable to configure hardware: %s", snd_strerror(err));
+-        goto done;
+-    }
+-
+-    // Set the interleaved read and write format.
+-    if(mmap == 1){
+-        mask = (snd_pcm_access_mask_t *)malloc(snd_pcm_access_mask_sizeof());
+-        snd_pcm_access_mask_none(mask);
+-        snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_INTERLEAVED);
+-        snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_NONINTERLEAVED);
+-        snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_COMPLEX);
+-        err = snd_pcm_hw_params_set_access_mask(handle->handle, hardwareParams, mask);
+-
+-        if (err < 0 ) {
+-            ALOGW("Unable to enable MMAP access for PCM: %s", snd_strerror(err));
+-            err = snd_pcm_hw_params_set_access(handle->handle, hardwareParams,
+-                    SND_PCM_ACCESS_RW_INTERLEAVED);
+-            if (err < 0) {
+-                ALOGE("Unable to configure PCM read/write format: %s",
+-                    snd_strerror(err));
+-                free(mask);
+-                goto done;
+-            }
+-            handle->mmap = 0;
+-        } else {
+-            handle->mmap = 1;
+-            ALOGW("enable MMAP access for PCM");
+-        }
+-        free(mask);
+-    }else
+-    {
+-        ALOGW("Don't enable MMAP access for PCM");
+-        err = snd_pcm_hw_params_set_access(handle->handle, hardwareParams,
+-                SND_PCM_ACCESS_RW_INTERLEAVED);
+-        if (err < 0) {
+-            ALOGE("Unable to configure PCM read/write format: %s",
+-                    snd_strerror(err));
+-            goto done;
+-        }
+-        handle->mmap = 0;
+-    }
+-
+-    err = snd_pcm_hw_params_set_format(handle->handle, hardwareParams,
+-            handle->format);
+-    if (err < 0) {
+-        ALOGE("Unable to configure PCM format %s (%s): %s",
+-                formatName, formatDesc, snd_strerror(err));
+-        goto done;
+-    }
+-
+-    ALOGV("Set %s PCM format to %s (%s)", streamName(handle), formatName, formatDesc);
+-
+-    err = snd_pcm_hw_params_set_channels(handle->handle, hardwareParams,
+-            handle->channels);
+-    if (err < 0) {
+-        ALOGE("Unable to set channel count to %i: %s",
+-                handle->channels, snd_strerror(err));
+-        goto done;
+-    }
+-
+-    ALOGV("Using %i %s .", handle->channels,
+-            handle->channels == 1 ? "channel" : "channels");
+-
+-    err = snd_pcm_hw_params_set_rate_near(handle->handle, hardwareParams,
+-            &requestedRate, 0);
+-
+-    if (err < 0)
+-        ALOGE("Unable to set %s sample rate to %u: %s",
+-                streamName(handle), handle->sampleRate, snd_strerror(err));
+-    else if (requestedRate != handle->sampleRate)
+-        // Some devices have a fixed sample rate, and can not be changed.
+-        // This may cause resampling problems; i.e. PCM playback will be too
+-        // slow or fast.
+-        ALOGW("Requested rate (%u HZ) does not match actual rate (%u HZ)",
+-                handle->sampleRate, requestedRate);
+-    else
+-        ALOGW("Set sample rate to %u HZ", requestedRate);
+-
+-    // get the max buffer size we can set
+-    /* pass cts, don't use the max buffer size,which will add big latency
+-    err = snd_pcm_hw_params_get_buffer_size_max(hardwareParams, &bufferSize);
+-    if (err < 0) {
+-        ALOGE("Unable to get max buffer size:  %s", snd_strerror(err));
+-        goto done;
+-    }
+-    */
+-    // Make sure we have at least the size we originally wanted
+-    err = snd_pcm_hw_params_set_buffer_size(handle->handle, hardwareParams,
+-            bufferSize);
+-    if (err < 0) {
+-        ALOGE("Unable to set buffer size to %d:  %s",
+-                (int)bufferSize, snd_strerror(err));
+-        goto done;
+-    }
+-
+-    // Setup buffers for latency
+-    err = snd_pcm_hw_params_set_buffer_time_near(handle->handle,
+-            hardwareParams, &latency, NULL);
+-    if (err < 0) {
+-        /* That didn't work, set the period instead */
+-        unsigned int periodTime = latency / 4;
+-        err = snd_pcm_hw_params_set_period_time_near(handle->handle,
+-                hardwareParams, &periodTime, NULL);
+-        if (err < 0) {
+-            ALOGE("Unable to set the period time for latency: %s", snd_strerror(err));
+-            goto done;
+-        }
+-        snd_pcm_uframes_t periodSize;
+-        err = snd_pcm_hw_params_get_period_size(hardwareParams, &periodSize,
+-                NULL);
+-        if (err < 0) {
+-            ALOGE("Unable to get the period size for latency: %s", snd_strerror(err));
+-            goto done;
+-        }
+-        bufferSize = periodSize * 4;
+-        if (bufferSize < handle->bufferSize) bufferSize = handle->bufferSize;
+-        err = snd_pcm_hw_params_set_buffer_size_near(handle->handle,
+-                hardwareParams, &bufferSize);
+-        if (err < 0) {
+-            ALOGE("Unable to set the buffer size for latency: %s", snd_strerror(err));
+-            goto done;
+-        }
+-        ALOGV("Setup buffers time near for latency failed %d", latency);
+-    } else {
+-        // OK, we got buffer time near what we expect. See what that did for bufferSize.
+-        err = snd_pcm_hw_params_get_buffer_size(hardwareParams, &bufferSize);
+-        if (err < 0) {
+-            ALOGE("Unable to get the buffer size for latency: %s", snd_strerror(err));
+-            goto done;
+-        }
+-        // Does set_buffer_time_near change the passed value? It should.
+-        err = snd_pcm_hw_params_get_buffer_time(hardwareParams, &latency, NULL);
+-        if (err < 0) {
+-            ALOGE("Unable to get the buffer time for latency: %s", snd_strerror(err));
+-            goto done;
+-        }
+-        unsigned int periodTime = latency / 4;
+-        err = snd_pcm_hw_params_set_period_time_near(handle->handle,
+-                hardwareParams, &periodTime, NULL);
+-        if (err < 0) {
+-            ALOGE("Unable to set the period time for latency: %s", snd_strerror(err));
+-            goto done;
+-        }
+-        ALOGV("Setup buffers time near for latency ok %d", latency);
+-    }
+-
+-    ALOGW("Buffer size: %d", (int)bufferSize);
+-    ALOGW("Latency: %d", (int)latency);
+-
+-    handle->bufferSize = bufferSize;
+-    handle->latency = latency;
+-
+-    // Commit the hardware parameters back to the device.
+-    err = snd_pcm_hw_params(handle->handle, hardwareParams);
+-    if (err < 0) ALOGE("Unable to set hardware parameters: %s", snd_strerror(err));
+-
+-    done:
+-    snd_pcm_hw_params_free(hardwareParams);
+-
+-    return err;
+-}
+-
+-status_t setSoftwareParams(alsa_handle_t *handle)
+-{
+-    snd_pcm_sw_params_t * softwareParams;
+-    int err;
+-
+-    snd_pcm_uframes_t bufferSize = 0;
+-    snd_pcm_uframes_t periodSize = 0;
+-    snd_pcm_uframes_t startThreshold, stopThreshold;
+-
+-    if (snd_pcm_sw_params_malloc(&softwareParams) < 0) {
+-        LOG_ALWAYS_FATAL("Failed to allocate ALSA software parameters!");
+-        return NO_INIT;
+-    }
+-
+-    // Get the current software parameters
+-    err = snd_pcm_sw_params_current(handle->handle, softwareParams);
+-    if (err < 0) {
+-        ALOGE("Unable to get software parameters: %s", snd_strerror(err));
+-        goto done;
+-    }
+-
+-    // Configure ALSA to start the transfer when the buffer is almost full.
+-    snd_pcm_get_params(handle->handle, &bufferSize, &periodSize);
+-
+-    if (handle->devices & AudioSystem::DEVICE_OUT_ALL) {
+-        // For playback, configure ALSA to start the transfer when the
+-        // buffer is full.
+-        startThreshold = bufferSize - 1;
+-        stopThreshold = bufferSize;
+-    } else {
+-        // For recording, configure ALSA to start the transfer on the
+-        // first frame.
+-        startThreshold = 1;
+-        stopThreshold = bufferSize;
+-    }
+-
+-    err = snd_pcm_sw_params_set_start_threshold(handle->handle, softwareParams,
+-            startThreshold);
+-    if (err < 0) {
+-        ALOGE("Unable to set start threshold to %lu frames: %s",
+-                startThreshold, snd_strerror(err));
+-        goto done;
+-    }
+-
+-    err = snd_pcm_sw_params_set_stop_threshold(handle->handle, softwareParams,
+-            stopThreshold);
+-    if (err < 0) {
+-        ALOGE("Unable to set stop threshold to %lu frames: %s",
+-                stopThreshold, snd_strerror(err));
+-        goto done;
+-    }
+-
+-    // Allow the transfer to start when at least periodSize samples can be
+-    // processed.
+-    err = snd_pcm_sw_params_set_avail_min(handle->handle, softwareParams,
+-            periodSize);
+-    if (err < 0) {
+-        ALOGE("Unable to configure available minimum to %lu: %s",
+-                periodSize, snd_strerror(err));
+-        goto done;
+-    }
+-
+-    // Commit the software parameters back to the device.
+-    err = snd_pcm_sw_params(handle->handle, softwareParams);
+-    if (err < 0) ALOGE("Unable to configure software parameters: %s",
+-            snd_strerror(err));
+-
+-    done:
+-    snd_pcm_sw_params_free(softwareParams);
+-
+-    return err;
+-}
+-
+-void setDefaultControls(uint32_t devices, int mode, const char *cardname)
+-{
+-
+-    ALSAControl *ctl = new ALSAControl(cardname);
+-    ALOGD ("setDefaultControls set card: %s",cardname);
+-
+-    if(devices & IMX_IN_CODEC_DEFAULT)
+-    {
+-        if(selecteddevice == DEVICE_SGTL5000)
+-        {
+-            if(devices & AudioSystem::DEVICE_IN_BUILTIN_MIC){
+-                ctl->set("Mic Volume", 2, 0);
+-            }
+-        }
+-    }
+-
+-    if(devices & IMX_OUT_CODEC_DEFAULT)
+-    {
+-        if(selecteddevice == DEVICE_WM8962)
+-        {
+-              if(devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
+-                   devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE ){
+-                 ctl->set("Speaker Switch", 0, -1);
+-                 ctl->set("Headphone Switch", 1, -1);
+-                 ctl->set("Headphone Volume", 127, -1);
+-              }else {
+-		 ctl->set("Headphone Switch", 0, -1);
+-                 ctl->set("Speaker Switch", 1, -1);
+-                 ctl->set("Speaker Volume", 127, -1);
+-              }
+-        }
+-    }
+-
+-    if(devices & IMX_IN_CODEC_DEFAULT)
+-    {
+-        if(selecteddevice == DEVICE_WM8962)
+-        {
+-             if(devices & AudioSystem::DEVICE_IN_BUILTIN_MIC){
+-                ctl->set("Capture Switch", 1, -1);
+-                ctl->set("Capture Volume", 63, -1);
+-                ctl->set("MIXINR IN3R Switch", 1, 0);
+-                ctl->set("MIXINR IN3R Volume", 7, 0);
+-                //ctl->set("INPGAR IN3R Switch", 1, 0);
+-                //ctl->set("MIXINR PGA Switch", 1, 0);
+-                //ctl->set("MIXINR PGA Volume", 7, 0);
+-                ctl->set("Digital Capture Volume", 127, -1);
+-             }
+-        }
+-    }
+-
+-    if(devices & IMX_OUT_CODEC_DEFAULT)
+-    {
+-        if(selecteddevice == DEVICE_WM8958)
+-        {
+-            ctl->set("AIF1DAC Mux", 0, 0); /* 0: AIF1DACDAT, 1: AIF3DACDAT */
+-            ctl->set("AIF2DAC Mux", 0, 0); /* 0: AIF2DACDAT, 1: AIF3DACDAT */
+-            if (mode == AudioSystem::MODE_IN_CALL)
+-            {
+-                ctl->set("DAC1L Mixer AIF1.1 Switch", 0, 0);
+-                ctl->set("DAC1L Mixer AIF1.2 Switch", 0, 0);
+-                ctl->set("DAC1L Mixer AIF2 Switch", 1, 0);
+-                ctl->set("DAC1L Mixer Left Sidetone Switch", 0, 0);
+-                ctl->set("DAC1L Mixer Right Sidetone Switch", 0, 0);
+-
+-                ctl->set("DAC1R Mixer AIF1.1 Switch", 0, 0);
+-                ctl->set("DAC1R Mixer AIF1.2 Switch", 0, 0);
+-                ctl->set("DAC1R Mixer AIF2 Switch", 1, 0);
+-                ctl->set("DAC1R Mixer Left Sidetone Switch", 0, 0);
+-                ctl->set("DAC1R Mixer Right Sidetone Switch", 0, 0);
+-
+-                if(devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
+-                    devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE ){
+-                    ctl->set("Speaker Switch", 0, -1);   /*0 : mute  1: unmute */
+-                    ctl->set("Earpiece Switch", 0, 0);   /*0 : mute  1: unmute */
+-                    ctl->set("Left Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
+-                    ctl->set("Right Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
+-                    ctl->set("DAC1 Switch", 1, -1);
+-                    ctl->set("Headphone Switch", 1, -1); /*0 : mute  1: unmute */
+-                    ctl->set("Headphone Volume", 57, -1); /* 0 ~ 63 */
+-
+-                }else {
+-                    ctl->set("Earpiece Switch", 0, 0); /*0 : mute  1: unmute */
+-                    ctl->set("Headphone Switch", 0, -1); /*0 : mute  1: unmute */
+-                    ctl->set("SPKL DAC1 Switch", 1, 0);
+-                    ctl->set("SPKL DAC1 Volume", 1, 0);
+-                    ctl->set("SPKR DAC1 Switch", 1, 0);
+-                    ctl->set("SPKR DAC1 Volume", 1, 0);
+-                    ctl->set("SPKL Boost SPKL Switch", 1, 0);
+-                    ctl->set("SPKR Boost SPKR Switch", 1, 0);
+-                    ctl->set("Speaker Mixer Volume", 3, -1);
+-                    ctl->set("DAC1 Switch", 1, -1);
+-                    ctl->set("Speaker Switch", 1, -1);   /*0 : mute  1: unmute */
+-                    ctl->set("Speaker Volume", 60, -1); /* 0 ~ 63 */
+-                }
+-
+-
+-                if (devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ){
+-                    ctl->set("IN1R Switch", 0, 0);
+-                    ctl->set("IN1L Switch", 1, 0);
+-                    ctl->set("IN1L Volume", 27, 0);
+-                    ctl->set("MIXINL IN1L Switch", 1, 0);
+-                    ctl->set("MIXINL IN1L Volume", 1, 0);
+-                    ctl->set("IN1L PGA IN1LN Switch", 1, 0);
+-                    ctl->set("IN1L PGA IN1LP Switch", 1, 0);
+-                    ctl->set("ADCL Mux", 0, 0);   /* 0: ADC  1: DMIC */
+-                    ctl->set("DAC2 Left Sidetone Volume", 12, 0);
+-                    ctl->set("DAC2 Switch", 1, -1);
+-                    ctl->set("AIF2ADC Mux", 0, 0); /*AIF2ADCDAT AIF3DACDAT */
+-                    ctl->set("AIF2DAC2L Mixer Left Sidetone Switch", 1, 0);
+-
+-                }else {
+-                    ctl->set("IN1L Switch", 0, 0);
+-                    ctl->set("IN1R Switch", 1, 0);
+-                    ctl->set("IN1R Volume", 27, 0);
+-                    ctl->set("MIXINR IN1R Switch", 1, 0);
+-                    ctl->set("MIXINR IN1R Volume", 1, 0);
+-                    ctl->set("IN1R PGA IN1RN Switch", 1, 0);
+-                    ctl->set("IN1R PGA IN1RP Switch", 1, 0);
+-                    ctl->set("ADCR Mux", 0, 0);   /* 0: ADC  1: DMIC */
+-                    ctl->set("DAC2 Right Sidetone Volume", 12, 0);
+-                    ctl->set("DAC2 Switch", 1, -1);
+-                    ctl->set("AIF2ADC Mux", 0, 0); /*AIF2ADCDAT AIF3DACDAT */
+-                    ctl->set("AIF2DAC2R Mixer Right Sidetone Switch", 1, 0);
+-
+-                }
+-            }
+-            else
+-            {
+-
+-                ctl->set("DAC1L Mixer AIF1.1 Switch", 1, 0);
+-                ctl->set("DAC1L Mixer AIF1.2 Switch", 0, 0);
+-                ctl->set("DAC1L Mixer AIF2 Switch", 0, 0);
+-                ctl->set("DAC1L Mixer Left Sidetone Switch", 0, 0);
+-                ctl->set("DAC1L Mixer Right Sidetone Switch", 0, 0);
+-
+-                ctl->set("DAC1R Mixer AIF1.1 Switch", 1, 0);
+-                ctl->set("DAC1R Mixer AIF1.2 Switch", 0, 0);
+-                ctl->set("DAC1R Mixer AIF2 Switch", 0, 0);
+-                ctl->set("DAC1R Mixer Left Sidetone Switch", 0, 0);
+-                ctl->set("DAC1R Mixer Right Sidetone Switch", 0, 0);
+-
+-
+-                if (devices & AudioSystem::DEVICE_OUT_SPEAKER || devices & AudioSystem::DEVICE_OUT_EARPIECE)
+-                {
+-                    ctl->set("Earpiece Switch", 0, 0); /*0 : mute  1: unmute */
+-                    ctl->set("Headphone Switch", 0, -1); /*0 : mute  1: unmute */
+-                    ctl->set("SPKL DAC1 Switch", 1, 0);
+-                    ctl->set("SPKL DAC1 Volume", 1, 0);
+-                    ctl->set("SPKR DAC1 Switch", 1, 0);
+-                    ctl->set("SPKR DAC1 Volume", 1, 0);
+-                    ctl->set("SPKL Boost SPKL Switch", 1, 0);
+-                    ctl->set("SPKR Boost SPKR Switch", 1, 0);
+-                    ctl->set("Speaker Mixer Volume", 3, -1);
+-                    ctl->set("DAC1 Switch", 1, -1);
+-                    ctl->set("Speaker Switch", 1, -1);   /*0 : mute  1: unmute */
+-                    ctl->set("Speaker Volume", 60, -1); /* 0 ~ 63 */
+-
+-                }else if(devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
+-                    devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE ){
+-                    ctl->set("Speaker Switch", 0, -1);   /*0 : mute  1: unmute */
+-                    ctl->set("Earpiece Switch", 0, 0);   /*0 : mute  1: unmute */
+-                    ctl->set("Left Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
+-                    ctl->set("Right Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
+-                    ctl->set("DAC1 Switch", 1, -1);
+-                    ctl->set("Headphone Switch", 1, -1); /*0 : mute  1: unmute */
+-                    ctl->set("Headphone Volume", 57, -1); /* 0 ~ 63 */
+-                }
+-            }
+-        }
+-    }
+-
+-    if(devices & IMX_IN_CODEC_DEFAULT)
+-    {
+-        if(selecteddevice == DEVICE_WM8958)
+-        {
+-            ctl->set("AIF1DAC Mux", 0, 0); /* 0: AIF1DACDAT, 1: AIF3DACDAT */
+-            ctl->set("AIF2DAC Mux", 0, 0); /* 0: AIF2DACDAT, 1: AIF3DACDAT */
+-
+-            if (devices & AudioSystem::DEVICE_IN_WIRED_HEADSET ){
+-                ctl->set("IN1R Switch", 0, 0);
+-                ctl->set("IN1L Switch", 1, 0);
+-                ctl->set("IN1L Volume", 27, 0);
+-                ctl->set("MIXINL IN1L Switch", 1, 0);
+-                ctl->set("MIXINL IN1L Volume", 1, 0);
+-                ctl->set("IN1L PGA IN1LN Switch", 1, 0);
+-                ctl->set("ADCL Mux", 0, 0);   /* 0: ADC  1: DMIC */
+-                if (mode == AudioSystem::MODE_IN_CALL)
+-                {
+-                    ctl->set("AIF2DAC2L Mixer Left Sidetone Switch", 1, 0);
+-                    ctl->set("Left Sidetone",0, 0);/*0: ADC/DMIC1, 1:DMIC2 */
+-                }
+-                else
+-                    ctl->set("AIF1ADC1L Mixer ADC/DMIC Switch", 1, 0);
+-
+-            }else if(devices & AudioSystem::DEVICE_IN_BUILTIN_MIC ){
+-                ctl->set("IN1R Switch", 0, 0);
+-                ctl->set("IN1L Switch", 1, 0);
+-                ctl->set("IN1L Volume", 27, 0);
+-                ctl->set("MIXINL IN1L Switch", 1, 0);
+-                ctl->set("MIXINL IN1L Volume", 1, 0);
+-                ctl->set("IN1L PGA IN1LN Switch", 1, 0);
+-                ctl->set("IN1L PGA IN1LP Switch", 1, 0);
+-                ctl->set("ADCL Mux", 0, 0);   /* 0: ADC  1: DMIC */
+-                if (mode == AudioSystem::MODE_IN_CALL)
+-                {
+-                    ctl->set("AIF2DAC2L Mixer Left Sidetone Switch", 1, 0);
+-                    ctl->set("Left Sidetone", 0, 0);/*0: ADC/DMIC1, 1:DMIC2 */
+-                }
+-                else
+-                    ctl->set("AIF1ADC1L Mixer ADC/DMIC Switch", 1, 0);
+-            }
+-        }
+-    }
+-}
+-
+-void setAlsaControls(alsa_handle_t *handle, uint32_t devices, int mode)
+-{
+-    if(!handle->modPrivate) return;
+-    AlsaControlSet set = (AlsaControlSet) handle->modPrivate;
+-    const char *card = deviceName(handle, devices, mode, 0);
+-    set(devices, mode, card);
+-}
+-
+-// ----------------------------------------------------------------------------
+-
+-static status_t s_init(alsa_device_t *module, ALSAHandleList &list)
+-{
+-    ALOGD("Initializing devices for IMX51 ALSA module");
+-
+-    list.clear();
+-
+-    for (size_t i = 0; i < ARRAY_SIZE(_defaults); i++) {
+-
+-        _defaults[i].module   = module;
+-#ifdef BOARD_IS_PCBA
+-        _defaults[i].handle_1 = &modem_handle;
+-        _defaults[i].handle_2 = &bt_handle;
+-#endif
+-        list.push_back(_defaults[i]);
+-    }
+-
+-    return NO_ERROR;
+-}
+-
+-static status_t s_open(alsa_handle_t *handle, uint32_t devices, int mode)
+-{
+-    // Close off previously opened device.
+-    // It would be nice to determine if the underlying device actually
+-    // changes, but we might be recovering from an error or manipulating
+-    // mixer settings (see asound.conf).
+-    //
+-    s_close(handle);
+-
+-    int mmap = 1;
+-    ALOGD("open called for devices %08x in mode %d...", devices, mode);
+-
+-    const char *stream = streamName(handle);
+-    const char *devName = deviceName(handle, devices, mode, 1);
+-
+-    // The PCM stream is opened in blocking mode, per ALSA defaults.  The
+-    // AudioFlinger seems to assume blocking mode too, so asynchronous mode
+-    // should not be used.
+-    int err = snd_pcm_open(&handle->handle, devName, direction(handle), 0);
+-
+-    if (err < 0) {
+-        ALOGE("Failed to Initialize any ALSA %s device: %s", stream, strerror(err));
+-        return NO_INIT;
+-    }
+-
+-    if(strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI)==0)
+-    {
+-        handle->bufferSize = 768*8;
+-        mmap = 0;
+-    }
+-    else
+-        handle->bufferSize = 2048;
+-
+-    err = setHardwareParams(handle, mmap);
+-
+-    if (err == NO_ERROR) err = setSoftwareParams(handle);
+-
+-    ALOGI("Initialized ALSA %s device %s", stream, devName);
+-
+-    setAlsaControls(handle, devices, mode);
+-
+-    handle->curDev = devices;
+-    handle->curMode = mode;
+-
+-    return err;
+-}
+-
+-static status_t s_close(alsa_handle_t *handle)
+-{
+-    ALOGW("s_close--");
+-    status_t err = NO_ERROR;
+-    snd_pcm_t *h = handle->handle;
+-    handle->handle = 0;
+-    handle->curDev = 0;
+-    handle->curMode = 0;
+-    if (h) {
+-        snd_pcm_drain(h);
+-        err = snd_pcm_close(h);
+-    }
+-
+-    return err;
+-}
+-
+-static status_t s_route(alsa_handle_t *handle, uint32_t devices, int mode)
+-{
+-    status_t status = NO_ERROR;
+-
+-    ALOGD("route called for devices %08x in mode %d...", devices, mode);
+-
+-    if (handle->handle && handle->curDev == devices && handle->curMode == mode)
+-        ; // Nothing to do
+-    else if (handle->handle && (handle->devices & devices)) {
+-            ALOGD("Call setAlsaControls, devices %08x in mode %d...", devices, mode);
+-
+-            if(mode == AudioSystem::MODE_IN_CALL && (handle->handle_1) && (!handle->handle_1->handle)){
+-                status = s_open(handle->handle_1, devices, mode);
+-            }
+-            else if(mode != AudioSystem::MODE_IN_CALL && (handle->handle_1) && handle->handle_1->handle){
+-                status = s_close(handle->handle_1);
+-            }
+-
+-            if((devices & IMX_BT_DEFAULT) && (handle->handle_2) && (!handle->handle_2->handle)){
+-                status = s_open(handle->handle_2, devices, mode);
+-            }
+-            else if((devices & ~IMX_BT_DEFAULT) && (handle->handle_2) && handle->handle_2->handle){
+-                status = s_close(handle->handle_2);
+-            }
+-            if(mode != AudioSystem::MODE_IN_CALL)
+-            {
+-                if(devices == AudioSystem::DEVICE_OUT_AUX_DIGITAL &&  (!(strcmp(handle->devName,AUDIOCARD_DEVICE_SPDIF)==0 
+-                                                    || strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI)==0 ))){
+-                    status = s_open(handle, devices, mode);
+-                }else if(devices != AudioSystem::DEVICE_OUT_AUX_DIGITAL && (strcmp(handle->devName,AUDIOCARD_DEVICE_SPDIF) == 0
+-                                                    || strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI) == 0)){
+-                    status = s_open(handle, devices, mode);
+-                }
+-                else{
+-                    setAlsaControls(handle, devices, mode);
+-                    handle->curDev  = devices;
+-                    handle->curMode = mode;
+-                }
+-            }else {
+-                if(strcmp(handle->devName,AUDIOCARD_DEVICE_SPDIF) == 0 || strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI) == 0)
+-                {
+-                    status = s_open(handle, AudioSystem::DEVICE_OUT_SPEAKER , mode);
+-                }else {
+-                    setAlsaControls(handle, devices, mode);
+-                    handle->curDev  = devices;
+-                    handle->curMode = mode;
+-                }
+-            }
+-    }
+-    else {
+-        ALOGW("Maybe the route is wrong!!");
+-        status = s_open(handle, devices, mode);
+-    }
+-    return status;
+-}
+-
+-}
+diff --git a/alsa/audio_hardware.h b/alsa/audio_hardware.h
+index f339036..b6d74e3 100644
+--- a/alsa/audio_hardware.h
++++ b/alsa/audio_hardware.h
+@@ -156,7 +156,6 @@ struct imx_stream_in {
+             AUDIO_DEVICE_IN_WIRED_HEADSET |      \
+             AUDIO_DEVICE_IN_AUX_DIGITAL |        \
+             AUDIO_DEVICE_IN_BACK_MIC |           \
+-            AUDIO_DEVICE_IN_ANLG_DOCK_MIC |      \
+             AUDIO_DEVICE_IN_ALL_SCO |            \
+             AUDIO_DEVICE_IN_DEFAULT )
+ 
+diff --git a/alsa/audio_policy.conf b/alsa/audio_policy.conf
+new file mode 100644
+index 0000000..154b040
+--- /dev/null
++++ b/alsa/audio_policy.conf
+@@ -0,0 +1,42 @@
++# Global configuration section: lists input and output devices always present on the device
++# as well as the output device selected by default.
++# Devices are designated by a string that corresponds to the enum in audio.h
++
++global_configuration {
++  attached_output_devices AUDIO_DEVICE_OUT_EARPIECE|AUDIO_DEVICE_OUT_SPEAKER
++  default_output_device AUDIO_DEVICE_OUT_SPEAKER
++  attached_input_devices AUDIO_DEVICE_IN_BUILTIN_MIC|AUDIO_DEVICE_IN_BACK_MIC
++}
++
++# audio hardware module section: contains descriptors for all audio hw modules present on the
++# device. Each hw module node is named after the corresponding hw module library base name.
++# For instance, "primary" corresponds to audio.primary.<device>.so.
++# The "primary" module is mandatory and must include at least one output with
++# AUDIO_OUTPUT_FLAG_PRIMARY flag.
++# Each module descriptor contains one or more output profile descriptors and zero or more
++# input profile descriptors. Each profile lists all the parameters supported by a given output
++# or input stream category.
++# The "channel_masks", "formats", "devices" and "flags" are specified using strings corresponding
++# to enums in audio.h and audio_policy.h. They are concatenated by use of "|" without space or "\n".
++
++audio_hw_modules {
++  primary {
++    outputs {
++      primary {
++        sampling_rates 44100
++        channel_masks AUDIO_CHANNEL_OUT_STEREO
++        formats AUDIO_FORMAT_PCM_16_BIT
++        devices AUDIO_DEVICE_OUT_EARPIECE|AUDIO_DEVICE_OUT_SPEAKER|AUDIO_DEVICE_OUT_WIRED_HEADSET|AUDIO_DEVICE_OUT_WIRED_HEADPHONE|AUDIO_DEVICE_OUT_ALL_SCO|AUDIO_DEVICE_OUT_AUX_DIGITAL|AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET
++        flags AUDIO_OUTPUT_FLAG_PRIMARY
++      }
++    }
++    inputs {
++      primary {
++        sampling_rates 8000|11025|16000|22050|24000|32000|44100|48000
++        channel_masks AUDIO_CHANNEL_IN_MONO|AUDIO_CHANNEL_IN_STEREO
++        formats AUDIO_FORMAT_PCM_16_BIT
++        devices AUDIO_DEVICE_IN_BUILTIN_MIC|AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET|AUDIO_DEVICE_IN_WIRED_HEADSET|AUDIO_DEVICE_IN_BACK_MIC
++      }
++    }
++  }
++}
+diff --git a/alsa/config_usbaudio.h b/alsa/config_usbaudio.h
+index b7bd4c2..37afec6 100644
+--- a/alsa/config_usbaudio.h
++++ b/alsa/config_usbaudio.h
+@@ -25,8 +25,7 @@
+ static struct audio_card  usbaudio_card = {
+     .name = "USB Device",
+     .driver_name = "USB-Audio",
+-    .supported_devices   = AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET | AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET | 
+-                           AUDIO_DEVICE_IN_ANLG_DOCK_MIC,
++    .supported_devices   = AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET | AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET,
+     .defaults            = NULL,
+     .bt_output           = NULL,
+     .speaker_output      = NULL,
+diff --git a/alsa/imx_audio_hal.cpp b/alsa/imx_audio_hal.cpp
+index ae339a9..f69288a 100644
+--- a/alsa/imx_audio_hal.cpp
++++ b/alsa/imx_audio_hal.cpp
+@@ -58,14 +58,8 @@ static int imx_adev_open(const hw_module_t* module, const char* name,
+     }
+ 
+     if(!found) {
+-        ALOGW("reload the legacy audio hal");
+-        ret = hw_get_module(AUDIO_HARDWARE_MODULE_ID_LEGACY, &module_audio);
+-        if(ret)
+-            goto out;
+-
+-        ret = module_audio->methods->open(module, AUDIO_HARDWARE_INTERFACE,(struct hw_device_t**)device);
+-        if(ret)
+-            goto out;
++        ALOGW("load tinyalsa hal failed");
++        ret = -1;
+     }
+ 
+ out:
+@@ -80,10 +74,10 @@ struct imx_audio_module HAL_MODULE_INFO_SYM = {
+     module: {
+         common: {
+             tag: HARDWARE_MODULE_TAG,
+-            version_major: 1,
+-            version_minor: 0,
++            module_api_version: AUDIO_MODULE_API_VERSION_0_1,
++            hal_api_version: HARDWARE_HAL_API_VERSION,
+             id: AUDIO_HARDWARE_MODULE_ID,
+-            name: "LEGACY Audio HW HAL",
++            name: "Primary Audio HW HAL",
+             author: "The Android Open Source Project",
+             methods: &imx_audio_module_methods,
+             dso : NULL,
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index 539f796..2a993a7 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -388,7 +388,7 @@ static int start_output_stream(struct imx_stream_out *out)
+     unsigned int port = 0;
+     int i;
+ 
+-    ALOGW("start_output_stream...");
++    ALOGW("start_output_stream... %d",(int)out);
+     adev->active_output[out->out_id] = out;
+ 
+     if (adev->mode != AUDIO_MODE_IN_CALL) {
+@@ -541,7 +541,7 @@ static struct echo_reference_itfe *get_echo_reference(struct imx_audio_device *a
+     /*only for mixer output, only one output*/
+     if(adev->out_stream_num == 1)
+         if (adev->active_output[0] != NULL &&
+-            adev->active_output[0]->config.format == AUDIO_FORMAT_PCM_16_BIT ) {
++            adev->active_output[0]->config.format == PCM_FORMAT_S16_LE) {
+             struct audio_stream *stream = &adev->active_output[0]->stream.common;
+             uint32_t wr_channel_count = popcount(stream->get_channels(stream));
+             uint32_t wr_sampling_rate = stream->get_sample_rate(stream);
+@@ -621,7 +621,7 @@ static uint32_t out_get_channels(const struct audio_stream *stream)
+         return AUDIO_CHANNEL_OUT_STEREO;
+ }
+ 
+-static int out_get_format(const struct audio_stream *stream)
++static audio_format_t out_get_format(const struct audio_stream *stream)
+ {
+     struct imx_stream_out *out = (struct imx_stream_out *)stream;
+     switch(out->config.format) {
+@@ -634,7 +634,7 @@ static int out_get_format(const struct audio_stream *stream)
+     }
+ }
+ 
+-static int out_set_format(struct audio_stream *stream, int format)
++static int out_set_format(struct audio_stream *stream, audio_format_t format)
+ {
+     ALOGE("out_set_format %d", format);
+     return 0;
+@@ -738,7 +738,7 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
+         }
+         pthread_mutex_unlock(&adev->lock);
+     }
+-    ALOGW("out_set_parameters %s, ret %d",kvpairs, ret);
++    ALOGW("out_set_parameters %s, ret %d, out %d",kvpairs, ret, (int)out);
+     str_parms_destroy(parms);
+     return 0;
+ }
+@@ -877,7 +877,7 @@ exit:
+     pthread_mutex_unlock(&out->lock);
+ 
+     if (ret != 0) {
+-        LOGW("write error, sleep few ms");
++        ALOGW("write error, sleep few ms");
+         usleep(bytes * 1000000 / audio_stream_frame_size(&stream->common) /
+                out_get_sample_rate(&stream->common));
+     }
+@@ -924,7 +924,7 @@ static int start_input_stream(struct imx_stream_in *in)
+     struct imx_audio_device *adev = in->dev;
+     unsigned int card = -1;
+     unsigned int port = 0;
+-    LOGW("start_input_stream....");
++    ALOGW("start_input_stream....");
+     adev->active_input = in;
+ 
+     if (adev->mode != AUDIO_MODE_IN_CALL) {
+@@ -944,24 +944,10 @@ static int start_input_stream(struct imx_stream_in *in)
+             return -EINVAL;
+         }
+     }
+-    LOGW("card %d, port %d device %x", card, port, in->device);
++    ALOGW("card %d, port %d device %x", card, port, in->device);
+ 
+     in->config.stop_threshold = in->config.period_size * in->config.period_count;
+ 
+-    if(in->device & AUDIO_DEVICE_IN_ANLG_DOCK_MIC) {
+-        if((int)in->config.rate != adev_get_rate_for_device(adev, AUDIO_DEVICE_IN_ANLG_DOCK_MIC, PCM_IN) ||
+-           in->config.channels != 1) {
+-           LOGE("Input 2 does not support this format!");
+-           return -EINVAL;
+-        }
+-    }else {
+-        if(in->config.rate != MM_FULL_POWER_SAMPLING_RATE ||
+-           in->config.channels != 2) {
+-           LOGE("Input 1 does not support this format!");
+-           return -EINVAL;
+-        }
+-    }
+-
+     if (in->need_echo_reference && in->echo_reference == NULL)
+         in->echo_reference = get_echo_reference(adev,
+                                         AUDIO_FORMAT_PCM_16_BIT,
+@@ -1017,7 +1003,7 @@ static uint32_t in_get_channels(const struct audio_stream *stream)
+     }
+ }
+ 
+-static int in_get_format(const struct audio_stream *stream)
++static audio_format_t in_get_format(const struct audio_stream *stream)
+ {
+     struct imx_stream_in *in = (struct imx_stream_in *)stream;
+     switch(in->config.format) {
+@@ -1031,7 +1017,7 @@ static int in_get_format(const struct audio_stream *stream)
+ 
+ }
+ 
+-static int in_set_format(struct audio_stream *stream, int format)
++static int in_set_format(struct audio_stream *stream, audio_format_t format)
+ {
+     return 0;
+ }
+@@ -1042,7 +1028,7 @@ static int do_input_standby(struct imx_stream_in *in)
+     struct imx_audio_device *adev = in->dev;
+ 
+     if (!in->standby) {
+-        LOGW("do_in_standby..");
++        ALOGW("do_in_standby..");
+         pcm_close(in->pcm);
+         in->pcm = NULL;
+         in->last_time_of_xrun = 0;
+@@ -1510,7 +1496,7 @@ static uint32_t in_get_input_frames_lost(struct audio_stream_in *stream)
+     struct imx_stream_in *in = (struct imx_stream_in *)stream;
+     times = pcm_get_time_of_xrun(in->pcm);
+     diff = times - in->last_time_of_xrun;
+-    LOGW_IF((diff != 0), "in_get_input_frames_lost %d ms total %d ms\n",diff, times);
++    ALOGW_IF((diff != 0), "in_get_input_frames_lost %d ms total %d ms\n",diff, times);
+     in->last_time_of_xrun = times;
+     return diff * in->requested_rate / 1000;
+ }
+@@ -1595,10 +1581,11 @@ exit:
+     return status;
+ }
+ 
+-
+ static int adev_open_output_stream(struct audio_hw_device *dev,
+-                                   uint32_t devices, int *format,
+-                                   uint32_t *channels, uint32_t *sample_rate,
++                                   audio_io_handle_t handle,
++                                   audio_devices_t devices,
++                                   audio_output_flags_t flags,
++                                   struct audio_config *config,
+                                    struct audio_stream_out **stream_out)
+ {
+     struct imx_audio_device *ladev = (struct imx_audio_device *)dev;
+@@ -1608,8 +1595,8 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+     out = (struct imx_stream_out *)calloc(1, sizeof(struct imx_stream_out));
+     if (!out)
+         return -ENOMEM;
+-    ALOGW("open output stream devices %d, format %d, channels %d, sample_rate %d",
+-                        devices, *format, *channels, *sample_rate);
++    ALOGW("open output stream devices %d, format %d, channels %d, sample_rate %d, flag %d",
++                        devices, config->format, config->channel_mask, config->sample_rate, flags);
+     ret = create_resampler(DEFAULT_OUT_SAMPLING_RATE,
+                            MM_FULL_POWER_SAMPLING_RATE,
+                            2,
+@@ -1654,11 +1641,12 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+      * This is because out_set_parameters() with a route is not
+      * guaranteed to be called after an output stream is opened. */
+ 
+-    *format = out_get_format(&out->stream.common);
+-    *channels = out_get_channels(&out->stream.common);
+-    *sample_rate = out_get_sample_rate(&out->stream.common);
++    config->format = out_get_format(&out->stream.common);
++    config->channel_mask = out_get_channels(&out->stream.common);
++    config->sample_rate = out_get_sample_rate(&out->stream.common);
+ 
+     *stream_out = &out->stream;
++    ALOGW("opened out stream...%d",(int)out);
+     return 0;
+ 
+ err_open:
+@@ -1672,7 +1660,7 @@ static void adev_close_output_stream(struct audio_hw_device *dev,
+ {
+     struct imx_stream_out *out = (struct imx_stream_out *)stream;
+     struct imx_audio_device *ladev = (struct imx_audio_device *)dev;
+-
++    ALOGW("adev_close_output_stream...");
+     ladev->out_stream_num--;
+ 
+     out_standby(&stream->common);
+@@ -1793,30 +1781,29 @@ static int adev_get_mic_mute(const struct audio_hw_device *dev, bool *state)
+ }
+ 
+ static size_t adev_get_input_buffer_size(const struct audio_hw_device *dev,
+-                                         uint32_t sample_rate, int format,
+-                                         int channel_count)
++                                         const struct audio_config *config)
+ {
+     size_t size;
+-
+-    if (check_input_parameters(sample_rate, format, channel_count) != 0)
++    int channel_count = popcount(config->channel_mask);
++    if (check_input_parameters(config->sample_rate, config->format, channel_count) != 0)
+         return 0;
+ 
+-    return get_input_buffer_size(sample_rate, format, channel_count);
++    return get_input_buffer_size(config->sample_rate, config->format, channel_count);
+ }
+ 
+-static int adev_open_input_stream(struct audio_hw_device *dev, uint32_t devices,
+-                                  int *format, uint32_t *channel_mask,
+-                                  uint32_t *sample_rate,
+-                                  audio_in_acoustics_t acoustics,
++static int adev_open_input_stream(struct audio_hw_device *dev,
++                                  audio_io_handle_t handle,
++                                  audio_devices_t devices,
++                                  struct audio_config *config,
+                                   struct audio_stream_in **stream_in)
+ {
+     struct imx_audio_device *ladev = (struct imx_audio_device *)dev;
+     struct imx_stream_in *in;
+     int ret;
+     int rate;
+-    int channel_count = popcount(*channel_mask);
++    int channel_count = popcount(config->channel_mask);
+ 
+-    if (check_input_parameters(*sample_rate, *format, channel_count) != 0)
++    if (check_input_parameters(config->sample_rate, config->format, channel_count) != 0)
+         return -EINVAL;
+ 
+     in = (struct imx_stream_in *)calloc(1, sizeof(struct imx_stream_in));
+@@ -1839,30 +1826,16 @@ static int adev_open_input_stream(struct audio_hw_device *dev, uint32_t devices,
+     in->stream.read = in_read;
+     in->stream.get_input_frames_lost = in_get_input_frames_lost;
+ 
+-    in->requested_rate = *sample_rate;
++    in->requested_rate = config->sample_rate;
+ 
+-    ALOGW("In channels %d, rate %d, devices %x", channel_count, *sample_rate, devices);
++    ALOGW("In channels %d, rate %d, devices %x", channel_count, config->sample_rate, devices);
+     memcpy(&in->config, &pcm_config_mm_in, sizeof(pcm_config_mm_in));
+     //in->config.channels = channel_count;
+     //in->config.rate     = *sample_rate;
+     /*fix to 2 channel,  caused by the wm8958 driver*/
+-    *channel_mask       = AUDIO_CHANNEL_IN_STEREO;
++    config->channel_mask       = AUDIO_CHANNEL_IN_STEREO;
+     in->config.channels = 2;
+  
+-    if(devices == AUDIO_DEVICE_IN_ANLG_DOCK_MIC) {
+-        ret = scan_available_device(ladev);
+-        if(ret != 0) return -EINVAL;
+-        *channel_mask       = AUDIO_CHANNEL_IN_MONO;
+-        in->config.channels = 1;
+-        rate     = adev_get_rate_for_device(ladev, AUDIO_DEVICE_IN_ANLG_DOCK_MIC, PCM_IN);
+-        LOGW("rate %d", rate);
+-        if( rate == 0) {
+-              LOGW("can not get rate for in_device %d ", AUDIO_DEVICE_IN_ANLG_DOCK_MIC);
+-              return -EINVAL;
+-        }
+-        in->config.rate     =  rate;
+-    }
+-
+     in->buffer = malloc(in->config.period_size *
+                         audio_stream_frame_size(&in->stream.common));
+     if (!in->buffer) {
+@@ -1980,7 +1953,7 @@ static int scan_available_device(struct imx_audio_device *adev)
+         imx_control = control_open(i);
+         if(!imx_control)
+             break;
+-        LOGW("card %d, id %s ,driver %s, name %s", i, control_card_info_get_id(imx_control),
++        ALOGW("card %d, id %s ,driver %s, name %s", i, control_card_info_get_id(imx_control),
+                                                       control_card_info_get_driver(imx_control),
+                                                       control_card_info_get_name(imx_control));
+         for(j = 0; j < SUPPORT_CARD_NUM; j++) {
+@@ -2011,13 +1984,13 @@ static int scan_available_device(struct imx_audio_device *adev)
+                 adev->mixer[n] = mixer_open(i);
+                 adev->card_list[n]->card = i;
+                 if (!adev->mixer[n]) {
+-                    LOGE("Unable to open the mixer, aborting.");
++                    ALOGE("Unable to open the mixer, aborting.");
+                     return -EINVAL;
+                 }
+                 rate = 8000;
+                 if( pcm_get_near_rate(i, 0, PCM_IN, &rate) == 0)
+                         adev->card_list[n]->in_rate = rate;
+-                LOGW("in rate %d",adev->card_list[n]->in_rate);
++                ALOGW("in rate %d",adev->card_list[n]->in_rate);
+                 left_devices &= ~audio_card_list[j]->supported_devices;
+                 k ++;
+                 found = true;
+@@ -2027,13 +2000,13 @@ static int scan_available_device(struct imx_audio_device *adev)
+ 
+         control_close(imx_control);
+         if(!found){
+-            LOGW("unrecognized card found.");
++            ALOGW("unrecognized card found.");
+         }
+     }
+     adev->audio_card_num = k;
+     /*must have one card*/
+     if(!adev->card_list[0]) {
+-        LOGE("no supported sound card found, aborting.");
++        ALOGE("no supported sound card found, aborting.");
+         return  -EINVAL;
+     }
+     /*second card maybe null*/
+@@ -2119,8 +2092,8 @@ static struct hw_module_methods_t hal_module_methods = {
+ struct audio_module HAL_MODULE_INFO_SYM = {
+     .common = {
+         .tag = HARDWARE_MODULE_TAG,
+-        .version_major = 1,
+-        .version_minor = 0,
++        .module_api_version = AUDIO_MODULE_API_VERSION_0_1,
++        .hal_api_version = HARDWARE_HAL_API_VERSION,
+         .id = "audio.tinyalsa",
+         .name = "tinyalsa audio HW HAL",
+         .author = "The Android Open Source Project",
+-- 
+1.8.0
+

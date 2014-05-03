@@ -1,0 +1,342 @@
+From 3bff76b559e1f8ad905963daa0e3225e1486f405 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Thu, 17 Apr 2008 10:43:53 +0800
+Subject: [PATCH 020/435] ENGR00072268 Update FW to 1.0.2 on MX37 and bug
+ fixes
+
+Update Fireware to V1.0.2 on MX37, and vpu lib version to v3.0.1
+Use IRAM as temporary buffer for VPU decoding
+Use IPU hardware rotation on MX37 by default, VPU rotation on other platform.
+Add the debug codes for easier trace.
+Add missing error MB numers statistics
+Fix ps and slice memory un-released bug when program exits.
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 59 ++++++++++++++++++++++++++++++++++----
+ test/mxc_vpu_test/display.c  | 68 ++++++++++++++++++++++++++++++++++++++++----
+ test/mxc_vpu_test/vpu_test.h | 16 ++++++++++-
+ 3 files changed, 131 insertions(+), 12 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 5b74c3f..065080b 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -195,6 +195,7 @@ decoder_start(struct decode *dec)
+ 	float total_time = 0, frame_id = 0;
+ 	int rotid = 0, dblkid = 0, mirror;
+ 	int count = dec->cmdl->count;
++	int totalNumofErrMbs = 0;
+ 
+ 	if (rot_en || dering_en) {
+ 		rotid = dec->fbcount;
+@@ -422,6 +423,12 @@ decoder_start(struct decode *dec)
+ 			}
+ 		}
+ 		
++		if (outinfo.numOfErrMBs) {
++			totalNumofErrMbs += outinfo.numOfErrMBs;
++			printf("Num of Error Mbs : %d, in Frame : %d \n",
++					outinfo.numOfErrMBs, (int)frame_id);
++		}
++
+ 		frame_id++;
+ 		if ((count != 0) && (frame_id >= count))
+ 			break;
+@@ -439,6 +446,10 @@ decoder_start(struct decode *dec)
+ 		}
+ 	}
+ 
++	if (totalNumofErrMbs) {
++		printf("Total Num of Error MBs : %d\n", totalNumofErrMbs);
++	}
++
+ 	printf("%d frames took %d microseconds\n", (int)frame_id,
+ 						(int)total_time);
+ 	printf("fps = %.2f\n", (frame_id / (total_time / 1000000)));
+@@ -449,9 +460,22 @@ void
+ decoder_free_framebuffer(struct decode *dec)
+ {
+ 	int i, totalfb;
++	vpu_mem_desc *mvcol_md = dec->mvcol_memdesc;
++       	int rot_en = dec->cmdl->rot_en;
++	int mp4dblk_en = dec->cmdl->mp4dblk_en;
++	int dering_en = dec->cmdl->dering_en;
+ 
+ 	if (dec->cmdl->dst_scheme == PATH_V4L2) {
+ 		v4l_display_close(dec->disp);
++
++		if ((rot_en == 0) && (mp4dblk_en == 0) && (dering_en == 0)) {
++			if (platform_is_mx37()) {
++				for (i = 0; i < dec->fbcount; i++) {
++					IOFreePhyMem(&mvcol_md[i]);
++				}
++				free(mvcol_md);
++			}
++		}
+ 	}
+ 
+ 	if ((dec->cmdl->dst_scheme != PATH_V4L2) ||
+@@ -473,16 +497,18 @@ int
+ decoder_allocate_framebuffer(struct decode *dec)
+ {
+ 	DecBufInfo bufinfo;
+-	int i, fbcount = dec->fbcount, rotation, extrafb = 0, totalfb, img_size;
++	int i, fbcount = dec->fbcount, extrafb = 0, totalfb, img_size;
+        	int dst_scheme = dec->cmdl->dst_scheme, rot_en = dec->cmdl->rot_en;
+ 	int mp4dblk_en = dec->cmdl->mp4dblk_en;
+ 	int dering_en = dec->cmdl->dering_en;
++	struct rot rotation;
+ 	RetCode ret;
+ 	DecHandle handle = dec->handle;
+ 	FrameBuffer *fb;
+ 	struct frame_buf **pfbpool;
+ 	struct vpu_display *disp = NULL;
+ 	int stride;
++	vpu_mem_desc *mvcol_md = NULL;
+ 
+ 	/* 1 extra fb for rotation(or dering) */
+ 	if (rot_en || dering_en) {
+@@ -533,8 +559,13 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	}
+ 	
+ 	if (dst_scheme == PATH_V4L2) {
+-		rotation = (dec->cmdl->rot_angle == 90 ||
+-				dec->cmdl->rot_angle == 270) ? 1 : 0;
++		rotation.rot_en = dec->cmdl->rot_en;
++		rotation.rot_angle = dec->cmdl->rot_angle;
++		/* use the ipu h/w rotation instead of vpu rotaton */
++		if (platform_is_mx37() && rotation.rot_en) {
++			rotation.rot_en = 0;
++			rotation.ipu_rot_en = 1;
++		}
+ 
+ 		disp = v4l_display_open(dec->picwidth, dec->picheight,
+ 					fbcount, rotation, dec->stride);
+@@ -544,11 +575,27 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 
+ 		if ((rot_en == 0) && (mp4dblk_en == 0) && (dering_en == 0)) {
+ 			img_size = dec->stride * dec->picheight;
++
++			if (platform_is_mx37()) {
++				mvcol_md = dec->mvcol_memdesc =
++					calloc(fbcount, sizeof(vpu_mem_desc));
++			}
+ 			for (i = 0; i < fbcount; i++) {
+ 				fb[i].bufY = disp->buffers[i]->offset;
+ 				fb[i].bufCb = fb[i].bufY + img_size;
+ 				fb[i].bufCr = fb[i].bufCb + (img_size >> 2);
+-				/* TODO: bufMvCol */
++				/* allocate MvCol buffer here */
++				if (platform_is_mx37()) {
++					memset(&mvcol_md[i], 0,
++							sizeof(vpu_mem_desc));
++					mvcol_md[i].size = img_size >> 2;
++					ret = IOGetPhyMem(&mvcol_md[i]);
++					if (ret) {
++						printf("buffer alloc failed\n");
++						goto err1;
++					}
++					fb[i].bufMvCol = mvcol_md[i].phy_addr;
++				}
+ 			}
+ 		}
+ 	}
+@@ -754,8 +801,10 @@ decode_test(void *arg)
+ 
+ err1:
+ 	if (cmdl->format == STD_AVC) {
+-		IOFreeVirtMem(&ps_mem_desc);
++		IOFreeVirtMem(&slice_mem_desc);
+ 		IOFreePhyMem(&slice_mem_desc);
++		IOFreeVirtMem(&ps_mem_desc);
++		IOFreePhyMem(&ps_mem_desc);
+ 	}
+ 
+ 	lock(cmdl);
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 93bb3aa..9a3bf01 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -71,7 +71,8 @@ calculate_ratio(int width, int height, int maxwidth, int maxheight)
+ }
+ 
+ struct vpu_display *
+-v4l_display_open(int width, int height, int nframes, int rot, int stride)
++v4l_display_open(int width, int height, int nframes, struct rot rotation,
++							int stride)
+ {
+ 	int fd, err, out, i;
+ 	char v4l_device[32] = "/dev/video16";
+@@ -81,15 +82,26 @@ v4l_display_open(int width, int height, int nframes, int rot, int stride)
+ 	struct v4l2_format fmt = {0};
+ 	struct v4l2_requestbuffers reqbuf = {0};
+ 	struct vpu_display *disp;
+-	int ratio;
+-
++	int ratio = 1;
++	
+ 	if (platform_is_mx27()) {
+ 		out = 0;
+ 	} else {
+ 		out = 3;
+ 	}
++	dprintf(3, "rot_en:%d; rot_angle:%d; ipu_rot_en:%d\n", rotation.rot_en,
++			rotation.rot_angle, rotation.ipu_rot_en);
+ 	
+-	if (rot) {
++#ifdef	TVOUT_ENABLE
++	err = system("/bin/echo U:720x480i-60 > /sys/class/graphics/fb1/mode");
++	if (err == -1) {
++		printf("set tv mode error\n");
++	}
++
++	out = 5;
++#endif
++		
++	if (rotation.rot_en) {
+ 		i = width;
+ 		width = height;
+ 		height = i;
+@@ -119,15 +131,27 @@ v4l_display_open(int width, int height, int nframes, int rot, int stride)
+ 		printf("VIDIOC_CROPCAP failed\n");
+ 		goto err;
+ 	}
++	dprintf(1, "cropcap.bounds.width = %d\ncropcap.bound.height = %d\n" \
++		"cropcap.defrect.width = %d\ncropcap.defrect.height = %d\n",
++		cropcap.bounds.width, cropcap.bounds.height,
++		cropcap.defrect.width, cropcap.defrect.height);
+ 
+-	ratio = calculate_ratio(width, height, cropcap.bounds.width,
++	if (rotation.ipu_rot_en == 0) {
++		ratio = calculate_ratio(width, height, cropcap.bounds.width,
+ 				cropcap.bounds.height);
++	}
+ 
+ 	crop.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 	crop.c.top = 0;
+ 	crop.c.left = 0;
+ 	crop.c.width = width / ratio;
+ 	crop.c.height = height / ratio;
++	dprintf(1, "crop.c.width/height: %d/%d\n", width/ratio, height/ratio);
++	
++	if (platform_is_mx37()) {
++		crop.c.width = cropcap.bounds.width;
++		crop.c.height = cropcap.bounds.height;
++	}
+ 
+ 	err = ioctl(fd, VIDIOC_S_CROP, &crop);
+ 	if (err < 0) {
+@@ -135,6 +159,30 @@ v4l_display_open(int width, int height, int nframes, int rot, int stride)
+ 		goto err;
+ 	}
+ 
++	if (rotation.ipu_rot_en) {
++		/* Set rotation via V4L2 i/f */
++		struct v4l2_control ctrl;
++		ctrl.id = V4L2_CID_PRIVATE_BASE;
++		if (rotation.rot_angle == 90)
++			ctrl.value = 4;
++		else if (rotation.rot_angle == 270)
++			ctrl.value = 7;
++		err = ioctl(fd, VIDIOC_S_CTRL, &ctrl);
++		if (err < 0) {
++			printf("VIDIOC_S_CTRL failed\n");
++			goto err;
++		}
++	} else {
++		struct v4l2_control ctrl;
++		ctrl.id = V4L2_CID_PRIVATE_BASE;
++		ctrl.value = 0;
++		err = ioctl(fd, VIDIOC_S_CTRL, &ctrl);
++		if (err < 0) {
++			printf("VIDIOC_S_CTRL failed\n");
++			goto err;
++		}
++	}
++
+ 	if (platform_is_mx27()) {
+ 		fb.capability = V4L2_FBUF_CAP_EXTERNOVERLAY;
+ 		fb.flags = V4L2_FBUF_FLAG_PRIMARY;
+@@ -150,7 +198,13 @@ v4l_display_open(int width, int height, int nframes, int rot, int stride)
+ 	fmt.fmt.pix.width = width;
+ 	fmt.fmt.pix.height = height;
+ 	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+-	fmt.fmt.pix.bytesperline = stride;
++	dprintf(1, "stride %d , width %d\n", stride , width);
++	/*fmt.fmt.pix.bytesperline = stride;*/
++	if (rotation.ipu_rot_en) {
++		fmt.fmt.pix.bytesperline = height;
++	} else {
++		fmt.fmt.pix.bytesperline = width;
++	}
+ 
+ 	err = ioctl(fd, VIDIOC_S_FMT, &fmt);
+ 	if (err < 0) {
+@@ -204,6 +258,8 @@ v4l_display_open(int width, int height, int nframes, int rot, int stride)
+ 
+ 		buf->offset = buffer.m.offset;
+ 		buf->length = buffer.length;
++		dprintf(3, "V4L2buf phy addr: %08x, size = %d\n",
++					(unsigned int)buf->offset, buf->length);
+ 		buf->start = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE,
+ 				MAP_SHARED, fd, buffer.m.offset);
+ 		
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 0eece7a..2f1613d 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -22,6 +22,12 @@
+ #include "vpu_lib.h"
+ #include "vpu_io.h"
+ 
++#define	DEBUG_LEVEL	0
++#define dprintf(level, fmt, arg...)     if (DEBUG_LEVEL >= level) \
++        printf("<VPU-test> " fmt , ## arg)
++
++/*#define TVOUT_ENABLE*/
++
+ typedef unsigned long u32;
+ typedef unsigned short u16;
+ typedef unsigned char u8;
+@@ -79,6 +85,12 @@ struct capture_testbuffer {
+ 	unsigned int length;
+ };
+ 
++struct rot {
++	int rot_en;
++	int ipu_rot_en;
++	int rot_angle;
++};
++
+ #define MAX_PATH	64
+ struct cmd_line {
+ 	char input[MAX_PATH];	/* Input file name */
+@@ -93,6 +105,7 @@ struct cmd_line {
+ 	int mp4dblk_en;
+ 	int dering_en;
+ 	int rot_en;
++	int ipu_rot_en;
+ 	int rot_angle;
+ 	int mirror;
+ 	int bitrate;
+@@ -123,6 +136,7 @@ struct decode {
+ 	FrameBuffer *fb;
+ 	struct frame_buf **pfbpool;
+ 	struct vpu_display *disp;
++	vpu_mem_desc *mvcol_memdesc;
+ 	struct cmd_line *cmdl;
+ };
+ 
+@@ -152,7 +166,7 @@ char*skip_unwanted(char *ptr);
+ int parse_options(char *buf, struct cmd_line *cmd, int *mode);
+ 
+ struct vpu_display *v4l_display_open(int width, int height, int nframes,
+-					int rot, int stride);
++					struct rot rotation, int stride);
+ 
+ int v4l_put_data(struct vpu_display *disp);
+ void v4l_display_close(struct vpu_display *disp);
+-- 
+1.8.0
+

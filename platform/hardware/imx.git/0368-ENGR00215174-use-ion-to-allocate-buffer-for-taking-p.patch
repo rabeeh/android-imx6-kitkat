@@ -1,0 +1,333 @@
+From 5262906bddacfb35d4edd8c95985ffc5365a38df Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Tue, 13 Nov 2012 16:56:10 +0800
+Subject: [PATCH 368/486] ENGR00215174 use ion to allocate buffer for taking
+ picture.
+
+it requires 8M phycical continues memory for taking picture.
+when system runs a long time, it will not meet this requirement.
+so, use ion to allocate buffer.
+
+Change-Id: I20463b85dc6f38f8f158ebb3fbf9021a46474ab4
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera/Android.mk       |   1 +
+ mx6/libcamera/CameraHal.cpp    | 132 +++++++++++++++++++++++++++++++++++++++--
+ mx6/libcamera/CameraHal.h      |  13 ++--
+ mx6/libcamera/CameraModule.cpp |   6 +-
+ 4 files changed, 141 insertions(+), 11 deletions(-)
+
+diff --git a/mx6/libcamera/Android.mk b/mx6/libcamera/Android.mk
+index 79cb336..3e60b7e 100755
+--- a/mx6/libcamera/Android.mk
++++ b/mx6/libcamera/Android.mk
+@@ -40,6 +40,7 @@ LOCAL_SHARED_LIBRARIES:= \
+     libbinder \
+     libmedia \
+     libhardware_legacy \
++    libion \
+     libdl \
+     libc
+ 
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index f331197..c436dd0 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -30,7 +30,9 @@
+ #include <ui/Rect.h>
+ #include "gralloc_priv.h"
+ 
+-namespace android {
++#include <ion/ion.h>
++
++using namespace android;
+ 
+     CameraHal::CameraHal(int cameraid)
+         :
+@@ -40,6 +42,7 @@ namespace android {
+         mExitPreviewThread(false),
+         mExitEncodeThread(false),
+         mTakePictureInProcess(false),
++        mTakePictureAllocBuffer(false),
+         mParameters(),
+         mCallbackCookie(NULL),
+         mNotifyCb(NULL),
+@@ -79,15 +82,27 @@ namespace android {
+         mPowerLock(false),
+         mDirectInput(false),
+         mCameraid(cameraid),
+-        mPreviewRotate(CAMERA_PREVIEW_BACK_REF)
++        mPreviewRotate(CAMERA_PREVIEW_BACK_REF),
++        mIonFd(-1),
++        mUseIon(true)
+    {
+         CAMERA_LOG_FUNC;
++
++        if(mUseIon) {
++            mIonFd = ion_open();
++            if(mIonFd <= 0) {
++                CAMERA_LOG_INFO("open ion failed.");
++            }
++        }
+         preInit();
+     }
+ 
+     CameraHal :: ~CameraHal()
+     {
+         CAMERA_LOG_FUNC;
++        if(mUseIon) {
++            ion_close(mIonFd);
++        }
+         CameraMiscDeInit();
+         CloseCaptureDevice();
+         FreeInterBuf();
+@@ -98,6 +113,8 @@ namespace android {
+         if(mPreviewMemory != NULL) {
+             mPreviewMemory->release(mPreviewMemory);
+         }
++        status_t err;
++
+     }
+ 
+     void CameraHal :: release()
+@@ -732,6 +749,13 @@ namespace android {
+     status_t CameraHal::freeBuffersToNativeWindow()
+     {
+         CAMERA_LOG_FUNC;
++        if(mTakePictureAllocBuffer && mIonFd > 0 && mUseIon) {
++            status_t err = freeBufferToIon();
++            if(err == NO_ERROR) {
++                return err;
++            }
++        }
++
+ 
+         if (mNativeWindow == NULL){
+             CAMERA_LOG_ERR("the native window is null!");
+@@ -764,6 +788,90 @@ namespace android {
+         return NO_ERROR;
+     }
+ 
++    status_t CameraHal::freeBufferToIon()
++    {
++        if(!mTakePictureAllocBuffer || mIonFd <= 0 || !mUseIon) {
++            CAMERA_LOG_ERR("try to free buffer from ion in preview or ion invalid");
++            return BAD_VALUE;
++        }
++
++        CAMERA_LOG_INFO("freeBufferToIon buffer num:%d", mCaptureBufNum);
++        for(unsigned int i = 0; i < mCaptureBufNum; i++) {
++            struct ion_handle * ionHandle = (struct ion_handle *)mCaptureBuffers[i].native_buf;
++            ion_free(mIonFd, ionHandle);
++            munmap(mCaptureBuffers[i].virt_start, mCaptureBuffers[i].length);
++        }
++
++        return NO_ERROR;
++    }
++
++    status_t CameraHal::allocateBufferFromIon()
++    {
++        if(!mTakePictureAllocBuffer || mIonFd <= 0 || !mUseIon) {
++            CAMERA_LOG_ERR("try to allocate buffer from ion in preview or ion invalid");
++            return BAD_VALUE;
++        }
++
++        int width = 0, height = 0, size = 0;
++        width = mCaptureDeviceCfg.width;
++        height = mCaptureDeviceCfg.height;
++        if(width == 0 || height == 0) {
++            CAMERA_LOG_ERR("allocateBufferFromIon: width or height = 0");
++            return BAD_VALUE;
++        }
++
++        switch(mPreviewCapturedFormat) {
++            case v4l2_fourcc('N','V','1','2'):
++                size = width * height * 3/2;
++                break;
++            case v4l2_fourcc('Y','U','1','2'):
++                size = width * height * 3/2;
++                break;
++            case v4l2_fourcc('Y','U','Y','V'):
++                size = width * height * 2;
++                break;
++            default:
++                CAMERA_LOG_ERR("Error: format not supported int ion alloc");
++                return BAD_VALUE;
++        }
++
++        unsigned char *ptr = NULL;
++        int sharedFd;
++        int phyAddr;
++        struct ion_handle * ionHandle;
++
++        CAMERA_LOG_INFO("allocateBufferFromIon buffer num:%d", mCaptureBufNum);
++        for(unsigned int i = 0; i < mCaptureBufNum; i++) {
++            ionHandle = NULL;
++            size = (size + PAGE_SIZE)&(~(PAGE_SIZE-1));
++            int err = ion_alloc(mIonFd, size, 8, 1, &ionHandle);
++            if(err) {
++                CAMERA_LOG_ERR("ion_alloc failed.");
++                return BAD_VALUE;
++            }
++
++            err = ion_map(mIonFd, ionHandle, size, PROT_READ|PROT_WRITE, MAP_SHARED, 0, &ptr, &sharedFd);
++            if(err) {
++                CAMERA_LOG_ERR("ion_map failed.");
++                return BAD_VALUE;
++            }
++            phyAddr = ion_phys(mIonFd, ionHandle);
++            if(phyAddr == 0) {
++                CAMERA_LOG_ERR("ion_phys failed.");
++                return BAD_VALUE;
++            }
++
++            mCaptureBuffers[i].virt_start = ptr;
++            mCaptureBuffers[i].phy_offset = phyAddr;
++            mCaptureBuffers[i].length =  size;
++            mCaptureBuffers[i].native_buf = (void*)ionHandle;
++            mCaptureBuffers[i].refCount = 0;
++            mCaptureBuffers[i].buf_state = WINDOW_BUFS_DEQUEUED;
++            close(sharedFd);
++        }
++        return NO_ERROR;
++    }
++
+     int CameraHal::convertPreviewFormatToPixelFormat(unsigned int format)
+     {
+         int nFormat = 0;
+@@ -789,6 +897,13 @@ namespace android {
+     {
+         CAMERA_LOG_FUNC;
+ 
++        if(mTakePictureAllocBuffer && mIonFd > 0 && mUseIon) {
++            status_t err = allocateBufferFromIon();
++            if(err == NO_ERROR) {
++                return err;
++            }
++        }
++
+         status_t err;
+         if (mNativeWindow == NULL){
+             CAMERA_LOG_ERR("the native window is null!");
+@@ -1085,7 +1200,9 @@ namespace android {
+ 
+         /* Stop preview, start picture capture, and then restart preview again for CSI camera*/
+         CameraHALStopPreview();
++        mTakePictureAllocBuffer = true;
+         cameraHALTakePicture();
++        mTakePictureAllocBuffer = false;
+         mTakePictureInProcess = false;
+ 
+         return UNKNOWN_ERROR;
+@@ -1138,7 +1255,14 @@ namespace android {
+         }else{
+                 mCaptureDeviceCfg.tv.denominator = 15;
+         }
+-        mCaptureBufNum = PICTURE_CAPTURE_BUFFER_NUM;
++
++        if(mUseIon) {
++            mCaptureBufNum = PICTURE_CAPTURE_BUFFER_NUM;
++        }
++        else {
++            //surface texture requires larger than 2 buffers to work.
++            mCaptureBufNum = PICTURE_CAPTURE_BUFFER_NUM + 1;
++        }
+         mTakePicFlag = true;
+         if ((ret = GetJpegEncoderParam()) < 0)
+             return ret;
+@@ -2265,6 +2389,6 @@ Pic_out:
+ 
+     }
+ 
+-};
++//};
+ 
+ 
+diff --git a/mx6/libcamera/CameraHal.h b/mx6/libcamera/CameraHal.h
+index 69a00b0..03bbda5 100755
+--- a/mx6/libcamera/CameraHal.h
++++ b/mx6/libcamera/CameraHal.h
+@@ -59,7 +59,7 @@
+ #define TAKE_PIC_QUE_BUF_NUM 6
+ 
+ #define PREVIEW_CAPTURE_BUFFER_NUM 6
+-#define PICTURE_CAPTURE_BUFFER_NUM 3
++#define PICTURE_CAPTURE_BUFFER_NUM 2
+ 
+ #define DEFAULT_PREVIEW_FPS (15)
+ #define DEFAULT_PREVIEW_W   (640)
+@@ -72,8 +72,8 @@
+ #define DEFAULT_PICTURE_H   (480)
+ 
+ #define MAX_VPU_SUPPORT_FORMAT 2
+-
+-namespace android {
++using namespace android;
++//namespace android {
+ 
+     typedef enum{
+         CAMERA_HAL_ERR_NONE = 0,
+@@ -115,6 +115,8 @@ namespace android {
+         virtual void        disableMsgType(int32_t msgType);
+         virtual bool        msgTypeEnabled(int32_t msgType);
+ 
++        status_t freeBufferToIon();
++        status_t allocateBufferFromIon();
+         virtual status_t    startPreview();
+         virtual void        stopPreview();
+         virtual bool        previewEnabled();
+@@ -318,6 +320,7 @@ namespace android {
+         bool mWaitForTakingPicture;
+         bool mTakePictureInProcess;
+ 
++        bool mTakePictureAllocBuffer;
+         CameraParameters    mParameters;
+         void               *mCallbackCookie;
+         camera_notify_callback    mNotifyCb;
+@@ -395,9 +398,11 @@ namespace android {
+ 
+         unsigned int mVpuSupportFmt[MAX_VPU_SUPPORT_FORMAT];
+         CAMERA_TYPE mSensorType;
++        int mIonFd;
++        bool mUseIon;
+     };
+ 
+-}; // namespace android
++//}; // namespace android
+ 
+ #endif
+ 
+diff --git a/mx6/libcamera/CameraModule.cpp b/mx6/libcamera/CameraModule.cpp
+index b884e86..d28a3d3 100755
+--- a/mx6/libcamera/CameraModule.cpp
++++ b/mx6/libcamera/CameraModule.cpp
+@@ -33,7 +33,7 @@
+ 
+ #define MAX_CAMERAS_SUPPORTED 2
+ //static android::CameraProperties gCameraProperties;
+-static android::CameraHal* gCameraHals[MAX_CAMERAS_SUPPORTED];
++static CameraHal* gCameraHals[MAX_CAMERAS_SUPPORTED];
+ static unsigned int gCamerasOpen = 0;
+ static android::Mutex gCameraHalDeviceLock;
+ 
+@@ -503,7 +503,7 @@ int camera_device_open(const hw_module_t* module, const char* name,
+     int cameraid;
+     fsl_camera_device_t* camera_device = NULL;
+     camera_device_ops_t* camera_ops = NULL;
+-    android::CameraHal* camera = NULL;
++    CameraHal* camera = NULL;
+     char *SelectedCameraName;
+     android::sp<android::CaptureDeviceInterface> pCaptureDevice = NULL;
+     android::sp<android::JpegEncoderInterface>pJpegEncoder = NULL;
+@@ -591,7 +591,7 @@ int camera_device_open(const hw_module_t* module, const char* name,
+                 gCameraDevPath[sCameraInfo[cameraid].facing]);
+         pJpegEncoder = android::createJpegEncoder(android::SOFTWARE_JPEG_ENC);
+ 
+-        camera = new android::CameraHal(cameraid);
++        camera = new CameraHal(cameraid);
+ 
+         if(!camera)
+         {
+-- 
+1.8.0
+

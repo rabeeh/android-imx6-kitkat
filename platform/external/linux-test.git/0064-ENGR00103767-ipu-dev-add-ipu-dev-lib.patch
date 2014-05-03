@@ -1,0 +1,361 @@
+From b8fe1a446ec406184216e75cbc4ebc13702f9976 Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Mon, 29 Dec 2008 16:47:09 +0800
+Subject: [PATCH 064/435] ENGR00103767 ipu dev:add ipu dev lib
+
+move ipu dev lib to linux-lib repos and add
+ctrl-c control to ipu device unit test
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ test/mxc_ipudev_test/Makefile      |   4 +-
+ test/mxc_ipudev_test/mxc_ipu_dev.c |  33 +++++-
+ test/mxc_ipudev_test/mxc_ipu_lib.c | 221 -------------------------------------
+ 3 files changed, 31 insertions(+), 227 deletions(-)
+ delete mode 100644 test/mxc_ipudev_test/mxc_ipu_lib.c
+
+diff --git a/test/mxc_ipudev_test/Makefile b/test/mxc_ipudev_test/Makefile
+index aa0c8ba..208243b 100644
+--- a/test/mxc_ipudev_test/Makefile
++++ b/test/mxc_ipudev_test/Makefile
+@@ -1,12 +1,12 @@
+ # list of platforms which want this test case
+ INCLUDE_LIST:=IMX31_3STACK IMX35_3STACK IMX37_3STACK IMX51_3STACK
+ 
+-SRCS = mxc_ipu_dev.c mxc_ipu_lib.c
++SRCS = mxc_ipu_dev.c
+ 
+ ifeq ($(PLATFORM),$(findstring $(PLATFORM),$(INCLUDE_LIST)))
+ OBJS = mxc_ipu_dev.out
+ $(OBJS): $(SRCS)
+-	$(VERBOSE) $(CC) -g $(INC) $(CFLAGS) $^ $(LIBS) -o $@
++	$(VERBOSE) $(CC) -g $(INC) $(CFLAGS) $^ $(LIBS) -lipu -o $@
+ 	mkdir -p $(OBJDIR)
+ 	mv $@ $(OBJDIR)
+ else
+diff --git a/test/mxc_ipudev_test/mxc_ipu_dev.c b/test/mxc_ipudev_test/mxc_ipu_dev.c
+index 6a2f76b..cec720e 100644
+--- a/test/mxc_ipudev_test/mxc_ipu_dev.c
++++ b/test/mxc_ipudev_test/mxc_ipu_dev.c
+@@ -28,6 +28,7 @@
+ #include <stdint.h>
+ #include <malloc.h>
+ #include <string.h>
++#include <signal.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <linux/videodev.h>
+@@ -268,7 +269,7 @@ static int ipu_ic_mem_alloc(ipu_ic_param *i_para, ipu_ic_param *o_para,
+                         goto err;
+                 }
+ 
+-		if (pp_mode | ROT_MODE){
++		if (pp_mode & ROT_MODE){
+ 			owidth = o_para->height;
+ 			oheight = o_para->width;
+ 		} else {
+@@ -603,6 +604,12 @@ static void ipu_ic_task_disable(pp_mode_t pp_mode)
+ 	}
+ }
+ 
++static int ctrl_c_rev = 0;
++void ctrl_c_handler(int signum, siginfo_t *info, void *myact)
++{
++	ctrl_c_rev = 1;
++}
++
+ int ipu_ic_task(int fd_ipu, FILE *file_in, FILE *file_out,
+ 		ipu_ic_param *i_para, ipu_ic_param *o_para, int fcount)
+ {
+@@ -617,6 +624,7 @@ int ipu_ic_task(int fd_ipu, FILE *file_in, FILE *file_out,
+ 	pp_mode_t pp_mode = NULL_MODE;
+ 	ipu_event_info einfo;
+ 	int ret = 0, i, bufcnt = 1;
++	struct sigaction act;
+ 
+ 	pp_mode = ipu_ic_task_check(i_para, o_para);
+ 	if (pp_mode == NULL_MODE){
+@@ -624,6 +632,17 @@ int ipu_ic_task(int fd_ipu, FILE *file_in, FILE *file_out,
+ 		goto done;
+ 	}
+ 
++	/*for ctrl-c*/
++	sigemptyset(&act.sa_mask);
++	act.sa_flags = SA_SIGINFO;
++	act.sa_sigaction = ctrl_c_handler;
++
++	if(sigaction(SIGINT, &act, NULL) < 0)
++	{
++		printf("install sigal error\n");
++		goto done;
++	}
++
+ 	if (file_out == NULL) show_to_fb = 1;
+ 	if (fcount > 1) bufcnt = 2;
+ 	if (ipu_ic_mem_alloc(i_para, o_para, i_minfo, inbuf_start,
+@@ -650,11 +669,11 @@ int ipu_ic_task(int fd_ipu, FILE *file_in, FILE *file_out,
+ 		static int pingpang = 0;
+ 
+ 		/*wait for IPU task finish*/
++		einfo.irq = 0;
+ 		do {
+ 			ipu_get_interrupt_event(&einfo);
+-		} while (einfo.irq != irq);
++		} while ((einfo.irq != irq) && !ctrl_c_rev);
+ 		
+-
+ 		if (!show_to_fb)
+ 			if(fwrite(outbuf_start[pingpang], 1, o_minfo[pingpang].size, file_out) < o_minfo[pingpang].size) {
+ 				ret = -1;
+@@ -673,6 +692,12 @@ int ipu_ic_task(int fd_ipu, FILE *file_in, FILE *file_out,
+ 			ipu_select_buffer(begin_chan, IPU_INPUT_BUFFER, pingpang);
+ 		}
+ 		pingpang = (pingpang == 0) ? 1 : 0;
++
++		if (ctrl_c_rev) {
++			if (einfo.irq == irq)
++				i++;
++			break;
++		}
+ 	}
+ 
+ 	printf("Frame %d done!\n",i);
+@@ -680,7 +705,7 @@ int ipu_ic_task(int fd_ipu, FILE *file_in, FILE *file_out,
+ 	ipu_ic_task_disable(pp_mode);
+ 
+ 	/*make sure buffer1 still at fbmem base*/
+-	if (show_to_fb && (fcount % 2)) {
++	if (show_to_fb && (i % 2)) {
+ 		memcpy(fb_mem, fb_mem + screen_size, screen_size);
+ 		ipu_select_buffer(fb_chan, IPU_INPUT_BUFFER, 1);
+ 	}
+diff --git a/test/mxc_ipudev_test/mxc_ipu_lib.c b/test/mxc_ipudev_test/mxc_ipu_lib.c
+deleted file mode 100644
+index e479387..0000000
+--- a/test/mxc_ipudev_test/mxc_ipu_lib.c
++++ /dev/null
+@@ -1,221 +0,0 @@
+-/*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+- *
+- */
+-
+-/*
+- * The code contained herein is licensed under the GNU Lesser General
+- * Public License.  You may obtain a copy of the GNU Lesser General
+- * Public License Version 2.1 or later at the following locations:
+- *
+- * http://www.opensource.org/licenses/lgpl-license.html
+- * http://www.gnu.org/copyleft/lgpl.html
+- */
+-
+-/*!
+- * @file mxc_ipu_lib.c
+- *
+- * @brief IPU library implementation
+- *
+- * @ingroup IPU
+- */
+-
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <errno.h>
+-#include <stdint.h>
+-#include <fcntl.h>
+-#include <unistd.h>
+-#include <math.h>
+-#include <string.h>
+-#include <malloc.h>
+-#include <sys/time.h>
+-#include <sys/stat.h>
+-#include <sys/mman.h>
+-#include <sys/ioctl.h>
+-#include <sys/types.h>
+-#include <asm/arch/ipu.h>
+-
+-static int fd_ipu = -1;
+-
+-int32_t ipu_init_channel(ipu_channel_t channel, ipu_channel_params_t * params)
+-{
+-	ipu_channel_parm parm;
+-	parm.channel = channel;
+-	if(params != NULL){
+-		parm.params = *params;
+-		parm.flag = 0;
+-	}else{
+-		parm.flag = 1;
+-	}
+-	return ioctl(fd_ipu, IPU_INIT_CHANNEL, &parm);
+-}
+-void ipu_uninit_channel(ipu_channel_t channel)
+-{
+-	ioctl(fd_ipu, IPU_UNINIT_CHANNEL, &channel);
+-}
+-
+-int32_t ipu_init_channel_buffer(ipu_channel_t channel, ipu_buffer_t type,
+-		uint32_t pixel_fmt,
+-		uint16_t width, uint16_t height,
+-		uint32_t stride,
+-		ipu_rotate_mode_t rot_mode,
+-		dma_addr_t phyaddr_0, dma_addr_t phyaddr_1,
+-		uint32_t u_offset, uint32_t v_offset)
+-{
+-	ipu_channel_buf_parm buf_parm;
+-	buf_parm.channel = channel;
+-	buf_parm.type = type;
+-	buf_parm.pixel_fmt = pixel_fmt;
+-	buf_parm.width = width;
+-	buf_parm.height = height;
+-	buf_parm.stride = stride;
+-	buf_parm.rot_mode = rot_mode;
+-	buf_parm.phyaddr_0 = phyaddr_0;
+-	buf_parm.phyaddr_1 = phyaddr_1;
+-	buf_parm.u_offset = u_offset;
+-	buf_parm.v_offset = v_offset;
+-	return ioctl(fd_ipu, IPU_INIT_CHANNEL_BUFFER, &buf_parm);
+-}
+-
+-int32_t ipu_update_channel_buffer(ipu_channel_t channel, ipu_buffer_t type,
+-		uint32_t bufNum, dma_addr_t phyaddr)
+-{
+-	ipu_channel_buf_parm buf_parm;
+-	buf_parm.channel = channel;
+-	buf_parm.type = type;
+-	buf_parm.bufNum = bufNum;
+-	if(bufNum == 0){
+-		buf_parm.phyaddr_0 = phyaddr;
+-		buf_parm.phyaddr_1 = (dma_addr_t)NULL;
+-	}
+-	else{
+-		buf_parm.phyaddr_1 = phyaddr;
+-		buf_parm.phyaddr_0 = (dma_addr_t)NULL;
+-	}
+-	return ioctl(fd_ipu, IPU_UPDATE_CHANNEL_BUFFER, &buf_parm);
+-
+-}
+-
+-int32_t ipu_select_buffer(ipu_channel_t channel,
+-		ipu_buffer_t type, uint32_t bufNum)
+-{
+-	ipu_channel_buf_parm buf_parm;
+-	buf_parm.channel = channel;
+-	buf_parm.type = type;
+-	buf_parm.bufNum = bufNum;
+-	return ioctl(fd_ipu, IPU_SELECT_CHANNEL_BUFFER, &buf_parm);
+-}
+-
+-int32_t ipu_link_channels(ipu_channel_t src_ch, ipu_channel_t dest_ch)
+-{
+-	ipu_channel_link link;
+-	link.src_ch = src_ch;
+-	link.dest_ch = dest_ch;
+-	return ioctl(fd_ipu, IPU_LINK_CHANNELS, &link);
+-}
+-int32_t ipu_unlink_channels(ipu_channel_t src_ch, ipu_channel_t dest_ch)
+-{
+-	ipu_channel_link link;
+-	link.src_ch = src_ch;
+-	link.dest_ch = dest_ch;
+-	return ioctl(fd_ipu, IPU_UNLINK_CHANNELS, &link);
+-}
+-
+-int32_t ipu_enable_channel(ipu_channel_t channel)
+-{
+-	return ioctl(fd_ipu, IPU_ENABLE_CHANNEL, &channel);
+-}
+-int32_t ipu_disable_channel(ipu_channel_t channel, bool wait_for_stop)
+-{
+-	ipu_channel_info c_info;
+-	c_info.channel = channel;
+-	c_info.stop = wait_for_stop;
+-	return ioctl(fd_ipu, IPU_DISABLE_CHANNEL, &c_info);
+-}
+-
+-void ipu_enable_irq(uint32_t irq)
+-{
+-	ioctl(fd_ipu, IPU_ENABLE_IRQ, &irq);
+-}
+-void ipu_disable_irq(uint32_t irq)
+-{
+-	ioctl(fd_ipu, IPU_DISABLE_IRQ, &irq);
+-}
+-void ipu_clear_irq(uint32_t irq)
+-{
+-	ioctl(fd_ipu, IPU_CLEAR_IRQ, &irq);
+-}
+-
+-void ipu_free_irq(uint32_t irq, void *dev_id)
+-{
+-	ipu_irq_info irq_info;
+-	irq_info.irq = irq;
+-	irq_info.dev_id = dev_id;
+-	ioctl(fd_ipu, IPU_FREE_IRQ, &irq_info);
+-}
+-
+-bool ipu_get_irq_status(uint32_t irq)
+-{
+-	return ioctl(fd_ipu, IPU_REQUEST_IRQ_STATUS, &irq);
+-}
+-
+-uint32_t bytes_per_pixel(uint32_t fmt)
+-{
+-	switch (fmt) {
+-		case IPU_PIX_FMT_GENERIC:       /*generic data */
+-		case IPU_PIX_FMT_RGB332:
+-		case IPU_PIX_FMT_YUV420P:
+-		case IPU_PIX_FMT_YUV422P:
+-			return 1;
+-			break;
+-		case IPU_PIX_FMT_RGB565:
+-		case IPU_PIX_FMT_YUYV:
+-		case IPU_PIX_FMT_UYVY:
+-			return 2;
+-			break;
+-		case IPU_PIX_FMT_BGR24:
+-		case IPU_PIX_FMT_RGB24:
+-			return 3;
+-			break;
+-		case IPU_PIX_FMT_GENERIC_32:    /*generic data */
+-		case IPU_PIX_FMT_BGR32:
+-		case IPU_PIX_FMT_RGB32:
+-		case IPU_PIX_FMT_ABGR32:
+-			return 4;
+-			break;
+-		default:
+-			return 1;
+-			break;
+-	}
+-	return 0;
+-}
+-
+-/* Extra IPU-lib functions that are required */
+-
+-int ipu_open()
+-{
+-	fd_ipu = open("/dev/mxc_ipu",O_RDWR);
+-	if(fd_ipu < 0)
+-		printf("Unable to Open IPU device\n");
+-	return fd_ipu;
+-}
+-
+-void ipu_close()
+-{
+-	close(fd_ipu);
+-}
+-
+-int ipu_register_generic_isr(int irq, void *dev)
+-{
+-	ipu_event_info ev; /* Defined in the ipu.h header file */
+-	ev.irq = irq;
+-	ev.dev = dev;
+-	return ioctl(fd_ipu,IPU_REGISTER_GENERIC_ISR,&ev);
+-}
+-
+-int ipu_get_interrupt_event(ipu_event_info *ev)
+-{
+-	return ioctl(fd_ipu,IPU_GET_EVENT,ev);
+-}
+-
+-- 
+1.8.0
+

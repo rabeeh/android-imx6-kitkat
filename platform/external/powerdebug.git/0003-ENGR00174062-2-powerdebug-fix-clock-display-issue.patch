@@ -1,0 +1,224 @@
+From cebc3e08be44a93adc7a13fce6acdbbaae53650a Mon Sep 17 00:00:00 2001
+From: Lin Fuzhen <fuzhen.lin@freescale.com>
+Date: Wed, 13 Jun 2012 18:48:24 +0800
+Subject: [PATCH 3/4] ENGR00174062-2 powerdebug: fix clock display issue
+
+Fix clock rate display issue when clock is not integer, such CPU
+work at 1.2GHz but it print 1GHz;
+Aadd gpio support and etc.
+
+Signed-off-by: Lin Fuzhen <fuzhen.lin@freescale.com>
+---
+ Android.mk   |  2 +-
+ clocks.c     | 33 +++++++++++++++++----------------
+ gpio.c       |  4 ++++
+ powerdebug.c |  3 +--
+ utils.c      | 37 +++++++++++++++++++++++++++++++++++++
+ utils.h      |  2 ++
+ 6 files changed, 62 insertions(+), 19 deletions(-)
+
+diff --git a/Android.mk b/Android.mk
+index e062c1c..36c73cd 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -29,6 +29,6 @@ LOCAL_C_INCLUDES += external/stlport/stlport/ \
+ 
+ LOCAL_SRC_FILES += \
+ 	powerdebug.c sensor.c clocks.c regulator.c \
+-	display.c tree.c utils.c mainloop.c
++	display.c tree.c utils.c mainloop.c gpio.c
+ 
+ include $(BUILD_EXECUTABLE)
+diff --git a/clocks.c b/clocks.c
+index 2611a0d..47dc0aa 100644
+--- a/clocks.c
++++ b/clocks.c
+@@ -38,7 +38,7 @@
+ 
+ struct clock_info {
+ 	int flags;
+-	int rate;
++	float rate;
+ 	int usecount;
+ 	bool expanded;
+ 	char *prefix;
+@@ -63,30 +63,31 @@ static struct clock_info *clock_alloc(void)
+ 	return ci;
+ }
+ 
+-static inline const char *clock_rate(int *rate)
++static inline const char *clock_rate(float *rate)
+ {
+-        int r;
++        float r;
+ 
+         /* GHZ */
+-        r = *rate >> 30;
+-        if (r) {
+-                *rate = r;
++        r = *rate ;
++        if (r >= 1000000000) {
++                *rate = r/1000000000;
+                 return "GHZ";
+         }
+ 
+         /* MHZ */
+-        r = *rate >> 20;
+-        if (r) {
+-                *rate = r;
++	else if (r>=1000000) {
++                *rate = r/1000000;
+                 return "MHZ";
+         }
+ 
+         /* KHZ */
+-        r = *rate >> 10;
+-        if (r) {
+-                *rate = r;
++	else if (r>=1000) {
++                *rate = r/1000;
+                 return "KHZ";
+         }
++	else 
++                *rate = r;
++                return "HZ";
+ 
+         return "";
+ }
+@@ -97,7 +98,7 @@ static int dump_clock_cb(struct tree *t, void *data)
+ 	struct clock_info *pclk;
+ 	const char *unit;
+ 	int ret = 0;
+-	int rate = clk->rate;
++	float rate = clk->rate;
+ 
+ 	if (!t->parent) {
+ 		printf("/\n");
+@@ -115,7 +116,7 @@ static int dump_clock_cb(struct tree *t, void *data)
+ 
+ 	unit = clock_rate(&rate);
+ 
+-	printf("%s%s-- %s (flags:0x%x, usecount:%d, rate: %d %s)\n",
++	printf("%s%s-- %s (flags:0x%x, usecount:%d, rate: %f %s)\n",
+ 	       clk->prefix,  !t->next ? "`" : "", t->name, clk->flags,
+ 	       clk->usecount, rate, unit);
+ 
+@@ -145,7 +146,7 @@ static inline int read_clock_cb(struct tree *t, void *data)
+ 	struct clock_info *clk = t->private;
+ 
+ 	file_read_value(t->path, "flags", "%x", &clk->flags);
+-	file_read_value(t->path, "rate", "%d", &clk->rate);
++	file_read_value(t->path, "rate", "%f", &clk->rate);
+ 	file_read_value(t->path, "usecount", "%d", &clk->usecount);
+ 
+ 	return 0;
+@@ -192,7 +193,7 @@ static int is_collapsed(struct tree *t, void *data)
+ static char *clock_line(struct tree *t)
+ {
+ 	struct clock_info *clk;
+-	int rate;
++	float rate;
+ 	const char *clkunit;
+ 	char *clkrate, *clkname, *clkline = NULL;
+ 
+diff --git a/gpio.c b/gpio.c
+index f7d2a10..86e88e6 100644
+--- a/gpio.c
++++ b/gpio.c
+@@ -86,6 +86,10 @@ static int gpio_filter_cb(const char *name)
+ static inline int read_gpio_cb(struct tree *t, void *data)
+ {
+ 	struct gpio_info *gpio = t->private;
++	int gpio_num;
++	file_read_value(t->path, "base", "%d", &gpio_num);
++	file_write_value("/sys/class/gpio", "export","%d", &gpio_num);
++
+ 
+ 	file_read_value(t->path, "active_low", "%d", &gpio->active_low);
+ 	file_read_value(t->path, "value", "%d", &gpio->value);
+diff --git a/powerdebug.c b/powerdebug.c
+index cc9e871..c1314f4 100644
+--- a/powerdebug.c
++++ b/powerdebug.c
+@@ -36,6 +36,7 @@ void usage(void)
+ 		"[ -v ]\n");
+ 	printf("powerdebug [ -r | -s | -c ]\n");
+ 	printf("  -r, --regulator 	Show regulator information\n");
++	printf("  -g, --gpio 		Show gpio information\n");
+ 	printf("  -s, --sensor		Show sensor information\n");
+ 	printf("  -c, --clock		Show clock information\n");
+ 	printf("  -p, --findparents	Show all parents for a particular"
+@@ -246,12 +247,10 @@ int main(int argc, char **argv)
+ 		printf("failed to initialize sensors\n");
+ 		options->sensors = false;
+ 	}
+-
+ 	if (gpio_init()) {
+ 		printf("failed to initialize gpios\n");
+ 		options->gpios = false;
+ 	}
+-
+ 	ret = options->dump ? powerdebug_dump(options) :
+ 		powerdebug_display(options);
+ 
+diff --git a/utils.c b/utils.c
+index e47c58e..1e000d4 100644
+--- a/utils.c
++++ b/utils.c
+@@ -53,3 +53,40 @@ out_free:
+         free(rpath);
+         return ret;
+ }
++
++
++/*
++ * This functions is a helper to write a specific file content and store
++ * the content inside a variable pointer passed as parameter, the format
++ * parameter gives the variable type to be read from the file.
++ *
++ * @path : directory path containing the file
++ * @name : name of the file to be read
++ * @format : the format of the format
++ * @value : a pointer to a variable to store the content of the file
++ * Returns 0 on success, -1 otherwise
++ */
++int file_write_value(const char *path, const char *name,
++                    const char *format, void *value)
++{
++        FILE *file;
++        char *rpath;
++        int ret;
++
++        ret = asprintf(&rpath, "%s/%s", path, name);
++        if (ret < 0)
++                return ret;
++
++        file = fopen(rpath, "w");
++        if (!file) {
++                ret = -1;
++                goto out_free;
++        }
++
++        ret = fprintf(file, format, value) == EOF ? -1 : 0;
++
++        fclose(file);
++out_free:
++        free(rpath);
++        return ret;
++}
+diff --git a/utils.h b/utils.h
+index d4ac65a..44c2e11 100644
+--- a/utils.h
++++ b/utils.h
+@@ -17,6 +17,8 @@
+ 
+ extern int file_read_value(const char *path, const char *name,
+                            const char *format, void *value);
++extern int file_write_value(const char *path, const char *name,
++                           const char *format, void *value);
+ 
+ 
+ #endif
+-- 
+1.8.0
+

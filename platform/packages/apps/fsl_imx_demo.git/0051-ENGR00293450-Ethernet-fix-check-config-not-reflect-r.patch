@@ -1,0 +1,269 @@
+From a2c506dc4900478e3fc431bfc4d56a30615d1515 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Tue, 31 Dec 2013 16:23:50 +0800
+Subject: [PATCH 51/52] ENGR00293450 Ethernet:fix check config not reflect
+ real config issue
+
+Due to introduce sharedpreference to save config, so it strongly
+depend on this file. In dhcp case we also need to update link propertity
+in this config.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ .../com/fsl/ethernet/EthernetConfigDialog.java     | 25 ++++------
+ Ethernet/com/fsl/ethernet/EthernetEnabler.java     |  4 +-
+ Ethernet/com/fsl/ethernet/EthernetManager.java     | 55 +++++++++++++++++-----
+ Ethernet/com/fsl/ethernet/MainActivity.java        | 14 +-----
+ 4 files changed, 55 insertions(+), 43 deletions(-)
+
+diff --git a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+index 73859e1..b543380 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
++++ b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -89,8 +89,6 @@ public class EthernetConfigDialog extends AlertDialog implements
+                 mDns.setEnabled(true);
+                 mIpaddr.setText(mEthEnabler.getManager().getSharedPreIpAddress(),TextView.BufferType.EDITABLE);
+                 mDns.setText(mEthEnabler.getManager().getSharedPreDnsAddress(),TextView.BufferType.EDITABLE);
+-                mEthEnabler.getManager().updateDevInfo(info);
+-                mEthEnabler.setEthEnabled();
+             }
+         } else {
+             mEthEnabler.getManager().setMode(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
+@@ -140,15 +138,7 @@ public class EthernetConfigDialog extends AlertDialog implements
+         info.setIfName(mDevList.getSelectedItem().toString());
+         if (localLOGV)
+             Log.d(TAG, "Config device for " + mDevList.getSelectedItem().toString());
+-        if (mConTypeDhcp.isChecked()) {
+-            info.setConnectMode(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
+-            info.setIpAddress(null);
+-            info.setDnsAddr(null);
+-            mEthEnabler.getManager().sharedPreferencesStore(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP, null, null);
+-            mEthEnabler.getManager().updateDevInfo(info);
+-            mEthEnabler.setEthEnabled();
+-
+-        } else {
++        if (mConTypeManual.isChecked()) {
+             if ((mIpaddr.getText().toString().equals(""))||(mDns.getText().toString().equals("")))
+             {
+                 Toast.makeText(this.getContext(), R.string.show_need_setting,Toast.LENGTH_SHORT).show();
+@@ -156,13 +146,14 @@ public class EthernetConfigDialog extends AlertDialog implements
+                 info.setConnectMode(EthernetDevInfo.ETHERNET_CONN_MODE_MANUAL);
+                 info.setIpAddress(mIpaddr.getText().toString());
+                 info.setDnsAddr(mDns.getText().toString());
+-                mEthEnabler.getManager().sharedPreferencesStore(EthernetDevInfo.ETHERNET_CONN_MODE_MANUAL,
+-                    mIpaddr.getText().toString(), mDns.getText().toString());
+-                mEthEnabler.getManager().updateDevInfo(info);
+-                mEthEnabler.setEthEnabled();
+-
+             }
++        } else {
++            info.setConnectMode(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
++            info.setIpAddress(null);
++            info.setDnsAddr(null);
+         }
++        mEthEnabler.getManager().updateDevInfo(info);
++        mEthEnabler.setEthEnabled();
+     }
+ 
+     public void onClick(DialogInterface dialog, int which) {
+diff --git a/Ethernet/com/fsl/ethernet/EthernetEnabler.java b/Ethernet/com/fsl/ethernet/EthernetEnabler.java
+index ae85755..79c6d77 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetEnabler.java
++++ b/Ethernet/com/fsl/ethernet/EthernetEnabler.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -37,6 +37,8 @@ public class EthernetEnabler {
+     public EthernetEnabler(Context context) {
+         mContext = context;
+         mEthManager = new EthernetManager(context);
++
++        mEthManager.resetInterface();
+     }
+ 
+     public EthernetManager getManager() {
+diff --git a/Ethernet/com/fsl/ethernet/EthernetManager.java b/Ethernet/com/fsl/ethernet/EthernetManager.java
+index 6af226f..27d213f 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetManager.java
++++ b/Ethernet/com/fsl/ethernet/EthernetManager.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -18,6 +18,7 @@ package com.fsl.ethernet;
+ import java.net.InetAddress;
+ import java.net.UnknownHostException;
+ import java.util.List;
++import java.util.Iterator;
+ import android.annotation.SdkConstant;
+ import android.annotation.SdkConstant.SdkConstantType;
+ import android.os.Handler;
+@@ -30,6 +31,7 @@ import android.os.ServiceManager;
+ import android.os.IBinder;
+ import android.content.ContentResolver;
+ import android.os.INetworkManagementService;
++import android.net.ConnectivityManager;
+ import android.net.DhcpInfo;
+ import android.net.NetworkUtils;
+ import android.net.LinkAddress;
+@@ -100,6 +102,7 @@ public class EthernetManager {
+     private String mode;
+     private String ip_address;
+     private String dns_address;
++    private ConnectivityManager mConnMgr;
+ 
+     public EthernetManager(Context context) {
+         mContext = context;
+@@ -109,7 +112,7 @@ public class EthernetManager {
+ 
+         DevName[0] = "eth0";//mTracker.getLinkProperties().getInterfaceName();
+ 
+-
++        mConnMgr = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+         IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
+         mNMService = INetworkManagementService.Stub.asInterface(b);
+         HandlerThread dhcpThread = new HandlerThread("DHCP Handler Thread");
+@@ -123,7 +126,7 @@ public class EthernetManager {
+      */
+     public boolean isConfigured() {
+         //return "1".equals(SystemProperties.get("net."+ DevName[0] + ".config", "0"));
+-        return (getSharedPreMode().equals("manual"))||(getSharedPreMode().equals("dhcp"));
++        return (getSharedPreMode() != null);
+     }
+ 
+     /**
+@@ -133,14 +136,14 @@ public class EthernetManager {
+     public synchronized EthernetDevInfo getSavedConfig() {
+         if (!isConfigured())
+             return null;
+-
+         EthernetDevInfo info = new EthernetDevInfo();
+-        info.setConnectMode(SystemProperties.get("net."+ DevName[0] + ".mode", ""));
+-        info.setIpAddress(SystemProperties.get("net."+ DevName[0] + ".ip", ""));
+-        info.setDnsAddr(SystemProperties.get("net."+ DevName[0] + ".dns1", ""));
+-        //info.setNetMask(Settings.Secure.getString(cr, Settings.Secure.ETHERNET_MASK));
+-        //info.setRouteAddr(Settings.Secure.getString(cr, Settings.Secure.ETHERNET_ROUTE));
++        info.setConnectMode(getSharedPreMode());
+         info.setIfName(DevName[0]);
++        if (info.getConnectMode().equals(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP)) {
++            updateDevInfo(getDhcpInfo());
++        }
++        info.setIpAddress(getSharedPreIpAddress());
++        info.setDnsAddr(getSharedPreDnsAddress());
+         return info;
+     }
+ 
+@@ -214,8 +217,29 @@ public class EthernetManager {
+             SystemProperties.set("net.dns1", info.getDnsAddr());
+             SystemProperties.set("net." + info.getIfName() + ".dns1",info.getDnsAddr());
+             SystemProperties.set("net." + info.getIfName() + ".dns2", "0.0.0.0");
++            updateDevInfo(info);
+         }
+     }
++    public EthernetDevInfo getDhcpInfo() {
++        EthernetDevInfo infotemp = new EthernetDevInfo();
++        infotemp.setIfName(mTracker.getLinkProperties().getInterfaceName());
++        infotemp.setConnectMode(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
++        String ip;
++        ip = mConnMgr.getLinkProperties(ConnectivityManager.TYPE_ETHERNET).getAddresses().toString();
++        Log.d(TAG, "===========IP=" + ip.substring(2, ip.length()-1));
++        infotemp.setIpAddress(ip.substring(2, ip.length()-1));
++        String dns = " ";
++        int i = 0;
++        for( InetAddress d : mConnMgr.getLinkProperties(ConnectivityManager.TYPE_ETHERNET).getDnses()) {
++            String temp = d.toString();
++            if (temp != null)
++                dns = temp.substring(1, temp.length()-1);
++            break;
++        }
++        infotemp.setDnsAddr(dns);// now only use dns1, need optimization later here.
++        return infotemp;
++    }
++
+     /**
+      * reset ethernet interface
+      * @return true
+@@ -237,7 +261,11 @@ public class EthernetManager {
+                 Log.d(TAG, "Could not stop DHCP");
+             }
+             configureInterface(info);
++        } else {
++            //First boot using AOSP dhcp
++            updateDevInfo(getDhcpInfo());
+         }
++
+     }
+ 
+     /**
+@@ -245,6 +273,7 @@ public class EthernetManager {
+      * @param info  the interface infomation
+      */
+     public synchronized void updateDevInfo(EthernetDevInfo info) {
++        sharedPreferencesStore(info);
+         SystemProperties.set("net.dns1", info.getDnsAddr());
+         SystemProperties.set("net." + info.getIfName() + ".dns1",info.getDnsAddr());
+         SystemProperties.set("net." + info.getIfName() + ".dns2", "0.0.0.0");
+@@ -259,12 +288,12 @@ public class EthernetManager {
+         return sp;
+     }
+ 
+-    public void sharedPreferencesStore(String mode,String ipAddress,String dnsAddress){
++    public void sharedPreferencesStore(EthernetDevInfo info){
+         Editor editor = sharedPreferences().edit();
+         try {
+-            editor.putString("conn_mode",mode);
+-            editor.putString("mIpaddr",ipAddress);
+-            editor.putString("mDns",dnsAddress);
++            editor.putString("conn_mode",info.getConnectMode());
++            editor.putString("mIpaddr",info.getIpAddress());
++            editor.putString("mDns",info.getDnsAddr());
+             } catch (NumberFormatException e) {
+                 e.printStackTrace();
+             }
+diff --git a/Ethernet/com/fsl/ethernet/MainActivity.java b/Ethernet/com/fsl/ethernet/MainActivity.java
+index ec7888a..c6ee937 100644
+--- a/Ethernet/com/fsl/ethernet/MainActivity.java
++++ b/Ethernet/com/fsl/ethernet/MainActivity.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -49,17 +49,7 @@ public class MainActivity extends Activity {
+         setContentView(R.layout.ethernet_configure);
+         SharedPreferences sp = getSharedPreferences("ethernet",
+                 Context.MODE_WORLD_WRITEABLE);
+-        first_run = sp.getBoolean(FIRST_RUN, false);
+-        if (!first_run){
+-        Editor editor = sp.edit();
+-        try {
+-            editor.putBoolean(FIRST_RUN, true);
+-            editor.putString("conn_mode",EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
+-            } catch (NumberFormatException e) {
+-                e.printStackTrace();
+-            }
+-            editor.commit();
+-        }
++
+         mEthEnabler = new EthernetEnabler(this);
+         mEthConfigDialog = new EthernetConfigDialog(this, mEthEnabler);
+         mEthEnabler.setConfigDialog(mEthConfigDialog);
+-- 
+1.8.0
+

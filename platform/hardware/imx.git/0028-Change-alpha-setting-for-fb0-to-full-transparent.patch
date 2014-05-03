@@ -1,0 +1,358 @@
+From 7223ce40413960b5bf4f73fd74883435313da569 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Fri, 26 Mar 2010 14:22:34 -0400
+Subject: [PATCH 028/486] Change alpha setting for fb0 to full transparent.
+ Change overlay test app to take use of a background
+ surface Signed-off-by: guoyin.chen
+ <guoyin.chen@freescale.com>
+
+---
+ liboverlay/overlay.cpp       |   2 +-
+ liboverlay/overlays_test.cpp | 219 ++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 208 insertions(+), 13 deletions(-)
+
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+index 7e531f2..0792990 100755
+--- a/liboverlay/overlay.cpp
++++ b/liboverlay/overlay.cpp
+@@ -611,7 +611,7 @@ static int overlay_init_fbdev(struct overlay_control_context_t *dev)
+     struct fb_var_screeninfo fb_var;
+     struct mxcfb_gbl_alpha gbl_alpha;
+ 
+-    gbl_alpha.alpha = 128;
++    gbl_alpha.alpha = 255;
+     gbl_alpha.enable = 1;
+     ret = ioctl(dev->fb_dev, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
+     if(ret <0)
+diff --git a/liboverlay/overlays_test.cpp b/liboverlay/overlays_test.cpp
+index eee451e..bdca120 100755
+--- a/liboverlay/overlays_test.cpp
++++ b/liboverlay/overlays_test.cpp
+@@ -3,6 +3,7 @@
+ #include <binder/IServiceManager.h>
+ #include <utils/Log.h>
+ 
++#include <ui/DisplayInfo.h>
+ #include <ui/Surface.h>
+ #include <ui/ISurface.h>
+ #include <ui/Overlay.h>
+@@ -35,7 +36,9 @@
+ #define u(rgb) ((((blue(rgb)*500L) - (red(rgb)*169L) - (green(rgb)*332L)) / 1000))
+ #define v(rgb) (((red(rgb)*500L - green(rgb)*419L - blue(rgb)*81L) / 1000))
+ 
+-
++#define red_rgb565 (0b11111000000000000)
++#define green_rgb565 (0b00000111111000000)
++#define blue_rgb565 (0b00000000000011111)
+ 
+ void gen_fill_pattern(char * buf, int in_width, int in_height,int h_step, int w_step)
+ {
+@@ -137,9 +140,13 @@ int main(int argc, char** argv)
+     OVERLAY_PARAM overlay_param1;
+     unsigned int panel_x,panel_y;
+     void *ret;
++    sp<SurfaceControl>			backgroundControl;
++    sp<Surface> 				background;
++    sp<SurfaceComposerClient> session;
+     memset(&overlay_param0, 0 ,sizeof(OVERLAY_PARAM));
+     memset(&overlay_param1, 0 ,sizeof(OVERLAY_PARAM));
+  
++    #if 0
+     if ((fd_fb = open("/dev/graphics/fb1", O_RDWR, 0)) < 0) {
+        LOGI("Error!Unable to open /dev/fb1\n");
+        return 0;
+@@ -149,9 +156,34 @@ int main(int argc, char** argv)
+         close(fd_fb);
+         return 0;
+     }
+-
+     panel_x = fb_var.xres;
+     panel_y = fb_var.yres;
++    #endif
++
++    DisplayInfo dinfo;
++    session = new SurfaceComposerClient();
++    status_t status = session->getDisplayInfo(0, &dinfo);
++    if (status)
++        return -1;
++
++	panel_x=dinfo.w;
++	panel_y=dinfo.h;
++
++
++    backgroundControl = session->createSurface(getpid(), 0, panel_x, panel_y, PIXEL_FORMAT_RGB_565);
++	// set front surface to top
++    session->openTransaction();
++    backgroundControl->setLayer(0x40000000);
++    session->closeTransaction();
++	//get the rendering surface
++    background = backgroundControl->getSurface();
++	Surface::SurfaceInfo		sinfo_background;
++
++	background->lock(&sinfo_background);
++    //Draw to white
++	memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++	background->unlockAndPost();
++
+ 
+     overlay_param0.w = 720;
+     overlay_param0.h = 576;
+@@ -160,7 +192,7 @@ int main(int argc, char** argv)
+     overlay_param0.crop_y = 0;
+     overlay_param0.crop_w = 720;
+     overlay_param0.crop_h = 576;
+-    overlay_param0.layer = 5;
++    overlay_param0.layer = 0x40000000;
+     overlay_param0.pos_x = 0;
+     overlay_param0.pos_y = 0;
+     overlay_param0.win_w = panel_x;
+@@ -175,11 +207,11 @@ int main(int argc, char** argv)
+     overlay_param1.crop_y = 0;
+     overlay_param1.crop_w = 320;
+     overlay_param1.crop_h = 240;
+-    overlay_param1.layer = 6;
++    overlay_param1.layer = 0x40000001;
+     overlay_param1.pos_x = panel_x/4;
+     overlay_param1.pos_y = panel_y/4;
+-    overlay_param1.win_w = panel_x/4;
+-    overlay_param1.win_h = panel_y/4;
++    overlay_param1.win_w = (panel_x/4+8)/8*8;
++    overlay_param1.win_h = (panel_y/4+8)/8*8;
+     overlay_param1.show_num = 200;
+     overlay_param1.step_line = 8;
+     //pthread_attr_t attr0,attr1;
+@@ -189,12 +221,33 @@ int main(int argc, char** argv)
+     LOGI("*******start main thread*******");
+     if(argc == 1) {
+         LOGI("****Run two overlay instances 720/576 & 320/240 test*****");
+-        //pthread_attr_init(&attr0);
+-        //pthread_attr_setdetachstate(&attr0, PTHREAD_CREATE_DETACHED);
++        LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++        LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++             overlay_param0.w,overlay_param0.h,
++             overlay_param0.pos_x,overlay_param0.pos_y,
++             overlay_param0.win_w,overlay_param0.win_h);
++        LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++             overlay_param1.w,overlay_param1.h,
++             overlay_param1.pos_x,overlay_param1.pos_y,
++             overlay_param1.win_w,overlay_param1.win_h);
++
++        //draw the background to black
++        LOGI("Draw background to black");
++        background->lock(&sinfo_background);
++        memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++        char *prgb565 = (char *)sinfo_background.bits+(overlay_param0.pos_y*sinfo_background.w+overlay_param0.pos_x)*2;
++        for(int height = overlay_param0.pos_y; height < (overlay_param0.pos_y+overlay_param0.win_h); height++) {
++            memset(prgb565, 0, overlay_param0.win_w*2);
++            prgb565 += (sinfo_background.w*2);
++        }
++        prgb565 = (char *)sinfo_background.bits+(overlay_param1.pos_y*sinfo_background.w+overlay_param1.pos_x)*2;
++        for(int height = overlay_param1.pos_y; height < (overlay_param1.pos_y+overlay_param1.win_h); height++) {
++            memset(prgb565, 0, overlay_param1.win_w*2);
++            prgb565 += (sinfo_background.w*2);
++        }
++    	background->unlockAndPost();
++        LOGI("Overlay running");
+         pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
+-    
+-        //pthread_attr_init(&attr1);
+-        //pthread_attr_setdetachstate(&attr1, PTHREAD_CREATE_DETACHED);
+         pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
+     
+     
+@@ -209,6 +262,24 @@ int main(int argc, char** argv)
+             if(argc==3) {
+                 overlay_param0.show_num = atoi(argv[2]);
+             }
++
++            LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param0.w,overlay_param0.h,
++                 overlay_param0.pos_x,overlay_param0.pos_y,
++                 overlay_param0.win_w,overlay_param0.win_h);
++
++            //draw the background to black
++            LOGI("Draw background to black");
++            background->lock(&sinfo_background);
++            memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++            char *prgb565 = (char *)sinfo_background.bits+(overlay_param0.pos_y*sinfo_background.w+overlay_param0.pos_x)*2;
++            for(int height = overlay_param0.pos_y; height < (overlay_param0.pos_y+overlay_param0.win_h); height++) {
++                memset(prgb565, 0, overlay_param0.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++        	background->unlockAndPost();
++            LOGI("Overlay running");
+             pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
+             pthread_join(thread0, &ret);
+         }
+@@ -219,6 +290,24 @@ int main(int argc, char** argv)
+             if(argc==3) {
+                 overlay_param1.show_num = atoi(argv[2]);
+             }
++
++            LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param1.w,overlay_param1.h,
++                 overlay_param1.pos_x,overlay_param1.pos_y,
++                 overlay_param1.win_w,overlay_param1.win_h);
++
++            //draw the background to black
++            LOGI("Draw background to black");
++            background->lock(&sinfo_background);
++            memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++            char *prgb565 = (char *)sinfo_background.bits+(overlay_param1.pos_y*sinfo_background.w+overlay_param1.pos_x)*2;
++            for(int height = overlay_param1.pos_y; height < (overlay_param1.pos_y+overlay_param1.win_h); height++) {
++                memset(prgb565, 0, overlay_param1.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++        	background->unlockAndPost();
++            LOGI("Overlay running");
+             pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
+             pthread_join(thread1, &ret);
+         }
+@@ -230,6 +319,46 @@ int main(int argc, char** argv)
+                 overlay_param0.show_num = atoi(argv[2]);
+                 overlay_param1.show_num = atoi(argv[2]);
+             }
++
++            overlay_param0.pos_x = 0;
++            overlay_param0.pos_y = panel_y/2;
++            overlay_param0.win_w = panel_x;
++            overlay_param0.win_h = (panel_y/2)/8*8;
++        
++            overlay_param1.pos_x = 0;
++            overlay_param1.pos_y = 0;
++            overlay_param1.win_w = (panel_x/4+8)/8*8;
++            overlay_param1.win_h = (panel_y/4+8)/8*8;
++
++
++            LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param0.w,overlay_param0.h,
++                 overlay_param0.pos_x,overlay_param0.pos_y,
++                 overlay_param0.win_w,overlay_param0.win_h);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param1.w,overlay_param1.h,
++                 overlay_param1.pos_x,overlay_param1.pos_y,
++                 overlay_param1.win_w,overlay_param1.win_h);
++
++
++            //draw the background to black
++            LOGI("Draw background to black");
++            background->lock(&sinfo_background);
++            memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++            char *prgb565 = (char *)sinfo_background.bits+(overlay_param0.pos_y*sinfo_background.w+overlay_param0.pos_x)*2;
++            for(int height = overlay_param0.pos_y; height < (overlay_param0.pos_y+overlay_param0.win_h); height++) {
++                memset(prgb565, 0, overlay_param0.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++            prgb565 = (char *)sinfo_background.bits+(overlay_param1.pos_y*sinfo_background.w+overlay_param1.pos_x)*2;
++            for(int height = overlay_param1.pos_y; height < (overlay_param1.pos_y+overlay_param1.win_h); height++) {
++                memset(prgb565, 0, overlay_param1.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++        	background->unlockAndPost();
++
++            LOGI("Overlay running");
+             pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
+             pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
+         
+@@ -245,6 +374,34 @@ int main(int argc, char** argv)
+             overlay_param0.performance_test = 1;
+             overlay_param1.performance_test = 1;
+             performance_run = 1;
++
++            LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param0.w,overlay_param0.h,
++                 overlay_param0.pos_x,overlay_param0.pos_y,
++                 overlay_param0.win_w,overlay_param0.win_h);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param1.w,overlay_param1.h,
++                 overlay_param1.pos_x,overlay_param1.pos_y,
++                 overlay_param1.win_w,overlay_param1.win_h);
++
++            //draw the background to black
++            LOGI("Draw background to black");
++            background->lock(&sinfo_background);
++            memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++            char *prgb565 = (char *)sinfo_background.bits+(overlay_param0.pos_y*sinfo_background.w+overlay_param0.pos_x)*2;
++            for(int height = overlay_param0.pos_y; height < (overlay_param0.pos_y+overlay_param0.win_h); height++) {
++                memset(prgb565, 0, overlay_param0.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++            prgb565 = (char *)sinfo_background.bits+(overlay_param1.pos_y*sinfo_background.w+overlay_param1.pos_x)*2;
++            for(int height = overlay_param1.pos_y; height < (overlay_param1.pos_y+overlay_param1.win_h); height++) {
++                memset(prgb565, 0, overlay_param1.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++        	background->unlockAndPost();
++
++            LOGI("Overlay running");
+             pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
+             pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
+         
+@@ -259,6 +416,26 @@ int main(int argc, char** argv)
+             overlay_param0.performance_test = 1;
+ 
+             performance_run = 1;
++
++            LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param0.w,overlay_param0.h,
++                 overlay_param0.pos_x,overlay_param0.pos_y,
++                 overlay_param0.win_w,overlay_param0.win_h);
++
++
++            //draw the background to black
++            LOGI("Draw background to black");
++            background->lock(&sinfo_background);
++            memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++            char *prgb565 = (char *)sinfo_background.bits+(overlay_param0.pos_y*sinfo_background.w+overlay_param0.pos_x)*2;
++            for(int height = overlay_param0.pos_y; height < (overlay_param0.pos_y+overlay_param0.win_h); height++) {
++                memset(prgb565, 0, overlay_param0.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++        	background->unlockAndPost();
++
++            LOGI("Overlay running");
+             pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
+             pthread_join(thread0, &ret);
+         }
+@@ -269,6 +446,24 @@ int main(int argc, char** argv)
+             }
+             overlay_param1.performance_test = 1;
+             performance_run = 1;
++
++            LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param1.w,overlay_param1.h,
++                 overlay_param1.pos_x,overlay_param1.pos_y,
++                 overlay_param1.win_w,overlay_param1.win_h);
++
++            //draw the background to black
++            LOGI("Draw background to black");
++            background->lock(&sinfo_background);
++            memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++            char *prgb565 = (char *)sinfo_background.bits+(overlay_param1.pos_y*sinfo_background.w+overlay_param1.pos_x)*2;
++            for(int height = overlay_param1.pos_y; height < (overlay_param1.pos_y+overlay_param1.win_h); height++) {
++                memset(prgb565, 0, overlay_param1.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++        	background->unlockAndPost();
++            LOGI("Overlay running");
+             pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
+             pthread_join(thread1, &ret);
+         }
+@@ -320,7 +515,7 @@ void *overlay_instance_test(void *arg)
+     sp<SurfaceControl> surface = client->createSurface(getpid(), 0, overlay_param->win_w, overlay_param->win_h, 
+             PIXEL_FORMAT_UNKNOWN, ISurfaceComposer::ePushBuffers);
+     client->openTransaction();
+-    LOGI("Set layer %d, posx %d, posy %d",
++    LOGI("Set layer 0x%x, posx %d, posy %d",
+          overlay_param->layer,overlay_param->pos_x,overlay_param->pos_y);
+     surface->setLayer(overlay_param->layer);
+     surface->setPosition(overlay_param->pos_x, overlay_param->pos_y);
+-- 
+1.8.0
+

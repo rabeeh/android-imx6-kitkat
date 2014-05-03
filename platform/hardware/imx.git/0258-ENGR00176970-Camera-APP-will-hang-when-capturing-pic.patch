@@ -1,0 +1,75 @@
+From 5d165112b2f3a5b933054cb81826626196af873a Mon Sep 17 00:00:00 2001
+From: YangYonggang <b31664@freescale.com>
+Date: Thu, 29 Mar 2012 15:55:38 +0800
+Subject: [PATCH 258/486] ENGR00176970 Camera APP will hang when capturing
+ pics with MIPI camera.
+
+The root cause was, when taking picture multi-times, mipi camera dequeued
+timeout and returned error. In this condition, the camera callback function
+would not called and made the Camera hang.
+Made the camera HAL call the callback function even when error happened.
+
+Signed-off-by: YangYonggang <b31664@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp | 18 ++++++------------
+ 1 file changed, 6 insertions(+), 12 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 197eba2..5651b9e 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -1089,8 +1089,6 @@ namespace android {
+         unsigned int DeQueBufIdx = 0;
+         struct jpeg_encoding_conf JpegEncConf;
+         DMA_BUFFER *Buf_input, Buf_output;
+-        //sp<MemoryBase> JpegMemBase = NULL;
+-        //sp<MemoryHeapBase> JpegImageHeap = NULL;
+         camera_memory_t* JpegMemBase = NULL;
+         int  max_fps, min_fps;
+ 
+@@ -1141,6 +1139,12 @@ namespace android {
+         if ((ret = PrepareJpegEncoder()) < 0)
+             return ret;
+ 
++        JpegMemBase = mRequestMemory(-1, mCaptureFrameSize, 1, NULL);
++        if (JpegMemBase == NULL || JpegMemBase->data == NULL){
++            ret = NO_MEMORY;
++            goto Pic_out;
++        }
++
+         if (mCaptureDevice->DevStart()<0){
+             CAMERA_HAL_ERR("the capture start up failed !!!!");
+             return INVALID_OPERATION;
+@@ -1162,12 +1166,6 @@ namespace android {
+             }
+         }
+ 
+-        JpegMemBase = mRequestMemory(-1, mCaptureFrameSize, 1, NULL);
+-        if (JpegMemBase == NULL || JpegMemBase->data == NULL){
+-            ret = NO_MEMORY;
+-            goto Pic_out;
+-        }
+-
+         // do the csc if necessary
+         if (mPPDeviceNeedForPic){
+             mPPInputParam.user_def_paddr = mCaptureBuffers[DeQueBufIdx].phy_offset;
+@@ -1195,16 +1193,12 @@ namespace android {
+ 
+ Pic_out:
+         freeBuffersToNativeWindow();
+-        //JpegMemBase = new MemoryBase(JpegImageHeap, 0, JpegEncConf.output_jpeg_size);
+         if ((JpegMemBase != NULL) &&(JpegMemBase->data != NULL) && (mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE)) {
+             CAMERA_HAL_LOG_INFO("==========CAMERA_MSG_COMPRESSED_IMAGE==================");
+             mDataCb(CAMERA_MSG_COMPRESSED_IMAGE, JpegMemBase, 0, NULL, mCallbackCookie);
+         }
+ 
+         mCaptureDevice->DevStop();
+-        //mCaptureDevice->DevDeAllocate();
+-        //freeBuffersToNativeWindow();
+-        //CloseCaptureDevice();
+ 
+         if(JpegMemBase) {
+             JpegMemBase->release(JpegMemBase);
+-- 
+1.8.0
+

@@ -1,0 +1,254 @@
+From 7f52c39b36fa6310d3352020fa631279e081141a Mon Sep 17 00:00:00 2001
+From: Robby Cai <R63905@freescale.com>
+Date: Wed, 3 Jul 2013 18:35:19 +0800
+Subject: [PATCH 401/435] ENGR00261293 csi/v4l2: Add resize/flip/rotation
+ support
+
+Add resize/flip/rotation support
+
+Signed-off-by: Robby Cai <R63905@freescale.com>
+---
+ test/mxc_v4l2_test/csi_v4l2_capture.c | 144 +++++++++++++++++++++++++++++-----
+ 1 file changed, 124 insertions(+), 20 deletions(-)
+
+diff --git a/test/mxc_v4l2_test/csi_v4l2_capture.c b/test/mxc_v4l2_test/csi_v4l2_capture.c
+index fe4a059..c586ae7 100644
+--- a/test/mxc_v4l2_test/csi_v4l2_capture.c
++++ b/test/mxc_v4l2_test/csi_v4l2_capture.c
+@@ -68,12 +68,17 @@ struct testbuffer buffers[TEST_BUFFER_NUM];
+ #ifdef	GET_CONTI_PHY_MEM_VIA_PXP_LIB
+ struct pxp_mem_desc mem[TEST_BUFFER_NUM];
+ #endif
+-int g_width = 640;
+-int g_height = 480;
++int g_in_width = 640;
++int g_in_height = 480;
++int g_out_width = 640;
++int g_out_height = 480;
+ int g_cap_fmt = V4L2_PIX_FMT_RGB565;
+ int g_capture_mode = 0;
+ int g_timeout = 10;
+ int g_camera_framerate = 30;	/* 30 fps */
++int g_hflip = 0;
++int g_vflip = 0;
++int g_rotation = 0;
+ int g_mem_type = V4L2_MEMORY_MMAP;
+ int g_frame_size;
+ 
+@@ -207,6 +212,8 @@ int v4l_capture_setup(void)
+ 	struct v4l2_streamparm parm;
+ 	struct v4l2_fmtdesc fmtdesc;
+ 	struct v4l2_frmivalenum frmival;
++	struct v4l2_crop crop;
++	struct v4l2_control vc;
+ 	int fd_v4l = 0;
+ 
+ 	if ((fd_v4l = find_video_device()) < 0)
+@@ -221,8 +228,8 @@ int v4l_capture_setup(void)
+ 				fmtdesc.pixelformat);
+ 		frmival.index = 0;
+ 		frmival.pixel_format = fmtdesc.pixelformat;
+-		frmival.width = g_width;
+-		frmival.height = g_height;
++		frmival.width = g_in_width;
++		frmival.height = g_in_height;
+ 		while (ioctl(fd_v4l, VIDIOC_ENUM_FRAMEINTERVALS, &frmival) >= 0)
+ 		{
+ 			printf("%.3f fps\n", 1.0 * frmival.discrete.denominator
+@@ -246,8 +253,8 @@ int v4l_capture_setup(void)
+         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	fmt.fmt.pix.pixelformat = g_cap_fmt;
+ 	print_pixelformat("pixelformat (output by v4l)", fmt.fmt.pix.pixelformat);
+-        fmt.fmt.pix.width = g_width;
+-        fmt.fmt.pix.height = g_height;
++        fmt.fmt.pix.width = g_in_width;
++        fmt.fmt.pix.height = g_in_height;
+         if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
+         {
+                 printf("set format failed\n");
+@@ -265,6 +272,63 @@ int v4l_capture_setup(void)
+ 	}
+ 	g_frame_size = fmt.fmt.pix.sizeimage;
+ 
++	memset(&fmt, 0, sizeof(fmt));
++	fmt.type = V4L2_BUF_TYPE_VIDEO_OVERLAY;
++	fmt.fmt.win.w.left = 0;
++	fmt.fmt.win.w.top = 0;
++	fmt.fmt.win.w.width = g_out_width;
++	fmt.fmt.win.w.height = g_out_height;
++	if (ioctl(fd_v4l, VIDIOC_S_FMT, &fmt) < 0)
++	{
++		printf("set format failed\n");
++		return 0;
++	}
++
++	memset(&crop, 0, sizeof(crop));
++	crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	crop.c.top = 0;
++	crop.c.left = 0;
++	crop.c.width = g_in_width;
++	crop.c.height = g_in_height;
++	if (ioctl(fd_v4l, VIDIOC_S_CROP, &crop) < 0) {
++		printf("set crop failed.\n");
++		return -1;
++	}
++	memset(&crop, 0, sizeof(crop));
++	crop.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	if (ioctl(fd_v4l, VIDIOC_G_CROP, &crop) < 0) {
++		printf("get crop failed.\n");
++		return -1;
++	} else
++		printf("crop.c.l/t/w/h = %d/%d/%d/%d\n", crop.c.left,
++			crop.c.top, crop.c.width, crop.c.height);
++
++	if (g_hflip)
++		vc.value = 1;
++	else
++		vc.value = 0;
++	vc.id = V4L2_CID_HFLIP;
++	if (ioctl(fd_v4l, VIDIOC_S_CTRL, &vc) < 0) {
++		printf("s_ctrl failed.\n");
++		return -1;
++	}
++	if (g_vflip)
++		vc.value = 1;
++	else
++		vc.value = 0;
++	vc.id = V4L2_CID_VFLIP;
++	if (ioctl(fd_v4l, VIDIOC_S_CTRL, &vc) < 0) {
++		printf("s_ctrl failed.\n");
++		return -1;
++	}
++
++	vc.id = V4L2_CID_PRIVATE_BASE;
++	vc.value = g_rotation;
++	if (ioctl(fd_v4l, VIDIOC_S_CTRL, &vc) < 0) {
++		printf("s_ctrl failed.\n");
++		return -1;
++	}
++
+         struct v4l2_requestbuffers req;
+         memset(&req, 0, sizeof (req));
+         req.count = TEST_BUFFER_NUM;
+@@ -290,6 +354,7 @@ int v4l_capture_test(int fd_v4l)
+ 	unsigned char *fb0;
+ 	struct timeval tv1, tv2;
+ 	int j = 0;
++	int out_w, out_h;
+ 
+ 	if ((fd_fb = open(fb_device, O_RDWR )) < 0) {
+ 		printf("Unable to open frame buffer\n");
+@@ -301,8 +366,25 @@ int v4l_capture_test(int fd_v4l)
+ 		goto FAIL;
+ 	}
+ 
++	if (g_rotation == 90 || g_rotation == 270) {
++		out_w = g_out_height;
++		out_h = g_out_width;
++	} else {
++		out_w = g_out_width;
++		out_h = g_out_height;
++	}
++
+ 	var.xres_virtual = var.xres;
+ 	var.yres_virtual = 2 * var.yres;
++
++	if (out_w > var.xres || out_h > var.yres) {
++		printf("The output width or height is exceeding the resolution"
++			" of the screen.\n"
++			"wxh: %dx%d, screen wxh: %dx%d\n", out_w, out_h,
++			var.xres, var.yres);
++		goto FAIL;
++	}
++
+ 	if (ioctl(fd_fb, FBIOPUT_VSCREENINFO, &var) < 0) {
+ 		printf("FBIOPUT_VSCREENINFO failed\n");
+ 		goto FAIL;
+@@ -338,10 +420,10 @@ int v4l_capture_test(int fd_v4l)
+ 			if (buf.m.userptr == buffers[i].offset) {
+ 				if (var.yoffset == 0) {
+ 					var.yoffset += var.yres;
+-					for (j = 0; j < g_height; j++) {
++					for (j = 0; j < out_h; j++) {
+ 						memcpy(fb0 + var.xres * var.yres * 2  + j * var.xres * 2,
+-							buffers[i].start + j * g_width * 2,
+-							g_width * 2);
++							buffers[i].start + j * out_w * 2,
++							out_w * 2);
+ 					}
+ 					if (ioctl(fd_fb, FBIOPAN_DISPLAY, &var) < 0) {
+ 						printf("FBIOPAN_DISPLAY failed\n");
+@@ -349,10 +431,10 @@ int v4l_capture_test(int fd_v4l)
+ 					}
+ 				} else {
+ 					var.yoffset = 0;
+-					for (j = 0; j < g_height; j++) {
++					for (j = 0; j < out_h; j++) {
+ 						memcpy(fb0 + j * var.xres * 2,
+-							buffers[i].start + j * g_width * 2,
+-							g_width * 2);
++							buffers[i].start + j * out_w * 2,
++							out_w * 2);
+ 					}
+ 					if (ioctl(fd_fb, FBIOPAN_DISPLAY, &var) < 0) {
+ 						printf("FBIOPAN_DISPLAY failed\n");
+@@ -397,14 +479,20 @@ FAIL:
+ 
+ void print_help(void)
+ {
++	printf("CSI Video4Linux capture Device Test\n"
++	       "Syntax: ./csi_v4l2_capture -iw <capture input width>\n"
++	       " -ih <capture input height>\n"
++	       " -ow <capture output width>\n"
++	       " -oh <capture output height>\n"
++	       " -hf <horizontal flip>\n"
++	       " -vf <vertical flip>\n"
++	       " -m <capture mode, 0-640x480, 1-320x240, etc>\n" \
++	       " -r <rotation 0, 90, 180, 270>\n"
++	       " -t <time> -fr <framerate>\n"
+ #ifdef	GET_CONTI_PHY_MEM_VIA_PXP_LIB
+-	printf("CSI Video4Linux capture Device Test\n" \
+-	       "Syntax: ./csi_v4l2_capture -t <time> -fr <framerate> " \
+-	       "[-u if defined, means use userp, otherwise mmap]\n");
+-#else
+-	printf("CSI Video4Linux capture Device Test\n" \
+-	       "Syntax: ./csi_v4l2_capture -t <time> -fr <framerate>\n");
++	       " [-u if defined, means use userp, otherwise mmap]\n"
+ #endif
++		);
+ }
+ 
+ int process_cmdline(int argc, char **argv)
+@@ -412,11 +500,27 @@ int process_cmdline(int argc, char **argv)
+         int i;
+ 
+         for (i = 1; i < argc; i++) {
+-		if (strcmp(argv[i], "-t") == 0) {
++		if (strcmp(argv[i], "-m") == 0) {
++			g_capture_mode = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-iw") == 0) {
++			g_in_width = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-ih") == 0) {
++			g_in_height = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-ow") == 0) {
++			g_out_width = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-oh") == 0) {
++			g_out_height = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-t") == 0) {
+ 			g_timeout = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-hf") == 0) {
++			g_hflip = 1;
++		} else if (strcmp(argv[i], "-vf") == 0) {
++			g_vflip = 1;
++		} else if (strcmp(argv[i], "-r") == 0) {
++			g_rotation = atoi(argv[++i]);
+ 		} else if (strcmp(argv[i], "-help") == 0) {
+ 			print_help();
+-                        return -1;
++			return -1;
+ 		} else if (strcmp(argv[i], "-fr") == 0) {
+ 			g_camera_framerate = atoi(argv[++i]);
+ #ifdef	GET_CONTI_PHY_MEM_VIA_PXP_LIB
+-- 
+1.8.0
+

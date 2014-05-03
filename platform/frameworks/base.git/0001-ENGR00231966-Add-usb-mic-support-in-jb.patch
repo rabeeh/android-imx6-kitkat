@@ -1,0 +1,141 @@
+From ea40b8013ad9bdd0b0b2591dba4e8d316ba6d29c Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Thu, 1 Nov 2012 10:06:52 +0800
+Subject: [PATCH 01/32] ENGR00231966 Add usb mic support in jb
+
+1.add new input type IN_USB_DEVICE
+2.observor the usb plug/unplug event, and send message.
+
+Change-Id: Ibbc05ba82aa2f9eb8d0e10d8079813b39e037af7
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ media/java/android/media/AudioManager.java         |  4 +++
+ .../com/android/server/WiredAccessoryManager.java  | 35 +++++++++++++++-------
+ 2 files changed, 29 insertions(+), 10 deletions(-)
+
+diff --git a/media/java/android/media/AudioManager.java b/media/java/android/media/AudioManager.java
+index d652cae..16b2dfd 100644
+--- a/media/java/android/media/AudioManager.java
++++ b/media/java/android/media/AudioManager.java
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2007 The Android Open Source Project
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -2585,6 +2586,9 @@ public class AudioManager {
+      *  platform-specific implementation.
+      */
+     public static final int DEVICE_OUT_DEFAULT = AudioSystem.DEVICE_OUT_DEFAULT;
++    /** {@hide} The audio input device code for an usb device attached
++     */
++    public static final int DEVICE_IN_USB_DEVICE = AudioSystem.DEVICE_IN_USB_DEVICE;
+ 
+     /**
+      * Return the enabled devices for the specified output stream type.
+diff --git a/services/java/com/android/server/WiredAccessoryManager.java b/services/java/com/android/server/WiredAccessoryManager.java
+index 415fcc1..74d9988 100644
+--- a/services/java/com/android/server/WiredAccessoryManager.java
++++ b/services/java/com/android/server/WiredAccessoryManager.java
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -60,9 +61,10 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
+     private static final int BIT_USB_HEADSET_ANLG = (1 << 2);
+     private static final int BIT_USB_HEADSET_DGTL = (1 << 3);
+     private static final int BIT_HDMI_AUDIO = (1 << 4);
++    private static final int BIT_IN_USB_DEVICE = (1 << 5);
+     private static final int SUPPORTED_HEADSETS = (BIT_HEADSET|BIT_HEADSET_NO_MIC|
+                                                    BIT_USB_HEADSET_ANLG|BIT_USB_HEADSET_DGTL|
+-                                                   BIT_HDMI_AUDIO);
++                                                   BIT_HDMI_AUDIO|BIT_IN_USB_DEVICE);
+ 
+     private static final String NAME_H2W = "h2w";
+     private static final String NAME_USB_AUDIO = "usb_audio";
+@@ -171,6 +173,7 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
+         int headsetState = newState & SUPPORTED_HEADSETS;
+         int usb_headset_anlg = headsetState & BIT_USB_HEADSET_ANLG;
+         int usb_headset_dgtl = headsetState & BIT_USB_HEADSET_DGTL;
++        int in_usb_deviec    = headsetState & BIT_IN_USB_DEVICE;
+         int h2w_headset = headsetState & (BIT_HEADSET | BIT_HEADSET_NO_MIC);
+         boolean h2wStateChange = true;
+         boolean usbStateChange = true;
+@@ -193,7 +196,9 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
+         }
+         // - c: 0 usb headset to 1 usb headset
+         // - d: 1 usb headset to 0 usb headset
+-        if (usb_headset_anlg == BIT_USB_HEADSET_ANLG && usb_headset_dgtl == BIT_USB_HEADSET_DGTL) {
++        if ((usb_headset_anlg == BIT_USB_HEADSET_ANLG && usb_headset_dgtl == BIT_USB_HEADSET_DGTL) ||
++            (in_usb_deviec    == BIT_IN_USB_DEVICE    && usb_headset_dgtl == BIT_USB_HEADSET_DGTL) ||
++            (usb_headset_anlg == BIT_USB_HEADSET_ANLG && in_usb_deviec    == BIT_IN_USB_DEVICE   )) {
+             Log.e(TAG, "Invalid combination, unsetting usb flag");
+             usbStateChange = false;
+         }
+@@ -255,6 +260,8 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
+                 device = AudioManager.DEVICE_OUT_ANLG_DOCK_HEADSET;
+             } else if (headset == BIT_USB_HEADSET_DGTL) {
+                 device = AudioManager.DEVICE_OUT_DGTL_DOCK_HEADSET;
++            } else if (headset == BIT_IN_USB_DEVICE) {
++                device = AudioManager.DEVICE_IN_USB_DEVICE;
+             } else if (headset == BIT_HDMI_AUDIO) {
+                 device = AudioManager.DEVICE_OUT_AUX_DIGITAL;
+             } else {
+@@ -339,12 +346,10 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
+             }
+ 
+             // Monitor USB
+-            uei = new UEventInfo(NAME_USB_AUDIO, BIT_USB_HEADSET_ANLG, BIT_USB_HEADSET_DGTL);
+-            if (uei.checkSwitchExists()) {
+-                retVal.add(uei);
+-            } else {
+-                Slog.w(TAG, "This kernel does not have usb audio support");
+-            }
++            // For usb_audio, it is added when the usb audio device plugged, it is dynamic,can not
++            // checked in beginning;
++            uei = new UEventInfo("usb_audio", BIT_USB_HEADSET_ANLG, BIT_IN_USB_DEVICE, BIT_USB_HEADSET_DGTL);
++            retVal.add(uei);
+ 
+             // Monitor HDMI
+             //
+@@ -399,11 +404,20 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
+             private final String mDevName;
+             private final int mState1Bits;
+             private final int mState2Bits;
++            private final int mState3Bits;
+ 
+             public UEventInfo(String devName, int state1Bits, int state2Bits) {
+                 mDevName = devName;
+                 mState1Bits = state1Bits;
+                 mState2Bits = state2Bits;
++                mState3Bits = 0;
++            }
++
++            public UEventInfo(String devName, int state1Bits, int state2Bits, int state3Bits) {
++                mDevName = devName;
++                mState1Bits = state1Bits;
++                mState2Bits = state2Bits;
++                mState3Bits = state3Bits;
+             }
+ 
+             public String getDevName() { return mDevName; }
+@@ -422,9 +436,10 @@ final class WiredAccessoryManager implements WiredAccessoryCallbacks {
+             }
+ 
+             public int computeNewHeadsetState(int headsetState, int switchState) {
+-                int preserveMask = ~(mState1Bits | mState2Bits);
++                int preserveMask = ~(mState1Bits | mState2Bits | mState3Bits);
+                 int setBits = ((switchState == 1) ? mState1Bits :
+-                              ((switchState == 2) ? mState2Bits : 0));
++                              ((switchState == 2) ? mState2Bits :
++                              ((switchState == 3) ? mState3Bits : 0)));
+ 
+                 return ((headsetState & preserveMask) | setBits);
+             }
+-- 
+1.8.0
+

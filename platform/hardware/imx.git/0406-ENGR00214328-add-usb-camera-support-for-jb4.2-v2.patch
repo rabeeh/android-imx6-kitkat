@@ -1,0 +1,977 @@
+From 6f7e41c0bbf72c0e4e5dd57a4d8881b7107d4185 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Wed, 16 Jan 2013 11:35:57 +0800
+Subject: [PATCH 406/486] ENGR00214328 add usb camera support for jb4.2 v2.
+
+add usb camera support for jb4.2 v2.
+switch camera v1 to camera v2.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ Android.mk                        |   7 +-
+ mx6/libcamera2/Android.mk         |   1 +
+ mx6/libcamera2/CameraModule.cpp   |  12 +
+ mx6/libcamera2/CameraUtil.h       |   1 +
+ mx6/libcamera2/DeviceAdapter.cpp  |   4 +-
+ mx6/libcamera2/DeviceAdapter.h    |  22 +-
+ mx6/libcamera2/Ov5640.cpp         |   2 +-
+ mx6/libcamera2/Ov5640.h           |   2 +-
+ mx6/libcamera2/Ov5642.cpp         |   2 +-
+ mx6/libcamera2/Ov5642.h           |   2 +-
+ mx6/libcamera2/OvDevice.cpp       |   2 +-
+ mx6/libcamera2/OvDevice.h         |   2 +-
+ mx6/libcamera2/PreviewStream.cpp  |   1 +
+ mx6/libcamera2/RequestManager.cpp |   3 +-
+ mx6/libcamera2/UvcDevice.cpp      | 618 ++++++++++++++++++++++++++++++++++++++
+ mx6/libcamera2/UvcDevice.h        |  37 ++-
+ 16 files changed, 694 insertions(+), 24 deletions(-)
+ create mode 100644 mx6/libcamera2/UvcDevice.cpp
+
+diff --git a/Android.mk b/Android.mk
+index a5311e4..988e584 100644
+--- a/Android.mk
++++ b/Android.mk
+@@ -1,8 +1,13 @@
+ common_imx_dirs := libsensors libgps lights wlan
+ mx5x_dirs := $(common_imx_dirs) mx5x/audio mx5x/libcopybit mx5x/libgralloc  mx5x/hwcomposer mx5x/libcamera
+-mx6_dirs := $(common_imx_dirs) alsa mx6/libgralloc_wrapper mx6/hwcomposer mx6/libcamera mx6/power
++mx6_dirs := $(common_imx_dirs) alsa mx6/libgralloc_wrapper mx6/hwcomposer mx6/power
+ 
+ ifeq ($(TARGET_BOARD_PLATFORM),imx6)
++  ifeq ($(IMX_CAMERA_HAL_V2),true)
++    mx6_dirs += mx6/libcamera2
++  else
++    mx6_dirs += mx6/libcamera
++  endif
+   include $(call all-named-subdir-makefiles,$(mx6_dirs))
+ else
+   ifeq ($(TARGET_BOARD_PLATFORM),imx5x)
+diff --git a/mx6/libcamera2/Android.mk b/mx6/libcamera2/Android.mk
+index 05a6813..1e4a2a1 100755
+--- a/mx6/libcamera2/Android.mk
++++ b/mx6/libcamera2/Android.mk
+@@ -34,6 +34,7 @@ LOCAL_SRC_FILES:=    \
+     OvDevice.cpp \
+     Ov5640.cpp \
+     Ov5642.cpp \
++    UvcDevice.cpp \
+     PhysMemAdapter.cpp \
+     YuvToJpegEncoder.cpp \
+     NV12_resize.c
+diff --git a/mx6/libcamera2/CameraModule.cpp b/mx6/libcamera2/CameraModule.cpp
+index fa6d162..ef73280 100755
+--- a/mx6/libcamera2/CameraModule.cpp
++++ b/mx6/libcamera2/CameraModule.cpp
+@@ -436,6 +436,18 @@ static int GetDevPath(const char  *pCameraName,
+                 continue;
+             } else if (v4l2_cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
+                 if (ioctl(fd, VIDIOC_DBG_G_CHIP_IDENT, &vid_chip) < 0) {
++                    if(strstr((const char*)v4l2_cap.driver, pCameraName)) {
++                       if (pathLen > strlen(dev_node)) {
++                            strcpy(pCameraDevPath, dev_node);
++                            ALOGI("Get sensor %s's dev path %s",
++                                  pCameraName,
++                                  pCameraDevPath);
++                            retCode = 0;
++                        }
++                        close(fd);
++                        fd = 0;
++                        break;
++                    }
+                     close(fd);
+                     fd = 0;
+                     continue;
+diff --git a/mx6/libcamera2/CameraUtil.h b/mx6/libcamera2/CameraUtil.h
+index 5f87692..b6c2e8f 100755
+--- a/mx6/libcamera2/CameraUtil.h
++++ b/mx6/libcamera2/CameraUtil.h
+@@ -77,6 +77,7 @@ using namespace android;
+ #define MAX_PREVIEW_BUFFER      6
+ #define MAX_CAPTURE_BUFFER      3
+ #define NUM_PREVIEW_BUFFER      4
++#define NUM_RECORD_BUFFER       4
+ #define NUM_CAPTURE_BUFFER      2
+ 
+ #define CAMAERA_FILENAME_LENGTH 256
+diff --git a/mx6/libcamera2/DeviceAdapter.cpp b/mx6/libcamera2/DeviceAdapter.cpp
+index 060d731..2c5dd0e 100755
+--- a/mx6/libcamera2/DeviceAdapter.cpp
++++ b/mx6/libcamera2/DeviceAdapter.cpp
+@@ -155,7 +155,7 @@ status_t DeviceAdapter::initialize(const CameraInfo& info)
+         return BAD_VALUE;
+     }
+ 
+-    initSensorInfo();
++    initSensorInfo(info);
+     setPreviewPixelFormat();
+     setPicturePixelFormat();
+     // Initialize flags
+@@ -194,7 +194,7 @@ status_t DeviceAdapter::setDeviceConfig(int         width,
+     if ((width > 1920) || (height > 1080)) {
+         fps = 15;
+     }
+-    FLOGI("Width * Height %d x %d format %d, fps: %d",
++    FLOGI("Width * Height %d x %d format 0x%x, fps: %d",
+           width, height, vformat, fps);
+ 
+     mVideoInfo->width       = width;
+diff --git a/mx6/libcamera2/DeviceAdapter.h b/mx6/libcamera2/DeviceAdapter.h
+index d2ec8a8..4f5dec3 100755
+--- a/mx6/libcamera2/DeviceAdapter.h
++++ b/mx6/libcamera2/DeviceAdapter.h
+@@ -40,7 +40,7 @@ public:
+     void             setErrorListener(CameraErrorListener *listener);
+     void             setCameraBufferProvide(CameraBufferProvider *bufferProvider);
+     virtual status_t initialize(const CameraInfo& info);
+-    status_t         setDeviceConfig(int         width,
++    virtual status_t setDeviceConfig(int         width,
+                                      int         height,
+                                      PixelFormat format,
+                                      int         fps);
+@@ -52,13 +52,13 @@ public:
+         return mPicturePixelFormat;
+     }
+ 
+-    virtual status_t initSensorInfo() = 0;
++    virtual status_t initSensorInfo(const CameraInfo& info) = 0;
+     virtual int getCaptureMode(int width, int height) {return 0;}
+     PixelFormat getMatchFormat(int *sfmt, int  slen,
+                                int *dfmt, int  dlen);
+     void setMetadaManager(sp<MetadaManager> &metadaManager);
+-    void setPreviewPixelFormat();
+-    void setPicturePixelFormat();
++    virtual void setPreviewPixelFormat();
++    virtual void setPicturePixelFormat();
+ 
+     status_t         autoFocus();
+     status_t         cancelAutoFocus();
+@@ -77,7 +77,7 @@ protected:
+                                           int        & num);
+     virtual void     handleFrameRelease(CameraFrame *buffer);
+ 
+-private:
++protected:
+     class AutoFocusThread : public Thread {
+     public:
+         AutoFocusThread(DeviceAdapter *hw) :
+@@ -128,12 +128,14 @@ private:
+         DeviceAdapter *mAdapter;
+     };
+ 
+-private:
+-    status_t     fillCameraFrame(CameraFrame *frame);
+-    CameraFrame* acquireCameraFrame();
++protected:
++    virtual status_t fillCameraFrame(CameraFrame *frame);
++    virtual CameraFrame* acquireCameraFrame();
++
++    virtual status_t startDeviceLocked();
++    virtual status_t stopDeviceLocked();
+ 
+-    status_t     startDeviceLocked();
+-    status_t     stopDeviceLocked();
++private:
+     int          deviceThread();
+     int          autoFocusThread();
+ 
+diff --git a/mx6/libcamera2/Ov5640.cpp b/mx6/libcamera2/Ov5640.cpp
+index 80f9d3e..20b2b30 100755
+--- a/mx6/libcamera2/Ov5640.cpp
++++ b/mx6/libcamera2/Ov5640.cpp
+@@ -17,7 +17,7 @@
+ #include "Ov5640.h"
+ 
+ 
+-status_t Ov5640::initSensorInfo()
++status_t Ov5640::initSensorInfo(const CameraInfo& info)
+ {
+     if (mCameraHandle < 0) {
+         FLOGE("OvDevice: initParameters sensor has not been opened");
+diff --git a/mx6/libcamera2/Ov5640.h b/mx6/libcamera2/Ov5640.h
+index ec8897b..ce0db85 100755
+--- a/mx6/libcamera2/Ov5640.h
++++ b/mx6/libcamera2/Ov5640.h
+@@ -21,7 +21,7 @@
+ 
+ class Ov5640 : public OvDevice {
+ public:
+-    virtual status_t initSensorInfo();
++    virtual status_t initSensorInfo(const CameraInfo& info);
+ };
+ 
+ #endif // ifndef _OV_DEVICE_H_
+diff --git a/mx6/libcamera2/Ov5642.cpp b/mx6/libcamera2/Ov5642.cpp
+index b52f05c..fc3706e 100755
+--- a/mx6/libcamera2/Ov5642.cpp
++++ b/mx6/libcamera2/Ov5642.cpp
+@@ -16,7 +16,7 @@
+ 
+ #include "Ov5642.h"
+ 
+-status_t Ov5642::initSensorInfo()
++status_t Ov5642::initSensorInfo(const CameraInfo& info)
+ {
+     if (mCameraHandle < 0) {
+         FLOGE("OvDevice: initParameters sensor has not been opened");
+diff --git a/mx6/libcamera2/Ov5642.h b/mx6/libcamera2/Ov5642.h
+index c198c9c..ef05fa8 100755
+--- a/mx6/libcamera2/Ov5642.h
++++ b/mx6/libcamera2/Ov5642.h
+@@ -21,7 +21,7 @@
+ 
+ class Ov5642 : public OvDevice {
+ public:
+-    virtual status_t initSensorInfo();
++    virtual status_t initSensorInfo(const CameraInfo& info);
+ };
+ 
+ #endif // ifndef _OV_DEVICE_H_
+diff --git a/mx6/libcamera2/OvDevice.cpp b/mx6/libcamera2/OvDevice.cpp
+index 57d9dce..1d89b91 100755
+--- a/mx6/libcamera2/OvDevice.cpp
++++ b/mx6/libcamera2/OvDevice.cpp
+@@ -55,7 +55,7 @@ status_t OvDevice::changeSensorFormats(int *src, int len)
+     return 0;
+ }
+ 
+-status_t OvDevice::initSensorInfo()
++status_t OvDevice::initSensorInfo(const CameraInfo& info)
+ {
+     if (mCameraHandle < 0) {
+         FLOGE("OvDevice: initParameters sensor has not been opened");
+diff --git a/mx6/libcamera2/OvDevice.h b/mx6/libcamera2/OvDevice.h
+index 20ee6dd..4123d13 100755
+--- a/mx6/libcamera2/OvDevice.h
++++ b/mx6/libcamera2/OvDevice.h
+@@ -29,7 +29,7 @@
+ 
+ class OvDevice : public DeviceAdapter {
+ public:
+-    virtual status_t initSensorInfo();
++    virtual status_t initSensorInfo(const CameraInfo& info);
+     virtual int getCaptureMode(int width, int height);
+ 
+ protected:
+diff --git a/mx6/libcamera2/PreviewStream.cpp b/mx6/libcamera2/PreviewStream.cpp
+index 2e670b2..c6f6712 100755
+--- a/mx6/libcamera2/PreviewStream.cpp
++++ b/mx6/libcamera2/PreviewStream.cpp
+@@ -167,6 +167,7 @@ int PreviewStream::registerBuffers(int num_buffers, buffer_handle_t *buffers)
+         mCameraBuffer[i].initialize(buffers[i], i);
+         mCameraBuffer[i].mWidth  = mWidth;
+         mCameraBuffer[i].mHeight = mHeight;
++        mCameraBuffer[i].mFormat = mFormat;
+         mCameraBuffer[i].setState(CameraFrame::BUFS_IN_SERVICE);
+     }
+ 
+diff --git a/mx6/libcamera2/RequestManager.cpp b/mx6/libcamera2/RequestManager.cpp
+index 030c56a..6807b53 100755
+--- a/mx6/libcamera2/RequestManager.cpp
++++ b/mx6/libcamera2/RequestManager.cpp
+@@ -372,18 +372,19 @@ int RequestManager::allocateStream(uint32_t width,
+                           width, height, format);
+             sid = STREAM_ID_RECORD;
+             cameraStream = new StreamAdapter(sid);
++            *max_buffers = NUM_RECORD_BUFFER;
+         }
+         else {
+             FLOGI("%s preview stream, w:%d, h:%d, fmt:0x%x", __FUNCTION__,
+                           width, height, format);
+             sid = STREAM_ID_PREVIEW;
+             cameraStream = new PreviewStream(sid);
++            *max_buffers = NUM_PREVIEW_BUFFER;
+         }
+ 
+         //*format_actual = HAL_PIXEL_FORMAT_YCrCb_420_SP;
+         *format_actual = mDeviceAdapter->getPreviewPixelFormat();
+         FLOGI("actual format 0x%x", *format_actual);
+-        *max_buffers = NUM_PREVIEW_BUFFER;
+     }
+     else if (format == HAL_PIXEL_FORMAT_BLOB) {
+         FLOGI("%s jpeg stream, w:%d, h:%d, fmt:0x%x", __FUNCTION__,
+diff --git a/mx6/libcamera2/UvcDevice.cpp b/mx6/libcamera2/UvcDevice.cpp
+new file mode 100644
+index 0000000..492e3ec
+--- /dev/null
++++ b/mx6/libcamera2/UvcDevice.cpp
+@@ -0,0 +1,618 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "CameraUtil.h"
++#include "UvcDevice.h"
++
++UvcDevice::UvcDevice()
++{
++}
++
++UvcDevice::~UvcDevice()
++{
++}
++
++void UvcDevice::adjustSensorFormats(int *src, int len)
++{
++    if (src == NULL || len == 0) {
++        return;
++    }
++
++    mDefaultFormat = 0;
++    memset(mSensorFormats, 0, sizeof(mSensorFormats));
++    int k = 0;
++    for (int i=0; i<len && i<MAX_SENSOR_FORMAT; i++) {
++        switch (src[i]) {
++            case v4l2_fourcc('N', 'V', '1', '2'):
++                mSensorFormats[k++] = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++                mDefaultFormat = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++                break;
++
++            case v4l2_fourcc('Y', 'V', '1', '2'):
++                mSensorFormats[k++] = HAL_PIXEL_FORMAT_YCbCr_420_P;
++                break;
++
++            case v4l2_fourcc('Y', 'U', 'Y', 'V'):
++                mSensorFormats[k++] = HAL_PIXEL_FORMAT_YCbCr_422_I;
++                if (mDefaultFormat == 0) {
++                    mDefaultFormat = HAL_PIXEL_FORMAT_YCbCr_422_I;
++                }
++                break;
++
++            case v4l2_fourcc('B', 'L', 'O', 'B'):
++                mSensorFormats[k++] = HAL_PIXEL_FORMAT_BLOB;
++                break;
++
++            case v4l2_fourcc('R', 'A', 'W', 'S'):
++                mSensorFormats[k++] = HAL_PIXEL_FORMAT_RAW_SENSOR;
++                break;
++
++            default:
++                FLOGE("Error: format 0x%x not supported!", src[i]);
++                break;
++        }
++    }
++
++    return;
++}
++
++status_t UvcDevice::setDeviceConfig(int         width,
++                                    int         height,
++                                    PixelFormat format,
++                                    int         fps)
++{
++    if (mCameraHandle <= 0) {
++        if (pDevPath != NULL) {
++            mCameraHandle = open(pDevPath, O_RDWR);
++        }
++        if (mCameraHandle <= 0) {
++            FLOGE("setDeviceConfig: DeviceAdapter uninitialized");
++            return BAD_VALUE;
++        }
++    }
++    if ((width == 0) || (height == 0)) {
++        FLOGE("setDeviceConfig: invalid parameters");
++        return BAD_VALUE;
++    }
++
++    status_t ret = NO_ERROR;
++    int vformat;
++    vformat = convertPixelFormatToV4L2Format(mDefaultFormat);
++
++    if ((width > 1920) || (height > 1080)) {
++        fps = 15;
++    }
++    FLOGI("Width * Height %d x %d format 0x%x, fps: %d",
++          width, height, vformat, fps);
++
++    mVideoInfo->width       = width;
++    mVideoInfo->height      = height;
++    mVideoInfo->framesizeIn = (width * height << 1);
++    mVideoInfo->formatIn    = vformat;
++
++    mVideoInfo->param.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    mVideoInfo->param.parm.capture.timeperframe.numerator   = 1;
++    mVideoInfo->param.parm.capture.timeperframe.denominator = fps;
++    ret = ioctl(mCameraHandle, VIDIOC_S_PARM, &mVideoInfo->param);
++    if (ret < 0) {
++        FLOGE("Open: VIDIOC_S_PARM Failed: %s", strerror(errno));
++        return ret;
++    }
++
++    mVideoInfo->format.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    mVideoInfo->format.fmt.pix.width        = width & 0xFFFFFFF8;
++    mVideoInfo->format.fmt.pix.height       = height & 0xFFFFFFF8;
++    mVideoInfo->format.fmt.pix.pixelformat  = vformat;
++    mVideoInfo->format.fmt.pix.priv         = 0;
++    mVideoInfo->format.fmt.pix.sizeimage    = 0;
++    mVideoInfo->format.fmt.pix.bytesperline = 0;
++
++    ret = ioctl(mCameraHandle, VIDIOC_S_FMT, &mVideoInfo->format);
++    if (ret < 0) {
++        FLOGE("Open: VIDIOC_S_FMT Failed: %s", strerror(errno));
++        return ret;
++    }
++
++    return ret;
++}
++
++void UvcDevice::setPreviewPixelFormat()
++{
++    mPreviewNeedCsc = true;
++    if (mDefaultFormat == HAL_PIXEL_FORMAT_YCbCr_420_SP) {
++        mPreviewNeedCsc = false;
++    }
++
++    int n = 0;
++    if (mPreviewNeedCsc) {
++        mAvailableFormats[n++] = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++    }
++    for (int i=0; i<MAX_SENSOR_FORMAT && (mSensorFormats[i] != 0); i++) {
++        mAvailableFormats[n++] = mSensorFormats[i];
++    }
++    mAvailableFormatCount = n;
++    mPreviewPixelFormat = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++}
++
++void UvcDevice::setPicturePixelFormat()
++{
++    mPictureNeedCsc = true;
++    if (mDefaultFormat == HAL_PIXEL_FORMAT_YCbCr_420_SP) {
++        mPictureNeedCsc = false;
++    }
++
++    mPicturePixelFormat = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++}
++
++status_t UvcDevice::initSensorInfo(const CameraInfo& info)
++{
++    if (mCameraHandle < 0) {
++        FLOGE("OvDevice: initParameters sensor has not been opened");
++        return BAD_VALUE;
++    }
++    pDevPath = info.devPath;
++
++    // first read sensor format.
++    int ret = 0, index = 0;
++    int sensorFormats[MAX_SENSOR_FORMAT];
++    memset(mAvailableFormats, 0, sizeof(mAvailableFormats));
++    memset(sensorFormats, 0, sizeof(sensorFormats));
++
++    struct v4l2_fmtdesc vid_fmtdesc;
++    while (ret == 0) {
++        vid_fmtdesc.index = index;
++        vid_fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        ret               = ioctl(mCameraHandle, VIDIOC_ENUM_FMT, &vid_fmtdesc);
++        FLOG_RUNTIME("index:%d,ret:%d, format:%c%c%c%c", index, ret,
++                     vid_fmtdesc.pixelformat & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 8) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 16) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 24) & 0xFF);
++        if (ret == 0) {
++            sensorFormats[index++] = vid_fmtdesc.pixelformat;
++        }
++    }
++    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
++    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
++
++    //mAvailableFormatCount = index;
++    adjustSensorFormats(sensorFormats, index);
++    if (mDefaultFormat == 0) {
++        FLOGE("Error: invalid mDefaultFormat:%d", mDefaultFormat);
++        return BAD_VALUE;
++    }
++
++    ret = 0;
++    index = 0;
++    char TmpStr[20];
++    int  previewCnt = 0, pictureCnt = 0;
++    struct v4l2_frmsizeenum vid_frmsize;
++    struct v4l2_frmivalenum vid_frmval;
++    while (ret == 0) {
++        memset(TmpStr, 0, 20);
++        memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
++        vid_frmsize.index        = index++;
++        vid_frmsize.pixel_format = 
++                    convertPixelFormatToV4L2Format(mDefaultFormat);
++        ret = ioctl(mCameraHandle,
++                    VIDIOC_ENUM_FRAMESIZES, &vid_frmsize);
++        if (vid_frmsize.discrete.width == 1600 &&
++                     vid_frmsize.discrete.height == 1200) {
++            continue;
++        }
++
++        if (ret == 0) {
++            FLOG_RUNTIME("enum frame size w:%d, h:%d",
++                       vid_frmsize.discrete.width, vid_frmsize.discrete.height);
++            memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
++            vid_frmval.index        = 0;
++            vid_frmval.pixel_format = vid_frmsize.pixel_format;
++            vid_frmval.width        = vid_frmsize.discrete.width;
++            vid_frmval.height       = vid_frmsize.discrete.height;
++
++            ret = ioctl(mCameraHandle, VIDIOC_ENUM_FRAMEINTERVALS, &vid_frmval);
++            if (ret == 0) {
++                FLOG_RUNTIME("vid_frmval denominator:%d, numeraton:%d",
++                             vid_frmval.discrete.denominator,
++                             vid_frmval.discrete.numerator);
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++
++                if (vid_frmval.discrete.denominator /
++                    vid_frmval.discrete.numerator > 15) {
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.width;
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.height;;
++                }
++            }
++        }
++    } // end while
++
++    mPreviewResolutionCount = previewCnt;
++    mPictureResolutionCount = pictureCnt;
++
++    mMinFrameDuration = 33331760L;
++    mMaxFrameDuration = 30000000000L;
++    int i;
++    for (i=0; i<MAX_RESOLUTION_SIZE && i<pictureCnt; i+=2) {
++        FLOGI("SupportedPictureSizes: %d x %d", mPictureResolutions[i], mPictureResolutions[i+1]);
++    }
++
++    adjustPreviewResolutions();
++    for (i=0; i<MAX_RESOLUTION_SIZE && i<previewCnt; i+=2) {
++        FLOGI("SupportedPreviewSizes: %d x %d", mPreviewResolutions[i], mPreviewResolutions[i+1]);
++    }
++    FLOGI("FrameDuration is %lld, %lld", mMinFrameDuration, mMaxFrameDuration);
++
++    i = 0;
++    mTargetFpsRange[i++] = 12;
++    mTargetFpsRange[i++] = 15;
++    mTargetFpsRange[i++] = 27;
++    mTargetFpsRange[i++] = 30;
++
++    setMaxPictureResolutions();
++    FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
++    mFocalLength = 10.001;
++
++    return NO_ERROR;
++}
++
++status_t UvcDevice::registerCameraBuffers(CameraFrame *pBuffer, int &num)
++{
++    struct v4l2_buffer buf;
++    struct v4l2_requestbuffers req;
++
++    if ((mCameraHandle <= 0) || (pBuffer == NULL) || (num <= 0)) {
++        FLOGE("requestCameraBuffers invalid pBuffer");
++        return BAD_VALUE;
++    }
++
++    memset(&req, 0, sizeof (req));
++    req.count = num;
++    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    req.memory = V4L2_MEMORY_MMAP;
++    if (ioctl(mCameraHandle, VIDIOC_REQBUFS, &req) < 0) {
++        FLOGE("v4l_capture_setup: VIDIOC_REQBUFS failed\n");
++        return BAD_VALUE;
++    }
++
++    memset(mUvcBuffers, 0, sizeof(mUvcBuffers));
++    for (int i = 0; i < num; i++) {
++        CameraFrame *buffer = pBuffer + i;
++        // Associate each Camera buffer
++        buffer->setObserver(this);
++        mDeviceBufs[i] = buffer;
++
++        memset(&buf, 0, sizeof (buf));
++        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        buf.index = i;
++        if (ioctl(mCameraHandle, VIDIOC_QUERYBUF, &buf) < 0) {
++            FLOGE("VIDIOC_QUERYBUF error\n");
++            return BAD_VALUE;
++        }
++
++        mUvcBuffers[i].mSize = buf.length;
++        mUvcBuffers[i].mPhyAddr = (size_t)buf.m.offset;
++        mUvcBuffers[i].mVirtAddr = (void *)mmap(NULL, mUvcBuffers[i].mSize,
++                    PROT_READ | PROT_WRITE, MAP_SHARED, mCameraHandle,
++                    mUvcBuffers[i].mPhyAddr);
++        mUvcBuffers[i].mFormat = mDefaultFormat;
++        mUvcBuffers[i].mWidth = buffer->mWidth;
++        mUvcBuffers[i].mHeight = buffer->mHeight;
++        memset(mUvcBuffers[i].mVirtAddr, 0xFF, mUvcBuffers[i].mSize);
++    }
++
++    mBufferSize  = pBuffer->mSize;
++    mBufferCount = num;
++
++    return NO_ERROR;
++}
++
++status_t UvcDevice::fillCameraFrame(CameraFrame *frame)
++{
++    status_t ret = NO_ERROR;
++
++    if (!mVideoInfo->isStreamOn) {
++        return NO_ERROR;
++    }
++
++    int i = frame->mIndex;
++    if (i < 0) {
++        return BAD_VALUE;
++    }
++
++    struct v4l2_buffer cfilledbuffer;
++    memset(&cfilledbuffer, 0, sizeof (struct v4l2_buffer));
++    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    cfilledbuffer.memory = V4L2_MEMORY_MMAP;
++    cfilledbuffer.index    = i;
++    cfilledbuffer.m.offset = mUvcBuffers[i].mPhyAddr;
++
++    ret = ioctl(mCameraHandle, VIDIOC_QBUF, &cfilledbuffer);
++    if (ret < 0) {
++        FLOGE("fillCameraFrame: VIDIOC_QBUF Failed");
++        return BAD_VALUE;
++    }
++    mQueued++;
++
++    return ret;
++}
++
++CameraFrame * UvcDevice::acquireCameraFrame()
++{
++    int n;
++    fd_set rfds;
++    struct timeval tv;
++    struct v4l2_buffer cfilledbuffer;
++    CameraFrame *camBuf = NULL;
++
++    FD_ZERO(&rfds);
++    FD_SET(mCameraHandle, &rfds);
++    tv.tv_sec = 0;
++    tv.tv_usec = MAX_DEQUEUE_WAIT_TIME*1000;
++    n = select(mCameraHandle+1, &rfds, NULL, NULL, &tv);
++    if(n < 0) {
++        FLOGE("Error!Query the V4L2 Handler state error.");
++    }
++    else if(n == 0) {
++        FLOGI("Warning!Time out wait for V4L2 capture reading operation!");
++    }
++    else if(FD_ISSET(mCameraHandle, &rfds)) {
++        memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
++        cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        cfilledbuffer.memory = V4L2_MEMORY_MMAP;
++        int rtval;
++        rtval = ioctl(mCameraHandle, VIDIOC_DQBUF, &cfilledbuffer);
++        if (rtval < 0) {
++            FLOGE("Camera VIDIOC_DQBUF failure, ret=%d", rtval);
++            return camBuf;
++        }
++        mDequeued++;
++
++        int index = cfilledbuffer.index;
++        fAssert(index >= 0 && index < mBufferCount);
++        camBuf = mDeviceBufs[index];
++        camBuf->mTimeStamp = systemTime();
++
++        //should do hardware accelerate.
++        if(mPreviewNeedCsc || mPictureNeedCsc) {
++            doColorConvert(camBuf, &mUvcBuffers[index]);
++        }
++        else
++            memcpy(camBuf->mVirtAddr,
++                   mUvcBuffers[index].mVirtAddr, camBuf->mSize);
++    }
++    else {
++        FLOGE("Error!Query the V4L2 Handler state, no known error.");
++    }
++
++    return camBuf;
++}
++
++status_t UvcDevice::startDeviceLocked()
++{
++    status_t ret = NO_ERROR;
++    struct v4l2_buffer cfilledbuffer;
++
++    fAssert(mBufferProvider != NULL);
++
++    int state;
++    for (int i = 0; i < mBufferCount; i++) {
++        CameraFrame* frame = mDeviceBufs[i];
++        state = frame->getState();
++        if (state != CameraFrame::BUFS_FREE) {
++            continue;
++        }
++        frame->setState(CameraFrame::BUFS_IN_DRIVER);
++
++        memset(&cfilledbuffer, 0, sizeof (struct v4l2_buffer));
++        cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        cfilledbuffer.memory = V4L2_MEMORY_MMAP;
++        cfilledbuffer.index    = i;
++        cfilledbuffer.m.offset = mUvcBuffers[i].mPhyAddr;
++        ret = ioctl(mCameraHandle, VIDIOC_QBUF, &cfilledbuffer);
++        if (ret < 0) {
++            FLOGE("VIDIOC_QBUF Failed");
++            return BAD_VALUE;
++        }
++
++        mQueued++;
++    }
++
++    enum v4l2_buf_type bufType;
++    if (!mVideoInfo->isStreamOn) {
++        bufType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++
++        ret = ioctl(mCameraHandle, VIDIOC_STREAMON, &bufType);
++        if (ret < 0) {
++            FLOGE("VIDIOC_STREAMON failed: %s", strerror(errno));
++            return ret;
++        }
++
++        mVideoInfo->isStreamOn = true;
++    }
++
++    mDeviceThread = new DeviceThread(this);
++
++    FLOGI("Created device thread");
++    return ret;
++
++}
++
++status_t UvcDevice::stopDeviceLocked()
++{
++    int ret = 0;
++    ret = DeviceAdapter::stopDeviceLocked();
++    if (ret != 0) {
++        FLOGE("call %s failed", __FUNCTION__);
++        return ret;
++    }
++
++    for (int i = 0; i < mBufferCount; i++) {
++        if (mUvcBuffers[i].mVirtAddr != NULL && mUvcBuffers[i].mSize > 0) {
++            munmap(mUvcBuffers[i].mVirtAddr, mUvcBuffers[i].mSize);
++        }
++    }
++
++    close(mCameraHandle);
++    mCameraHandle = 0;
++    return ret;
++}
++
++status_t UvcDevice::adjustPreviewResolutions()
++{
++    int xTmp, yTmp, xMax, yMax, idx;
++    idx = 0;
++    xTmp = xMax = mPreviewResolutions[0];
++    yTmp = yMax = mPreviewResolutions[1];
++    for (int i=0; i<MAX_RESOLUTION_SIZE; i+=2) {
++        if (mPreviewResolutions[i] > xMax) {
++            xMax = mPreviewResolutions[i];
++            yMax = mPreviewResolutions[i+1];
++            idx = i;
++        }
++    }
++
++    mPreviewResolutions[0] = xMax;
++    mPreviewResolutions[1] = yMax;
++    mPreviewResolutions[idx] = xTmp;
++    mPreviewResolutions[idx+1] = yTmp;
++
++    return 0;
++}
++
++status_t UvcDevice::setMaxPictureResolutions()
++{
++    int xMax, yMax;
++    xMax = mPictureResolutions[0];
++    yMax = mPictureResolutions[1];
++
++    for (int i=0; i<MAX_RESOLUTION_SIZE; i+=2) {
++        if (mPictureResolutions[i] > xMax || mPictureResolutions[i+1] > yMax) {
++            xMax = mPictureResolutions[i];
++            yMax = mPictureResolutions[i+1];
++        }
++    }
++
++    mMaxWidth = xMax;
++    mMaxHeight = yMax;
++
++    return 0;
++}
++
++void UvcDevice::doColorConvert(StreamBuffer *dst, StreamBuffer *src)
++{
++    if (dst->mFormat == HAL_PIXEL_FORMAT_YCbCr_420_SP &&
++        src->mFormat == HAL_PIXEL_FORMAT_YCbCr_422_I) {
++        convertYUYUToNV12(dst, src);
++        return;
++    }
++
++    FLOGE("%s not support format:0x%x converted to format:0x%x",
++               __FUNCTION__, src->mFormat, dst->mFormat);
++}
++
++void UvcDevice::convertYUYUToNV12(StreamBuffer *dst, StreamBuffer *src)
++{
++    unsigned char *pSrcBufs = (unsigned char*)src->mVirtAddr;
++    unsigned char *pDstBufs = (unsigned char*)dst->mVirtAddr;
++    unsigned int bufWidth = src->mWidth;
++    unsigned int bufHeight = src->mHeight;
++
++    unsigned char *pSrcY1Offset = pSrcBufs;
++    unsigned char *pSrcY2Offset = pSrcBufs + (bufWidth << 1);
++    unsigned char *pSrcY3Offset = pSrcBufs + (bufWidth << 1) * 2;
++    unsigned char *pSrcY4Offset = pSrcBufs + (bufWidth << 1) * 3;
++    unsigned char *pSrcU1Offset = pSrcY1Offset + 1;
++    unsigned char *pSrcU2Offset = pSrcY2Offset + 1;
++    unsigned char *pSrcU3Offset = pSrcY3Offset + 1;
++    unsigned char *pSrcU4Offset = pSrcY4Offset + 1;
++    unsigned char *pSrcV1Offset = pSrcY1Offset + 3;
++    unsigned char *pSrcV2Offset = pSrcY2Offset + 3;
++    unsigned char *pSrcV3Offset = pSrcY3Offset + 3;
++    unsigned char *pSrcV4Offset = pSrcY4Offset + 3;
++    unsigned int srcYStride = (bufWidth << 1) * 3;
++    unsigned int srcUVStride = srcYStride;
++
++    unsigned char *pDstY1Offset = pDstBufs;
++    unsigned char *pDstY2Offset = pDstBufs + bufWidth;
++    unsigned char *pDstY3Offset = pDstBufs + bufWidth * 2;
++    unsigned char *pDstY4Offset = pDstBufs + bufWidth * 3;
++    unsigned char *pDstU1Offset = pDstBufs + bufWidth * bufHeight;
++    unsigned char *pDstU2Offset = pDstBufs + bufWidth * (bufHeight + 1);
++    unsigned char *pDstV1Offset = pDstU1Offset + 1;
++    unsigned char *pDstV2Offset = pDstU2Offset + 1;
++    unsigned int dstYStride = bufWidth * 3;
++    unsigned int dstUVStride = bufWidth;
++
++    unsigned int nw, nh;
++    for(nh = 0; nh < (bufHeight >> 2); nh++) {
++        for(nw=0; nw < (bufWidth >> 1); nw++) {
++            *pDstY1Offset++ = *pSrcY1Offset;
++            *pDstY2Offset++ = *pSrcY2Offset;
++            *pDstY3Offset++ = *pSrcY3Offset;
++            *pDstY4Offset++ = *pSrcY4Offset;
++
++            pSrcY1Offset += 2;
++            pSrcY2Offset += 2;
++            pSrcY3Offset += 2;
++            pSrcY4Offset += 2;
++
++            *pDstY1Offset++ = *pSrcY1Offset;
++            *pDstY2Offset++ = *pSrcY2Offset;
++            *pDstY3Offset++ = *pSrcY3Offset;
++            *pDstY4Offset++ = *pSrcY4Offset;
++
++            pSrcY1Offset += 2;
++            pSrcY2Offset += 2;
++            pSrcY3Offset += 2;
++            pSrcY4Offset += 2;
++
++            *pDstU1Offset = *pSrcU1Offset;
++            *pDstU2Offset = *pSrcU3Offset;
++            pDstU1Offset += 2;
++            pDstU2Offset += 2;
++            pSrcU1Offset += 4;
++            pSrcU3Offset += 4;
++
++            *pDstV1Offset = *pSrcV1Offset;
++            *pDstV2Offset = *pSrcV3Offset;
++            pDstV1Offset += 2;
++            pDstV2Offset += 2;
++            pSrcV1Offset += 4;
++            pSrcV3Offset += 4;
++        }
++        pSrcY1Offset += srcYStride;
++        pSrcY2Offset += srcYStride;
++        pSrcY3Offset += srcYStride;
++        pSrcY4Offset += srcYStride;
++
++        pSrcU1Offset += srcUVStride;
++        pSrcU3Offset += srcUVStride;
++        pSrcV1Offset += srcUVStride;
++        pSrcV3Offset += srcUVStride;
++
++        pDstY1Offset += dstYStride;
++        pDstY2Offset += dstYStride;
++        pDstY3Offset += dstYStride;
++        pDstY4Offset += dstYStride;
++
++        pDstU1Offset += dstUVStride;
++        pDstU2Offset += dstUVStride;
++        pDstV1Offset += dstUVStride;
++        pDstV2Offset += dstUVStride;
++    }
++}
++
+diff --git a/mx6/libcamera2/UvcDevice.h b/mx6/libcamera2/UvcDevice.h
+index 948c7b0..fab8be4 100755
+--- a/mx6/libcamera2/UvcDevice.h
++++ b/mx6/libcamera2/UvcDevice.h
+@@ -18,6 +18,7 @@
+ #define _UVC_DEVICE_H
+ 
+ #include "CameraUtil.h"
++#include "DeviceAdapter.h"
+ 
+ #define DEFAULT_PREVIEW_FPS (15)
+ #define DEFAULT_PREVIEW_W   (640)
+@@ -25,14 +26,42 @@
+ #define DEFAULT_PICTURE_W   (640)
+ #define DEFAULT_PICTURE_H   (480)
+ #define FORMAT_STRING_LEN 64
++#define MAX_DEQUEUE_WAIT_TIME  (5000)  //5000ms for uvc camera
+ 
++using namespace android;
+ 
+ class UvcDevice : public DeviceAdapter {
+ public:
+-    virtual status_t initSensorInfo()
+-    {
+-        return 0;
+-    }
++    UvcDevice();
++    ~UvcDevice();
++
++    virtual status_t initSensorInfo(const CameraInfo& info);
++    virtual status_t setDeviceConfig(int         width,
++                                     int         height,
++                                     PixelFormat format,
++                                     int         fps);
++    virtual void setPreviewPixelFormat();
++    virtual void setPicturePixelFormat();
++    virtual status_t registerCameraBuffers(CameraFrame *pBuffer, int &num);
++    virtual status_t fillCameraFrame(CameraFrame *frame);
++    virtual CameraFrame * acquireCameraFrame();
++    virtual status_t startDeviceLocked();
++    virtual status_t stopDeviceLocked();
++
++private:
++    status_t adjustPreviewResolutions();
++    status_t setMaxPictureResolutions();
++    void adjustSensorFormats(int *src, int len);
++    void convertYUYUToNV12(StreamBuffer *dst, StreamBuffer *src);
++    void doColorConvert(StreamBuffer *dst, StreamBuffer *src);
++
++private:
++    const char* pDevPath;
++    int mDefaultFormat;
++    bool mPreviewNeedCsc;
++    bool mPictureNeedCsc;
++    int mSensorFormats[MAX_SENSOR_FORMAT];
++    CameraFrame mUvcBuffers[MAX_PREVIEW_BUFFER];
+ };
+ 
+ #endif // ifndef _UVC_DEVICE_H
+-- 
+1.8.0
+

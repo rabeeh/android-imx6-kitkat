@@ -1,0 +1,477 @@
+From 808a337c04209f88fb2bb4afff6c1cf57c038d39 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 15 Jul 2011 02:51:36 +0800
+Subject: [PATCH 147/249] ENGR00153132 vpu: Enable iram and 2D cache for mx6q
+
+1) Enable internal ram;
+2) Enable 2-D cache for decoder.
+
+The performance is improved much with the features.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c  | 69 ++++++++++++++++++-----------------------------
+ vpu/vpu_reg.h  | 80 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ vpu/vpu_util.c | 85 +++++++++++++++++++++++++++++++++++++++++++++++++---------
+ vpu/vpu_util.h | 23 +++++++++++-----
+ 4 files changed, 195 insertions(+), 62 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index c3a15ff..7378aee 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -139,9 +139,12 @@ RetCode vpu_Init(void *cb)
+ 		}
+ 
+ 		IOClkGateSet(true);
+-		VpuWriteReg(BIT_TEMP_BUF_ADDR, tempBuffer);
+ 		VpuWriteReg(BIT_PARA_BUF_ADDR, paraBuffer);
+ 		VpuWriteReg(BIT_CODE_BUF_ADDR, codeBuffer);
++		if (cpu_is_mx6q())
++			VpuWriteReg(BIT_WORK_BUF_ADDR, tempBuffer);
++		else
++			VpuWriteReg(BIT_TEMP_BUF_ADDR, tempBuffer);
+ 
+ 		if (cpu_is_mx27())
+ 			VpuWriteReg(BIT_RESET_CTRL, 0);
+@@ -1058,9 +1061,9 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ 		      (pEncInfo->cacheConfig.DualConf << 2) |
+ 		      (pEncInfo->cacheConfig.PageMerge << 0);
+ 		val = val << 24;
+-		val |= (pEncInfo->cacheConfig.luma.cfg.BufferSize << 16) |
+-		       (pEncInfo->cacheConfig.chroma.cfg.BufferSize << 8) |
+-		       (pEncInfo->cacheConfig.chroma.cfg.BufferSize << 8);
++		val |= (pEncInfo->cacheConfig.LumaBufferSize << 16) |
++		       (pEncInfo->cacheConfig.CbBufferSize << 8) |
++		       (pEncInfo->cacheConfig.CrBufferSize);
+ 		VpuWriteReg(CMD_SET_FRAME_CACHE_CONFIG, val);
+ 
+ 	}
+@@ -1463,14 +1466,14 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	if (cpu_is_mx6q()) {
+ 		val = (pEncInfo->secAxiUse.useBitEnable |
+ 		       pEncInfo->secAxiUse.useIpEnable << 1 |
+-		       pEncInfo->secAxiUse.useDbkYEnable << 2 |
+-		       pEncInfo->secAxiUse.useDbkCEnable << 3 |
++		       pEncInfo->secAxiUse.useDbkEnable << 2 |
++		       pEncInfo->secAxiUse.useDbkEnable << 3 |
+ 		       pEncInfo->secAxiUse.useOvlEnable << 4 |
+ 		       pEncInfo->secAxiUse.useBtpEnable << 5 |
+ 		       pEncInfo->secAxiUse.useHostBitEnable << 8 |
+ 		       pEncInfo->secAxiUse.useHostIpEnable << 9 |
+-		       pEncInfo->secAxiUse.useHostDbkYEnable << 10 |
+-		       pEncInfo->secAxiUse.useHostDbkCEnable << 11 |
++		       pEncInfo->secAxiUse.useHostDbkEnable << 10 |
++		       pEncInfo->secAxiUse.useHostDbkEnable << 11 |
+ 		       pEncInfo->secAxiUse.useHostOvlEnable << 12 |
+ 		       pEncInfo->secAxiUse.useHostBtpEnable << 13);
+ 	} else {
+@@ -1784,33 +1787,6 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 			break;
+ 		}
+ 
+-	 case SET_MC_CACHE_CONFIG:
+-		{
+-			MaverickCacheConfig *mcCacheConfig;
+-
+-			if (param == 0)
+-				return RETCODE_INVALID_PARAM;
+-			mcCacheConfig = (MaverickCacheConfig *)param;
+-			pEncInfo->cacheConfig.luma.word = mcCacheConfig->luma.word;
+-			pEncInfo->cacheConfig.chroma.word = mcCacheConfig->chroma.word;
+-			pEncInfo->cacheConfig.Bypass = mcCacheConfig->Bypass;
+-			pEncInfo->cacheConfig.DualConf = mcCacheConfig->DualConf;
+-			pEncInfo->cacheConfig.PageMerge = mcCacheConfig->PageMerge;
+-			break;
+-		}
+-
+-	case ENABLE_MC_CACHE:
+-		{
+-			pEncInfo->cacheConfig.Bypass = 0;
+-			break;
+-		}
+-
+-	case DISABLE_MC_CACHE:
+-		{
+-			pEncInfo->cacheConfig.Bypass = 1;
+-			break;
+-		}
+-
+ 	case ENC_GET_SPS_RBSP:
+ 		{
+ 			if (pCodecInst->codecMode != AVC_ENC) {
+@@ -2806,6 +2782,11 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		SetDecSecondAXIIRAM(&pDecInfo->secAxiUse, &iramParam);
+ 	}
+ 
++	/* Enable 2-D cache */
++	if (cpu_is_mx6q())
++		SetMaverickCache(&pDecInfo->cacheConfig, pDecInfo->mapType,
++			    pDecInfo->openParam.chromaInterleave);
++
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -2934,13 +2915,14 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 		      (pDecInfo->cacheConfig.chroma.cfg.CacheSizeX << 4) |
+ 		      (pDecInfo->cacheConfig.chroma.cfg.CacheSizeY << 0);
+ 		VpuWriteReg(CMD_SET_FRAME_CACHE_SIZE, val);
++
+ 		val = (pDecInfo->cacheConfig.Bypass << 4) |
+ 		      (pDecInfo->cacheConfig.DualConf << 2) |
+ 		      (pDecInfo->cacheConfig.PageMerge << 0);
+ 		val = val << 24;
+-		val |= (pDecInfo->cacheConfig.luma.cfg.BufferSize << 16) |
+-		       (pDecInfo->cacheConfig.chroma.cfg.BufferSize << 8) |
+-		       (pDecInfo->cacheConfig.chroma.cfg.BufferSize << 0);
++		val |= (pDecInfo->cacheConfig.LumaBufferSize << 16) |
++		       (pDecInfo->cacheConfig.CbBufferSize << 8) |
++		       (pDecInfo->cacheConfig.CrBufferSize);
+ 		VpuWriteReg(CMD_SET_FRAME_CACHE_CONFIG, val);
+ 	}
+ 
+@@ -2962,7 +2944,8 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 			     1024));
+ 	}
+ 
+-	VpuWriteReg(CMD_SET_FRAME_MAX_DEC_SIZE,
++	if (!cpu_is_mx6q())
++		VpuWriteReg(CMD_SET_FRAME_MAX_DEC_SIZE,
+ 		     (pBufInfo->maxDecFrmInfo.maxMbNum << 16 |
+ 		      pBufInfo->maxDecFrmInfo.maxMbX << 8 |
+ 		      pBufInfo->maxDecFrmInfo.maxMbY));
+@@ -3446,14 +3429,14 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	if (cpu_is_mx6q()) {
+ 		val = (pDecInfo->secAxiUse.useBitEnable |
+ 		       pDecInfo->secAxiUse.useIpEnable << 1 |
+-		       pDecInfo->secAxiUse.useDbkYEnable << 2 |
+-		       pDecInfo->secAxiUse.useDbkCEnable << 3 |
++		       pDecInfo->secAxiUse.useDbkEnable << 2 |
++		       pDecInfo->secAxiUse.useDbkEnable << 3 |
+ 		       pDecInfo->secAxiUse.useOvlEnable << 4 |
+ 		       pDecInfo->secAxiUse.useBtpEnable << 5 |
+ 		       pDecInfo->secAxiUse.useHostBitEnable << 8 |
+ 		       pDecInfo->secAxiUse.useHostIpEnable << 9 |
+-		       pDecInfo->secAxiUse.useHostDbkYEnable << 10 |
+-		       pDecInfo->secAxiUse.useHostDbkCEnable << 11 |
++		       pDecInfo->secAxiUse.useHostDbkEnable << 10 |
++		       pDecInfo->secAxiUse.useHostDbkEnable << 11 |
+ 		       pDecInfo->secAxiUse.useHostOvlEnable << 12 |
+ 		       pDecInfo->secAxiUse.useHostBtpEnable << 13 );
+ 	} else {
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 999dd94..f9fc1f0 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -27,6 +27,7 @@
+ /*---------------------------------------------------------------------------
+  * HARDWARE REGISTER
+  *-------------------------------------------------------------------------*/
++#define GDMA_BASE	0x1000
+ #define NPT_BASE        0x3000
+ 
+ #define BIT_CODE_RUN			0x000
+@@ -408,6 +409,85 @@
+ #define BIT_PIC_WIDTH_OFFSET            16
+ #endif
+ 
++#define GDI_PRI_RD_PRIO_L           (GDMA_BASE + 0x000)
++#define GDI_PRI_RD_PRIO_H           (GDMA_BASE + 0x004)
++#define GDI_PRI_WR_PRIO_L           (GDMA_BASE + 0x008)
++#define GDI_PRI_WR_PRIO_H           (GDMA_BASE + 0x00c)
++#define GDI_PRI_RD_LOCK_CNT         (GDMA_BASE + 0x010)
++#define GDI_PRI_WR_LOCK_CNT         (GDMA_BASE + 0x014)
++#define GDI_SEC_RD_PRIO_L           (GDMA_BASE + 0x018)
++#define GDI_SEC_RD_PRIO_H           (GDMA_BASE + 0x01c)
++#define GDI_SEC_WR_PRIO_L           (GDMA_BASE + 0x020)
++#define GDI_SEC_WR_PRIO_H           (GDMA_BASE + 0x024)
++#define GDI_SEC_RD_LOCK_CNT         (GDMA_BASE + 0x028)
++#define GDI_SEC_WR_LOCK_CNT         (GDMA_BASE + 0x02c)
++#define GDI_SEC_CLIENT_EN           (GDMA_BASE + 0x030)
++#define GDI_CONTROL                 (GDMA_BASE + 0x034)
++#define GDI_PIC_INIT_HOST           (GDMA_BASE + 0x038)
++
++#define GDI_PINFO_REQ               (GDMA_BASE + 0x060)
++#define GDI_PINFO_ACK               (GDMA_BASE + 0x064)
++#define GDI_PINFO_ADDR              (GDMA_BASE + 0x068)
++#define GDI_PINFO_DATA              (GDMA_BASE + 0x06c)
++#define GDI_BWB_ENABLE              (GDMA_BASE + 0x070)
++#define GDI_BWB_SIZE                (GDMA_BASE + 0x074)
++#define GDI_BWB_STD_STRUCT          (GDMA_BASE + 0x078)
++#define GDI_BWB_STATUS              (GDMA_BASE + 0x07c)
++
++#define GDI_STATUS                  (GDMA_BASE + 0x080)
++
++#define GDI_DEBUG_0                 (GDMA_BASE + 0x084)
++#define GDI_DEBUG_1                 (GDMA_BASE + 0x088)
++#define GDI_DEBUG_2                 (GDMA_BASE + 0x08c)
++#define GDI_DEBUG_3                 (GDMA_BASE + 0x090)
++#define GDI_DEBUG_PROBE_ADDR        (GDMA_BASE + 0x094)
++#define GDI_DEBUG_PROBE_DATA        (GDMA_BASE + 0x098)
++
++// write protect
++#define GDI_WPROT_ERR_CLR	    (GDMA_BASE + 0x0A0)
++#define GDI_WPROT_ERR_RSN	    (GDMA_BASE + 0x0A4)
++#define GDI_WPROT_ERR_ADR	    (GDMA_BASE + 0x0A8)
++#define GDI_WPROT_RGN_EN	    (GDMA_BASE + 0x0AC)
++#define GDI_WPROT_RGN0_STA	    (GDMA_BASE + 0x0B0)
++#define GDI_WPROT_RGN0_END	    (GDMA_BASE + 0x0B4)
++#define GDI_WPROT_RGN1_STA	    (GDMA_BASE + 0x0B8)
++#define GDI_WPROT_RGN1_END	    (GDMA_BASE + 0x0BC)
++#define GDI_WPROT_RGN2_STA	    (GDMA_BASE + 0x0C0)
++#define GDI_WPROT_RGN2_END	    (GDMA_BASE + 0x0C4)
++#define GDI_WPROT_RGN3_STA	    (GDMA_BASE + 0x0C8)
++#define GDI_WPROT_RGN3_END	    (GDMA_BASE + 0x0CC)
++#define GDI_WPROT_RGN4_STA	    (GDMA_BASE + 0x0D0)
++#define GDI_WPROT_RGN4_END	    (GDMA_BASE + 0x0D4)
++#define GDI_WPROT_RGN5_STA	    (GDMA_BASE + 0x0D8)
++#define GDI_WPROT_RGN5_END	    (GDMA_BASE + 0x0DC)
++
++#define GDI_BUS_CTRL                (GDMA_BASE + 0x0f0)
++#define GDI_BUS_STATUS              (GDMA_BASE + 0x0f4)
++
++#define GDI_DCU_PIC_SIZE            (GDMA_BASE + 0x0a8)
++
++#define GDI_SIZE_ERR_FLAG           (GDMA_BASE + 0x0e0)
++#define GDI_INFO_CONTROL            (GDMA_BASE + 0x400)
++#define GDI_INFO_PIC_SIZE           (GDMA_BASE + 0x404)
++#define GDI_INFO_BASE_Y             (GDMA_BASE + 0x408)
++#define GDI_INFO_BASE_CB            (GDMA_BASE + 0x40c)
++#define GDI_INFO_BASE_CR            (GDMA_BASE + 0x410)
++
++#define GDI_XY2_CAS_0               (GDMA_BASE + 0x800)
++#define GDI_XY2_CAS_F               (GDMA_BASE + 0x83c)
++
++#define GDI_XY2_BA_0                (GDMA_BASE + 0x840)
++#define GDI_XY2_BA_1                (GDMA_BASE + 0x844)
++#define GDI_XY2_BA_2                (GDMA_BASE + 0x848)
++#define GDI_XY2_BA_3                (GDMA_BASE + 0x84c)
++
++#define GDI_XY2_RAS_0               (GDMA_BASE + 0x850)
++#define GDI_XY2_RAS_F               (GDMA_BASE + 0x88c)
++
++#define GDI_XY2_RBC_CONFIG          (GDMA_BASE + 0x890)
++#define GDI_RBC2_AXI_0              (GDMA_BASE + 0x8a0)
++#define GDI_RBC2_AXI_1F             (GDMA_BASE + 0x91c)
++
+ /*--------------------------------------------------------------------
+ NIEUPORT REGISTERS
+ --------------------------------------------------------------------*/
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 8b96055..6891994 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -848,7 +848,7 @@ RetCode SetHecMode(EncHandle handle, int mode)
+ void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm)
+ {
+ 	iram_t iram;
+-	int size, dbk_size, bitram_size, ipacdc_size, ovl_size;
++	int size, dbk_size, bitram_size, ipacdc_size, ovl_size, btp_size;
+ 
+ 	if (!parm->width) {
+ 		err_msg("Width is zero when calling SetDecSecondAXIIRAM function\n");
+@@ -890,11 +890,21 @@ void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm)
+ 	} else
+ 		goto out;
+ 
+-	ovl_size = (80 * parm->width / 16 + 1023) & ~1023;
+-	if ((parm->codecMode == VC1_DEC) && (size >= ovl_size)) {
+-		psecAxiIramInfo->useHostOvlEnable = 1;
+-		psecAxiIramInfo->bufOvlUse = psecAxiIramInfo->bufIpAcDcUse + ipacdc_size;
+-		size -= ovl_size;
++	ovl_size = (160 * parm->width / 16 + 1023) & ~1023;
++	if (parm->codecMode == VC1_DEC) {
++		if (size >= ovl_size) {
++			psecAxiIramInfo->useHostOvlEnable = 1;
++			psecAxiIramInfo->bufOvlUse = psecAxiIramInfo->bufIpAcDcUse + ipacdc_size;
++			size -= ovl_size;
++		}
++		if (cpu_is_mx6q()) {
++			btp_size = (160 * parm->width / 16 + 1023) & ~1023;
++			if (size >= btp_size) {
++				psecAxiIramInfo->useHostBtpEnable = 1;
++				psecAxiIramInfo->bufBtpUse = psecAxiIramInfo->bufOvlUse + ovl_size;
++				size -= btp_size;
++			}
++		}
+ 	}
+ out:
+ 	/* i.MX51 has no secondary AXI memory, but use on chip RAM
+@@ -902,12 +912,13 @@ out:
+ 	   Set the useXXXX as 0 at the same time to use IRAM,
+ 	   i.MX53 uses secondary AXI for IRAM access, also needs to
+ 	   set the useXXXX. */
+-	if (cpu_is_mx53()) {
+-		/* i.MX53 uses secondary AXI for IRAM access */
+-		psecAxiIramInfo->useBitEnable = psecAxiIramInfo->useHostDbkEnable;
+-		psecAxiIramInfo->useIpEnable = psecAxiIramInfo->useHostBitEnable;
+-		psecAxiIramInfo->useDbkEnable = psecAxiIramInfo->useHostIpEnable;
++	if (cpu_is_mx53() || cpu_is_mx6q()) {
++		/* i.MX53/i.MX6Q uses secondary AXI for IRAM access */
++		psecAxiIramInfo->useBitEnable = psecAxiIramInfo->useHostBitEnable;
++		psecAxiIramInfo->useIpEnable = psecAxiIramInfo->useHostIpEnable;
++		psecAxiIramInfo->useDbkEnable = psecAxiIramInfo->useHostDbkEnable;
+ 		psecAxiIramInfo->useOvlEnable = psecAxiIramInfo->useHostOvlEnable;
++		psecAxiIramInfo->useBtpEnable = psecAxiIramInfo->useHostBtpEnable;
+ 	}
+ 
+ 	if (((parm->codecMode == VC1_DEC) && !psecAxiIramInfo->useHostOvlEnable) ||
+@@ -930,6 +941,12 @@ void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm)
+ 	IOGetIramBase(&iram);
+ 	size = iram.end - iram.start + 1;
+ 
++	if (cpu_is_mx6q()) {
++		psecAxiIramInfo->searchRamSize = 0;
++		psecAxiIramInfo->searchRamAddr = 0;
++		goto set_dbk;
++	}
++
+ 	/* Setting internal iram usage per priority when iram isn't enough */
+ 	psecAxiIramInfo->searchRamSize = (parm->width * 36 + 2048 + 1023) & ~1023;
+ 	if (size >= psecAxiIramInfo->searchRamSize) {
+@@ -941,6 +958,7 @@ void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm)
+ 		goto out;
+ 	}
+ 
++set_dbk:
+ 	/* Only H.264BP and H.263P3 are considered */
+ 	dbk_size = (128 * parm->width / 16 + 1023) & ~1023;
+ 	if (size >= dbk_size) {
+@@ -967,14 +985,15 @@ void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm)
+ 	}
+ 
+ 	psecAxiIramInfo->useHostOvlEnable = 0; /* no need to enable ovl in encoder */
++	psecAxiIramInfo->useBtpEnable = 0;
+ 
+ out:
+ 	/* i.MX51 has no secondary AXI memory, but use on chip RAM
+ 	   Set the useHoseXXX as 1 to enable corresponding IRAM
+ 	   Set the useXXXX as 0 at the same time to use IRAM,
+-	   i.MX53 uses secondary AXI for IRAM access, also needs to set
++	   i.MX53/i.MX6Q uses secondary AXI for IRAM access, also needs to set
+ 	   useXXXX. */
+-	if (cpu_is_mx53()) {
++	if (cpu_is_mx53() || cpu_is_mx6q()) {
+ 		/* i.MX53 uses secondary AXI for IRAM access */
+ 		psecAxiIramInfo->useBitEnable = psecAxiIramInfo->useHostBitEnable;
+ 		psecAxiIramInfo->useIpEnable = psecAxiIramInfo->useHostIpEnable;
+@@ -986,6 +1005,46 @@ out:
+ 		warn_msg("VPU iram is less than needed, some parts don't use iram\n");
+ }
+ 
++void SetMaverickCache(MaverickCacheConfig *pCacheConf, int mapType, int chromInterleave)
++{
++	if (mapType == LINEAR_FRAME_MAP) {
++		/* Set luma */
++		pCacheConf->luma.cfg.PageSizeX = 2;
++		pCacheConf->luma.cfg.PageSizeY = 0;
++		pCacheConf->luma.cfg.CacheSizeX = 2;
++		pCacheConf->luma.cfg.CacheSizeY = 6;
++		/* Set chroma */
++		pCacheConf->chroma.cfg.PageSizeX = 2;
++		pCacheConf->chroma.cfg.PageSizeY = 0;
++		pCacheConf->chroma.cfg.CacheSizeX = 2;
++		pCacheConf->chroma.cfg.CacheSizeY = 4;
++		pCacheConf->PageMerge = 2;
++	} else {
++		/* Set luma */
++		pCacheConf->luma.cfg.PageSizeX = 0;
++		pCacheConf->luma.cfg.PageSizeY = 2;
++		pCacheConf->luma.cfg.CacheSizeX = 4;
++		pCacheConf->luma.cfg.CacheSizeY = 4;
++		/* Set chroma */
++		pCacheConf->chroma.cfg.PageSizeX = 0;
++		pCacheConf->chroma.cfg.PageSizeY = 2;
++		pCacheConf->chroma.cfg.CacheSizeX = 4;
++		pCacheConf->chroma.cfg.CacheSizeY = 3;
++		pCacheConf->PageMerge = 1;
++	}
++
++	pCacheConf->Bypass = 0; /* cache enable */
++	pCacheConf->DualConf = 0;
++	pCacheConf->LumaBufferSize = 32;
++	if (chromInterleave) {
++		pCacheConf->CbBufferSize = 0;
++		pCacheConf->CrBufferSize = 0x10;
++	} else {
++		pCacheConf->CbBufferSize = 8;
++		pCacheConf->CrBufferSize = 8;
++	}
++}
++
+ semaphore_t *vpu_semaphore_open(void)
+ {
+ 	semaphore_t *semap;
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 3aae860..d831f4f 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -154,12 +154,22 @@ enum {
+ 	SOF_Marker      = 0xFFC0,           // Start of frame : Baseline DCT
+ 	SOS_Marker      = 0xFFDA,           // Start of scan
+ };
++
++enum {
++	LINEAR_FRAME_MAP  = 0,
++	TILED_FRAME_V_MAP = 1,
++	TILED_FRAME_H_MAP = 2,
++	TILED_FIELD_V_MAP = 3,
++	TILED_MIXED_V_MAP = 4,
++	TILED_FRAME_MB_RASTER_MAP = 5,
++	TILED_FIELD_MB_RASTER_MAP = 6,
++	TILED_MAP_TYPE_MAX
++};
++
+ typedef struct {
+ 	int useBitEnable;
+ 	int useIpEnable;
+ 	int useDbkEnable;
+-	int useDbkYEnable;
+-	int useDbkCEnable;
+ 	int useOvlEnable;
+ 	int useBtpEnable;
+ 	int useMeEnable;
+@@ -167,8 +177,6 @@ typedef struct {
+ 	int useHostBitEnable;
+ 	int useHostIpEnable;
+ 	int useHostDbkEnable;
+-	int useHostDbkYEnable;
+-	int useHostDbkCEnable;
+ 	int useHostBtpEnable;
+ 	int useHostOvlEnable;
+ 	int useHostMeEnable;
+@@ -186,12 +194,11 @@ typedef struct {
+ } SecAxiUse;
+ 
+ typedef struct CacheSizeCfg {
+-    unsigned BufferSize : 8;
+     unsigned PageSizeX  : 4;
+     unsigned PageSizeY  : 4;
+     unsigned CacheSizeX : 4;
+     unsigned CacheSizeY : 4;
+-    unsigned Reserved   : 8;
++    unsigned Reserved   : 16;
+ } CacheSizeCfg;
+ 
+ typedef struct {
+@@ -206,6 +213,9 @@ typedef struct {
+     unsigned Bypass : 1;
+     unsigned DualConf : 1;
+     unsigned PageMerge : 2;
++    unsigned LumaBufferSize: 8;
++    unsigned CbBufferSize: 8;
++    unsigned CrBufferSize: 8;
+ } MaverickCacheConfig;
+ 
+ typedef struct {
+@@ -445,6 +455,7 @@ RetCode SetHecMode(EncHandle handle, int mode);
+ 
+ void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm);
+ void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, SetIramParam *parm);
++void SetMaverickCache(MaverickCacheConfig *pCacheConf, int mapType, int chromInterleave);
+ 
+ semaphore_t *vpu_semaphore_open(void);
+ void semaphore_post(semaphore_t *semap, int mutex);
+-- 
+1.8.0
+

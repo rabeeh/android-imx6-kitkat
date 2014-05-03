@@ -1,0 +1,158 @@
+From 0825c68904ae07f1143b1d8871f16fdad8c9e402 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 27 Jul 2011 00:01:22 +0800
+Subject: [PATCH 151/249] ENGR00153830 vpu: Use mmap vmalloced memory for
+ multi-instances support
+
+Currently only mx6q used vmalloced share memory from vpu driver, mx5x
+platform keeps current solution, then it is convenient to do vpu lib,
+upgrade, no need to upgrade depenent kernel.
+
+Will change mx5x solution when android uses 2.6.38 kernel as formal
+release.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_io.c   | 26 ++++++++++++++++++++++++++
+ vpu/vpu_io.h   |  2 ++
+ vpu/vpu_lib.h  |  2 +-
+ vpu/vpu_util.c | 29 ++++++++++++-----------------
+ 4 files changed, 41 insertions(+), 18 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index 4bfd32f..8343043 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -382,6 +382,32 @@ int IOFreeVirtMem(vpu_mem_desc * buff)
+ 	return 0;
+ }
+ 
++/*!
++ * @brief map vmalloced share memory to user space.
++ *
++ * @param       buff    the structure containing memory information to be unmapped;
++ *
++ * @return      user space address.
++ */
++int IOGetVShareMem(int size)
++{
++	unsigned long va_addr;
++	vpu_mem_desc buff = { 0 };
++
++	buff.size = size;
++	if (ioctl(vpu_fd, VPU_IOC_REQ_VSHARE_MEM, &buff)) {
++		err_msg("mem allocation failed!\n");
++		return 0;
++	}
++	va_addr = (unsigned long)mmap(NULL, size, PROT_READ | PROT_WRITE,
++                       MAP_SHARED, vpu_fd, buff.cpu_addr);
++
++	if ((void *)va_addr == MAP_FAILED)
++		return 0;
++
++	return va_addr;
++}
++
+ int IOWaitForInt(int timeout_in_ms)
+ {
+ 	int ret = 0;
+diff --git a/vpu/vpu_io.h b/vpu/vpu_io.h
+index f3e21eb..2c29ac6 100644
+--- a/vpu/vpu_io.h
++++ b/vpu/vpu_io.h
+@@ -56,6 +56,7 @@ typedef struct iram_t {
+ #define	VPU_IOC_IRAM_BASE	_IO(VPU_IOC_MAGIC, 6)
+ #define	VPU_IOC_CLKGATE_SETTING	_IO(VPU_IOC_MAGIC, 7)
+ #define VPU_IOC_GET_WORK_ADDR   _IO(VPU_IOC_MAGIC, 8)
++#define VPU_IOC_REQ_VSHARE_MEM  _IO(VPU_IOC_MAGIC, 9)
+ #define VPU_IOC_SYS_SW_RESET	_IO(VPU_IOC_MAGIC, 11)
+ #define VPU_IOC_GET_SHARE_MEM   _IO(VPU_IOC_MAGIC, 12)
+ 
+@@ -67,6 +68,7 @@ int IOGetPhyMem(vpu_mem_desc * buff);
+ int IOFreePhyMem(vpu_mem_desc * buff);
+ int IOGetVirtMem(vpu_mem_desc * buff);
+ int IOFreeVirtMem(vpu_mem_desc * buff);
++int IOGetVShareMem(int size);
+ int IOWaitForInt(int timeout_in_ms);
+ int IOGetIramBase(iram_t * iram);
+ int IOClkGateSet(int on);
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 67cadd7..be52670 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -591,7 +591,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 3, 0)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 3, 1)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 54de53a..fba9434 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -53,8 +53,6 @@ extern semaphore_t *vpu_semap;
+ static int mutex_timeout;
+ static vpu_mem_desc share_mem;
+ 
+-static semaphore_t  g_sema_buffer;
+-
+ RetCode LoadBitCodeTable(Uint16 * pBitCode, int *size)
+ {
+ 	FILE *fp;
+@@ -93,7 +91,7 @@ RetCode LoadBitCodeTable(Uint16 * pBitCode, int *size)
+ 		return RETCODE_FAILURE;
+ 	}
+ 
+-	fread(&info, sizeof(headerInfo), 1, fp);
++	ret = fread(&info, sizeof(headerInfo), 1, fp);
+ 
+ 	if (info.size > MAX_FW_BINARY_LEN) {
+ 		err_msg("Size in VPU header is too large.Size: %d\n",
+@@ -1106,16 +1104,18 @@ semaphore_t *vpu_semaphore_open(void)
+ 	char *timeout_env;
+ 	int i;
+ 
+-
++	/*
++	 * Currently only mx6q uses vmalloced share memory, mx5x platfrom
++	 * keeps current solution, then it is convenient to do vpu lib
++	 * upgrade, no need to upgrade depenent kernel.
++	 * Will change mx5x solution later.
++	 */
+ 	if (cpu_is_mx6q()) {
+-		/*
+-		 * Temporarily to use global variable for shared memory for mx6q now,
+-		 * Will fix this later since getting shared memory from kernel will
+-		 * make vpu hang now.
+-		 * And mx6q cannot support multi-instances currently.
+-		 * Fixme later......
+-		 */
+-		semap = &g_sema_buffer;
++		semap = (semaphore_t *)IOGetVShareMem(sizeof(semaphore_t));
++		if (!semap) {
++			err_msg("Unable to Get VShare memory\n");
++			return NULL;
++		}
+ 		goto semap_init;
+ 	}
+ 
+@@ -1193,13 +1193,8 @@ unsigned char semaphore_wait(semaphore_t *semap, int mutex)
+ 
+ void vpu_semaphore_close(semaphore_t * semap)
+ {
+-	/* Fixme later for mx6q */
+-	if (cpu_is_mx6q())
+-	    goto ret;
+-
+ 	if (munmap((void *)semap, sizeof(semaphore_t)) != 0)
+ 		err_msg("munmap share mem failed\n");
+-ret:
+ 	return;
+ }
+ 
+-- 
+1.8.0
+

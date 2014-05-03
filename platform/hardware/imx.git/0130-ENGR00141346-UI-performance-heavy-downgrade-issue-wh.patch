@@ -1,0 +1,346 @@
+From 6e47700306f2c0c94343cd63c33a2e796de9e39a Mon Sep 17 00:00:00 2001
+From: b07117 <b07117@freescale.com>
+Date: Wed, 30 Mar 2011 15:02:29 +0800
+Subject: [PATCH 130/486] ENGR00141346, UI performance heavy downgrade issue
+ when enable dual display
+
+Resizing with 2cd, surfaceflinger post time is reduced to 25-30ms from 70-75ms.
+when enable parallel display, the post time is reduced to 18-23ms.
+
+Signed-off-by: xianzhong <b07117@freescale.com>
+---
+ libgralloc/Android.mk      |   5 +-
+ libgralloc/framebuffer.cpp | 225 ++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 213 insertions(+), 17 deletions(-)
+
+diff --git a/libgralloc/Android.mk b/libgralloc/Android.mk
+index 36690e1..290dfc3 100755
+--- a/libgralloc/Android.mk
++++ b/libgralloc/Android.mk
+@@ -20,8 +20,9 @@ LOCAL_PATH := $(call my-dir)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu
++LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu libc2d_z430
+ LOCAL_C_INCLUDES += external/linux-lib/ipu
++LOCAL_C_INCLUDES += hardware/mx5x/libcopybit
+ 
+ LOCAL_SRC_FILES := 	\
+ 	allocator.cpp 	\
+@@ -30,7 +31,7 @@ LOCAL_SRC_FILES := 	\
+ 	mapper.cpp
+ 	
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+-LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\"
++LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX
+ 
+ 
+ ifeq ($(HAVE_FSL_EPDC_FB),true)
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index 90ab80b..d27a485 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -50,6 +50,9 @@ extern "C" {
+ 
+ #endif
+ #include <GLES/gl.h>
++#include <c2d_api.h>
++#include <pthread.h>
++#include <semaphore.h>
+ 
+ #include "gralloc_priv.h"
+ #include "gr.h"
+@@ -88,7 +91,14 @@ struct fb_context_t {
+     int sec_disp_next_buf;
+     struct fb_var_screeninfo sec_info;
+     struct fb_fix_screeninfo sec_finfo;
++    struct framebuffer_device_t* dev;
++    buffer_handle_t buffer;
++    sem_t sec_display_begin;
++    sem_t sec_display_end;
++    pthread_t thread_id;
++    C2D_CONTEXT c2dctx;
+     int sec_rotation;
++    int mRotate;
+ #endif
+ };
+ 
+@@ -97,6 +107,8 @@ struct fb_context_t {
+ #define MAX_SEC_DISP_HEIGHT (1024)
+ static int mapSecFrameBuffer(fb_context_t* ctx);
+ static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx);
++static int resizeToSecFrameBuffer_c2d(int base,int phys,fb_context_t* ctx);
++void * secDispShowFrames(void * arg);
+ #endif
+ 
+ #ifdef FSL_EPDC_FB
+@@ -280,6 +292,22 @@ static int fb_setSecRotation(struct framebuffer_device_t* dev,int secRotation)
+     if((ctx->sec_rotation != secRotation)&&(ctx->sec_disp_base != 0))      
+        memset((void *)ctx->sec_disp_base, 0, ctx->sec_frame_size*NUM_BUFFERS);
+     ctx->sec_rotation = secRotation;
++    switch(secRotation)
++    {
++    case 4:
++       ctx->mRotate = 90;
++       break;
++    case 3:
++       ctx->mRotate = 180;
++       break;
++    case 7:
++       ctx->mRotate = 270;
++       break;
++    case 0:
++    default:
++       ctx->mRotate = 0;
++       break;
++    }
+     return 0;
+ }
+ #endif
+@@ -323,6 +351,13 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+                 if(mapSecFrameBuffer(ctx)== 0)
+                 {    
+                     ctx->sec_display_inited = true;
++                    c2dCreateContext(&ctx->c2dctx); 
++
++                    sem_init(&ctx->sec_display_begin, 0, 0);
++                    sem_init(&ctx->sec_display_end, 0, 0);
++                     
++                    pthread_create(&ctx->thread_id, NULL, &secDispShowFrames, (void *)ctx);
++                                        
+                     //Set the prop rw.SECOND_DISPLAY_ENABLED to 1
+                     LOGI("sys.SECOND_DISPLAY_ENABLED Set to 1");
+                     property_set("sys.SECOND_DISPLAY_ENABLED", "1");
+@@ -331,23 +366,24 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+ 
+             if(ctx->sec_display_inited) {
+                 //Resize the primary display to the second display
+-                resizeToSecFrameBuffer(hnd->base,
+-                                       m->framebuffer->phys+offset,
+-                                       ctx);
+-                ctx->sec_info.activate = FB_ACTIVATE_VBL;
+-                if(!ctx->sec_disp_next_buf) {
+-                    ctx->sec_info.yoffset = 0; 
+-                }
+-                else{
+-                    ctx->sec_info.yoffset = ctx->sec_disp_h;
+-                }
+-
+-                ctx->sec_disp_next_buf = !ctx->sec_disp_next_buf;
+-                ioctl(ctx->sec_fp, FBIOPAN_DISPLAY, &ctx->sec_info);
++                ctx->dev = dev;
++                ctx->buffer = buffer;
++                sem_post(&ctx->sec_display_begin);
+             }
+         }
+         else{
+             if(ctx->sec_display_inited) {
++                
++                ctx->sec_display_inited = false;
++                
++                sem_post(&ctx->sec_display_begin);
++                sem_wait(&ctx->sec_display_end);
++                
++                sem_destroy(&ctx->sec_display_begin);
++                sem_destroy(&ctx->sec_display_end);
++                
++                if (ctx->c2dctx != NULL)c2dDestroyContext(ctx->c2dctx);
++                
+                 //Set the prop rw.SECOND_DISPLAY_ENABLED to 0
+                 LOGI("Switch back to display 0");
+                 LOGI("sys.SECOND_DISPLAY_ENABLED Set to 0");
+@@ -404,7 +440,6 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+                     close(ctx->sec_fp);
+                     ctx->sec_fp = 0;
+                 }
+-                ctx->sec_display_inited = false;
+             }
+         }
+ 
+@@ -416,6 +451,10 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+             return -errno;
+         }
+ 
++    #ifdef SECOND_DISPLAY_SUPPORT
++        if(ctx->sec_display_inited) sem_wait(&ctx->sec_display_end);
++    #endif
++
+ #ifdef FSL_EPDC_FB
+         if(ctx->rect_update) {
+             for(int i=0; i < ctx->count; i++)
+@@ -911,7 +950,7 @@ static int mapSecFrameBuffer(fb_context_t* ctx)
+     ctx->sec_disp_w = info.xres;
+     ctx->sec_disp_h = info.yres;
+     ctx->sec_frame_size = fbSize/NUM_BUFFERS;
+-    ctx->sec_disp_next_buf = 0;
++    ctx->sec_disp_next_buf = info.yoffset ? 0 : 1;
+     ctx->sec_info = info;
+     ctx->sec_finfo = finfo;
+ 
+@@ -1067,6 +1106,162 @@ static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx)
+ 
+     return 0;
+ }
++
++/** convert HAL_PIXEL_FORMAT to C2D format */
++static C2D_COLORFORMAT get_format(int format) {
++    switch (format) {
++	case HAL_PIXEL_FORMAT_BGRA_8888:   return C2D_COLOR_8888_ABGR;    
++    case HAL_PIXEL_FORMAT_RGB_565:     return C2D_COLOR_0565;
++    default:                           return C2D_COLOR_0565; 
++    }
++}
++
++/** get  pixelbit from HAL_PIXEL_FORMAT format */
++static int get_pixelbit(int format) {
++    switch (format) {
++    case HAL_PIXEL_FORMAT_BGRA_8888:   return 32;
++    case HAL_PIXEL_FORMAT_RGB_565:     return 16;
++    default:                           return 16;
++    }
++}
++
++static int resizeToSecFrameBuffer_c2d(int base,int phys,fb_context_t* ctx)
++{
++    C2D_SURFACE_DEF srcSurfaceDef;
++    C2D_SURFACE_DEF dstSurfaceDef;
++    C2D_SURFACE srcSurface;
++    C2D_SURFACE dstSurface; 
++    C2D_RECT dstRect;
++
++    if(!ctx || !ctx->c2dctx) return -1;
++
++    srcSurfaceDef.format = get_format(ctx->device.format);
++    srcSurfaceDef.width =  ctx->device.width;
++    srcSurfaceDef.height = ctx->device.height;
++
++	//make sure stride is 32 pixel aligned
++    srcSurfaceDef.stride = ((ctx->device.width + 31) & ~31)*get_pixelbit(ctx->device.format)>>3;
++
++    srcSurfaceDef.buffer = (void *)phys;
++    srcSurfaceDef.host = (void *)base;
++    srcSurfaceDef.flags = C2D_SURFACE_NO_BUFFER_ALLOC;
++
++    if (c2dSurfAlloc(ctx->c2dctx, &srcSurface, &srcSurfaceDef) != C2D_STATUS_OK)
++    {
++        LOGE("srcSurface c2dSurfAlloc fail");
++        return -EINVAL;
++    }
++
++    dstSurfaceDef.format = get_format(ctx->device.format);
++    dstSurfaceDef.width =  ctx->sec_disp_w;
++    dstSurfaceDef.height = ctx->sec_disp_h;
++
++    //make sure stride is 32 pixel aligned
++    dstSurfaceDef.stride = ((ctx->sec_disp_w + 31) & ~31)*get_pixelbit(HAL_PIXEL_FORMAT_RGB_565)>>3;
++
++    dstSurfaceDef.buffer = (void *)ctx->sec_disp_phys + ctx->sec_disp_next_buf*ctx->sec_frame_size;
++    dstSurfaceDef.host = (void *)ctx->sec_disp_base + ctx->sec_disp_next_buf*ctx->sec_frame_size;
++    dstSurfaceDef.flags = C2D_SURFACE_NO_BUFFER_ALLOC;
++
++    dstRect.x = dstRect.y = 0;
++    dstRect.width = dstSurfaceDef.width;
++    dstRect.height = dstSurfaceDef.height;
++                
++    if((ctx->mRotate == 0)||(ctx->mRotate == 180))
++    {
++        if(ctx->sec_disp_w/ctx->sec_disp_h >= ctx->device.width/ctx->device.height){
++            dstRect.width = ctx->sec_disp_h*ctx->device.width/ctx->device.height;
++        }
++        else{
++            dstRect.height = ctx->sec_disp_w*ctx->device.height/ctx->device.width;
++        }
++    }
++    else{
++        if(ctx->sec_disp_w/ctx->sec_disp_h >= ctx->device.height/ctx->device.width){
++            dstRect.width = ctx->sec_disp_h*ctx->device.height/ctx->device.width;
++        }
++        else{
++            dstRect.height = ctx->sec_disp_w*ctx->device.width/ctx->device.height;
++        }
++    }
++
++    dstRect.x = (ctx->sec_disp_w - dstRect.width)/2;
++    dstRect.y = (ctx->sec_disp_h - dstRect.height)/2;
++            
++    if (c2dSurfAlloc(ctx->c2dctx, &dstSurface, &dstSurfaceDef) != C2D_STATUS_OK)
++    {
++        LOGE("dstSurface c2dSurfAlloc fail");
++        c2dSurfFree(ctx->c2dctx, srcSurface);
++        return -EINVAL;
++    }
++
++    c2dSetSrcSurface(ctx->c2dctx, srcSurface);
++    c2dSetDstSurface(ctx->c2dctx, dstSurface); 
++    c2dSetSrcRotate(ctx->c2dctx, ctx->mRotate);
++    
++    c2dSetBlendMode(ctx->c2dctx, C2D_ALPHA_BLEND_NONE);         
++    c2dSetDither(ctx->c2dctx, 0); 
++ 
++    c2dSetDstRectangle(ctx->c2dctx, &dstRect);
++    c2dDrawBlit(ctx->c2dctx); 
++        
++    c2dFinish(ctx->c2dctx);
++    c2dSurfFree(ctx->c2dctx, srcSurface);
++    c2dSurfFree(ctx->c2dctx, dstSurface);
++
++    return 0;
++}
++
++void * secDispShowFrames(void * arg)
++{
++    private_module_t* m = NULL;
++    private_handle_t const* hnd = NULL;
++    fb_context_t* ctx = (fb_context_t*)arg;
++    
++    while(1)
++    {
++        sem_wait(&ctx->sec_display_begin);
++
++        if(!ctx->sec_display_inited)
++        {
++            sem_post(&ctx->sec_display_end);
++            break;
++        }
++
++        hnd = reinterpret_cast<private_handle_t const*>(ctx->buffer);
++        m = reinterpret_cast<private_module_t*>(ctx->dev->common.module);
++
++        if(ctx->c2dctx != NULL)
++        {
++            resizeToSecFrameBuffer_c2d(hnd->base,
++                       m->framebuffer->phys + hnd->base - m->framebuffer->base,
++                       ctx);
++        }
++        else
++        {
++            resizeToSecFrameBuffer(hnd->base,
++                               m->framebuffer->phys + hnd->base - m->framebuffer->base,
++                               ctx);
++        }
++
++        sem_post(&ctx->sec_display_end);
++        
++        if(!ctx->sec_disp_next_buf) {
++            ctx->sec_info.yoffset = 0; 
++        }
++        else{
++            ctx->sec_info.yoffset = ctx->sec_disp_h;
++        }
++
++        ctx->sec_disp_next_buf = !ctx->sec_disp_next_buf;  
++        ctx->sec_info.activate = FB_ACTIVATE_VBL;
++
++        ioctl(ctx->sec_fp, FBIOPAN_DISPLAY, &ctx->sec_info);
++    }
++
++    return NULL;
++}
++
+ #endif
+ 
+ /*****************************************************************************/
+-- 
+1.8.0
+

@@ -1,0 +1,447 @@
+From 9181bdb1fcc3b7575aa078b1439bc266f93b320c Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Tue, 18 Jun 2013 13:53:56 +0800
+Subject: [PATCH 454/486] ENGR00265715 WFD:update new wifi driver
+
+Merge some change from atheros.
+Its official version is android_olca34_cs_patch_5_1_build_189_20130530.
+
+Change-Id: I6319e25d6fcf171dbca3d3672ede53d155cb86eb
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ wlan/atheros/compat-wireless/drivers/bcma/Makefile |  9 +++
+ .../compat-wireless/drivers/misc/eeprom/Makefile   |  2 +-
+ .../drivers/net/wireless/ath/ath6kl/cfg80211.c     | 22 +++----
+ .../drivers/net/wireless/ath/ath6kl/core.h         | 20 +++---
+ .../drivers/net/wireless/ath/ath6kl/init.c         | 25 +++++---
+ .../drivers/net/wireless/ath/ath6kl/main.c         | 72 +++++++++++++++++-----
+ .../drivers/net/wireless/ath/ath6kl/platform.c     |  2 +-
+ .../drivers/net/wireless/ath/ath6kl/sdio.c         |  6 +-
+ .../drivers/net/wireless/ath/ath6kl/txrx.c         |  3 +-
+ .../drivers/net/wireless/ath/ath6kl/wmi.c          | 22 +++++++
+ .../drivers/net/wireless/ath/ath6kl/wmi.h          |  9 +++
+ 11 files changed, 145 insertions(+), 47 deletions(-)
+
+diff --git a/wlan/atheros/compat-wireless/drivers/bcma/Makefile b/wlan/atheros/compat-wireless/drivers/bcma/Makefile
+index 8b13789..82de24e 100644
+--- a/wlan/atheros/compat-wireless/drivers/bcma/Makefile
++++ b/wlan/atheros/compat-wireless/drivers/bcma/Makefile
+@@ -1 +1,10 @@
++bcma-y					+= main.o scan.o core.o sprom.o
++bcma-y					+= driver_chipcommon.o driver_chipcommon_pmu.o
++bcma-y					+= driver_pci.o
++bcma-$(CONFIG_BCMA_DRIVER_PCI_HOSTMODE)	+= driver_pci_host.o
++bcma-$(CONFIG_BCMA_DRIVER_MIPS)		+= driver_mips.o
++bcma-$(CONFIG_BCMA_HOST_PCI)		+= host_pci.o
++bcma-$(CONFIG_BCMA_HOST_SOC)		+= host_soc.o
++obj-$(CONFIG_BCMA)			+= bcma.o
+ 
++ccflags-$(CONFIG_BCMA_DEBUG)		:= -DDEBUG
+diff --git a/wlan/atheros/compat-wireless/drivers/misc/eeprom/Makefile b/wlan/atheros/compat-wireless/drivers/misc/eeprom/Makefile
+index 8b13789..151feb2 100644
+--- a/wlan/atheros/compat-wireless/drivers/misc/eeprom/Makefile
++++ b/wlan/atheros/compat-wireless/drivers/misc/eeprom/Makefile
+@@ -1 +1 @@
+-
++obj-$(CONFIG_EEPROM_93CX6)	+= eeprom_93cx6.o
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/cfg80211.c b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/cfg80211.c
+index a8d4a52..00324f7 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/cfg80211.c
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/cfg80211.c
+@@ -610,15 +610,6 @@ static int ath6kl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
+ 		}
+ 	}
+ 
+-	status = ath6kl_wmi_connect_cmd(ar->wmi, vif->fw_vif_idx, vif->nw_type,
+-					vif->dot11_auth_mode, vif->auth_mode,
+-					vif->prwise_crypto,
+-					vif->prwise_crypto_len,
+-					vif->grp_crypto, vif->grp_crypto_len,
+-					vif->ssid_len, vif->ssid,
+-					vif->req_bssid, vif->ch_hint,
+-					ar->connect_ctrl_flags, nw_subtype);
+-
+ 	/* disable background scan if period is 0 */
+ 	if (sme->bg_scan_period == 0)
+ 		sme->bg_scan_period = 0xffff;
+@@ -630,6 +621,15 @@ static int ath6kl_cfg80211_connect(struct wiphy *wiphy, struct net_device *dev,
+ 	ath6kl_wmi_scanparams_cmd(ar->wmi, vif->fw_vif_idx, 0, 0,
+ 				  sme->bg_scan_period, 0, 0, 0, 3, 0, 0, 0);
+ 
++	status = ath6kl_wmi_connect_cmd(ar->wmi, vif->fw_vif_idx, vif->nw_type,
++					vif->dot11_auth_mode, vif->auth_mode,
++					vif->prwise_crypto,
++					vif->prwise_crypto_len,
++					vif->grp_crypto, vif->grp_crypto_len,
++					vif->ssid_len, vif->ssid,
++					vif->req_bssid, vif->ch_hint,
++					ar->connect_ctrl_flags, nw_subtype);
++
+ 	up(&ar->sem);
+ 
+ 	if (status == -EINVAL) {
+@@ -4025,8 +4025,6 @@ int ath6kl_register_ieee80211_hw(struct ath6kl *ar)
+ 		NL80211_PROBE_RESP_OFFLOAD_SUPPORT_P2P |
+ 		NL80211_PROBE_RESP_OFFLOAD_SUPPORT_80211U;
+ 
+-	ath6kl_setup_android_resource(ar);
+-
+ 	if (test_bit(ATH6KL_FW_CAPABILITY_MAC_ACL, ar->fw_capabilities)) {
+ 		ar->wiphy->features |= NL80211_FEATURE_MAC_ACL;
+ 		ar->wiphy->max_acl_mac_addrs = MAX_ACL_MAC_ADDRS;
+@@ -4038,6 +4036,8 @@ int ath6kl_register_ieee80211_hw(struct ath6kl *ar)
+ 		return ret;
+ 	}
+ 
++	ath6kl_setup_android_resource(ar);
++
+ 	return 0;
+ }
+ 
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/core.h b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/core.h
+index 3f45655..8dbb81b 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/core.h
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/core.h
+@@ -718,8 +718,7 @@ struct ath6kl_vif {
+ #define ATH6KL_PRIV_GET_WLAN_STATS	(SIOCIWFIRSTPRIV + 21)
+ 
+ /* ATH6KL_IOCTL_EXTENDED - extended ioctl */
+-#define ATH6KL_IOCTL_WEXT_PRIV26        (SIOCIWFIRSTPRIV+26)
+-
++#define ATH6KL_IOCTL_WEXT_PRIV	(SIOCDEVPRIVATE + 1)
+ 
+ struct ath6kl_wifi_priv_cmd {
+ 	char *buf;
+@@ -727,14 +726,6 @@ struct ath6kl_wifi_priv_cmd {
+ 	int total_len;
+ };
+ 
+-/* TBD: ioctl number is aligned to olca branch
+- * will refine one the loopback tool is ready for native ath6kl
+- */
+-enum ath6kl_xioctl {
+-	ATH6KL_XIOCTL_TRAFFIC_ACTIVITY_CHANGE	= 80,
+-	ATH6KL_XIOCTL_PKT_FILTER_ADD_DEL	= 81,
+-};
+-
+ /* Flag info */
+ enum ath6kl_dev_state {
+ 	WMI_ENABLED,
+@@ -1018,6 +1009,11 @@ struct dhcp_packet {
+ 	struct bootp_pkt bootp_hdr;
+ } __packed;
+ 
++struct ath6kl_drv_priv_cmd_ops {
++	char *cmd;
++	int (*handler) (struct ath6kl_vif *vif, char *buf, int len);
++};
++
+ static inline struct ath6kl *ath6kl_priv(struct net_device *dev)
+ {
+ 	return ((struct ath6kl_vif *) netdev_priv(dev))->ar;
+@@ -1142,6 +1138,10 @@ bool ath6kl_is_other_vif_connected(struct ath6kl *ar,
+ int ath6kl_ioctl_pkt_filter_set(struct ath6kl_vif *vif,
+ 				char *buf,
+ 				int len);
++
++int ath6kl_ioctl_ap_ps_parameter_set(struct ath6kl_vif *vif,
++				     char *buf, int len);
++
+ /* Fw error recovery */
+ void ath6kl_init_hw_restart(struct ath6kl *ar);
+ void ath6kl_recovery_err_notify(struct ath6kl *ar, enum ath6kl_fw_err reason);
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/init.c b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/init.c
+index bb66ec2..f03d6e6 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/init.c
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/init.c
+@@ -1859,6 +1859,7 @@ int ath6kl_core_init(struct ath6kl *ar)
+ 	struct net_device *ndev;
+ 	int ret = 0, i;
+ 	struct net_device *ndev_p2p0;
++
+ 	ar->ath6kl_wq = create_singlethread_workqueue("ath6kl");
+ 	if (!ar->ath6kl_wq)
+ 		return -ENOMEM;
+@@ -1956,12 +1957,16 @@ int ath6kl_core_init(struct ath6kl *ar)
+ 	ath6kl_rx_refill(ar->htc_target, ar->ac2ep_map[WMM_AC_BE]);
+ 
+ 	ret = ath6kl_register_ieee80211_hw(ar);
+-	if (ret)
+-		goto err_rxbuf_cleanup;
++	if (ret) {
++		set_bit(DESTROY_IN_PROGRESS, &ar->flag);
++		goto err_reg_cleanup;
++	}
+ 
+ 	ret = ath6kl_debug_init_fs(ar);
+-	if (ret)
+-		goto err_rxbuf_cleanup;
++	if (ret) {
++		set_bit(DESTROY_IN_PROGRESS, &ar->flag);
++		goto err_wiphy_cleanup;
++	}
+ 
+ 	for (i = 0; i < ar->vif_max; i++)
+ 		ar->avail_idx_map |= BIT(i);
+@@ -1976,8 +1981,9 @@ int ath6kl_core_init(struct ath6kl *ar)
+ 
+ 	if (!ndev) {
+ 		ath6kl_err("Failed to instantiate a network device\n");
++		set_bit(DESTROY_IN_PROGRESS, &ar->flag);
+ 		ret = -ENOMEM;
+-		goto err_rxbuf_cleanup;
++		goto err_wiphy_cleanup;
+ 	}
+ 
+ 	ath6kl_dbg(ATH6KL_DBG_TRC, "%s: name=%s dev=0x%p, ar=0x%p\n",
+@@ -1994,9 +2000,11 @@ int ath6kl_core_init(struct ath6kl *ar)
+ 
+ 	if (!ndev_p2p0) {
+ 		ath6kl_err("Failed to create p2p0 iface\n");
++		set_bit(DESTROY_IN_PROGRESS, &ar->flag);
+ 		ret = -ENOMEM;
+ 		goto err_ndev_cleanup;
+ 	}
++
+ 	ar->tp_ctl.tp_monitor_timer.function = ath6kl_tp_monitor_timer;
+ 	ar->tp_ctl.tp_monitor_timer.data = (unsigned long) ar;
+ 	init_timer_deferrable(&ar->tp_ctl.tp_monitor_timer);
+@@ -2028,12 +2036,15 @@ err_ndev_cleanup:
+ 	rtnl_lock();
+ 	ath6kl_deinit_if_data(netdev_priv(ndev));
+ 	rtnl_unlock();
++err_wiphy_cleanup:
++	wiphy_unregister(ar->wiphy);
++	ath6kl_cleanup_android_resource(ar);
++err_reg_cleanup:
++	ath6kl_init_hw_stop(ar);
+ err_rxbuf_cleanup:
+ 	ath6kl_debug_cleanup(ar);
+ 	ath6kl_htc_flush_rx_buf(ar->htc_target);
+ 	ath6kl_cleanup_amsdu_rxbufs(ar);
+-	wiphy_unregister(ar->wiphy);
+-	ath6kl_cleanup_android_resource(ar);
+ 	ath6kl_wmi_shutdown(ar->wmi);
+ 	clear_bit(WMI_ENABLED, &ar->flag);
+ 	ar->wmi = NULL;
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/main.c b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/main.c
+index 2b112d5..ee724ea 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/main.c
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/main.c
+@@ -1621,6 +1621,48 @@ int ath6kl_ioctl_pkt_filter_set(struct ath6kl_vif *vif,
+ 	return ret;
+ }
+ 
++int ath6kl_ioctl_ap_ps_parameter_set(struct ath6kl_vif *vif,
++				     char *buf, int len)
++{
++	struct ath6kl *ar = vif->ar;
++	char *sptr, *token;
++	u8 ps_type, sleep_period;
++	u32 idle_time, ps_period;
++	int ret;
++
++	if (len <= 0)
++		return -EFAULT;
++
++	sptr = buf;
++
++	token = strsep(&sptr, " ");
++	if (!token || kstrtou8(token, 0, &ps_type))
++		return -EINVAL;
++
++	token = strsep(&sptr, " ");
++	if (!token || kstrtou32(token, 0, &idle_time))
++		return -EINVAL;
++
++	token = strsep(&sptr, " ");
++	if (!token || kstrtou32(token, 0, &ps_period))
++		return -EINVAL;
++
++	token = strsep(&sptr, " ");
++	if (!token || kstrtou8(token, 0, &sleep_period))
++		return -EINVAL;
++
++	ret = ath6kl_wmi_set_ap_ps_cmd(ar->wmi, vif->fw_vif_idx,
++				       ps_type, idle_time, ps_period,
++				       sleep_period);
++
++	return ret;
++}
++
++static struct ath6kl_drv_priv_cmd_ops ath6kl_priv_ops[] = {
++	{"PKT_FILTER ", ath6kl_ioctl_pkt_filter_set},
++	{"AP_PS_PARAMETER ", ath6kl_ioctl_ap_ps_parameter_set},
++};
++
+ static int ath6kl_ioctl_wext_priv(struct net_device *dev,
+ 				  struct ifreq *rq, int cmd)
+ {
+@@ -1628,7 +1670,8 @@ static int ath6kl_ioctl_wext_priv(struct net_device *dev,
+ 	struct ath6kl_vif *vif = netdev_priv(dev);
+ 	void *data = (void *)(rq->ifr_data);
+ 	char *user_cmd = NULL;
+-	int ret = 0, offset = 0, priv_cmd = 0;
++	int ret = 0, cmd_len;
++	u8 i;
+ 
+ 	if (copy_from_user(&hr_cmd,
+ 			   data,
+@@ -1650,20 +1693,21 @@ static int ath6kl_ioctl_wext_priv(struct net_device *dev,
+ 	}
+ 	user_cmd[hr_cmd.used_len] = '\0';
+ 
+-	if (0 == strncasecmp(user_cmd, "ATH6KL PKT_FILTER ", 18)) {
+-		priv_cmd = ATH6KL_XIOCTL_PKT_FILTER_ADD_DEL;
+-		offset = 18;
+-	}
++	for (i = 0; i < ARRAY_SIZE(ath6kl_priv_ops); i++) {
++		cmd_len = strlen(ath6kl_priv_ops[i].cmd);
+ 
+-	switch (priv_cmd) {
+-	case ATH6KL_XIOCTL_PKT_FILTER_ADD_DEL:
+-		ret = ath6kl_ioctl_pkt_filter_set(vif, user_cmd + offset,
+-						  hr_cmd.used_len - offset);
+-		break;
+-	default:
+-		ret = -EINVAL;
+-		break;
++		if (hr_cmd.used_len < cmd_len)
++			continue;
+ 
++		if (strncmp(user_cmd, ath6kl_priv_ops[i].cmd, cmd_len))
++			continue;
++
++		if (!ath6kl_priv_ops[i].handler)
++			continue;
++
++		ret = ath6kl_priv_ops[i].handler(vif, user_cmd + cmd_len,
++						 hr_cmd.used_len - cmd_len);
++		break;
+ 	}
+ 
+ 	kfree(user_cmd);
+@@ -1692,7 +1736,7 @@ static int ath6kl_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+ 	case ATH6KL_PRIV_GET_WLAN_STATS:
+ 		ret = ath6kl_update_stats(ar, vif, rq->ifr_data);
+ 		break;
+-	case ATH6KL_IOCTL_WEXT_PRIV26:
++	case ATH6KL_IOCTL_WEXT_PRIV:
+ 		ret = ath6kl_ioctl_wext_priv(dev, rq, cmd);
+ 		break;
+ 	default:
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/platform.c b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/platform.c
+index ec289a1..ee1473a 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/platform.c
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/platform.c
+@@ -25,7 +25,7 @@
+ 
+ 
+ 
+-#define ATH6KL_INIT_TIMEOUT	(3 * HZ)
++#define ATH6KL_INIT_TIMEOUT	(6 * HZ)
+ 
+ wait_queue_head_t init_wq;
+ static atomic_t init_done = ATOMIC_INIT(0);
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/sdio.c b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/sdio.c
+index 5c3ccf2..2d4fa8e 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/sdio.c
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/sdio.c
+@@ -531,8 +531,10 @@ static int ath6kl_sdio_power_off(struct ath6kl *ar)
+ 	ret = sdio_disable_func(ar_sdio->func);
+ 	sdio_release_host(ar_sdio->func);
+ 
+-	if (ret)
++	if (ret) {
++		ath6kl_err("Failed to disable sdio func: %d\n", ret);
+ 		return ret;
++	}
+ 
+ 	ar_sdio->is_disabled = true;
+ 
+@@ -1345,7 +1347,7 @@ static int ath6kl_sdio_probe(struct sdio_func *func,
+ 	}
+ 
+ 	ret = ath6kl_core_init(ar);
+-	ath6kl_info("Current ath6kl driver version is: 3.4.0.158\n");
++	ath6kl_info("Current ath6kl driver version is: 3.4.0.189\n");
+ 	if (ret) {
+ 		ath6kl_err("Failed to init ath6kl core\n");
+ 		goto err_core_alloc;
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/txrx.c b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/txrx.c
+index a1c6656..945a975 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/txrx.c
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/txrx.c
+@@ -1457,7 +1457,8 @@ void ath6kl_rx(struct htc_target *target, struct htc_packet *packet)
+ 		   __func__, ar, ept, skb, packet->buf,
+ 		   packet->act_len, status);
+ 
+-	if (status || !(skb->data + HTC_HDR_LENGTH)) {
++	if (status || (packet->act_len < HTC_HDR_LENGTH) ||
++	    test_bit(DESTROY_IN_PROGRESS, &ar->flag)) {
+ 		dev_kfree_skb(skb);
+ 		return;
+ 	}
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.c b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.c
+index d848710..71df84d 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.c
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.c
+@@ -3027,6 +3027,28 @@ int ath6kl_wmi_add_pkt_filter_pattern_cmd(struct wmi *wmi, u8 if_idx,
+ 	return ret;
+ }
+ 
++int ath6kl_wmi_set_ap_ps_cmd(struct wmi *wmi, u8 if_idx, u8 ps_type,
++			     u32 idle_time, u32 ps_period, u8 sleep_period)
++{
++	struct sk_buff *skb;
++	struct wmi_set_apps_cmd *cmd;
++	int ret;
++
++	skb = ath6kl_wmi_get_new_buf(sizeof(*cmd));
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_set_apps_cmd *) skb->data;
++	cmd->ps_type = ps_type;
++	cmd->idle_time = cpu_to_le32(idle_time);
++	cmd->ps_period = cpu_to_le32(ps_period);
++	cmd->sleep_period = sleep_period;
++
++	ret = ath6kl_wmi_cmd_send(wmi, if_idx, skb, WMI_SET_AP_PS_CMDID,
++				  NO_SYNC_WMIFLAG);
++	return ret;
++}
++
+ int ath6kl_wmi_del_pkt_filter_pattern_cmd(struct wmi *wmi,
+ 					  u8 if_idx, u8 filter_id)
+ {
+diff --git a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.h b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.h
+index df9367b..af15981 100644
+--- a/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.h
++++ b/wlan/atheros/compat-wireless/drivers/net/wireless/ath/ath6kl/wmi.h
+@@ -2146,6 +2146,13 @@ struct wmi_add_wow_pattern_cmd {
+ 	u8 filter[0];
+ } __packed;
+ 
++struct wmi_set_apps_cmd {
++	__le32 idle_time;
++	__le32 ps_period;
++	u8 sleep_period;
++	u8 ps_type;
++} __packed;
++
+ struct wmi_del_wow_pattern_cmd {
+ 	__le16 filter_list_id;
+ 	__le16 filter_id;
+@@ -2745,6 +2752,8 @@ int ath6kl_wmi_add_pkt_filter_pattern_cmd(struct wmi *wmi, u8 if_idx,
+ 					  u8 *mask);
+ int ath6kl_wmi_del_pkt_filter_pattern_cmd(struct wmi *wmi, u8 if_idx,
+ 					  u8 filter_id);
++int ath6kl_wmi_set_ap_ps_cmd(struct wmi *wmi, u8 if_idx, u8 ps_type,
++			     u32 idle_time, u32 ps_period, u8 sleep_period);
+ 
+ int ath6kl_wmi_set_rssi_filter_cmd(struct wmi *wmi, u8 if_idx, s8 rssi);
+ int ath6kl_wmi_set_roam_lrssi_cmd(struct wmi *wmi, u8 lrssi);
+-- 
+1.8.0
+

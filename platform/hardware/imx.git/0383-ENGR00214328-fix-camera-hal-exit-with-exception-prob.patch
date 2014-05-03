@@ -1,0 +1,359 @@
+From 9986941fccb9192e586db28b43b3275b9294552a Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Thu, 6 Dec 2012 10:21:01 +0800
+Subject: [PATCH 383/486] ENGR00214328 fix camera hal exit with exception
+ problem.
+
+make sure postSyncMessage can return normally to avoid
+thread dead lock.
+when handle event with exception, the thread should not
+exit, but just stay dead state.
+and thread wait for message with timeout.
+
+Change-Id: Icd99d7fb729e9e5e5f6d1f9e84b6fce0d6ecfc0a
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera/CameraBridge.cpp   | 60 +++++++++++++++++++++++++++-----------
+ mx6/libcamera/CameraBridge.h     |  1 +
+ mx6/libcamera/CameraHal.cpp      |  3 +-
+ mx6/libcamera/CameraUtil.h       |  1 +
+ mx6/libcamera/DisplayAdapter.cpp | 63 ++++++++++++++++++++++------------------
+ mx6/libcamera/DisplayAdapter.h   |  2 +-
+ 6 files changed, 83 insertions(+), 47 deletions(-)
+
+diff --git a/mx6/libcamera/CameraBridge.cpp b/mx6/libcamera/CameraBridge.cpp
+index 9f948ac..f73c957 100644
+--- a/mx6/libcamera/CameraBridge.cpp
++++ b/mx6/libcamera/CameraBridge.cpp
+@@ -18,8 +18,8 @@
+ #include "CameraBridge.h"
+ 
+ CameraBridge::CameraBridge()
+-    : mEventProvider(NULL),
+-      mFrameProvider(NULL), mUseMetaDataBufferMode(false),
++    : mEventProvider(NULL), mFrameProvider(NULL),
++      mThreadLive(false), mUseMetaDataBufferMode(false),
+       mNotifyCb(NULL), mDataCb(NULL),
+       mDataCbTimestamp(NULL), mRequestMemory(NULL), mCallbackCookie(NULL),
+       mMsgEnabled(0), mBridgeState(BRIDGE_INVALID),
+@@ -59,6 +59,7 @@ status_t CameraBridge::initialize()
+         return NO_MEMORY;
+     }
+ 
++    mThreadLive = true;
+     // /Start the display thread
+     status_t ret = mBridgeThread->run("BridgeThread", PRIORITY_URGENT_DISPLAY);
+     if (ret != NO_ERROR) {
+@@ -444,7 +445,10 @@ status_t CameraBridge::start()
+ 
+     mBufferSize  = bufSize;
+     mBufferCount = bufCnt;
+-    mThreadQueue.postSyncMessage(new SyncMessage(BridgeThread::BRIDGE_START, 0));
++
++    if (mBridgeThread != NULL) {
++        mThreadQueue.postSyncMessage(new SyncMessage(BridgeThread::BRIDGE_START, 0));
++    }
+     FSL_ASSERT(mFrameProvider.get() != NULL);
+     mFrameProvider->addFrameListener(this);
+ 
+@@ -459,7 +463,11 @@ status_t CameraBridge::stop()
+     }
+ 
+     Mutex::Autolock lock(mLock);
+-    mThreadQueue.postSyncMessage(new SyncMessage(BridgeThread::BRIDGE_STOP, 0));
++
++    if (mBridgeThread != NULL) {
++        mThreadQueue.postSyncMessage(new SyncMessage(BridgeThread::BRIDGE_STOP, 0));
++    }
++
+     FSL_ASSERT(mFrameProvider.get() != NULL);
+     mFrameProvider->removeFrameListener(this);
+ 
+@@ -470,21 +478,35 @@ bool CameraBridge::bridgeThread()
+ {
+     bool shouldLive = true;
+ 
+-    sp<CMessage> msg = mThreadQueue.waitMessage();
++    sp<CMessage> msg = mThreadQueue.waitMessage(THREAD_WAIT_TIMEOUT);
+     if (msg == 0) {
+-        FLOGE("displayThread: get invalid message");
+-        return false;
++        if (mBridgeState == CameraBridge::BRIDGE_STARTED) {
++            FLOGE("bridgeThread: get invalid message");
++        }
++        return true;
+     }
+ 
+     switch (msg->what) {
+         case BridgeThread::BRIDGE_START:
+             FLOGI("BridgeThread received BRIDGE_START command from Camera HAL");
+-            mBridgeState = CameraBridge::BRIDGE_STARTED;
++            if (mThreadLive == false) {
++                FLOGI("can't start bridge thread, thread dead...");
++            }
++            else {
++                mBridgeState = CameraBridge::BRIDGE_STARTED;
++            }
++
+             break;
+ 
+         case BridgeThread::BRIDGE_STOP:
+             FLOGI("BridgeThread received BRIDGE_STOP command from Camera HAL");
+-            mBridgeState = CameraBridge::BRIDGE_STOPPED;
++            if (mThreadLive == false) {
++                FLOGI("can't stop bridge thread, thread dead...");
++            }
++            else {
++                mBridgeState = CameraBridge::BRIDGE_STOPPED;
++            }
++
+             break;
+ 
+         case BridgeThread::BRIDGE_EVENT:
+@@ -493,11 +515,13 @@ bool CameraBridge::bridgeThread()
+                 break;
+             }
+             if (mBridgeState == CameraBridge::BRIDGE_STARTED) {
+-                shouldLive = processEvent((CameraEvent *)msg->arg0);
+-            }
+-            if (mBridgeState == CameraBridge::BRIDGE_EXITED) {
+-                shouldLive = false;
++                mThreadLive = processEvent((CameraEvent *)msg->arg0);
++                if (mThreadLive == false) {
++                    FLOGE("Bridge Thread dead because of error...");
++                    mBridgeState = CameraBridge::BRIDGE_EXITED;
++                }
+             }
++
+             break;
+ 
+         case BridgeThread::BRIDGE_FRAME:
+@@ -508,11 +532,13 @@ bool CameraBridge::bridgeThread()
+                 break;
+             }
+             if (mBridgeState == CameraBridge::BRIDGE_STARTED) {
+-                shouldLive = processFrame((CameraFrame *)msg->arg0);
+-            }
+-            if (mBridgeState == CameraBridge::BRIDGE_EXITED) {
+-                shouldLive = false;
++                mThreadLive = processFrame((CameraFrame *)msg->arg0);
++                if(mThreadLive == false) {
++                    FLOGE("Bridge Thread dead because of error...");
++                    mBridgeState = CameraBridge::BRIDGE_EXITED;
++                }
+             }
++
+             break;
+ 
+         case BridgeThread::BRIDGE_EXIT:
+diff --git a/mx6/libcamera/CameraBridge.h b/mx6/libcamera/CameraBridge.h
+index 804f826..de9ce55 100644
+--- a/mx6/libcamera/CameraBridge.h
++++ b/mx6/libcamera/CameraBridge.h
+@@ -129,6 +129,7 @@ private:
+     CMessageQueue    mThreadQueue;
+     CameraEventProvider *mEventProvider;
+     CameraFrameProvider *mFrameProvider;
++    bool mThreadLive;
+ 
+ private:
+     bool mUseMetaDataBufferMode;
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 7bf8c33..2a2ac6a 100644
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -355,11 +355,12 @@ void CameraHal::stopPreview()
+     FLOG_RUNTIME("stopPreview");
+     Mutex::Autolock lock(mLock);
+     if (mTakePictureInProcess && !(mMsgEnabled & CAMERA_MSG_COMPRESSED_IMAGE)) {
+-        FLOGI("stop takePicture");
++        FLOG_RUNTIME("stop takePicture");
+         stopPicture();
+     }
+ 
+     if (!previewEnabled() || mRecordingEnabled) {
++        FLOG_RUNTIME("stopPreview return with preview not enabled");
+         return;
+     }
+ 
+diff --git a/mx6/libcamera/CameraUtil.h b/mx6/libcamera/CameraUtil.h
+index e1c4ef8..914544b 100644
+--- a/mx6/libcamera/CameraUtil.h
++++ b/mx6/libcamera/CameraUtil.h
+@@ -79,6 +79,7 @@ using namespace android;
+ #define CAMERA_FORMAT_LENGTH    32
+ #define CAMER_PARAM_BUFFER_SIZE 512
+ #define PARAMS_DELIMITER ","
++#define THREAD_WAIT_TIMEOUT 500 * 1000 * 1000
+ 
+ #define CAMERA_GRALLOC_USAGE GRALLOC_USAGE_HW_TEXTURE | \
+     GRALLOC_USAGE_HW_RENDER |                           \
+diff --git a/mx6/libcamera/DisplayAdapter.cpp b/mx6/libcamera/DisplayAdapter.cpp
+index d62c4ef..f08916c 100644
+--- a/mx6/libcamera/DisplayAdapter.cpp
++++ b/mx6/libcamera/DisplayAdapter.cpp
+@@ -20,7 +20,7 @@
+ DisplayAdapter::DisplayAdapter()
+     : mDisplayThread(NULL),
+       mDisplayState(DisplayAdapter::DISPLAY_INVALID),
+-      mDisplayEnabled(false)
++      mThreadLive(false)
+ {
+     mFrameProvider = NULL;
+ 
+@@ -39,7 +39,7 @@ DisplayAdapter::~DisplayAdapter()
+     destroy();
+ 
+     // /If Display thread exists
+-    if (mDisplayThread.get()) {
++    if (mDisplayThread.get() != NULL) {
+         mThreadQueue.postSyncMessage(new SyncMessage(DisplayThread::DISPLAY_EXIT,
+                                                      0));
+         mDisplayThread->requestExitAndWait();
+@@ -57,6 +57,7 @@ status_t DisplayAdapter::initialize()
+     }
+ 
+     // /Start the display thread
++    mThreadLive = true;
+     status_t ret = mDisplayThread->run("DisplayThread", PRIORITY_URGENT_DISPLAY);
+     if (ret != NO_ERROR) {
+         FLOGE("Couldn't run display thread");
+@@ -77,12 +78,14 @@ int DisplayAdapter::setCameraFrameProvider(CameraFrameProvider *frameProvider)
+ int DisplayAdapter::startDisplay(int width,
+                                  int height)
+ {
+-    if (mDisplayEnabled) {
+-        FLOGW("Display is already enabled");
++    if (mDisplayState == DisplayAdapter::DISPLAY_STARTED) {
++        FLOGW("Display is already started");
+         return NO_ERROR;
+     }
+ 
+-    mThreadQueue.postSyncMessage(new SyncMessage(DisplayThread::DISPLAY_START, 0));
++    if (NULL != mDisplayThread.get()) {
++        mThreadQueue.postSyncMessage(new SyncMessage(DisplayThread::DISPLAY_START, 0));
++    }
+ 
+     // Send START_DISPLAY COMMAND to display thread. Display thread will start
+     // and then wait for a message
+@@ -91,7 +94,6 @@ int DisplayAdapter::startDisplay(int width,
+     FSL_ASSERT(mFrameProvider);
+     mFrameProvider->addFrameListener(this);
+ 
+-    mDisplayEnabled = true;
+     mPreviewWidth   = width;
+     mPreviewHeight  = height;
+ 
+@@ -102,11 +104,11 @@ int DisplayAdapter::startDisplay(int width,
+ 
+ int DisplayAdapter::stopDisplay()
+ {
+-    status_t ret                = NO_ERROR;
++    status_t ret = NO_ERROR;
+     GraphicBufferMapper& mapper = GraphicBufferMapper::get();
+ 
+-    if (!mDisplayEnabled) {
+-        FLOGW("Display is already disabled");
++    if (mDisplayState == DisplayAdapter::DISPLAY_STOPPED) {
++        FLOGW("Display is already stopped");
+         return ALREADY_EXISTS;
+     }
+ 
+@@ -125,9 +127,6 @@ int DisplayAdapter::stopDisplay()
+ 
+     Mutex::Autolock lock(mLock);
+     {
+-        // /Reset the display enabled flag
+-        mDisplayEnabled = false;
+-
+         // /Reset the frame width and height values
+         mFrameWidth    = 0;
+         mFrameHeight   = 0;
+@@ -135,17 +134,19 @@ int DisplayAdapter::stopDisplay()
+         mPreviewHeight = 0;
+     }
+ 
+-    return NO_ERROR;
++    return ret;
+ }
+ 
+ bool DisplayAdapter::displayThread()
+ {
+     bool shouldLive = true;
+ 
+-    sp<CMessage> msg = mThreadQueue.waitMessage();
++    sp<CMessage> msg = mThreadQueue.waitMessage(THREAD_WAIT_TIMEOUT);
+     if (msg == 0) {
+-        FLOGE("displayThread: get invalid message");
+-        return false;
++        if (mDisplayState == DisplayAdapter::DISPLAY_STARTED) {
++            FLOGI("displayThread: get invalid message");
++        }
++        return true;
+     }
+ 
+     switch (msg->what) {
+@@ -156,29 +157,35 @@ bool DisplayAdapter::displayThread()
+             if (mDisplayState == DisplayAdapter::DISPLAY_INIT) {
+                 break;
+             }
+-            if (mDisplayState == DisplayAdapter::DISPLAY_STARTED)
+-            {
+-                shouldLive = requestFrameBuffer();
++            if (mDisplayState == DisplayAdapter::DISPLAY_STARTED) {
++                mThreadLive = requestFrameBuffer();
++                if (mThreadLive == false) {
++                    FLOGI("display thread dead because of error...");
++                    mDisplayState = DisplayAdapter::DISPLAY_EXITED;
++                }
+             }
+ 
+-            if (mDisplayState == DisplayAdapter::DISPLAY_EXITED)
+-            {
+-                // /we exit the thread even though there are frames still to
+-                // dequeue. They will be dequeued
+-                // /in stopDisplay
+-                shouldLive = false;
+-            }
+             break;
+ 
+         case DisplayThread::DISPLAY_START:
+             FLOGI("Display thread received DISPLAY_START command from Camera HAL");
+-            mDisplayState = DisplayAdapter::DISPLAY_STARTED;
++            if (mThreadLive == false) {
++                FLOGI("can't start display thread, thread dead...");
++            }
++            else {
++                mDisplayState = DisplayAdapter::DISPLAY_STARTED;
++            }
+ 
+             break;
+ 
+         case DisplayThread::DISPLAY_STOP:
+             FLOGI("Display thread received DISPLAY_STOP command from Camera HAL");
+-            mDisplayState = DisplayAdapter::DISPLAY_STOPPED;
++            if (mThreadLive == false) {
++                FLOGI("can't stop display thread, thread dead...");
++            }
++            else {
++                mDisplayState = DisplayAdapter::DISPLAY_STOPPED;
++            }
+ 
+             break;
+ 
+diff --git a/mx6/libcamera/DisplayAdapter.h b/mx6/libcamera/DisplayAdapter.h
+index c2d6a05..ef4a104 100644
+--- a/mx6/libcamera/DisplayAdapter.h
++++ b/mx6/libcamera/DisplayAdapter.h
+@@ -90,7 +90,7 @@ private:
+     unsigned int  mDisplayState;
+ 
+     mutable Mutex mLock;
+-    bool mDisplayEnabled;
++    bool mThreadLive;
+ };
+ 
+ #endif // ifndef _DISPLAY_ADAPTER_H_
+-- 
+1.8.0
+

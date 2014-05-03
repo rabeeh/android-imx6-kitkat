@@ -1,0 +1,209 @@
+From 14604c8f1ed5c9d4e67cdf48e92c7d60d1c9cb87 Mon Sep 17 00:00:00 2001
+From: Richard Liu <r66033@freescale.com>
+Date: Tue, 17 Dec 2013 14:51:48 +0800
+Subject: [PATCH 20/23] ENGR00292415 fix mx6sl_evk screenshot not work issue
+
+screenshot not work on mx6sl_evk, root cause is screenshot
+implementation on KitKat use FBO it need OpenGL ES2.0 API,
+mx6sl_evk does not have GPU 3D core so it can't support,
+has to use old screenshot implementation on mx6sl_evk.
+
+Signed-off-by: Richard Liu <r66033@freescale.com>
+---
+ libs/gui/SurfaceComposerClient.cpp         |  14 +++
+ services/surfaceflinger/Android.mk         |   3 +
+ services/surfaceflinger/SurfaceFlinger.cpp | 132 +++++++++++++++++++++++++++++
+ 3 files changed, 149 insertions(+)
+
+diff --git a/libs/gui/SurfaceComposerClient.cpp b/libs/gui/SurfaceComposerClient.cpp
+index aafc4d2..61cef4e 100644
+--- a/libs/gui/SurfaceComposerClient.cpp
++++ b/libs/gui/SurfaceComposerClient.cpp
+@@ -667,6 +667,20 @@ status_t ScreenshotClient::update(const sp<IBinder>& display,
+     if (err == NO_ERROR) {
+         err = mCpuConsumer->lockNextBuffer(&mBuffer);
+         if (err == NO_ERROR) {
++            if (mBuffer.format == HAL_PIXEL_FORMAT_BGRA_8888) {
++                mBuffer.format = HAL_PIXEL_FORMAT_RGBA_8888;
++                int *pData = (int *)mBuffer.data;
++                for (uint32_t i=0; i<mBuffer.height; i++) {
++                    int *data = pData + i * mBuffer.stride;
++                    for (uint32_t j=0; j<mBuffer.width; j++) {
++                        int value = *data;
++                        *data = (value & 0xff00ff00) |
++                                ((value & 0x00ff0000) >> 16) |
++                                ((value & 0x000000ff) << 16);
++                        data ++;
++                    }
++                }
++            }
+             mHaveBuffer = true;
+         }
+     }
+diff --git a/services/surfaceflinger/Android.mk b/services/surfaceflinger/Android.mk
+index 74f1888..ae91d93 100644
+--- a/services/surfaceflinger/Android.mk
++++ b/services/surfaceflinger/Android.mk
+@@ -50,6 +50,9 @@ ifeq ($(TARGET_BOARD_PLATFORM), imx5x)
+ 	LOCAL_CFLAGS += -DNO_RGBX_8888
+ 	LOCAL_CFLAGS += -DIMX5_PIXEL_FORMAT_FIXUP
+ endif
++ifneq ($(HAVE_FSL_IMX_GPU3D),true)
++        LOCAL_CFLAGS += -DNO_FBO_SCREENSHOT
++endif
+ 
+ ifeq ($(TARGET_DISABLE_TRIPLE_BUFFERING),true)
+ 	LOCAL_CFLAGS += -DTARGET_DISABLE_TRIPLE_BUFFERING
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index dd6bdec..0e9b7a9 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -2998,6 +2998,137 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
+     return res;
+ }
+ 
++#ifdef NO_FBO_SCREENSHOT
++/* mx6sl_evk don't have GPU 3D core, it will use software OpenGL ES1.1 (libagl)
++ * which can't support FBO feature, so mx6sl_evk screenshot can only use below
++ * implementation although it may not fast as FBO path.
++ */
++#include <GLES/gl.h>
++#include <GLES/glext.h>
++void SurfaceFlinger::renderScreenImplLocked(
++        const sp<const DisplayDevice>& hw,
++        uint32_t reqWidth, uint32_t reqHeight,
++        uint32_t minLayerZ, uint32_t maxLayerZ,
++        bool yswap)
++{
++    ATRACE_CALL();
++
++    // get screen geometry
++    const uint32_t hw_w = hw->getWidth();
++    const uint32_t hw_h = hw->getHeight();
++
++    const bool filtering = reqWidth != hw_w || reqWidth != hw_h;
++
++    // make sure to clear all GL error flags
++    while ( glGetError() != GL_NO_ERROR ) ;
++
++    // set-up our viewport
++    glViewport(0, 0, reqWidth, reqHeight);
++    glMatrixMode(GL_PROJECTION);
++    glLoadIdentity();
++    if (yswap)  glOrthof(0, hw_w, hw_h, 0, 0, 1);
++    else        glOrthof(0, hw_w, 0, hw_h, 0, 1);
++    glMatrixMode(GL_MODELVIEW);
++    glLoadIdentity();
++
++    // redraw the screen entirely...
++    glDisable(GL_SCISSOR_TEST);
++    glClearColor(0,0,0,1);
++    glClear(GL_COLOR_BUFFER_BIT);
++    glDisable(GL_TEXTURE_EXTERNAL_OES);
++    glDisable(GL_TEXTURE_2D);
++
++    const LayerVector& layers( mDrawingState.layersSortedByZ );
++    const size_t count = layers.size();
++    for (size_t i=0 ; i<count ; ++i) {
++        const sp<Layer>& layer(layers[i]);
++        const Layer::State& state(layer->getDrawingState());
++        if (state.layerStack == hw->getLayerStack()) {
++            if (state.z >= minLayerZ && state.z <= maxLayerZ) {
++                if (layer->isVisible()) {
++                    if (filtering) layer->setFiltering(true);
++                    layer->draw(hw);
++                    if (filtering) layer->setFiltering(false);
++                }
++            }
++        }
++    }
++
++    // compositionComplete is needed for older driver
++    hw->compositionComplete();
++}
++
++
++status_t SurfaceFlinger::captureScreenImplLocked(
++        const sp<const DisplayDevice>& hw,
++        const sp<IGraphicBufferProducer>& producer,
++        uint32_t reqWidth, uint32_t reqHeight,
++        uint32_t minLayerZ, uint32_t maxLayerZ)
++{
++    ATRACE_CALL();
++
++    // get screen geometry
++    const uint32_t hw_w = hw->getWidth();
++    const uint32_t hw_h = hw->getHeight();
++
++    // if we have secure windows on this display, never allow the screen capture
++    if (hw->getSecureLayerVisible()) {
++        ALOGW("FB is protected: PERMISSION_DENIED");
++        return PERMISSION_DENIED;
++    }
++
++    if ((reqWidth > hw_w) || (reqHeight > hw_h)) {
++        ALOGE("size mismatch (%d, %d) > (%d, %d)",
++                reqWidth, reqHeight, hw_w, hw_h);
++        return BAD_VALUE;
++    }
++
++    reqWidth = (!reqWidth) ? hw_w : reqWidth;
++    reqHeight = (!reqHeight) ? hw_h : reqHeight;
++
++    // Create a surface to render into
++    sp<Surface> surface = new Surface(producer);
++    ANativeWindow* const window = surface.get();
++
++    // set the buffer size to what the user requested
++    native_window_set_buffers_user_dimensions(window, reqWidth, reqHeight);
++
++    // and create the corresponding EGLSurface
++    EGLSurface eglSurface = eglCreateWindowSurface(
++            mEGLDisplay, mEGLConfig, window, NULL);
++    if (eglSurface == EGL_NO_SURFACE) {
++        ALOGE("captureScreenImplLocked: eglCreateWindowSurface() failed 0x%4x",
++                eglGetError());
++        return BAD_VALUE;
++    }
++
++    if (!eglMakeCurrent(mEGLDisplay, eglSurface, eglSurface, mEGLContext)) {
++        ALOGE("captureScreenImplLocked: eglMakeCurrent() failed 0x%4x",
++                eglGetError());
++        eglDestroySurface(mEGLDisplay, eglSurface);
++        return BAD_VALUE;
++    }
++
++    renderScreenImplLocked(hw, reqWidth, reqHeight, minLayerZ, maxLayerZ, false);
++
++    // and finishing things up...
++    if (eglSwapBuffers(mEGLDisplay, eglSurface) != EGL_TRUE) {
++        ALOGE("captureScreenImplLocked: eglSwapBuffers() failed 0x%4x",
++                eglGetError());
++        eglDestroySurface(mEGLDisplay, eglSurface);
++        getDefaultDisplayDevice()->makeCurrent(mEGLDisplay, mEGLContext);
++        return BAD_VALUE;
++    }
++
++    eglDestroySurface(mEGLDisplay, eglSurface);
++    getDefaultDisplayDevice()->makeCurrent(mEGLDisplay, mEGLContext);
++    return NO_ERROR;
++}
++#if defined(__gl_h_)
++#undef __gl_h_
++#endif
++
++#else /* screenshot path using FBO*/
+ 
+ void SurfaceFlinger::renderScreenImplLocked(
+         const sp<const DisplayDevice>& hw,
+@@ -3153,6 +3284,7 @@ status_t SurfaceFlinger::captureScreenImplLocked(
+ 
+     return result;
+ }
++#endif /* screenshot path using FBO */
+ 
+ void SurfaceFlinger::checkScreenshot(size_t w, size_t s, size_t h, void const* vaddr,
+         const sp<const DisplayDevice>& hw, uint32_t minLayerZ, uint32_t maxLayerZ) {
+-- 
+1.8.0
+

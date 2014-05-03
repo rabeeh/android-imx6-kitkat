@@ -1,0 +1,86 @@
+From b59a3c2daa26ecfc9cab30e60f5e8afeb85c1e00 Mon Sep 17 00:00:00 2001
+From: Liu Ying <Ying.Liu@freescale.com>
+Date: Wed, 2 Nov 2011 12:55:01 +0800
+Subject: [PATCH 166/249] ENGR00161220 IPU lib:Support rotation buf allocated
+ by user
+
+This patch supports rotation buffer allocated by user so
+that IPU lib may not allocate by itself.
+
+Signed-off-by: Liu Ying <Ying.Liu@freescale.com>
+---
+ ipu/mxc_ipu_hl_lib.c | 23 ++++++++++++++++-------
+ ipu/mxc_ipu_hl_lib.h |  8 +++++++-
+ 2 files changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/ipu/mxc_ipu_hl_lib.c b/ipu/mxc_ipu_hl_lib.c
+index f1936ba..f95236f 100644
+--- a/ipu/mxc_ipu_hl_lib.c
++++ b/ipu/mxc_ipu_hl_lib.c
+@@ -1185,18 +1185,27 @@ static int _ipu_mem_alloc(ipu_lib_input_param_t * input,
+ 			}
+ 		}
+ 
+-		/* allocate dma buffer for rotation? */
++		/* allocate or get dma buffer for rotation? */
+ 		if((ipu_priv_handle->output.task_mode == (ROT_MODE | IC_MODE)) ||
+ 		   (ipu_priv_handle->output.task_mode == (ROT_MODE | VDI_IC_MODE))) {
+ 			ipu_priv_handle->output.r_minfo[i].size =
+ 				ipu_priv_handle->output.owidth/8*ipu_priv_handle->output.oheight
+ 				*fmt_to_bpp(output->fmt);
+-			ret = __ipu_mem_alloc(&ipu_priv_handle->output.r_minfo[i], NULL);
+-			if (ret < 0)
+-				goto err;
+-			dbg(DBG_INFO, "\033[0;35mAlocate %d dma mem [%d] for rotation, dma addr 0x%x!\033[0m\n",
+-					ipu_priv_handle->output.r_minfo[i].size, i,
+-					ipu_priv_handle->output.r_minfo[i].paddr);
++			if (ipu_handle->rotbuf_phy_start[i] == 0 ||
++			    ipu_handle->rotfr_size < ipu_priv_handle->output.r_minfo[i].size) {
++				ret = __ipu_mem_alloc(&ipu_priv_handle->output.r_minfo[i], NULL);
++				if (ret < 0)
++					goto err;
++				dbg(DBG_INFO, "\033[0;35mAlocate %d dma mem [%d] for rotation, dma addr 0x%x!\033[0m\n",
++						ipu_priv_handle->output.r_minfo[i].size, i,
++						ipu_priv_handle->output.r_minfo[i].paddr);
++			} else {
++				ipu_priv_handle->output.r_minfo[i].paddr = ipu_handle->rotbuf_phy_start[i];
++				ipu_priv_handle->output.r_minfo[i].size = ipu_handle->rotfr_size;
++				dbg(DBG_INFO, "\033[0;35mGet %d dma mem [%d] from user for rotation, dma addr 0x%x!\033[0m\n",
++						ipu_priv_handle->output.r_minfo[i].size, i,
++						ipu_priv_handle->output.r_minfo[i].paddr);
++			}
+ 		}
+ 
+ again:
+diff --git a/ipu/mxc_ipu_hl_lib.h b/ipu/mxc_ipu_hl_lib.h
+index 565b5f4..4aed0db 100644
+--- a/ipu/mxc_ipu_hl_lib.h
++++ b/ipu/mxc_ipu_hl_lib.h
+@@ -307,17 +307,23 @@ typedef struct {
+  * The ifr_size/ofr_size indicate the size of input/output buffer.
+  * User should not care the priv parameter and DO NOT change it.
+  * Note that inbuf_start[2] is used only for TASK_VDI_VF_MODE and motion
+- * mode is selected to be medium motion or low motion.
++ * mode is selected to be medium motion or low motion,
++ * rotbuf_phy_start[] is set by the user to tell the physical address(es)
++ * of rotation buffer(s) so that IPU lib will not do allocation in kernel
++ * and rotfr_size is also set by the user to tell the rotation buffer
++ * size.
+  */
+ typedef struct {
+         void * inbuf_start[3];
+         void * ovbuf_start[2];
+         void * ovbuf_alpha_start[2];
+ 	void * outbuf_start[3];
++	void * rotbuf_phy_start[2];
+ 	int ifr_size;
+ 	int ovfr_size;
+ 	int ovfr_alpha_size;
+ 	int ofr_size;
++	int rotfr_size;
+ 
+ 	void * priv;
+ } ipu_lib_handle_t;
+-- 
+1.8.0
+

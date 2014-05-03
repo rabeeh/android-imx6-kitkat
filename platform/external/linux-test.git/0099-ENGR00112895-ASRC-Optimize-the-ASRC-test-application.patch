@@ -1,0 +1,415 @@
+From 2033d8dd2d524ade0227691f01797b4be8d14426 Mon Sep 17 00:00:00 2001
+From: William Lai <b04597@freescale.com>
+Date: Tue, 12 May 2009 20:55:23 +0800
+Subject: [PATCH 099/435] ENGR00112895 ASRC: Optimize the ASRC test
+ application
+
+1. Output exact the output data with no redudancy in the output file
+2. Change the DMA buffer size from 4096 to 10240
+3. Removed the temp file
+4. Add two buffers to read and store data
+5. Add pause/flush feature
+
+Signed-off-by: William Lai <b04597@freescale.com>
+---
+ test/mxc_asrc_test/mxc_asrc_test.c | 212 ++++++++++++++++++++++++++++---------
+ 1 file changed, 163 insertions(+), 49 deletions(-)
+
+diff --git a/test/mxc_asrc_test/mxc_asrc_test.c b/test/mxc_asrc_test/mxc_asrc_test.c
+index 3d646c1..6f62855 100644
+--- a/test/mxc_asrc_test/mxc_asrc_test.c
++++ b/test/mxc_asrc_test/mxc_asrc_test.c
+@@ -29,7 +29,7 @@
+ #include <sys/time.h>
+ #include <linux/mxc_asrc.h>
+ 
+-#define DMA_BUF_SIZE 4096
++#define DMA_BUF_SIZE 10240
+ #define BUF_NUM 4
+ 
+ struct audio_info_s {
+@@ -53,6 +53,12 @@ static struct audio_buf output_buf[BUF_NUM];
+ static enum asrc_pair_index pair_index;
+ static char header[58];
+ 
++static int *input_buffer;
++static int *output_buffer;
++static int output_done_bytes;
++static int pause_enable;
++static int flush_enable;
++
+ void help_info(int ac, char *av[])
+ {
+ 	printf("\n\n**************************************************\n");
+@@ -72,8 +78,15 @@ int configure_asrc_channel(int fd_asrc, struct audio_info_s *info)
+ 
+ 	req.chn_num = info->channel;
+ 	if ((err = ioctl(fd_asrc, ASRC_REQ_PAIR, &req)) < 0) {
++		printf("Req ASRC pair FAILED\n");
+ 		return err;
+ 	}
++	if (req.index == 0)
++		printf("Pair A requested\n");
++	else if (req.index == 1)
++		printf("Pair B requested\n");
++	else if (req.index == 2)
++		printf("Pair C requested\n");
+ 
+ 	config.pair = req.index;
+ 	config.channel_num = req.chn_num;
+@@ -81,9 +94,15 @@ int configure_asrc_channel(int fd_asrc, struct audio_info_s *info)
+ 	config.input_sample_rate = info->sample_rate;
+ 	config.output_sample_rate = info->output_sample_rate;
+ 	config.buffer_num = BUF_NUM;
++	config.word_width = 32;
++	config.inclk = INCLK_NONE;
++	//config.inclk = INCLK_SSI1_TX;
++	config.outclk = OUTCLK_SSI1_TX;
++	//config.outclk = OUTCLK_ASRCK1_CLK;
+ 	pair_index = req.index;
+-	if ((err = ioctl(fd_asrc, ASRC_CONIFG_PAIR, &config)) < 0)
++	if (err = ioctl(fd_asrc, ASRC_CONFIG_PAIR, &config) < 0)
+ 		return err;
++
+ 	for (i = 0; i < config.buffer_num; i++) {
+ 		buf_info.buffer_index = i;
+ 		if ((err = ioctl(fd_asrc, ASRC_QUERYBUF, &buf_info)) < 0)
+@@ -125,15 +144,22 @@ int asrc_get_output_buffer_size(int input_buffer_size,
+ 	return outbuffer_size;
+ }
+ 
+-int play_file(int fd_asrc, FILE * src, FILE * dst, struct audio_info_s *info)
++int play_file(int fd_asrc, struct audio_info_s *info)
+ {
+ 	int err = 0;
+ 	int i = 0;
++	int y = 0;
+ 	struct asrc_buffer inbuf, outbuf;
+ 	char *p;
+ 	int output_dma_size;
+-	int nleft, nwritten;
+-
++	char *input_p;
++	char *output_p;
++	struct asrc_status_flags flags;
++	int flush_done = 0;
++
++	flags.index = pair_index;
++	input_p = (char *)input_buffer;
++	output_p = (char *)output_buffer;
+ 	output_dma_size =
+ 	    asrc_get_output_buffer_size(DMA_BUF_SIZE, info->sample_rate,
+ 					info->output_sample_rate);
+@@ -148,15 +174,17 @@ int play_file(int fd_asrc, FILE * src, FILE * dst, struct audio_info_s *info)
+ 		goto ERROR;
+ 	i++;
+ 	while (i < BUF_NUM) {
+-		fread(input_buf[i].start, 1, DMA_BUF_SIZE, src);
++		memcpy(input_buf[i].start, input_p, DMA_BUF_SIZE);
++		input_p = input_p + DMA_BUF_SIZE;
+ 		inbuf.length = DMA_BUF_SIZE;
+ 		inbuf.index = i;
+ 		info->data_len -= DMA_BUF_SIZE;
++		if (info->data_len < 0)
++			break;
+ 		if ((err = ioctl(fd_asrc, ASRC_Q_INBUF, &inbuf)) < 0)
+ 			goto ERROR;
+ 		outbuf.index = i;
+ 		outbuf.length = output_dma_size;
+-		info->output_data_len -= output_dma_size;
+ 		if ((err = ioctl(fd_asrc, ASRC_Q_OUTBUF, &outbuf)) < 0)
+ 			goto ERROR;
+ 		i++;
+@@ -173,30 +201,34 @@ int play_file(int fd_asrc, FILE * src, FILE * dst, struct audio_info_s *info)
+ 	inbuf.length =
+ 	    (info->data_len > DMA_BUF_SIZE) ? DMA_BUF_SIZE : info->data_len;
+ 	if (info->data_len > 0) {
+-		fread(input_buf[inbuf.index].start, 1, inbuf.length, src);
++		memcpy(input_buf[inbuf.index].start, input_p, inbuf.length);
++		input_p = input_p + inbuf.length;
+ 		info->data_len -= inbuf.length;
+ 	} else
+ 		inbuf.length = DMA_BUF_SIZE;
+ 	if ((err = ioctl(fd_asrc, ASRC_Q_INBUF, &inbuf)) < 0)
+ 		goto ERROR;
+-	do {
++
++	while (info->data_len > 0) {
++		if ((err = ioctl(fd_asrc, ASRC_STATUS, &flags)) < 0)
++			goto ERROR;
++
+ 		if ((err = ioctl(fd_asrc, ASRC_DQ_OUTBUF, &outbuf)) < 0)
+ 			goto ERROR;
+ 		outbuf.length =
+ 		    (info->output_data_len >
+ 		     output_dma_size) ? output_dma_size : info->output_data_len;
+-		nleft = outbuf.length;
+ 		p = output_buf[outbuf.index].start;
+-		while (nleft > 0) {
+-			if ((nwritten = fwrite(p, 1, nleft, dst)) < 0) {
+-				perror("audio driver write error");
+-			}
+ 
+-			nleft -= nwritten;
+-			p += nwritten;
+-		}
++		if (flush_done == 0) {
++			memcpy(output_p, p, outbuf.length);
++			output_p = output_p + outbuf.length;
++		} else
++			flush_done = 0;
++
+ 		info->output_data_len -= outbuf.length;
+-		outbuf.length = output_dma_size;
++		output_done_bytes = output_done_bytes + outbuf.length;
++
+ 		if ((err = ioctl(fd_asrc, ASRC_Q_OUTBUF, &outbuf)) < 0)
+ 			goto ERROR;
+ 		if ((err = ioctl(fd_asrc, ASRC_DQ_INBUF, &inbuf)) < 0)
+@@ -204,43 +236,115 @@ int play_file(int fd_asrc, FILE * src, FILE * dst, struct audio_info_s *info)
+ 		inbuf.length =
+ 		    (info->data_len >
+ 		     DMA_BUF_SIZE) ? DMA_BUF_SIZE : info->data_len;
+-		if (info->data_len > 0) {
+-			fread(input_buf[inbuf.index].start, 1, inbuf.length,
+-			      src);
+-			info->data_len -= inbuf.length;
+-		} else
+-			inbuf.length = DMA_BUF_SIZE;
++
++		memcpy(input_buf[inbuf.index].start, input_p, inbuf.length);
++		input_p = input_p + inbuf.length;
++		info->data_len -= inbuf.length;
++
+ 		if ((err = ioctl(fd_asrc, ASRC_Q_INBUF, &inbuf)) < 0)
+ 			goto ERROR;
+-	} while (info->output_data_len > 0);
++		y++;
++		i = 0;
++		if (y == 4 && pause_enable == 1) {
++			printf("pause\n");
++			if ((err =
++			     ioctl(fd_asrc, ASRC_STOP_CONV, &pair_index)) < 0)
++				goto ERROR;
++
++			if (flush_enable == 1) {
++				if ((err =
++				     ioctl(fd_asrc, ASRC_FLUSH,
++					   &pair_index)) < 0)
++					goto ERROR;
++				printf("flushing\n");
++				flush_done = 1;
++				while (i < BUF_NUM) {
++					memcpy(input_buf[i].start, input_p,
++					       DMA_BUF_SIZE);
++					input_p = input_p + DMA_BUF_SIZE;
++					inbuf.length = DMA_BUF_SIZE;
++					inbuf.index = i;
++					info->data_len -= DMA_BUF_SIZE;
++					if (info->data_len < 0)
++						break;
++					if ((err =
++					     ioctl(fd_asrc, ASRC_Q_INBUF,
++						   &inbuf)) < 0) {
++						printf("Q INBUF error\n");
++						goto ERROR;
++					}
++					outbuf.index = i;
++					outbuf.length = output_dma_size;
++					if ((err =
++					     ioctl(fd_asrc, ASRC_Q_OUTBUF,
++						   &outbuf)) < 0) {
++						printf("Q OUTBUF error\n");
++						goto ERROR;
++					}
++					i++;
++				}
++			}
++
++			if ((err =
++			     ioctl(fd_asrc, ASRC_START_CONV, &pair_index)) < 0)
++				goto ERROR;
++			printf("start again\n");
++		}
++
++	}
++
++	while (info->output_data_len > 0) {
++		if ((err = ioctl(fd_asrc, ASRC_DQ_OUTBUF, &outbuf)) < 0)
++			goto ERROR;
++		outbuf.length =
++		    (info->output_data_len >
++		     output_dma_size) ? output_dma_size : info->output_data_len;
++		p = output_buf[outbuf.index].start;
++		output_done_bytes = output_done_bytes + outbuf.length;
++		memcpy(output_p, p, outbuf.length);
++		output_p = output_p + outbuf.length;
++		info->output_data_len -= outbuf.length;
++		if ((err = ioctl(fd_asrc, ASRC_Q_OUTBUF, &outbuf)) < 0)
++			goto ERROR;
++		if ((err = ioctl(fd_asrc, ASRC_DQ_INBUF, &inbuf)) < 0)
++			goto ERROR;
++		inbuf.length = DMA_BUF_SIZE;
++		memset(input_buf[inbuf.index].start, 0, inbuf.length);
+ 
++		if ((err = ioctl(fd_asrc, ASRC_Q_INBUF, &inbuf)) < 0)
++			goto ERROR;
++	}
+ 	err = ioctl(fd_asrc, ASRC_STOP_CONV, &pair_index);
+ 
+       ERROR:
+ 	return err;
+ }
+ 
+-void bitshift(FILE * src, FILE * dst, struct audio_info_s *info)
++void bitshift(FILE * src, struct audio_info_s *info)
+ {
+ 
+ 	unsigned int data;
+ 	unsigned int zero;
+ 	int nleft;
+ 	int format_size;
+-
++	int i = 0;
+ 	format_size = *(int *)&header[16];
+ 	if (strncmp((char *)&header[20 + format_size], "fact", 4) == 0) {
+ 		format_size += 12;
+ 	}
+ 
+-	fseek(dst, 28 + format_size, SEEK_SET);
+-
+ 	if (info->frame_bits <= 16) {
+ 		nleft = (info->data_len >> 1);
++		input_buffer = (int *)malloc(sizeof(int) * nleft);
++		if (input_buffer == NULL) {
++			printf("allocate input buffer error\n");
++		}
++
+ 		do {
+ 			fread(&data, 2, 1, src);
+ 			zero = ((data << 8) & 0xFFFF00);
+-			fwrite(&zero, 4, 1, dst);
++			//fwrite(&zero, 4, 1, dst);
++			input_buffer[i++] = zero;
+ 		} while (--nleft);
+ 		info->data_len = info->data_len << 1;
+ 		info->output_data_len = info->output_data_len << 1;
+@@ -259,16 +363,21 @@ void bitshift(FILE * src, FILE * dst, struct audio_info_s *info)
+ 		*(unsigned short *)&header[34] = info->frame_bits;
+ 	} else {
+ 		nleft = (info->data_len >> 2);
++		input_buffer = (int *)malloc(sizeof(int) * nleft);
++		if (input_buffer == NULL) {
++			printf("allocate input buffer error\n");
++		}
+ 		do {
+ 			fread(&data, 4, 1, src);
+ 			zero = ((data >> 8) & 0xFFFF00);
+-			fwrite(&zero, 4, 1, dst);
++			//fwrite(&zero, 4, 1, dst);
++			input_buffer[i++] = zero;
+ 		} while (--nleft);
+ 	}
+-	fseek(dst, 0, SEEK_SET);
+-	fwrite(header, 1, 28 + format_size, dst);
+-	fseek(dst, 28 + format_size, SEEK_SET);
+-
++	output_buffer = (int *)malloc(info->output_data_len);
++	if (output_buffer == NULL) {
++		printf("output buffer allocate error\n");
++	}
+ }
+ 
+ void header_parser(FILE * src, struct audio_info_s *info)
+@@ -322,21 +431,28 @@ void header_parser(FILE * src, struct audio_info_s *info)
+ 
+ }
+ 
+-void convert_data(FILE * raw, FILE * dst, struct audio_info_s *info)
++void convert_data(FILE * dst, struct audio_info_s *info)
+ {
+ 	unsigned int data;
+ 	unsigned int size;
+ 	int format_size;
++	int i = 0;
+ 
+ 	format_size = *(int *)&header[16];
++
+ 	if (strncmp((char *)&header[20 + format_size], "fact", 4) == 0) {
+ 		format_size += 12;
+ 	}
++	*(int *)&header[24 + format_size] = output_done_bytes;
++	*(int *)&header[4] = output_done_bytes + 20 + format_size;
+ 	size = *(int *)&header[24 + format_size];
+-	fseek(dst, 28 + format_size, SEEK_SET);
+-	fseek(raw, 0, SEEK_SET);
++	while (i < 58) {
++		fwrite(&header[i], 1, 1, dst);
++		i++;
++	}
++
+ 	do {
+-		fread(&data, 4, 1, raw);
++		data = output_buffer[i++];
+ 		data = (data << 8) & 0xFFFF0000;
+ 		fwrite(&data, 4, 1, dst);
+ 		size -= 4;
+@@ -347,11 +463,12 @@ int main(int ac, char *av[])
+ {
+ 	FILE *fd_dst = NULL;
+ 	FILE *fd_src = NULL;
+-	FILE *fd_raw = NULL;
+ 	int fd_asrc;
+ 	struct audio_info_s audio_info;
+ 	int i = 0, err = 0;
+-
++	output_done_bytes = 0;
++	pause_enable = 0;
++	flush_enable = 0;
+ 	printf("Hi... \n");
+ 
+ 	if (ac != 5) {
+@@ -378,35 +495,32 @@ int main(int ac, char *av[])
+ 
+ 	header_parser(fd_src, &audio_info);
+ 
+-	bitshift(fd_src, fd_dst, &audio_info);
++	bitshift(fd_src, &audio_info);
+ 
+ 	err = configure_asrc_channel(fd_asrc, &audio_info);
+ 
+ 	if (err < 0)
+ 		goto end_err;
+ 
+-	fd_raw = fopen("/dev/raw.txt", "wb+");
+ 	/* Config HW */
+-	err += play_file(fd_asrc, fd_dst, fd_raw, &audio_info);
++	err += play_file(fd_asrc, &audio_info);
+ 
+ 	if (err < 0)
+ 		goto end_err;
+ 
+-	convert_data(fd_raw, fd_dst, &audio_info);
++	convert_data(fd_dst, &audio_info);
+ 
+-	if (fd_raw != NULL)
+-		fclose(fd_raw);
+ 	fclose(fd_src);
+ 	fclose(fd_dst);
+ 	close(fd_asrc);
+ 
++	free(input_buffer);
++	free(output_buffer);
+ 	printf("All tests passed with success\n");
+ 	return 0;
+ 
+       end_err:
+ 	fclose(fd_src);
+-	if (fd_raw != NULL)
+-		fclose(fd_raw);
+       err_src_not_found:
+ 	fclose(fd_dst);
+       err_dst_not_found:
+-- 
+1.8.0
+

@@ -1,0 +1,98 @@
+From 7e39f36fa97c41928774710810a9b3ac292956a4 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 18 Nov 2011 01:00:47 +0800
+Subject: [PATCH 174/249] ENGR00162444 vpu: Change VP8 decoder to streaming
+ mode
+
+The VP8 in f/w from v2.1.2 can support streaming mode, so change
+vpu lib to align with it on mx6q.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c | 35 ++++++++++++-----------------------
+ 1 file changed, 12 insertions(+), 23 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 7f45087..38d0c27 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -2659,15 +2659,16 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 			    pDecInfo->openParam.streamStartByteOffset);
+ 	}
+ 
++	if (pCodecInst->codecMode == VPX_DEC)
++		VpuWriteReg(CMD_DEC_SEQ_START_BYTE, 0);
++
+ 	val = 0;
+ 	if (!cpu_is_mx6q())
+ 		val = ((pDecInfo->dynamicAllocEnable << 3) & 0x8) |
+ 			((pDecInfo->filePlayEnable << 2) & 0x4);
+ 
+ 	val |= ((pDecInfo->openParam.reorderEnable << 1) & 0x2);
+-	if (pCodecInst->codecMode == VPX_DEC)
+-		val |= (1 << 2) & 0x4;
+-	else if (pCodecInst->codecMode == MJPG_DEC) {
++	if (pCodecInst->codecMode == MJPG_DEC) {
+ 		val |= 1 << 10; /* force not interrupt mode */
+ 		val |= pDecInfo->decReportUserData.enable << 5;
+ 	}
+@@ -3221,7 +3222,7 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 		    pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
+ 
+ 	if ((!cpu_is_mx6q() && pDecInfo->filePlayEnable != 1) ||
+-	    (cpu_is_mx6q() && pCodecInst->codecMode != VPX_DEC)) {
++	    cpu_is_mx6q()) {
+ 		if (wrPtr < rdPtr) {
+ 			if (rdPtr <= wrPtr + size) {
+ 				UnlockVpuReg(vpu_semap);
+@@ -3232,16 +3233,14 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 
+ 	wrPtr += size;
+ 
+-	if (pCodecInst->codecMode != VPX_DEC) {
+-		if (wrPtr > pDecInfo->streamBufEndAddr) {
+-			room = wrPtr - pDecInfo->streamBufEndAddr;
+-			wrPtr = pDecInfo->streamBufStartAddr;
+-			wrPtr += room;
+-		}
++	if (wrPtr > pDecInfo->streamBufEndAddr) {
++		room = wrPtr - pDecInfo->streamBufEndAddr;
++		wrPtr = pDecInfo->streamBufStartAddr;
++		wrPtr += room;
++	}
+ 
+-		if (wrPtr == pDecInfo->streamBufEndAddr) {
+-			wrPtr = pDecInfo->streamBufStartAddr;
+-		}
++	if (wrPtr == pDecInfo->streamBufEndAddr) {
++		wrPtr = pDecInfo->streamBufStartAddr;
+ 	}
+ 
+ 	pDecInfo->streamWrPtr = wrPtr;
+@@ -3650,11 +3649,6 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	}
+ 	VpuWriteReg(BIT_AXI_SRAM_USE, val);
+ 
+-	if (pCodecInst->codecMode == VPX_DEC) {
+-		VpuWriteReg(CMD_DEC_PIC_CHUNK_SIZE,
+-			    pDecInfo->streamWrPtr - pDecInfo->streamBufStartAddr);
+-	}
+-
+ 	BitIssueCommand(pCodecInst, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+@@ -4105,11 +4099,6 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = VpuReadReg(BIT_RD_PTR);
+ 	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = VpuReadReg(BIT_BIT_STREAM_PARAM);
+ 
+-	if (pCodecInst->codecMode == VPX_DEC) {
+-		pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = pDecInfo->streamBufStartAddr;
+-		pDecInfo->streamWrPtr = pDecInfo->streamBufStartAddr;
+-	}
+-
+ 	if (cpu_is_mx27()) {
+ 		if (pCodecInst->codecMode == MP4_DEC &&
+ 		    pDecInfo->openParam.qpReport == 1) {
+-- 
+1.8.0
+

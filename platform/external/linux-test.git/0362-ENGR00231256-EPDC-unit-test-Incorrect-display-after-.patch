@@ -1,0 +1,459 @@
+From c465153398ec41defd484906692e277822883aed Mon Sep 17 00:00:00 2001
+From: Michael Minnick <michael.minnick@freescale.com>
+Date: Fri, 26 Oct 2012 09:59:18 -0500
+Subject: [PATCH 362/435] ENGR00231256 EPDC: unit test: Incorrect display
+ after screen mode change
+
+The FBIOPUT_VSCREENINFO ioctl causes the fb console driver to clear
+the FB to all zeros (black) when changing screen modes (RGB to grayscale).
+Some tests did not account for this and so the display was incorrect
+after executing the ioctl. Fix is to blank the screen to white and
+redraw the contents (if necessary).
+
+In addition, the following minor changes were made to the unit test:
+
+1. Added max SEND_UPDATE retry so test doesn't hang if driver in bad state.
+2. Don't check for collision status if wait for update fails.
+3. test_auto_waveform: Don't check for waveform selected
+   (not implemented by mx6 epdc driver).
+4. test_animation_mode: blank screen on enter and exit from A2 animation mode.
+5. test_fast_square: wait for updates so moving square can be seen.
+6. test_dry_run: disallow running with snapshot scheme.
+7. Add "-p" argument documentation and other minor changes in usage strings.
+8. Add printfs when exiting due to error.
+
+Signed-off-by: Michael Minnick <michael.minnick@freescale.com>
+---
+ test/mxc_fb_test/mxc_epdc_fb_test.c | 206 ++++++++++++++++++++++--------------
+ 1 file changed, 129 insertions(+), 77 deletions(-)
+
+diff --git a/test/mxc_fb_test/mxc_epdc_fb_test.c b/test/mxc_fb_test/mxc_epdc_fb_test.c
+index f8b9c0d..fd03f74 100644
+--- a/test/mxc_fb_test/mxc_epdc_fb_test.c
++++ b/test/mxc_fb_test/mxc_epdc_fb_test.c
+@@ -136,7 +136,7 @@ static __u32 update_to_display(int left, int top, int width, int height, int wav
+ 	struct mxcfb_update_marker_data upd_marker_data;
+ 	int retval;
+ 	int wait = wait_for_complete | (flags & EPDC_FLAG_TEST_COLLISION);
+-
++	int max_retry = 10;
+ 
+ 	upd_data.update_mode = UPDATE_MODE_PARTIAL;
+ 	upd_data.waveform_mode = wave_mode;
+@@ -159,6 +159,12 @@ static __u32 update_to_display(int left, int top, int width, int height, int wav
+ 		 * then try again after some updates have completed */
+ 		sleep(1);
+ 		retval = ioctl(fd_fb_ioctl, MXCFB_SEND_UPDATE, &upd_data);
++		if (--max_retry <= 0) {
++			printf("Max retries exceeded\n");
++			wait = 0;
++			flags = 0;
++			break;
++		}
+ 	}
+ 
+ 	if (wait) {
+@@ -168,6 +174,7 @@ static __u32 update_to_display(int left, int top, int width, int height, int wav
+ 		retval = ioctl(fd_fb_ioctl, MXCFB_WAIT_FOR_UPDATE_COMPLETE, &upd_marker_data);
+ 		if (retval < 0) {
+ 			printf("Wait for update complete failed.  Error = 0x%x", retval);
++			flags = 0;
+ 		}
+ 	}
+ 
+@@ -704,7 +711,10 @@ static int test_y8(void)
+ 		}
+ 
+ 		printf("Top-half black\n");
+-		memset(fb, 0x00, screen_info.xres_virtual*screen_info.yres*screen_info.bits_per_pixel/8/2);
++		memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*
++			screen_info.bits_per_pixel/8);
++		memset(fb, 0x00, screen_info.xres_virtual*screen_info.yres*
++			screen_info.bits_per_pixel/8/2);
+ 		update_to_display(0, 0, screen_info.xres, screen_info.yres,
+ 			WAVEFORM_MODE_AUTO, FALSE, 0);
+ 
+@@ -736,8 +746,13 @@ static int test_auto_waveform(void)
+ {
+ 	int retval = TPASS;
+ 	int i, j;
+-	__u32 waveform_used;
+-	int anyfail = FALSE;
++
++	/*
++	 * Note: i.MX 6 EPDC does not support returning the waveform
++	 * used in the update data structure, like the i.MX 508 does.
++	 * This is because the i.MX 508 uses the PxP to select the the
++	 * waveform and it is known before the update is sent to the EPDC.
++	 */
+ 
+ 	printf("Change to Y8 FB\n");
+ 	screen_info.rotate = FB_ROTATE_UR;
+@@ -746,19 +761,15 @@ static int test_auto_waveform(void)
+ 	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
+ 	if (retval < 0)
+ 	{
+-		printf("Back to normal failed\n");
++		printf("Change to Y8 failed\n");
+ 		return TFAIL;
+ 	}
+ 
+ 	printf("Blank screen - auto-selected to DU\n");
+ 	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*screen_info.bits_per_pixel/8);
+-	waveform_used = update_to_display(0, 0, screen_info.xres, screen_info.yres,
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
+ 		WAVEFORM_MODE_AUTO, TRUE, 0);
+ 
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_DU)
+-		anyfail = TRUE;
+-
+ 	/* Draw 0x5 square */
+ 	for (i = 10; i < 50; i++)
+ 		for (j = 10; j < 50; j++)
+@@ -770,11 +781,7 @@ static int test_auto_waveform(void)
+ 			*((__u8 *)fb + (i*screen_info.xres_virtual+j)) = 0xA0;
+ 
+ 	printf("Update auto-selected to GC4\n");
+-	waveform_used = update_to_display(0, 0, 100, 100, WAVEFORM_MODE_AUTO, FALSE, 0);
+-
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_GC4)
+-		anyfail = TRUE;
++	update_to_display(0, 0, 100, 100, WAVEFORM_MODE_AUTO, FALSE, 0);
+ 
+ 	sleep(2);
+ 
+@@ -782,21 +789,11 @@ static int test_auto_waveform(void)
+ 	fb[5] = 0x8080;
+ 
+ 	printf("Update auto-selected to GC16\n");
+-	waveform_used = update_to_display(0, 0, 100, 100, WAVEFORM_MODE_AUTO, FALSE, 0);
+-
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_GC16)
+-		anyfail = TRUE;
++	update_to_display(0, 0, 100, 100, WAVEFORM_MODE_AUTO, FALSE, 0);
+ 
+ 	sleep(3);
+ 
+-	printf("Blank screen\n");
+-	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*screen_info.bits_per_pixel/8);
+-	update_to_display(0, 0, screen_info.xres, screen_info.yres,
+-		WAVEFORM_MODE_DU, TRUE, 0);
+-
+-	sleep(2);
+-	printf("Back to unrotated RGB565\n");
++	printf("Back to RGB565\n");
+ 	screen_info.rotate = FB_ROTATE_UR;
+ 	screen_info.bits_per_pixel = 16;
+ 	screen_info.grayscale = 0;
+@@ -807,55 +804,33 @@ static int test_auto_waveform(void)
+ 		return TFAIL;
+ 	}
+ 
+-	/* Test PxP 8x8 alignment handling */
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*
++		screen_info.bits_per_pixel/8);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_AUTO, TRUE, 0);
++
++	sleep(2);
++
++	/* Test 8x8 alignment handling */
+ 	printf("Draw gray junk at (18,0)\n");
+ 	draw_rectangle(fb, 18, 0, 2, 18, 0xE71C);
+ 
+-	waveform_used = update_to_display(0, 0, 17, 18, WAVEFORM_MODE_AUTO, 0, 0);
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_DU)
+-		anyfail = TRUE;
++	update_to_display(0, 0, 17, 18, WAVEFORM_MODE_AUTO, 0, 0);
+ 
+-	waveform_used = update_to_display(0, 0, 16, 18, WAVEFORM_MODE_AUTO, 0, 0);
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_DU)
+-		anyfail = TRUE;
++	update_to_display(0, 0, 16, 18, WAVEFORM_MODE_AUTO, 0, 0);
+ 
+-	/* Test PxP input alignment */
++	/* Test input alignment */
+ 	printf("Draw gray junk at (1,0)\n");
+ 	draw_rectangle(fb, 1, 0, 2, 18, 0xE71C);
+ 
+-	waveform_used = update_to_display(4, 0, 10, 18, WAVEFORM_MODE_AUTO, 0, 0);
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_DU)
+-		anyfail = TRUE;
++	update_to_display(4, 0, 10, 18, WAVEFORM_MODE_AUTO, 0, 0);
+ 
+-	waveform_used = update_to_display(3, 0, 10, 18, WAVEFORM_MODE_AUTO, 0, 0);
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_DU)
+-		anyfail = TRUE;
++	update_to_display(3, 0, 10, 18, WAVEFORM_MODE_AUTO, 0, 0);
+ 
+-	waveform_used = update_to_display(0, 0, 10, 18, WAVEFORM_MODE_AUTO, 0, 0);
+-	printf("Waveform used = %d\n", waveform_used);
+-	if (waveform_used != WAVEFORM_MODE_GC16)
+-		anyfail = TRUE;
++	update_to_display(0, 0, 10, 18, WAVEFORM_MODE_AUTO, 0, 0);
+ 
+-	sleep(2);
+-	printf("Back to unrotated RGB565\n");
+-	screen_info.rotate = FB_ROTATE_UR;
+-	screen_info.bits_per_pixel = 16;
+-	screen_info.grayscale = 0;
+-	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
+-	if (retval < 0)
+-	{
+-		printf("Setting RGB565 failed\n");
+-		return TFAIL;
+-	}
+-
+-	if (anyfail && (scheme == UPDATE_SCHEME_SNAPSHOT))
+-		return TFAIL;
+-	else
+-		return TPASS;
++	return TPASS;
+ }
+ 
+ static int test_auto_update(void)
+@@ -1367,6 +1342,20 @@ static int test_animation_mode(void)
+ 	update_to_display(50, 350, 200, 200, WAVEFORM_MODE_AUTO, TRUE, 0);
+ 	update_to_display(350, 350, 200, 200, WAVEFORM_MODE_AUTO, TRUE, 0);
+ 
++	sleep(2);
++
++	/*
++	 * Rule for animiation mode is that you must enter and exit all
++	 * white or all black
++	 */
++	if (use_animation) {
++		printf("Blank screen\n");
++		memset(fb, 0xFF, 800*600*2);
++		update_to_display(0, 0, screen_info.xres, screen_info.yres,
++			WAVEFORM_MODE_AUTO, TRUE, 0);
++		draw_rgb_color_squares(&screen_info);
++	}
++
+ 	printf("Squares update black/white\n");
+ 	update_to_display(50, 50, 200, 200, wave_mode, TRUE,
+ 		EPDC_FLAG_FORCE_MONOCHROME);
+@@ -1377,19 +1366,51 @@ static int test_animation_mode(void)
+ 	update_to_display(350, 350, 200, 200, wave_mode, TRUE,
+ 		EPDC_FLAG_FORCE_MONOCHROME);
+ 
++	sleep(2);
++	if (use_animation) {
++		printf("Blank screen\n");
++		memset(fb, 0xFF, 800*600*2);
++		update_to_display(0, 0, screen_info.xres, screen_info.yres,
++			WAVEFORM_MODE_AUTO, TRUE, 0);
++	}
++
+ 	copy_image_to_buffer(0, 0, 800, 600, ginger_rgb_800x600, BUFFER_FB, &screen_info);
+ 	printf("Ginger update normal\n");
+ 	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, TRUE, 0);
+ 	sleep(2);
++
++	if (use_animation) {
++		printf("Blank screen\n");
++		memset(fb, 0xFF, 800*600*2);
++		update_to_display(0, 0, screen_info.xres, screen_info.yres,
++			WAVEFORM_MODE_AUTO, TRUE, 0);
++		copy_image_to_buffer(0, 0, 800, 600, ginger_rgb_800x600,
++			BUFFER_FB, &screen_info);
++	}
++
+ 	printf("Ginger update black/white\n");
+ 	update_to_display(0, 0, 800, 600, wave_mode, TRUE, EPDC_FLAG_FORCE_MONOCHROME);
+-
+ 	sleep(2);
+ 
++	if (use_animation) {
++		printf("Blank screen\n");
++		memset(fb, 0xFF, 800*600*2);
++		update_to_display(0, 0, screen_info.xres, screen_info.yres,
++			WAVEFORM_MODE_AUTO, TRUE, 0);
++	}
++
+ 	copy_image_to_buffer(0, 0, 800, 600, colorbar_rgb_800x600, BUFFER_FB, &screen_info);
+ 	printf("Colorbar update normal\n");
+ 	update_to_display(0, 0, 800, 600, WAVEFORM_MODE_AUTO, TRUE, 0);
+ 	sleep(2);
++	if (use_animation) {
++		printf("Blank screen\n");
++		memset(fb, 0xFF, 800*600*2);
++		update_to_display(0, 0, screen_info.xres, screen_info.yres,
++			WAVEFORM_MODE_AUTO, TRUE, 0);
++		copy_image_to_buffer(0, 0, 800, 600, colorbar_rgb_800x600,
++			BUFFER_FB, &screen_info);
++	}
+ 	printf("Colorbar update black/white\n");
+ 	update_to_display(0, 0, 800, 600, wave_mode, TRUE, EPDC_FLAG_FORCE_MONOCHROME);
+ 
+@@ -1429,12 +1450,27 @@ static int test_animation_mode(void)
+ 			WAVEFORM_MODE_AUTO, TRUE, 0);
+ 
+ 		sleep(2);
++		if (use_animation) {
++			printf("Blank screen\n");
++			memset(fb, 0xFF, 800*600*2);
++			update_to_display(0, 0, screen_info.xres,
++				screen_info.yres,
++				WAVEFORM_MODE_AUTO, TRUE, 0);
++			draw_y_colorbar(&screen_info);
++		}
+ 
+ 		printf("Draw Y8 colorbar black/white\n");
+ 		update_to_display(0, 0, screen_info.xres, screen_info.yres,
+ 			wave_mode, TRUE, EPDC_FLAG_FORCE_MONOCHROME);
+ 
+ 		sleep(2);
++		if (use_animation) {
++			printf("Blank screen\n");
++			memset(fb, 0xFF, 800*600*2);
++			update_to_display(0, 0, screen_info.xres,
++				screen_info.yres,
++				WAVEFORM_MODE_AUTO, TRUE, 0);
++		}
+ 	}
+ 
+ 	printf("Change back to non-inverted RGB565\n");
+@@ -1458,7 +1494,7 @@ static int test_fast_square(void)
+ 	int xpos, ypos, last_pos;
+ 	int side_len, increment;
+ 	int first_go;
+-	int wait_upd_compl = ALLOW_COLLISIONS;
++	int wait_upd_compl = NO_COLLISIONS;
+ 	int wave_mode = use_animation ? WAVEFORM_MODE_A2 : WAVEFORM_MODE_AUTO;
+ 
+ 	/********************************************
+@@ -1573,6 +1609,8 @@ static int test_partial_to_full(void) {
+ 		}
+ 	}
+ 
++	sleep(2);
++
+ 	upd_data.update_mode = UPDATE_MODE_FULL;
+ 	upd_data.waveform_mode = WAVEFORM_MODE_AUTO;
+ 	upd_data.update_region.left = 0;
+@@ -1720,11 +1758,6 @@ static int test_colormap(void)
+ 	int retval = TPASS;
+ 	int i;
+ 
+-	printf("Blank screen\n");
+-	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*screen_info.bits_per_pixel/8);
+-	update_to_display(0, 0, screen_info.xres, screen_info.yres,
+-		WAVEFORM_MODE_GC16, TRUE, 0);
+-
+ 	printf("Changing to Y8 Framebuffer\n");
+ 	screen_info.rotate = FB_ROTATE_UR;
+ 	screen_info.bits_per_pixel = 8;
+@@ -1736,6 +1769,12 @@ static int test_colormap(void)
+ 		return TFAIL;
+ 	}
+ 
++	printf("Blank screen\n");
++	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*
++		screen_info.bits_per_pixel/8);
++	update_to_display(0, 0, screen_info.xres, screen_info.yres,
++		WAVEFORM_MODE_GC16, TRUE, 0);
++
+ 	/* Get default colormap */
+ 	retval = ioctl(fd_fb, FBIOGETCMAP, &einkfb_8bpp_cmap);
+ 	if (retval < 0)
+@@ -1762,14 +1801,14 @@ static int test_colormap(void)
+ 
+ 	sleep(2);
+ 
+-	/* Make update request using new colormap */
++	/* Make update request without using new colormap */
+ 	update_to_display(0, 0, screen_info.xres, screen_info.yres,
+ 		WAVEFORM_MODE_GC16, TRUE, 0);
+ 	printf("Screen should be white now\n");
+ 
+ 	sleep(2);
+ 
+-	/* Make update request using new colormap */
++	/* Make update request using new colormap with inversion */
+ 	update_to_display(0, 0, screen_info.xres, screen_info.yres,
+ 		WAVEFORM_MODE_GC16, TRUE, EPDC_FLAG_USE_CMAP | EPDC_FLAG_ENABLE_INVERSION);
+ 	printf("Screen should be white still\n");
+@@ -1825,6 +1864,11 @@ static int test_dry_run(void)
+ 	int retval = TPASS;
+ 	__u32 coll;
+ 
++	if (scheme == UPDATE_SCHEME_SNAPSHOT) {
++		printf("Unable to run collision test with SNAPSHOT scheme.\n");
++		return TPASS;
++	}
++
+ 	printf("Blank screen\n");
+ 	memset(fb, 0xFF, screen_info.xres_virtual*screen_info.yres*2);
+ 	update_to_display(0, 0, screen_info.xres, screen_info.yres,
+@@ -1947,12 +1991,16 @@ void usage(char *app)
+ 	printf("\t-h\t  Print this message\n");
+ 	printf("\t-a\t  Enabled animation waveforms for fast updates (tests 8-9)\n");
+ 	printf("\t-p\t  Provide a power down delay (in ms) for the EPDC driver\n");
++	printf("\t\t  0 - Immediate (default)\n");
++	printf("\t\t  -1 - Never\n");
++	printf("\t\t  <ms> - After <ms> milliseconds\n");
+ 	printf("\t-u\t  Select an update scheme\n");
+ 	printf("\t\t  s - Snapshot update scheme\n");
+-	printf("\t\t  q - Queued update scheme\n");
+-	printf("\t\t  m - Queued update scheme with update merging\n");
++	printf("\t\t  q - Queue update scheme\n");
++	printf("\t\t  m - Queue and merge update scheme (default)\n");
+ 	printf("\t-n\t  Execute the tests specified in expression\n");
+ 	printf("\t\t  Expression is a set of comma-separated numeric ranges\n");
++	printf("\t\t  If not specified, tests 1-13 are run\n");
+ 	printf("Example:\n");
+ 	printf("%s -n 1-3,5,7\n", app);
+ 	printf("\nEPDC tests:\n");
+@@ -2129,7 +2177,7 @@ main(int argc, char **argv)
+ 	printf("screen_info.xres_virtual = %d\nscreen_info.yres_virtual = %d\nscreen_info.bits_per_pixel = %d\n",
+ 		screen_info.xres_virtual, screen_info.yres_virtual, screen_info.bits_per_pixel);
+ 
+-	printf("Mem-Mapping FB0\n");
++	printf("Mem-Mapping FB\n");
+ 
+ 	/* Map the device to memory*/
+ 	fb = (unsigned short *)mmap(0, g_fb_size,PROT_READ | PROT_WRITE, MAP_SHARED, fd_fb, 0);
+@@ -2144,6 +2192,7 @@ main(int argc, char **argv)
+ 	retval = ioctl(fd_fb_ioctl, MXCFB_SET_AUTO_UPDATE_MODE, &auto_update_mode);
+ 	if (retval < 0)
+ 	{
++		printf("\nError: failed to set update mode.\n");
+ 		goto err2;
+ 	}
+ 
+@@ -2157,6 +2206,7 @@ main(int argc, char **argv)
+ 	retval = ioctl(fd_fb_ioctl, MXCFB_SET_WAVEFORM_MODES, &wv_modes);
+ 	if (retval < 0)
+ 	{
++		printf("\nError: failed to set waveform mode.\n");
+ 		goto err2;
+ 	}
+ 
+@@ -2164,6 +2214,7 @@ main(int argc, char **argv)
+ 	retval = ioctl(fd_fb_ioctl, MXCFB_SET_UPDATE_SCHEME, &scheme);
+ 	if (retval < 0)
+ 	{
++		printf("\nError: failed to set update scheme.\n");
+ 		goto err2;
+ 	}
+ 
+@@ -2171,6 +2222,7 @@ main(int argc, char **argv)
+ 	retval = ioctl(fd_fb_ioctl, MXCFB_SET_PWRDOWN_DELAY, &pwrdown_delay);
+ 	if (retval < 0)
+ 	{
++		printf("\nError: failed to set power down delay.\n");
+ 		goto err2;
+ 	}
+ 
+-- 
+1.8.0
+

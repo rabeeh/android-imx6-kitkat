@@ -1,0 +1,877 @@
+From c1239ef8fe87be2f8c616ef7b18d402b8abd5e83 Mon Sep 17 00:00:00 2001
+From: Ding Qiang <b02550@freescale.com>
+Date: Wed, 15 Jul 2009 15:12:49 +0800
+Subject: [PATCH 071/249] ENGR00113922 IPUv3:  Add IPC mechanism in the
+ ScreenLayer lib.
+
+1, Define new API to support IPC in the ScreenLayer lib.
+2, Implement IPC mechanims based on semaphore+shared memory.
+
+Signed-off-by: DingQiang <b02550@freescale.com>
+(cherry picked from commit 75a604a52dd3b70de3c25a2f977a44e251c1b032)
+---
+ screenlayer/ScreenLayer.c | 495 +++++++++++++++++++++++++++++++---------------
+ screenlayer/ScreenLayer.h |  26 +++
+ 2 files changed, 367 insertions(+), 154 deletions(-)
+
+diff --git a/screenlayer/ScreenLayer.c b/screenlayer/ScreenLayer.c
+index c3b3c11..fced42c 100644
+--- a/screenlayer/ScreenLayer.c
++++ b/screenlayer/ScreenLayer.c
+@@ -23,12 +23,13 @@ extern "C"{
+ #include <stdint.h>
+ #include <malloc.h>
+ #include <string.h>
+-#include <pthread.h>
++#include <semaphore.h>
+ #include <linux/ipu.h>
+ #include <linux/mxcfb.h>
+ #include <linux/videodev.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include "ScreenLayer.h"
+ #include "mxc_ipu_hl_lib.h"
+ 
+@@ -40,16 +41,24 @@ extern "C"{
+ static int debug_level = DBG_ERR;
+ #define dbg(flag, fmt, args...)	{ if(flag <= debug_level)  printf("%s:%d "fmt, __FILE__, __LINE__,##args); }
+ 
+-static pthread_mutex_t SLmutex = PTHREAD_MUTEX_INITIALIZER;
++/* Indicates the max number which will be supported in the CreateScreenLayer */
++#define BUF_POOL_NUMBER		20
+ 
++/*
++**   Privare data will be stored in the shm.
++**
++**   layour of shared memory
++**
++**   Primary    Second     Third
++**ID:    1          2          3
++**  |----------|----------|----------|
++*/
+ typedef struct {
+ 	u8		isPrimary;
+ 	u8 		bufNum;
+ 	u8		curBufIdx;
+ 	dma_addr_t	dispPaddr[2];
+ 	u8		curDispIdx;
+-	ScreenLayer 	* pPreLayer;
+-	ScreenLayer 	* pNextLayer;
+ 	u8		alphaGlobalEnable;
+ 	u8		sepAlphaLocalEnable;
+ 	u8		alpha;
+@@ -60,7 +69,28 @@ typedef struct {
+         ipu_mem_info 	* bufMinfo;
+ 	ipu_mem_info 	* bufAlphaMinfo;
+         ipu_mem_info 	dispMinfo;
++	/* Add for IPC, backup infor from external ScreenLayer */
++	SLRect 		screenRect;
++	u32 		fmt;
++	bool		supportSepLocalAlpha;
++	dma_addr_t 	bufPaddr[BUF_POOL_NUMBER];
++	dma_addr_t 	bufAlphaPaddr[BUF_POOL_NUMBER];
++	char		fbdev[32];
++
++	int		layerID;
++	int		preLayerId;
++	int		nextLayerId;
+ } ScreenLayerPriv;
++/* variables for semaphore */
++sem_t * 	semID;
++const  char* 	semName="IPU_SL_SEM_NAME";
++static char	shmName[12]="shm_fb0";
++
++/* Indicates how many threads in the current process */
++static int pthread_counter=0;
++
++/* virtual address of shared memory in current Process */
++static ScreenLayerPriv  * vshmSLPriv = NULL;
+ 
+ static u32 fmt_to_bpp(u32 pixelformat)
+ {
+@@ -110,7 +140,7 @@ void yield(void)
+ SLRetCode _MemAllocSL(ScreenLayer *pSL)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv + (int)pSL->pPriv-1);
+ 	u8 i;
+ 	u32 width, height, screen_size;
+ 
+@@ -134,26 +164,31 @@ SLRetCode _MemAllocSL(ScreenLayer *pSL)
+  	 * 	PrimarySL -> OverlaySL0(tmpDispBuf) -> OverlaySL1(dispBuf)
+  	 */
+ 	if (!pSLPriv->isPrimary) {
+-		ScreenLayerPriv *pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
+-
+-		if (pSLPriv->pPreLayer != pSL->pPrimary) {
+-			/* case b -> c */
+-			width = ((ScreenLayer *)pSL->pPrimary)->screenRect.right - ((ScreenLayer *)pSL->pPrimary)->screenRect.left;
+-			height = ((ScreenLayer *)pSL->pPrimary)->screenRect.bottom - ((ScreenLayer *)pSL->pPrimary)->screenRect.top;
+-			pPreSLPriv->dispMinfo.size = width/8*height*fmt_to_bpp(((ScreenLayer *)pSL->pPrimary)->fmt);
+-			if (ioctl(pPreSLPriv->fdIpu, IPU_ALOC_MEM, &(pPreSLPriv->dispMinfo)) < 0) {
++		ScreenLayerPriv *pPreSLPriv = (ScreenLayerPriv *)(vshmSLPriv + pSLPriv->preLayerId-1);
++		ScreenLayerPriv *pPriSLPriv = vshmSLPriv;
++
++		if (pSLPriv->preLayerId != (int)pSL->pPrimary) {
++			/* case b -> c
++			 * allocate tmpDispBuf from current SL, make it as PreSL's DispBuf.
++			 * and use PreSL's DispBuf as currentSL's display buffer.
++			 */
++			width  = pPriSLPriv->screenRect.right  - pPriSLPriv->screenRect.left;
++			height = pPriSLPriv->screenRect.bottom - pPriSLPriv->screenRect.top;
++			pSLPriv->dispMinfo.size = width/8*height*fmt_to_bpp(pPriSLPriv->fmt);
++			if (ioctl(pSLPriv->fdIpu, IPU_ALOC_MEM, &(pSLPriv->dispMinfo)) < 0) {
+ 				ret = E_RET_MEM_ALOC_FAIL;
++				dbg(DBG_ERR, "_MemAllocSL: IPU memory alloc failed! \n");
+ 				goto done;
+ 			}
+ 
+ 			pSLPriv->dispPaddr[0] = pPreSLPriv->dispPaddr[0];
+ 			pSLPriv->dispPaddr[1] = pPreSLPriv->dispPaddr[1];
+ 			pSLPriv->curDispIdx = pPreSLPriv->curDispIdx;
+-			pPreSLPriv->dispPaddr[0] = pPreSLPriv->dispMinfo.paddr;
++			pPreSLPriv->dispPaddr[0] = pSLPriv->dispMinfo.paddr;
+ 			pPreSLPriv->dispPaddr[1] = 0;
+ 			pPreSLPriv->curDispIdx = 0;
+ 
+-			dbg(DBG_DEBUG, "allocate %d memory paddr 0x%x for pre layer\n", pPreSLPriv->dispMinfo.size, pPreSLPriv->dispMinfo.paddr);
++			dbg(DBG_DEBUG, "allocate %d memory paddr 0x%x for pre layer\n", pSLPriv->dispMinfo.size, pSLPriv->dispMinfo.paddr);
+ 		} else {
+ 			/* case a -> b */
+ 			pSLPriv->dispPaddr[0] = pPreSLPriv->dispPaddr[0];
+@@ -286,7 +321,7 @@ done:
+ 
+ void _MemFreeSL(ScreenLayer *pSL)
+ {
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv +(int)pSL->pPriv-1);
+ 	u8 i;
+ 
+ 	for (i=0;i<pSLPriv->bufNum;i++) {
+@@ -306,13 +341,12 @@ void _MemFreeSL(ScreenLayer *pSL)
+ 		}
+ 	}
+ 
+-	if (pSLPriv->pPreLayer && pSLPriv->pNextLayer) {
+-		/* case c -> b, destory middle layer */
+-		dbg(DBG_DEBUG, "free %d memory disppaddr 0x%x for current layer\n", pSLPriv->dispMinfo.size, pSLPriv->dispPaddr[0]);
+-		ioctl(pSLPriv->fdIpu, IPU_FREE_MEM, &(pSLPriv->dispMinfo));
+-	} else if (pSLPriv->pPreLayer) {
+-		ScreenLayerPriv *pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
+-		if (pSLPriv->pPreLayer == pSL->pPrimary) {
++	if (pSLPriv->preLayerId && pSLPriv->nextLayerId) {
++		/* case c -> b, destory middle layer, do nothing */
++		dbg(DBG_DEBUG, "free middle layer. \n");
++	} else if (pSLPriv->preLayerId) {
++		ScreenLayerPriv *pPreSLPriv = (ScreenLayerPriv *)(vshmSLPriv + pSLPriv->preLayerId-1);
++		if (pSLPriv->preLayerId == (int)pSL->pPrimary) {
+ 			/* case b -> a */
+ 			pPreSLPriv->dispPaddr[0] = pSLPriv->dispPaddr[0];
+ 			pPreSLPriv->dispPaddr[1] = pSLPriv->dispPaddr[1];
+@@ -321,8 +355,8 @@ void _MemFreeSL(ScreenLayer *pSL)
+ 			pSLPriv->dispPaddr[1] = 0;
+ 		} else {
+ 			/* case c -> b, destory top layer */
+-			dbg(DBG_DEBUG, "free %d memory disppaddr 0x%x for pre layer\n", pPreSLPriv->dispMinfo.size, pPreSLPriv->dispPaddr[0]);
+-			ioctl(pPreSLPriv->fdIpu, IPU_FREE_MEM, &(pPreSLPriv->dispMinfo));
++			dbg(DBG_DEBUG, "free %d memory disppaddr 0x%x for pre layer\n", pSLPriv->dispMinfo.size, pSLPriv->dispPaddr[0]);
++			ioctl(pSLPriv->fdIpu, IPU_FREE_MEM, &(pSLPriv->dispMinfo));
+ 			pPreSLPriv->dispPaddr[0] = pSLPriv->dispPaddr[0];
+ 			pPreSLPriv->dispPaddr[1] = pSLPriv->dispPaddr[1];
+ 			pPreSLPriv->curDispIdx = pSLPriv->curDispIdx;
+@@ -347,50 +381,146 @@ void _MemFreeSL(ScreenLayer *pSL)
+ 	close(pSLPriv->fdIpu);
+ }
+ 
++SLRetCode PreScreenLayerIPC(char *pFbdev)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++	int	shmID;
++	struct	stat shmStat;
++
++	dbg(DBG_DEBUG, "PreScreenLayerIPC begin!\n");
++	/* Create one new semaphore or opens an existing semaphore */
++	semID = sem_open(semName, O_CREAT, 0666, 1);
++	if(SEM_FAILED == semID){
++		dbg(DBG_ERR, "can not open the semaphore for : IPU_SL_SEM_NAME!\n");
++		ret = E_RET_IPC_SEM_OPEN_FAILED;
++		goto pre_err0;
++	}
++
++	sem_wait(semID);
++
++	/* Create one new shm or get one existing shm object's ID */
++	if(strstr(pFbdev,"fb1"))
++		strcpy(shmName, "shm_fb1");
++	else if(strstr(pFbdev,"fb2"))
++		strcpy(shmName, "shm_fb2");
++
++	shmID = shm_open(shmName, O_RDWR|O_CREAT, 0666);
++	if(shmID == -1){
++		dbg(DBG_ERR, "can not open the shared memory for : %s!\n",pFbdev);
++		ret = E_RET_IPC_SHM_FAILED;
++		sem_unlink(semName);
++		goto pre_err1;
++	}
++	/* Get special size shm */
++	ftruncate(shmID,3 * sizeof(ScreenLayerPriv));
++	/* Connect to the shm */
++	fstat(shmID, &shmStat);
++
++	if(vshmSLPriv == NULL)
++	{
++		vshmSLPriv = (ScreenLayerPriv *)mmap(NULL,shmStat.st_size,PROT_READ|PROT_WRITE,MAP_SHARED,shmID,0);
++		dbg(DBG_DEBUG, "PreScreenLayerIPC Memory map done !\n");
++	}
++
++	if(vshmSLPriv == MAP_FAILED || vshmSLPriv ==NULL){
++		dbg(DBG_ERR, "shm mmap failed!\n");
++		ret = E_RET_IPC_SHM_FAILED;
++		sem_unlink(semName);
++		goto pre_err1;
++	}
++pre_err1:
++	sem_post(semID);
++	dbg(DBG_DEBUG, "PreScreenLayerIPC end!\n");
++pre_err0:
++	return ret;
++}
+ SLRetCode CreateScreenLayer(ScreenLayer *pSL, u8 nBufNum)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+ 	ScreenLayerPriv *pSLPriv;
++	int	curShmPrivID;
++	int	i, primaryId = (int)(pSL->pPrimary);
+ 
+-	pSL->pPriv = (void *)malloc(sizeof(ScreenLayerPriv));
+-	memset(pSL->pPriv, 0, sizeof(ScreenLayerPriv));
+-	pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	if ((primaryId != 0) && (primaryId != 1)) {
++		dbg(DBG_ERR, "Primary Id error!\n");
++		ret = E_RET_PRIMARY_ERR;
++		goto done;
++	}
+ 
+-	if (pSL->pPrimary) {
+-		ScreenLayerPriv *pPriSLPriv = (ScreenLayerPriv *)((ScreenLayer *)pSL->pPrimary)->pPriv;
++	if(vshmSLPriv == NULL)
++		ret = PreScreenLayerIPC(pSL->fbdev);
++	if(ret != E_RET_SUCCESS)
++	{
++		dbg(DBG_ERR, "Prepared semaphore & shm failed !\n");
++		goto done;
++	}
++	sem_wait(semID);
++	pthread_counter++;
++
++	/* Alloc shared memory for current Layer private struct */
++	/*
++	**   layour of shared memory
++	**
++	**   Primary    Second     Third
++	**ID:    1          2          3
++	**  |----------|----------|----------|
++	*/
++
++	if (primaryId == 1) {
++		/* Non Primary SL*/
++		ScreenLayerPriv *pPriSLPriv = vshmSLPriv;
+ 		ScreenLayerPriv *pCurSLPriv;
+-		ScreenLayer *pCurSL;
++
++		if(pPriSLPriv->nextLayerId == 0){
++			/* The seconde layer*/
++			pSLPriv = vshmSLPriv + 1;
++			curShmPrivID = 2;
++		}else{
++			/* The third layer */
++			pSLPriv = vshmSLPriv + 2;
++			curShmPrivID = 3;
++		}
++		memset(pSLPriv, 0, sizeof(ScreenLayerPriv));
++		pSL->pPriv = (void *)curShmPrivID;
++		pSLPriv->layerID = curShmPrivID;
+ 
+ 		if (!pPriSLPriv->isPrimary) {
+ 			dbg(DBG_ERR, "new screen layer should created based on a primary one!\n");
+ 			ret = E_RET_PRIMARY_ERR;
+-			goto done;
++			goto err;
+ 		}
+ 
+-		if ((pSL->screenRect.left >= ((ScreenLayer *)pSL->pPrimary)->screenRect.right) ||
+-			(pSL->screenRect.right > ((ScreenLayer *)pSL->pPrimary)->screenRect.right) ||
+-			(pSL->screenRect.top >= ((ScreenLayer *)pSL->pPrimary)->screenRect.bottom) ||
+-			(pSL->screenRect.bottom > ((ScreenLayer *)pSL->pPrimary)->screenRect.bottom)) {
++		if ((pSL->screenRect.left >= pPriSLPriv->screenRect.right) ||
++			(pSL->screenRect.right > pPriSLPriv->screenRect.right) ||
++			(pSL->screenRect.top  >= pPriSLPriv->screenRect.bottom) ||
++			(pSL->screenRect.bottom> pPriSLPriv->screenRect.bottom)) {
+ 			dbg(DBG_ERR, "new screen layer is bigger than primary one!\n");
+ 			ret = E_RET_RECT_OVERFLOW;
+-			goto done;
++			goto err;
+ 		}
+ 
+-		pCurSL = (ScreenLayer *)pSL->pPrimary;
+ 		pCurSLPriv = pPriSLPriv;
+-		while (pCurSLPriv->pNextLayer) {
+-			pCurSL = pCurSLPriv->pNextLayer;
+-			pCurSLPriv = (ScreenLayerPriv *)pCurSL->pPriv;
++		while (pCurSLPriv->nextLayerId) {
++			pCurSLPriv = vshmSLPriv + (pCurSLPriv->nextLayerId-1);
+ 		}
+-		pCurSLPriv->pNextLayer = pSL;
+-		pSLPriv->pPreLayer = pCurSL;
++		pCurSLPriv->nextLayerId = pSLPriv->layerID;
++		pSLPriv->preLayerId = pCurSLPriv->layerID ;
+ 
+ 		pSLPriv->isPrimary = 0;
+ 	} else {
++		/* Primary SL */
++		/* shm initialization */
++		memset(vshmSLPriv, 0, 3*sizeof(ScreenLayerPriv));
++
++		pSLPriv = vshmSLPriv;
++		curShmPrivID = 1;
++		pSL->pPriv = (void *)curShmPrivID;
++		pSLPriv->layerID = curShmPrivID;
++
+ 		if (pSL->supportSepLocalAlpha) {
+ 			dbg(DBG_ERR, "primary screen layer should not support local alpha blending!\n");
+ 			ret = E_RET_PRIMARY_ERR;
+-			goto done;
++			goto err;
+ 		}
+ 
+ 		pSLPriv->isPrimary = 1;
+@@ -399,6 +529,22 @@ SLRetCode CreateScreenLayer(ScreenLayer *pSL, u8 nBufNum)
+ 	pSLPriv->bufNum = nBufNum;
+ 
+ 	ret = _MemAllocSL(pSL);
++	/* Back up SL infor from external to private struct */
++	pSLPriv->screenRect.left = pSL->screenRect.left;
++	pSLPriv->screenRect.top  = pSL->screenRect.top;
++	pSLPriv->screenRect.right  = pSL->screenRect.right;
++	pSLPriv->screenRect.bottom = pSL->screenRect.bottom;
++	pSLPriv->fmt = pSL->fmt;
++	pSLPriv->supportSepLocalAlpha = pSL->supportSepLocalAlpha;
++	strcpy(pSLPriv->fbdev, pSL->fbdev);
++	for(i=0;i<nBufNum;i++)
++	{
++		pSLPriv->bufPaddr[i]      = pSL->bufPaddr[i];
++		if (pSL->supportSepLocalAlpha)
++			pSLPriv->bufAlphaPaddr[i] = pSL->bufAlphaPaddr[i];
++	}
++err:
++	sem_post(semID);
+ done:
+ 	return ret;
+ }
+@@ -406,29 +552,42 @@ done:
+ SLRetCode DestoryScreenLayer(ScreenLayer *pSL)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv + (int)pSL->pPriv-1);
+ 	ScreenLayerPriv *pPreSLPriv, *pNextSLPriv;
+ 
+-	if (pSLPriv->isPrimary && pSLPriv->pNextLayer) {
++	if (pSLPriv->isPrimary && pSLPriv->nextLayerId) {
+ 		dbg(DBG_ERR, "Err: destory primary with sub layer, pls destory sub layer first!\n");
+ 		ret = E_RET_DESTORY_PRI_WITH_SUBSL;
+ 		goto done;
+ 	}
+ 
++	sem_wait(semID);
++
+ 	_MemFreeSL(pSL);
+ 
+-	if (pSLPriv->pPreLayer) {
+-		if (pSLPriv->pNextLayer) {
+-			pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
+-			pNextSLPriv = (ScreenLayerPriv *)pSLPriv->pNextLayer->pPriv;
+-			pPreSLPriv->pNextLayer = pSLPriv->pNextLayer;
+-			pNextSLPriv->pPreLayer = pSLPriv->pPreLayer;
++	if (pSLPriv->preLayerId) {
++		if (pSLPriv->nextLayerId) {
++			pPreSLPriv  = (ScreenLayerPriv *)(vshmSLPriv + pSLPriv->preLayerId-1);
++			pNextSLPriv = (ScreenLayerPriv *)(vshmSLPriv + pSLPriv->nextLayerId-1);
++			pPreSLPriv->nextLayerId = pSLPriv->nextLayerId;
++			pNextSLPriv->preLayerId = pSLPriv->preLayerId;
+ 		} else {
+-			pPreSLPriv = (ScreenLayerPriv *)pSLPriv->pPreLayer->pPriv;
+-			pPreSLPriv->pNextLayer = NULL;
++			pPreSLPriv = (ScreenLayerPriv *)(vshmSLPriv + pSLPriv->preLayerId-1);
++			pPreSLPriv->nextLayerId = 0;
+ 		}
+ 	}
+-	free(pSLPriv);
++	pthread_counter--;
++	if(pthread_counter == 0)
++	{
++		munmap(vshmSLPriv, 3*sizeof(ScreenLayerPriv));
++		vshmSLPriv = NULL;
++		sem_post(semID);
++		sem_unlink(semName);
++		shm_unlink(shmName);
++		goto done;
++	}
++
++	sem_post(semID);
+ done:
+ 	return ret;
+ }
+@@ -436,7 +595,7 @@ done:
+ SLRetCode LoadScreenLayer(ScreenLayer *pSL, LoadParam *pParam, u8 nBufIdx)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv + (int)pSL->pPriv-1);
+ 	ipu_lib_handle_t ipu_handle;
+ 	ipu_lib_input_param_t input;
+ 	ipu_lib_output_param_t output;
+@@ -451,7 +610,6 @@ SLRetCode LoadScreenLayer(ScreenLayer *pSL, LoadParam *pParam, u8 nBufIdx)
+ 		goto done;
+ 	}
+ 
+-	pthread_mutex_lock(&SLmutex);
+ 
+ 	if ((pParam->srcRect.left >=  pParam->srcWidth) ||
+ 		(pParam->srcRect.right > pParam->srcWidth) ||
+@@ -495,21 +653,19 @@ SLRetCode LoadScreenLayer(ScreenLayer *pSL, LoadParam *pParam, u8 nBufIdx)
+ 	output.rot = pParam->destRot;
+ 	output.user_def_paddr[0] = pSL->bufPaddr[nBufIdx];
+ 
++	sem_wait(semID);
+ 	if (mxc_ipu_lib_task_init(&input, NULL, &output, NULL, mode, &ipu_handle) < 0) {
+ 		ret = E_RET_TASK_SETUP_ERR;
+-		pthread_mutex_unlock(&SLmutex);
+ 		goto done;
+ 	}
+ 
+ 	if (mxc_ipu_lib_task_buf_update(&ipu_handle, 0, 0, 0, 0, 0) < 0) {
+ 		ret = E_RET_TASK_RUN_ERR;
+-		pthread_mutex_unlock(&SLmutex);
+ 		goto done;
+ 	}
+ 
+ 	mxc_ipu_lib_task_uninit(&ipu_handle);
+-
+-	pthread_mutex_unlock(&SLmutex);
++	sem_post(semID);
+ 
+ 	yield();
+ done:
+@@ -519,7 +675,7 @@ done:
+ SLRetCode LoadAlphaPoint(ScreenLayer *pSL, u32 x, u32 y, u8 alphaVal, u8 nBufIdx)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv +(int)pSL->pPriv-1);
+ 	u8 *pPointAlphaVal;
+ 
+ 	if (nBufIdx >= pSLPriv->bufNum) {
+@@ -545,31 +701,26 @@ SLRetCode LoadAlphaPoint(ScreenLayer *pSL, u32 x, u32 y, u8 alphaVal, u8 nBufIdx
+ 	*pPointAlphaVal = alphaVal;
+ err:
+ 	return ret;
+-
+ }
+ 
+ SLRetCode FlipScreenLayerBuf(ScreenLayer *pSL, u8 nBufIdx)
+ {
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv + (int)pSL->pPriv-1);
+ 
+ 	if (nBufIdx >= pSLPriv->bufNum)
+ 		return E_RET_FLIP_ERR;
+ 
+-	pthread_mutex_lock(&SLmutex);
+-
++	sem_wait(semID);
+ 	pSLPriv->curBufIdx = nBufIdx;
+-
+-	pthread_mutex_unlock(&SLmutex);
++	sem_post(semID);
+ 
+ 	return E_RET_SUCCESS;
+ }
+ 
+-SLRetCode _CopyScreenLayer(ScreenLayer *pSrcSL, ScreenLayer *pTgtSL)
++SLRetCode _CopyScreenLayer(ScreenLayerPriv *pSrcSLPriv, ScreenLayerPriv *pTgtSLPriv)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pSrcSLPriv = (ScreenLayerPriv *)pSrcSL->pPriv;
+-	ScreenLayerPriv *pTgtSLPriv = (ScreenLayerPriv *)pTgtSL->pPriv;
+-	ScreenLayer *pPriSL;
++	ScreenLayerPriv *pPriSLPriv;
+ 	ipu_lib_handle_t ipu_handle;
+ 	ipu_lib_input_param_t input;
+ 	ipu_lib_output_param_t output;
+@@ -580,20 +731,17 @@ SLRetCode _CopyScreenLayer(ScreenLayer *pSrcSL, ScreenLayer *pTgtSL)
+ 	memset(&output, 0, sizeof(ipu_lib_output_param_t));
+ 
+ 	/* Top SL should show to fb */
+-	if (!pTgtSLPriv->pNextLayer)
++	if (!pTgtSLPriv->nextLayerId)
+ 		pTgtSLPriv->curDispIdx = pTgtSLPriv->curDispIdx ? 0 : 1;
+ 
+-	if (pSrcSLPriv->isPrimary)
+-		pPriSL = pSrcSL;
+-	else
+-		pPriSL = (ScreenLayer *)pSrcSL->pPrimary;
++	pPriSLPriv = vshmSLPriv;
+ 
+ 	mode = OP_NORMAL_MODE | TASK_PP_MODE;
+-        input.width = output.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
+-        input.height = output.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
+-        input.fmt = output.fmt = pPriSL->fmt;
+-	if (pSrcSL == pPriSL)
+-		input.user_def_paddr[0] = pSrcSL->bufPaddr[pSrcSLPriv->curBufIdx];
++        input.width = output.width = pPriSLPriv->screenRect.right - pPriSLPriv->screenRect.left;
++        input.height = output.height = pPriSLPriv->screenRect.bottom - pPriSLPriv->screenRect.top;
++        input.fmt = output.fmt = pPriSLPriv->fmt;
++	if(pSrcSLPriv->isPrimary)
++		input.user_def_paddr[0] = pSrcSLPriv->bufPaddr[pSrcSLPriv->curBufIdx];
+ 	else
+ 		input.user_def_paddr[0] = pSrcSLPriv->dispPaddr[pSrcSLPriv->curDispIdx];
+ 	output.user_def_paddr[0] = pTgtSLPriv->dispPaddr[pTgtSLPriv->curDispIdx];
+@@ -616,12 +764,10 @@ done:
+ 	return ret;
+ }
+ 
+-SLRetCode _CombScreenLayers(ScreenLayer *pBotSL, ScreenLayer *pTopSL)
++SLRetCode _CombScreenLayers(ScreenLayerPriv *pBotSLPriv, ScreenLayerPriv *pTopSLPriv)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pBotSLPriv = (ScreenLayerPriv *)pBotSL->pPriv;
+-	ScreenLayerPriv *pTopSLPriv = (ScreenLayerPriv *)pTopSL->pPriv;
+-	ScreenLayer *pPriSL;
++	ScreenLayerPriv *pPriSLPriv;
+ 	ipu_lib_handle_t ipu_handle;
+ 	ipu_lib_input_param_t input;
+ 	ipu_lib_overlay_param_t overlay;
+@@ -633,10 +779,7 @@ SLRetCode _CombScreenLayers(ScreenLayer *pBotSL, ScreenLayer *pTopSL)
+ 	memset(&overlay, 0, sizeof(ipu_lib_overlay_param_t));
+ 	memset(&output, 0, sizeof(ipu_lib_output_param_t));
+ 
+-	if (pBotSLPriv->isPrimary)
+-		pPriSL = pBotSL;
+-	else
+-		pPriSL = (ScreenLayer *)pBotSL->pPrimary;
++	pPriSLPriv = vshmSLPriv;
+ 
+ 	if (pTopSLPriv->alphaGlobalEnable && (pTopSLPriv->alpha == 255)
+ 		&& !pTopSLPriv->keyColorEnable) {
+@@ -646,19 +789,19 @@ SLRetCode _CombScreenLayers(ScreenLayer *pBotSL, ScreenLayer *pTopSL)
+ 		mode = OP_NORMAL_MODE | TASK_PP_MODE;
+ 
+ 		/* top/overlay layer (graphic) */
+-		input.width = pTopSL->screenRect.right - pTopSL->screenRect.left;
+-		input.height = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
+-		input.fmt = pTopSL->fmt;
+-		input.user_def_paddr[0] = pTopSL->bufPaddr[pTopSLPriv->curBufIdx];
++		input.width = pTopSLPriv->screenRect.right - pTopSLPriv->screenRect.left;
++		input.height = pTopSLPriv->screenRect.bottom - pTopSLPriv->screenRect.top;
++		input.fmt = pTopSLPriv->fmt;
++		input.user_def_paddr[0] = pTopSLPriv->bufPaddr[pTopSLPriv->curBufIdx];
+ 
+ 		/* output */
+-		output.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
+-		output.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
+-		output.output_win.pos.x = pTopSL->screenRect.left;
+-		output.output_win.pos.y = pTopSL->screenRect.top;
+-		output.output_win.win_w = pTopSL->screenRect.right - pTopSL->screenRect.left;
+-		output.output_win.win_h = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
+-		output.fmt = pPriSL->fmt;
++		output.width = pPriSLPriv->screenRect.right - pPriSLPriv->screenRect.left;
++		output.height = pPriSLPriv->screenRect.bottom - pPriSLPriv->screenRect.top;
++		output.output_win.pos.x = pTopSLPriv->screenRect.left;
++		output.output_win.pos.y = pTopSLPriv->screenRect.top;
++		output.output_win.win_w = pTopSLPriv->screenRect.right - pTopSLPriv->screenRect.left;
++		output.output_win.win_h = pTopSLPriv->screenRect.bottom - pTopSLPriv->screenRect.top;
++		output.fmt = pPriSLPriv->fmt;
+ 		output.user_def_paddr[0] = pTopSLPriv->dispPaddr[pTopSLPriv->curDispIdx];
+ 
+ 		if (mxc_ipu_lib_task_init(&input, NULL, &output, NULL, mode, &ipu_handle) < 0) {
+@@ -670,41 +813,41 @@ SLRetCode _CombScreenLayers(ScreenLayer *pBotSL, ScreenLayer *pTopSL)
+ 
+ 		mode = OP_NORMAL_MODE | TASK_PP_MODE;
+ 		/* bottom layer */
+-		input.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
+-		input.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
+-		input.input_crop_win.pos.x = pTopSL->screenRect.left;
+-		input.input_crop_win.pos.y = pTopSL->screenRect.top;
+-		input.input_crop_win.win_w = pTopSL->screenRect.right - pTopSL->screenRect.left;
+-		input.input_crop_win.win_h = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
+-		input.fmt = pPriSL->fmt;
+-		if (pBotSL == pPriSL)
+-			input.user_def_paddr[0] = pBotSL->bufPaddr[pBotSLPriv->curBufIdx];
++		input.width = pPriSLPriv->screenRect.right - pPriSLPriv->screenRect.left;
++		input.height = pPriSLPriv->screenRect.bottom - pPriSLPriv->screenRect.top;
++		input.input_crop_win.pos.x = pTopSLPriv->screenRect.left;
++		input.input_crop_win.pos.y = pTopSLPriv->screenRect.top;
++		input.input_crop_win.win_w = pTopSLPriv->screenRect.right - pTopSLPriv->screenRect.left;
++		input.input_crop_win.win_h = pTopSLPriv->screenRect.bottom - pTopSLPriv->screenRect.top;
++		input.fmt = pPriSLPriv->fmt;
++		if (pBotSLPriv->isPrimary)
++			input.user_def_paddr[0] = pBotSLPriv->bufPaddr[pBotSLPriv->curBufIdx];
+ 		else
+ 			input.user_def_paddr[0] = pBotSLPriv->dispPaddr[pBotSLPriv->curDispIdx];
+ 
+ 		/* top/overlay layer (graphic) */
+-		overlay.width = pTopSL->screenRect.right - pTopSL->screenRect.left;
+-		overlay.height = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
+-		overlay.fmt = pTopSL->fmt;
+-		overlay.user_def_paddr[0] = pTopSL->bufPaddr[pTopSLPriv->curBufIdx];
++		overlay.width = pTopSLPriv->screenRect.right - pTopSLPriv->screenRect.left;
++		overlay.height = pTopSLPriv->screenRect.bottom - pTopSLPriv->screenRect.top;
++		overlay.fmt = pTopSLPriv->fmt;
++		overlay.user_def_paddr[0] = pTopSLPriv->bufPaddr[pTopSLPriv->curBufIdx];
+ 		overlay.global_alpha_en = pTopSLPriv->alphaGlobalEnable;
+ 		if (pTopSLPriv->sepAlphaLocalEnable &&
+-		    pTopSL->supportSepLocalAlpha) {
++		    pTopSLPriv->supportSepLocalAlpha) {
+ 			overlay.local_alpha_en = 1;
+-			overlay.user_def_alpha_paddr[0] = pTopSL->bufAlphaPaddr[pTopSLPriv->curBufIdx];
++			overlay.user_def_alpha_paddr[0] = pTopSLPriv->bufAlphaPaddr[pTopSLPriv->curBufIdx];
+ 		}
+ 		overlay.key_color_en = pTopSLPriv->keyColorEnable;
+ 		overlay.alpha = pTopSLPriv->alpha;
+ 		overlay.key_color = pTopSLPriv->keyColor;
+ 
+ 		/* output */
+-		output.width = pPriSL->screenRect.right - pPriSL->screenRect.left;
+-		output.height = pPriSL->screenRect.bottom - pPriSL->screenRect.top;
+-		output.output_win.pos.x = pTopSL->screenRect.left;
+-		output.output_win.pos.y = pTopSL->screenRect.top;
+-		output.output_win.win_w = pTopSL->screenRect.right - pTopSL->screenRect.left;
+-		output.output_win.win_h = pTopSL->screenRect.bottom - pTopSL->screenRect.top;
+-		output.fmt = pPriSL->fmt;
++		output.width = pPriSLPriv->screenRect.right - pPriSLPriv->screenRect.left;
++		output.height = pPriSLPriv->screenRect.bottom - pPriSLPriv->screenRect.top;
++		output.output_win.pos.x = pTopSLPriv->screenRect.left;
++		output.output_win.pos.y = pTopSLPriv->screenRect.top;
++		output.output_win.win_w = pTopSLPriv->screenRect.right - pTopSLPriv->screenRect.left;
++		output.output_win.win_h = pTopSLPriv->screenRect.bottom - pTopSLPriv->screenRect.top;
++		output.fmt = pPriSLPriv->fmt;
+ 		output.user_def_paddr[0] = pTopSLPriv->dispPaddr[pTopSLPriv->curDispIdx];
+ 
+ 		if (mxc_ipu_lib_task_init(&input, &overlay, &output, NULL, mode, &ipu_handle) < 0) {
+@@ -720,26 +863,22 @@ SLRetCode _CombScreenLayers(ScreenLayer *pBotSL, ScreenLayer *pTopSL)
+ 
+ 	mxc_ipu_lib_task_uninit(&ipu_handle);
+ 
+-	dbg(DBG_DEBUG, "Comb screen layer in [(%d,%d),(%d,%d)]\n", pTopSL->screenRect.left,
+-		pTopSL->screenRect.top, pTopSL->screenRect.right, pTopSL->screenRect.bottom);
++	dbg(DBG_DEBUG, "Comb screen layer in [(%d,%d),(%d,%d)]\n", pTopSLPriv->screenRect.left,
++		pTopSLPriv->screenRect.top, pTopSLPriv->screenRect.right, pTopSLPriv->screenRect.bottom);
+ done:
+ 	return ret;
+ }
+ 
+-SLRetCode _UpdateFramebuffer(ScreenLayer *pSL)
++SLRetCode _UpdateFramebuffer(ScreenLayerPriv *pSLPriv)
+ {
+ 	s32 fd_fb = 0;
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
+-	ScreenLayer *pPriSL;
++	ScreenLayerPriv *pPriSLPriv;
+ 	struct fb_var_screeninfo fb_var;
+ 
+-	if (pSLPriv->isPrimary)
+-		pPriSL = pSL;
+-	else
+-		pPriSL = (ScreenLayer *)pSL->pPrimary;
++	pPriSLPriv = vshmSLPriv;
+ 
+-	if ((fd_fb = open(pPriSL->fbdev, O_RDWR, 0)) < 0) {
++	if ((fd_fb = open(pPriSLPriv->fbdev, O_RDWR, 0)) < 0) {
+ 		ret = E_RET_DEV_FAIL;
+ 		goto done;
+ 	}
+@@ -768,45 +907,37 @@ done:
+ SLRetCode UpdateScreenLayer(ScreenLayer *pSL)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayer *pCurSL;
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv + (int)pSL->pPriv-1);
+ 	ScreenLayerPriv *pCurSLPriv;
+ 
+-	pthread_mutex_lock(&SLmutex);
+-
++	sem_wait(semID);
+ 	/* primary update? */
+-	if (pSLPriv->isPrimary && !pSLPriv->pNextLayer) {
++	if (pSLPriv->isPrimary && !pSLPriv->nextLayerId) {
+ 		/* there is only primary, update it only */
+ 		dbg(DBG_DEBUG, "Update primary layer only, just copy!\n");
+-		pCurSL = pSL;
+-		ret = _CopyScreenLayer(pCurSL, pCurSL);
++		pCurSLPriv = pSLPriv;
++		ret = _CopyScreenLayer(pCurSLPriv, pCurSLPriv);
+ 		if (ret != E_RET_SUCCESS)
+ 			goto done;
+ 	} else {
+ 		/* update from primary to top SL*/
+ 		dbg(DBG_DEBUG, "Update multi layers, from primary to top!\n");
+-		if (pSLPriv->isPrimary)
+-			pCurSL = pSL;
+-		else
+-			pCurSL = (ScreenLayer *)pSL->pPrimary;
+ 
+-		pCurSLPriv = (ScreenLayerPriv *)pCurSL->pPriv;
+-		while(pCurSLPriv->pNextLayer) {
+-			ret = _CopyScreenLayer(pCurSL, pCurSLPriv->pNextLayer);
++		pCurSLPriv = vshmSLPriv;
++		while(pCurSLPriv->nextLayerId) {
++			ret = _CopyScreenLayer(pCurSLPriv, (vshmSLPriv + pCurSLPriv->nextLayerId-1));
+ 			if (ret != E_RET_SUCCESS)
+ 				goto done;
+ 
+-			ret = _CombScreenLayers(pCurSL, pCurSLPriv->pNextLayer);
++			ret = _CombScreenLayers(pCurSLPriv, (vshmSLPriv + pCurSLPriv->nextLayerId -1));
+ 			if (ret != E_RET_SUCCESS)
+ 				goto done;
+-			pCurSL = pCurSLPriv->pNextLayer;
+-			pCurSLPriv = (ScreenLayerPriv *)pCurSL->pPriv;
++			pCurSLPriv = (ScreenLayerPriv *)(vshmSLPriv + pCurSLPriv->nextLayerId -1);
+ 		}
+ 	}
+ 
+-	ret = _UpdateFramebuffer(pCurSL);
+-
+-	pthread_mutex_unlock(&SLmutex);
++	ret = _UpdateFramebuffer(pCurSLPriv);
++	sem_post(semID);
+ 
+ 	yield();
+ done:
+@@ -816,8 +947,9 @@ done:
+ SLRetCode SetScreenLayer(ScreenLayer *pSL, SetMethodType eType, void *setData)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+-	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)(vshmSLPriv + (int)pSL->pPriv-1);
+ 
++	sem_wait(semID);
+ 	switch (eType) {
+ 	case E_SET_ALPHA:
+ 	{
+@@ -846,9 +978,64 @@ SLRetCode SetScreenLayer(ScreenLayer *pSL, SetMethodType eType, void *setData)
+ 		ret = E_RET_NOSUCH_METHODTYPE;
+ 	}
+ err:
++	sem_post(semID);
+ 	return ret;
+ }
+ 
++/*
++** Get the handle of Primaray screen layer, which will be used to create the others Non-primary screen layer.
++**
++** Input  : fbdev, this is the fixed id of frame buffer
++** Return : The handle of the Primary Screen Layer
++*/
++void* GetPrimarySLHandle(char * pFbdev)
++{
++	SLRetCode ret = E_RET_SUCCESS;
++
++	if(vshmSLPriv == NULL)
++		ret = PreScreenLayerIPC(pFbdev);
++	if(ret != E_RET_SUCCESS)
++	{
++		dbg(DBG_ERR, "Prepared semaphore & shm failed !\n");
++		return (void*)0;
++	}
++
++	sem_wait(semID);
++	if(vshmSLPriv->isPrimary)
++	{
++		dbg(DBG_DEBUG, "GetPrimarySLHandle end1!\n");
++		sem_post(semID);
++		return	(void *)1;
++	}
++	else
++	{
++		dbg(DBG_DEBUG, "GetPrimarySLHandle end2!\n");
++		sem_post(semID);
++		return  (void *)0;
++	}
++}
++
++/*
++** Get the width of Primary screen layer.
++**
++** Input  : pPrimaryHandle, this is the handle of primary screen layer
++** Return : the width of Primary screen layer
++*/
++u32   GetPrimarySLWidth(void * pPrimaryHandle)
++{
++	return (vshmSLPriv->screenRect.left - vshmSLPriv->screenRect.right);
++}
++
++/*
++** Get the height of Primary screen layer.
++**
++** Input  : pPrimaryHandle, this is the handle of primary screen layer
++** Return : the height of Primary screen layer
++*/
++u32   GetPrimarySLHeight(void * pPrimaryHandle)
++{
++	return (vshmSLPriv->screenRect.bottom - vshmSLPriv->screenRect.top);
++}
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/screenlayer/ScreenLayer.h b/screenlayer/ScreenLayer.h
+index 96c50a4..2ef7df0 100644
+--- a/screenlayer/ScreenLayer.h
++++ b/screenlayer/ScreenLayer.h
+@@ -41,6 +41,8 @@ typedef enum {
+ 	E_RET_ALPHA_BLENDING_CONFLICT,
+ 	E_RET_LOCAL_ALPHA_BLENDING_DISABLE,
+ 	E_RET_ALPHA_BUF_NOT_ALLOC_ERR,
++	E_RET_IPC_SEM_OPEN_FAILED,
++	E_RET_IPC_SHM_FAILED,
+ } SLRetCode;
+ 
+ typedef enum {
+@@ -101,6 +103,30 @@ SLRetCode UpdateScreenLayer(ScreenLayer *pSL);
+ SLRetCode SetScreenLayer(ScreenLayer *pSL, SetMethodType eType, void *setData);
+ SLRetCode DestoryScreenLayer(ScreenLayer *pSL);
+ 
++/*
++** Get the handle of Primaray screen layer, which will be used to create the others Non-primary screen layer.
++**
++** Input  : fbdev, this is the fixed id of frame buffer
++** Return : The handle of the Primary Screen Layer
++*/
++void* GetPrimarySLHandle(char * pFbdev) ;
++
++/*
++** Get the width of Primary screen layer.
++**
++** Input  : pPrimaryHandle, this is the handle of primary screen layer
++** Return : the width of Primary screen layer
++*/
++u32   GetPrimarySLWidth(void * pPrimaryHandle);
++
++/*
++** Get the height of Primary screen layer.
++**
++** Input  : pPrimaryHandle, this is the handle of primary screen layer
++** Return : the height of Primary screen layer
++*/
++u32   GetPrimarySLHeight(void * pPrimaryHandle);
++
+ #ifdef __cplusplus
+ }
+ #endif
+-- 
+1.8.0
+

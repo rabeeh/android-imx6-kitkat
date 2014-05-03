@@ -1,0 +1,387 @@
+From 95e8e78ff46819acbaddf01cdf51cb5562897107 Mon Sep 17 00:00:00 2001
+From: Alan Tull <r80115@freescale.com>
+Date: Thu, 13 Mar 2008 12:20:16 -0500
+Subject: [PATCH 011/435] ENGR00068616 support srtc with rtc test
+
+Signed-off-by: Alan Tull <r80115@freescale.com>
+---
+ test-utils.sh               |   7 +-
+ test/mxc_rtc/autorun-rtc.sh |  12 ++-
+ test/mxc_rtc/rtctest.c      | 208 ++++++++++++++++++++++++--------------------
+ 3 files changed, 131 insertions(+), 96 deletions(-)
+
+diff --git a/test-utils.sh b/test-utils.sh
+index 940d34c..9eb0f5c 100755
+--- a/test-utils.sh
++++ b/test-utils.sh
+@@ -145,10 +145,10 @@ print_status()
+ }
+ 
+ #
+-# This echos the plaftorm name in all caps: 
++# This echos the plaftorm name in all caps:
+ # MXC27530EVB, MXC27520EVB, IMX27ADS, IMX31ADS, MXC91131EVB, MXC30030EVB, MXC30020EVB
+ #
+-# for example use in an if statement like:  if [ "$(platform)" = MXC27530EVB ]; then 
++# for example use in an if statement like:  if [ "$(platform)" = MXC27530EVB ]; then
+ #
+ # This is only for use where a test needs to run differently for different platforms.
+ # To keep a test from running at all for a platform, add it to the EXCLUDES list in
+@@ -167,6 +167,9 @@ platform()
+ 				31* )	plat=IMX31ADS ;;
+ 				* )	plat=IMX32ADS ;;
+ 			esac ;;
++
++		MX373StackBoard )	plat=IMX37_3STACK ;;
++
+ 		* )     ;;
+ 	esac
+ 	echo "$plat"
+diff --git a/test/mxc_rtc/autorun-rtc.sh b/test/mxc_rtc/autorun-rtc.sh
+index 5766cc7..e2bf7c1 100755
+--- a/test/mxc_rtc/autorun-rtc.sh
++++ b/test/mxc_rtc/autorun-rtc.sh
+@@ -7,6 +7,15 @@ source /unit_tests/test-utils.sh
+ #
+ STATUS=0
+ 
++echo "$(platform)"
++if [ "$(platform)" == IMX37_3STACK ]; then
++	rtc_test_param=--no-periodic
++	RTC_IRQS_EXPECTED=1
++else
++	rtc_test_param=--full
++	RTC_IRQS_EXPECTED=131
++fi
++
+ # devnode test
+ check_devnode "/dev/rtc0"
+ 
+@@ -14,12 +23,11 @@ check_devnode "/dev/rtc0"
+ RTC_IRQS_BEFORE=$( cat /proc/interrupts |grep rtc|sed -r 's,.*: *([0-9]*) .*,\1,' )
+ 
+ # RTC test cases
+-run_testcase "./rtctest.out"
++run_testcase "./rtctest.out $rtc_test_param"
+ 
+ RTC_IRQS_AFTER=$( cat /proc/interrupts |grep rtc|sed -r 's,.*: *([0-9]*) .*,\1,' )
+ 
+ RTC_IRQS=$(( $RTC_IRQS_AFTER - $RTC_IRQS_BEFORE ))
+-RTC_IRQS_EXPECTED=131
+ 
+ echo "rtc irqs before running unit test: $RTC_IRQS_BEFORE"
+ echo "rtc irqs after running unit test:  $RTC_IRQS_AFTER"
+diff --git a/test/mxc_rtc/rtctest.c b/test/mxc_rtc/rtctest.c
+index dfa80a7..9df698a 100644
+--- a/test/mxc_rtc/rtctest.c
++++ b/test/mxc_rtc/rtctest.c
+@@ -25,7 +25,6 @@
+  * http://www.gnu.org/copyleft/gpl.html
+  */
+ 
+-
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <linux/rtc.h>
+@@ -35,87 +34,112 @@
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <string.h>
+ 
+-int main(void) {
++void usage(void)
++{
++	fprintf(stderr, "Usage:\n");
++	fprintf(stderr, "   rtctest --full         = do all tests\n");
++	fprintf(stderr, "   rtctest --no-periodic  = don't do periodic interrupt tests\n");
++}
+ 
++int main(int argc, char **argv)
++{
+ 	int i, fd, retval, irqcount = 0;
++	int periodic_test = 1;
+ 	unsigned long tmp, data;
+ 	struct rtc_time rtc_tm;
+ 
+-	fd = open ("/dev/rtc0", O_RDONLY);
++	if (argc != 2) {
++		usage();
++		return 1;
++	}
+ 
+-	if (fd ==  -1) {
+-		perror("/dev/rtc0");
+-		exit(errno);
++	if (strcmp(argv[1], "--no-periodic") == 0) {
++		periodic_test = 0;
++	} else if (strcmp(argv[1], "--full") != 0) {
++		usage();
++		return 1;
+ 	}
+ 
+-	fprintf(stderr, "\n\t\t\tRTC Driver Test Example.\n\n");
++	fd = open("/dev/rtc0", O_RDONLY);
+ 
+-/* Turn on update interrupts (one per second) */
+-	retval = ioctl(fd, RTC_UIE_ON, 0);
+-	if (retval == -1) {
+-		perror("ioctl");
++	if (fd == -1) {
++		perror("/dev/rtc0");
+ 		exit(errno);
+ 	}
+ 
+-	fprintf(stderr, "Counting 5 update (1/sec) interrupts from reading /dev/rtc0:");
+-	fflush(stderr);
+-	for (i=1; i<6; i++) {
+-		/* This read will block */
+-		retval = read(fd, &data, sizeof(unsigned long));
++	fprintf(stderr, "\n\t\t\tRTC Driver Test Example.\n\n");
++
++	if (periodic_test != 0) {
++		/* Turn on update interrupts (one per second) */
++		retval = ioctl(fd, RTC_UIE_ON, 0);
+ 		if (retval == -1) {
+-			perror("read");
++			perror("ioctl");
+ 			exit(errno);
+ 		}
+-		fprintf(stderr, " %d",i);
++
++		fprintf(stderr,
++			"Counting 5 update (1/sec) interrupts from reading /dev/rtc0:");
+ 		fflush(stderr);
+-		irqcount++;
+-	}
++		for (i = 1; i < 6; i++) {
++			/* This read will block */
++			retval = read(fd, &data, sizeof(unsigned long));
++			if (retval == -1) {
++				perror("read");
++				exit(errno);
++			}
++			fprintf(stderr, " %d", i);
++			fflush(stderr);
++			irqcount++;
++		}
+ 
+-	fprintf(stderr, "\nAgain, from using select(2) on /dev/rtc0:");
+-	fflush(stderr);
+-	for (i=1; i<6; i++) {
+-		struct timeval tv = {5, 0};	/* 5 second timeout on select */
+-		fd_set readfds;
+-
+-		FD_ZERO(&readfds);
+-		FD_SET(fd, &readfds);
+-		/* The select will wait until an RTC interrupt happens. */
+-		retval = select(fd+1, &readfds, NULL, NULL, &tv);
+-		if (retval == -1) {
+-			perror("select");
+-			exit(errno);
++		fprintf(stderr, "\nAgain, from using select(2) on /dev/rtc0:");
++		fflush(stderr);
++		for (i = 1; i < 6; i++) {
++			struct timeval tv = { 5, 0 };	/* 5 second timeout on select */
++			fd_set readfds;
++
++			FD_ZERO(&readfds);
++			FD_SET(fd, &readfds);
++			/* The select will wait until an RTC interrupt happens. */
++			retval = select(fd + 1, &readfds, NULL, NULL, &tv);
++			if (retval == -1) {
++				perror("select");
++				exit(errno);
++			}
++			/* This read won't block unlike the select-less case above. */
++			retval = read(fd, &data, sizeof(unsigned long));
++			if (retval == -1) {
++				perror("read");
++				exit(errno);
++			}
++			fprintf(stderr, " %d", i);
++			fflush(stderr);
++			irqcount++;
+ 		}
+-		/* This read won't block unlike the select-less case above. */
+-		retval = read(fd, &data, sizeof(unsigned long));
++
++		/* Turn off update interrupts */
++		retval = ioctl(fd, RTC_UIE_OFF, 0);
+ 		if (retval == -1) {
+-			perror("read");
++			perror("ioctl");
+ 			exit(errno);
+ 		}
+-		fprintf(stderr, " %d",i);
+-		fflush(stderr);
+-		irqcount++;
+-	}
+-
+-/* Turn off update interrupts */
+-	retval = ioctl(fd, RTC_UIE_OFF, 0);
+-	if (retval == -1) {
+-		perror("ioctl");
+-		exit(errno);
+ 	}
+ 
+-/* Read the RTC time/date */
++	/* Read the RTC time/date */
+ 	retval = ioctl(fd, RTC_RD_TIME, &rtc_tm);
+ 	if (retval == -1) {
+ 		perror("ioctl");
+ 		exit(errno);
+ 	}
+ 
+-	fprintf(stderr, "\n\nCurrent RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
++	fprintf(stderr,
++		"\n\nCurrent RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
+ 		rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+ 		rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+-/* Set the alarm to 5 sec in the future, and check for rollover */
++	/* Set the alarm to 5 sec in the future, and check for rollover */
+ 	rtc_tm.tm_sec += 5;
+ 	if (rtc_tm.tm_sec >= 60) {
+ 		rtc_tm.tm_sec %= 60;
+@@ -134,7 +158,7 @@ int main(void) {
+ 		exit(errno);
+ 	}
+ 
+-/* Read the current alarm settings */
++	/* Read the current alarm settings */
+ 	retval = ioctl(fd, RTC_ALM_READ, &rtc_tm);
+ 	if (retval == -1) {
+ 		perror("ioctl");
+@@ -144,7 +168,7 @@ int main(void) {
+ 	fprintf(stderr, "Alarm time now set to %02d:%02d:%02d.\n",
+ 		rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+ 
+-/* Enable alarm interrupts */
++	/* Enable alarm interrupts */
+ 	retval = ioctl(fd, RTC_AIE_ON, 0);
+ 	if (retval == -1) {
+ 		perror("ioctl");
+@@ -153,7 +177,7 @@ int main(void) {
+ 
+ 	fprintf(stderr, "Waiting 5 seconds for alarm...");
+ 	fflush(stderr);
+-/* This blocks until the alarm ring causes an interrupt */
++	/* This blocks until the alarm ring causes an interrupt */
+ 	retval = read(fd, &data, sizeof(unsigned long));
+ 	if (retval == -1) {
+ 		perror("read");
+@@ -162,70 +186,70 @@ int main(void) {
+ 	irqcount++;
+ 	fprintf(stderr, " okay. Alarm rang.\n");
+ 
+-/* Disable alarm interrupts */
++	/* Disable alarm interrupts */
+ 	retval = ioctl(fd, RTC_AIE_OFF, 0);
+ 	if (retval == -1) {
+ 		perror("ioctl");
+ 		exit(errno);
+ 	}
+ 
+-/* Read periodic IRQ rate */
+-	retval = ioctl(fd, RTC_IRQP_READ, &tmp);
+-	if (retval == -1) {
+-		perror("ioctl");
+-		exit(errno);
+-	}
+-	fprintf(stderr, "\nPeriodic IRQ rate was %ldHz.\n", tmp);
+-
+-	fprintf(stderr, "Counting 20 interrupts at:");
+-	fflush(stderr);
+-
+-/* The frequencies 128Hz, 256Hz, ... 8192Hz are only allowed for root. */
+-	for (tmp=2; tmp<=64; tmp*=2) {
+-
+-		retval = ioctl(fd, RTC_IRQP_SET, tmp);
++	if (periodic_test != 0) {
++		/* Read periodic IRQ rate */
++		retval = ioctl(fd, RTC_IRQP_READ, &tmp);
+ 		if (retval == -1) {
+ 			perror("ioctl");
+ 			exit(errno);
+ 		}
++		fprintf(stderr, "\nPeriodic IRQ rate was %ldHz.\n", tmp);
+ 
+-		fprintf(stderr, "\n%ldHz:\t", tmp);
++		fprintf(stderr, "Counting 20 interrupts at:");
+ 		fflush(stderr);
+ 
+-		/* Enable periodic interrupts */
+-		retval = ioctl(fd, RTC_PIE_ON, 0);
+-		if (retval == -1) {
+-			perror("ioctl");
+-			exit(errno);
+-		}
++		/* The frequencies 128Hz, 256Hz, ... 8192Hz are only allowed for root. */
++		for (tmp = 2; tmp <= 64; tmp *= 2) {
+ 
+-		for (i=1; i<21; i++) {
+-			/* This blocks */
+-			retval = read(fd, &data, sizeof(unsigned long));
++			retval = ioctl(fd, RTC_IRQP_SET, tmp);
+ 			if (retval == -1) {
+-				perror("read");
++				perror("ioctl");
+ 				exit(errno);
+ 			}
+-			fprintf(stderr, " %d",i);
++
++			fprintf(stderr, "\n%ldHz:\t", tmp);
+ 			fflush(stderr);
+-			irqcount++;
+-		}
+ 
+-		/* Disable periodic interrupts */
+-		retval = ioctl(fd, RTC_PIE_OFF, 0);
+-		if (retval == -1) {
+-			perror("ioctl");
+-			exit(errno);
++			/* Enable periodic interrupts */
++			retval = ioctl(fd, RTC_PIE_ON, 0);
++			if (retval == -1) {
++				perror("ioctl");
++				exit(errno);
++			}
++
++			for (i = 1; i < 21; i++) {
++				/* This blocks */
++				retval = read(fd, &data, sizeof(unsigned long));
++				if (retval == -1) {
++					perror("read");
++					exit(errno);
++				}
++				fprintf(stderr, " %d", i);
++				fflush(stderr);
++				irqcount++;
++			}
++
++			/* Disable periodic interrupts */
++			retval = ioctl(fd, RTC_PIE_OFF, 0);
++			if (retval == -1) {
++				perror("ioctl");
++				exit(errno);
++			}
+ 		}
+ 	}
+ 
+ 	fprintf(stderr, "\n\n\t\t\t *** Test complete ***\n");
+-	fprintf(stderr, "\nTyping \"cat /proc/interrupts\" will show %d more events on IRQ rtc.\n\n",
++	fprintf(stderr,
++		"\nTyping \"cat /proc/interrupts\" will show %d more events on IRQ rtc.\n\n",
+ 		irqcount);
+ 
+ 	close(fd);
+ 	return 0;
+-
+-} /* end main */
+-
+-
++}				/* end main */
+-- 
+1.8.0
+

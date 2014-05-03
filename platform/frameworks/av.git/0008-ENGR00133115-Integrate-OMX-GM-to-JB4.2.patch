@@ -1,0 +1,703 @@
+From ad6f4ac6acf3d678b0861548bd6979a064464829 Mon Sep 17 00:00:00 2001
+From: Song Bing <b06498@freescale.com>
+Date: Mon, 31 Dec 2012 14:18:40 +0800
+Subject: [PATCH 08/50] ENGR00133115 Integrate OMX GM to JB4.2.
+
+Integrate OMX GM to JB4.2.
+
+Signed-off-by: Song Bing b06498@freescale.com
+---
+ include/media/MediaPlayerInterface.h               |   4 +
+ include/media/OMXMediaRecorder.h                   |  81 +++++++++++++
+ include/media/OMXMetadataRetriever.h               |  68 +++++++++++
+ include/media/OMXPlayer.h                          | 133 +++++++++++++++++++++
+ include/media/mediarecorder.h                      |   3 +
+ media/libmediaplayerservice/Android.mk             |  19 +++
+ media/libmediaplayerservice/MediaPlayerFactory.cpp | 115 ++++++++++++++++++
+ media/libmediaplayerservice/MediaPlayerService.cpp |   6 +
+ .../libmediaplayerservice/MediaRecorderClient.cpp  |  18 ++-
+ .../MetadataRetrieverClient.cpp                    |  12 ++
+ media/libstagefright/Android.mk                    |   4 +
+ media/libstagefright/StagefrightMediaScanner.cpp   |   6 +
+ 12 files changed, 468 insertions(+), 1 deletion(-)
+
+diff --git a/include/media/MediaPlayerInterface.h b/include/media/MediaPlayerInterface.h
+index cc244f0..b0c3c89 100644
+--- a/include/media/MediaPlayerInterface.h
++++ b/include/media/MediaPlayerInterface.h
+@@ -14,6 +14,8 @@
+  * limitations under the License.
+  */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ #ifndef ANDROID_MEDIAPLAYERINTERFACE_H
+ #define ANDROID_MEDIAPLAYERINTERFACE_H
+ 
+@@ -50,6 +52,8 @@ enum player_type {
+     // The shared library with the test player is passed passed as an
+     // argument to the 'test:' url in the setDataSource call.
+     TEST_PLAYER = 5,
++
++    OMX_PLAYER = 6,
+ };
+ 
+ 
+diff --git a/include/media/OMXMediaRecorder.h b/include/media/OMXMediaRecorder.h
+new file mode 100644
+index 0000000..666dc12
+--- /dev/null
++++ b/include/media/OMXMediaRecorder.h
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (C) 2009 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* Copyright (C) 2011-2013 Freescale Semiconductor, Inc. */
++
++#ifndef OMX_RECORDER_H_
++#define OMX_RECORDER_H_
++
++#include <media/MediaRecorderBase.h>
++#include <utils/String8.h>
++#include <camera/ICamera.h>
++#include <gui/ISurface.h>
++
++namespace android {
++
++struct OMXRecorder : public MediaRecorderBase {
++    OMXRecorder();
++    virtual ~OMXRecorder();
++
++    virtual status_t init();
++    virtual status_t setAudioSource(audio_source_t as);
++    virtual status_t setVideoSource(video_source vs);
++    virtual status_t setOutputFormat(output_format of);
++    virtual status_t setAudioEncoder(audio_encoder ae);
++    virtual status_t setVideoEncoder(video_encoder ve);
++    virtual status_t setVideoSize(int width, int height);
++    virtual status_t setVideoFrameRate(int frames_per_second);
++	virtual status_t setCamera(const sp<ICamera>& camera);
++	virtual status_t setCamera(const sp<ICamera>& camera, const sp<ICameraRecordingProxy>& proxy);
++    virtual status_t setPreviewSurface(const sp<ISurface>& surface);
++    virtual status_t setPreviewSurface(const sp<Surface>& surface);
++    virtual status_t setOutputFile(const char *path);
++    virtual status_t setOutputFile(int fd, int64_t offset, int64_t length);
++    virtual status_t setParameters(const String8& params);
++    virtual status_t setListener(const sp<IMediaRecorderClient>& listener);
++    virtual status_t prepare();
++    virtual status_t start();
++    virtual status_t pause();
++    virtual status_t stop();
++    virtual status_t close();
++    virtual status_t reset();
++    virtual status_t getMaxAmplitude(int *max);
++    virtual status_t dump(int fd, const Vector<String16>& args) const;
++    status_t ProcessEvent(int msg, int ext1, int ext2);
++    // Querying a SurfaceMediaSourcer
++    virtual sp<ISurfaceTexture> querySurfaceMediaSource() const;
++
++private:
++    // Encoding parameter handling utilities
++    status_t setParameter(const String8 &key, const String8 &value);
++
++	sp<IMediaRecorderClient> mListener;
++    void                *recorder;
++	void                *cameraPtr;
++	void                *cameraProxyPtr;
++	sp<ICamera>			mCamera; 
++	sp<ICameraRecordingProxy> mCameraProxy; 
++    sp<ISurface> mPreviewSurface;
++    sp<Surface> mPreviewSurface2;
++
++    OMXRecorder(const OMXRecorder &);
++    OMXRecorder &operator=(const OMXRecorder &);
++};
++
++}  // namespace android
++
++#endif  // OMX_RECORDER_H_
++
+diff --git a/include/media/OMXMetadataRetriever.h b/include/media/OMXMetadataRetriever.h
+new file mode 100644
+index 0000000..8560e9c
+--- /dev/null
++++ b/include/media/OMXMetadataRetriever.h
+@@ -0,0 +1,68 @@
++/*
++**
++** Copyright (C) 2008 The Android Open Source Project
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++*/
++
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
++#ifndef ANDROID_OMXMETADATARETRIEVER_H
++#define ANDROID_OMXMETADATARETRIEVER_H
++
++#include <media/MediaMetadataRetrieverInterface.h>
++#include <binder/IInterface.h>
++#include <utils/List.h>
++#include <utils/String8.h>
++#include <utils/KeyedVector.h>
++
++#include <gui/Surface.h>
++#include <gui/ISurfaceComposer.h>
++#include <gui/SurfaceComposerClient.h>
++
++namespace android {
++
++class OMXMetadataRetriever : public MediaMetadataRetrieverInterface
++{
++public:
++                        OMXMetadataRetriever(int nMediaType = 0);
++    virtual             ~OMXMetadataRetriever();
++
++    virtual status_t    setDataSource(const char *url);
++    virtual status_t    setDataSource(const char *url, const KeyedVector<String8, String8> *headers = NULL);
++    virtual status_t    setDataSource(int fd, int64_t offset, int64_t length);
++    virtual status_t    setMode(int mode);
++    virtual status_t    getMode(int* mode) const;
++    virtual VideoFrame* captureFrame();
++    virtual VideoFrame* getFrameAtTime(int64_t timeUs, int option);
++    virtual MediaAlbumArt* extractAlbumArt();
++    virtual const char* extractMetadata(int keyCode);
++
++private:
++    void*               MetadataExtractor;
++    bool mParsedMetaData;
++	MediaAlbumArt *mAlbumArt;
++    void ExtractMetadata();
++    KeyedVector<int, String8> mMetaData;
++    int                 mSharedFd;
++    int                 mMediaType;  
++    char                contentURI[128];
++    sp<SurfaceComposerClient>           session;
++    sp<SurfaceControl>                  surfaceControl;
++    sp<Surface>                         surface;
++    bool sessionCreated;
++};
++
++}; // namespace android
++
++#endif // ANDROID_OMXMETADATARETRIEVER_H
+diff --git a/include/media/OMXPlayer.h b/include/media/OMXPlayer.h
+new file mode 100644
+index 0000000..3fb6f32
+--- /dev/null
++++ b/include/media/OMXPlayer.h
+@@ -0,0 +1,133 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/* Copyright 2009-2013 Freescale Semiconductor, Inc. */
++
++#ifndef ANDROID_OMXPLAYER_H
++#define ANDROID_OMXPLAYER_H
++
++#include <utils/Errors.h>
++#include <media/MediaPlayerInterface.h>
++#include <private/media/VideoFrame.h>
++#include <gui/ISurface.h>
++
++namespace android {
++
++class ISurfaceTexture;
++
++class OMXPlayer : public MediaPlayerInterface
++{
++public:
++                        OMXPlayer(int nMediaType = 0);
++    virtual             ~OMXPlayer();
++
++    virtual status_t    initCheck();
++    virtual status_t    setDataSource(const char *url, const KeyedVector<String8, String8> *headers);
++    virtual status_t    setDataSource(int fd, int64_t offset, int64_t length);
++    virtual status_t    setVideoSurface(const sp<ISurface>& surface);
++    virtual status_t    setVideoSurface(const sp<Surface>& surface);
++    virtual status_t    setVideoSurfaceTexture(const sp<ISurfaceTexture>& surfaceTexture);
++    virtual status_t    prepare();
++    virtual status_t    prepareAsync();
++    virtual status_t    start();
++    virtual status_t    stop();
++    virtual status_t    pause();
++    virtual bool        isPlaying();
++    virtual status_t    seekTo(int msec);
++    virtual status_t    getCurrentPosition(int *msec);
++    virtual status_t    getDuration(int *msec);
++    virtual status_t    reset();
++    virtual status_t    setLooping(int loop);
++    virtual player_type playerType() { return OMX_PLAYER; }
++    virtual status_t    suspend();
++    virtual status_t    resume();
++    virtual status_t    invoke(const Parcel& request, Parcel *reply);
++    virtual status_t    getMetadata(const SortedVector<media::Metadata::Type>& ids, Parcel *records);
++
++    virtual status_t    setAudioEffect(int iBandIndex, int iBandFreq, int iBandGain);
++    virtual status_t    setAudioEqualizer(bool isEnable);
++    virtual status_t    captureCurrentFrame(VideoFrame** pvframe);
++    virtual status_t    setVideoCrop(int top,int left, int bottom, int right);
++    virtual int         getAudioTrackCount();
++    virtual char*       getAudioTrackName(int index);
++    virtual int         getCurrentAudioTrackIndex();
++    virtual status_t    selectAudioTrack(int index);
++    virtual status_t    setPlaySpeed(int speed);
++    virtual status_t    setParameter(int key, const Parcel &request);
++    virtual status_t    getParameter(int key, Parcel *reply);
++
++    void                sendEvent(int msg, int ext1=0, int ext2=0) { MediaPlayerBase::sendEvent(msg, ext1, ext2); }
++
++    status_t            ProcessEvent(int eventID, void* Eventpayload);
++    status_t            ProcessAsyncCmd();
++    status_t            PropertyCheck();
++
++private:
++    typedef enum {
++        MSG_NONE,
++        MSG_PREPAREASYNC,
++        MSG_SEEKTO,
++    }MSGTYPE;
++
++    void                *player;
++    status_t            mInit;
++    sp<ISurface>        mISurface;
++    sp<Surface>         mSurface;
++    sp<ANativeWindow>   mNativeWindow;
++    int                 mSharedFd;
++    bool                bLoop;
++    char                *contentURI;
++    MSGTYPE             msg;
++    int                 msgData;
++    void                *sem;
++    void                *pPCmdThread;
++    bool                bStopPCmdThread;
++    void                *pPCheckThread;
++    bool                bStopPCheckThread;
++    bool                bTvOut;
++    bool                bDualDisplay;
++    bool                bFB0Display;
++    bool                bSuspend;
++    int                 sLeft;
++    int                 sRight;
++    int                 sTop;
++    int                 sBottom;
++    int                 sRot;
++    int                 mMediaType;
++    status_t            setVideoDispRect(int top,int left, int bottom, int right);
++    status_t            getSurfaceRegion(int *top,int *left, int *bottom, int *right, int *rot);
++    status_t            CheckSurfaceRegion();
++    status_t            CheckDualDisplaySetting();
++    status_t            CheckTvOutSetting();
++    status_t            CheckFB0DisplaySetting();
++    status_t            DoSeekTo(int msec);
++    status_t            setVideoScalingMode(int32_t mode);
++    status_t            getTrackInfo(Parcel *reply);
++
++    bool                qdFlag;
++};
++
++class OMXPlayerType
++{
++public:
++                        OMXPlayerType();
++    virtual             ~OMXPlayerType();
++    int                 IsSupportedContent(char *url);
++};
++
++}; // namespace android
++
++#endif // ANDROID_OMXPLAYER_H
+diff --git a/include/media/mediarecorder.h b/include/media/mediarecorder.h
+index 88a42a0..87c4b2e 100644
+--- a/include/media/mediarecorder.h
++++ b/include/media/mediarecorder.h
+@@ -15,6 +15,8 @@
+  ** limitations under the License.
+  */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ #ifndef ANDROID_MEDIARECORDER_H
+ #define ANDROID_MEDIARECORDER_H
+ 
+@@ -77,6 +79,7 @@ enum audio_encoder {
+     AUDIO_ENCODER_AAC = 3,
+     AUDIO_ENCODER_HE_AAC = 4,
+     AUDIO_ENCODER_AAC_ELD = 5,
++    AUDIO_ENCODER_MP3 = 6,
+ 
+     AUDIO_ENCODER_LIST_END // must be the last - used to validate the audio encoder type
+ };
+diff --git a/media/libmediaplayerservice/Android.mk b/media/libmediaplayerservice/Android.mk
+index 8f21632..12cd699 100644
+--- a/media/libmediaplayerservice/Android.mk
++++ b/media/libmediaplayerservice/Android.mk
+@@ -40,6 +40,17 @@ LOCAL_SHARED_LIBRARIES :=       \
+     libutils                    \
+     libvorbisidec               \
+ 
++ifeq ($(HAVE_FSL_IMX_CODEC),true)
++LOCAL_SHARED_LIBRARIES +=                       \
++	lib_omx_player_arm11_elinux \
++	lib_omx_osal_v2_arm11_elinux \
++	lib_omx_client_arm11_elinux \
++	lib_omx_utils_v2_arm11_elinux \
++	lib_omx_core_mgr_v2_arm11_elinux \
++	lib_omx_res_mgr_v2_arm11_elinux \
++	lib_id3_parser_arm11_elinux
++endif
++
+ LOCAL_STATIC_LIBRARIES :=       \
+     libstagefright_nuplayer     \
+     libstagefright_rtsp         \
+@@ -52,6 +63,14 @@ LOCAL_C_INCLUDES :=                                                 \
+     $(TOP)/frameworks/native/include/media/openmax                  \
+     $(TOP)/external/tremolo/Tremolo                                 \
+ 
++ifeq ($(HAVE_FSL_IMX_CODEC),true)
++LOCAL_CFLAGS += -DFSL_GM_PLAYER
++endif
++
++ifeq ($(TARGET_BOARD_PLATFORM), imx6)
++	LOCAL_CFLAGS += -DMX6X
++endif
++
+ LOCAL_MODULE:= libmediaplayerservice
+ 
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/media/libmediaplayerservice/MediaPlayerFactory.cpp b/media/libmediaplayerservice/MediaPlayerFactory.cpp
+index 90aed39..a819bff 100644
+--- a/media/libmediaplayerservice/MediaPlayerFactory.cpp
++++ b/media/libmediaplayerservice/MediaPlayerFactory.cpp
+@@ -15,6 +15,8 @@
+ ** limitations under the License.
+ */
+ 
++/* Copyright 2013 Freescale Semiconductor Inc. */
++
+ #define LOG_TAG "MediaPlayerFactory"
+ #include <utils/Log.h>
+ 
+@@ -26,6 +28,9 @@
+ 
+ #include "MediaPlayerFactory.h"
+ 
++#ifdef FSL_GM_PLAYER
++#include <media/OMXPlayer.h>
++#endif
+ #include "MidiFile.h"
+ #include "TestPlayerStub.h"
+ #include "StagefrightPlayer.h"
+@@ -167,6 +172,113 @@ sp<MediaPlayerBase> MediaPlayerFactory::createPlayer(
+  *                                                                           *
+  *****************************************************************************/
+ 
++#ifdef FSL_GM_PLAYER
++class OMXPlayerFactory : public MediaPlayerFactory::IFactory {
++    public:
++        virtual float scoreFactory(const sp<IMediaPlayer>& client,
++                const char* url,
++                float curScore) {
++            static const float kOurScore = 1.0;
++            static const char* const FILE_EXTS[] = {
++                ".avi",
++                ".mkv",
++                ".mp4",
++                ".m4a",
++                ".3gp",
++                ".3g2",
++                ".3gpp",
++                ".mov",
++                ".rmvb",
++                ".rm", 
++                ".wmv",
++                ".asf",
++                ".flv",
++                ".mpg",
++                ".vob",
++                ".ts", 
++                ".f4v",
++                ".mp3",
++                ".aac",
++                ".wma",
++                ".ra", 
++                ".wav",
++                ".flac",
++                ".divx",
++                ".m4v",        
++                //".ogg,   
++#ifdef MX6X
++                ".webm",   
++#endif
++                ".amr",
++                ".awb"
++            };
++
++            char value[PROPERTY_VALUE_MAX];
++            if (!(property_get("media.omxgm.enable-player", value, NULL)
++                    && (!strcmp("1", value) || !strcasecmp("true", value)))) {
++                return 0.0;
++            }
++
++            if (kOurScore <= curScore)
++                return 0.0;
++
++            if (!strncasecmp(url, "http://", 7) \
++                    || !strncasecmp(url, "rtsp://", 7) \
++                    || !strncasecmp(url, "udp://", 6) \
++                    || !strncasecmp(url, "rtp://", 6))
++                return kOurScore;
++
++            int lenURL = strlen(url);
++            for (int i = 0; i < NELEM(FILE_EXTS); ++i) {
++                int len = strlen(FILE_EXTS[i]);
++                int start = lenURL - len;
++                if (start > 0) {
++                    if (!strncasecmp(url + start, FILE_EXTS[i], len)) {
++                        return kOurScore;
++                    }
++                }
++            }
++
++            return 0.0;
++        }
++
++        virtual float scoreFactory(const sp<IMediaPlayer>& client,
++                int fd,
++                int64_t offset,
++                int64_t length,
++                float curScore) {
++            static const float kOurScore = 1.0;
++
++            char value[PROPERTY_VALUE_MAX];
++            if (!(property_get("media.omxgm.enable-player", value, NULL)
++                    && (!strcmp("1", value) || !strcasecmp("true", value)))) {
++                return 0.0;
++            }
++
++            if (kOurScore <= curScore)
++                return 0.0;
++
++            char url[128];
++            int ret = 0;
++
++            OMXPlayerType *pType = new OMXPlayerType();
++            sprintf(url, "sharedfd://%d:%lld:%lld",  fd, offset, length);
++            ret = pType->IsSupportedContent(url);
++            delete pType;
++            if(ret) {
++                return kOurScore;
++            }
++
++            return 0.0;
++        }
++
++        virtual sp<MediaPlayerBase> createPlayer() {
++            ALOGV(" create OMXPlayer");
++            return new OMXPlayer();
++        }
++};
++#endif
++
+ class StagefrightPlayerFactory :
+     public MediaPlayerFactory::IFactory {
+   public:
+@@ -334,6 +446,9 @@ void MediaPlayerFactory::registerBuiltinFactories() {
+     if (sInitComplete)
+         return;
+ 
++#ifdef FSL_GM_PLAYER
++    registerFactory_l(new OMXPlayerFactory(), OMX_PLAYER);
++#endif
+     registerFactory_l(new StagefrightPlayerFactory(), STAGEFRIGHT_PLAYER);
+     registerFactory_l(new NuPlayerFactory(), NU_PLAYER);
+     registerFactory_l(new SonivoxPlayerFactory(), SONIVOX_PLAYER);
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index 7d86672..08ee7ed 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -16,6 +16,8 @@
+ ** limitations under the License.
+ */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor, Inc. */
++
+ // Proxy for media player implementations
+ 
+ //#define LOG_NDEBUG 0
+@@ -631,6 +633,10 @@ status_t MediaPlayerService::Client::setDataSource(
+ 
+     if ((strncmp(url, "http://", 7) == 0) ||
+         (strncmp(url, "https://", 8) == 0) ||
++#ifdef FSL_GM_PLAYER
++        (strncmp(url, "rtp://", 6) == 0) ||
++        (strncmp(url, "udp://", 6) == 0) ||
++#endif
+         (strncmp(url, "rtsp://", 7) == 0)) {
+         if (!checkPermission("android.permission.INTERNET")) {
+             return PERMISSION_DENIED;
+diff --git a/media/libmediaplayerservice/MediaRecorderClient.cpp b/media/libmediaplayerservice/MediaRecorderClient.cpp
+index a9820e0..9387bfe 100644
+--- a/media/libmediaplayerservice/MediaRecorderClient.cpp
++++ b/media/libmediaplayerservice/MediaRecorderClient.cpp
+@@ -14,6 +14,8 @@
+  ** limitations under the License.
+  */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ //#define LOG_NDEBUG 0
+ #define LOG_TAG "MediaRecorderService"
+ #include <utils/Log.h>
+@@ -40,6 +42,10 @@
+ #include "StagefrightRecorder.h"
+ #include <gui/IGraphicBufferProducer.h>
+ 
++#ifdef FSL_GM_PLAYER
++#include "media/OMXMediaRecorder.h"
++#endif
++
+ namespace android {
+ 
+ const char* cameraPermission = "android.permission.CAMERA";
+@@ -304,7 +310,17 @@ MediaRecorderClient::MediaRecorderClient(const sp<MediaPlayerService>& service,
+ {
+     ALOGV("Client constructor");
+     mPid = pid;
+-    mRecorder = new StagefrightRecorder;
++#ifdef FSL_GM_PLAYER
++	char value[PROPERTY_VALUE_MAX];
++	if (property_get("media.omxgm.enable-record", value, NULL)
++			&& ( !strcmp(value, "1") || !strcasecmp(value, "true"))) {
++		mRecorder = new OMXRecorder;
++	} else {
++#endif
++		mRecorder = new StagefrightRecorder;
++#ifdef FSL_GM_PLAYER
++	}
++#endif
+     mMediaPlayerService = service;
+ }
+ 
+diff --git a/media/libmediaplayerservice/MetadataRetrieverClient.cpp b/media/libmediaplayerservice/MetadataRetrieverClient.cpp
+index 348957f..6aa775f 100644
+--- a/media/libmediaplayerservice/MetadataRetrieverClient.cpp
++++ b/media/libmediaplayerservice/MetadataRetrieverClient.cpp
+@@ -15,6 +15,8 @@
+ ** limitations under the License.
+ */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ //#define LOG_NDEBUG 0
+ #define LOG_TAG "MetadataRetrieverClient"
+ #include <utils/Log.h>
+@@ -33,6 +35,9 @@
+ #include <binder/IServiceManager.h>
+ #include <media/MediaMetadataRetrieverInterface.h>
+ #include <media/MediaPlayerInterface.h>
++#ifdef FSL_GM_PLAYER
++#include <media/OMXMetadataRetriever.h>
++#endif
+ #include <private/media/VideoFrame.h>
+ #include "MidiMetadataRetriever.h"
+ #include "MetadataRetrieverClient.h"
+@@ -82,6 +87,7 @@ void MetadataRetrieverClient::disconnect()
+ static sp<MediaMetadataRetrieverBase> createRetriever(player_type playerType)
+ {
+     sp<MediaMetadataRetrieverBase> p;
++
+     switch (playerType) {
+         case STAGEFRIGHT_PLAYER:
+         case NU_PLAYER:
+@@ -93,6 +99,12 @@ static sp<MediaMetadataRetrieverBase> createRetriever(player_type playerType)
+             ALOGV("create midi metadata retriever");
+             p = new MidiMetadataRetriever();
+             break;
++#ifdef FSL_GM_PLAYER
++        case OMX_PLAYER:
++            ALOGV("Create OMXMetadataRetriever.\n");
++            p = new OMXMetadataRetriever();
++            break;
++#endif
+         default:
+             // TODO:
+             // support for TEST_PLAYER
+diff --git a/media/libstagefright/Android.mk b/media/libstagefright/Android.mk
+index 5bd5c20..8df297e 100644
+--- a/media/libstagefright/Android.mk
++++ b/media/libstagefright/Android.mk
+@@ -107,6 +107,10 @@ LOCAL_SRC_FILES += \
+         chromium_http_stub.cpp
+ LOCAL_CPPFLAGS += -DCHROMIUM_AVAILABLE=1
+ 
++ifeq ($(HAVE_FSL_IMX_CODEC),true)
++LOCAL_CFLAGS += -DFSL_GM_PLAYER
++endif
++
+ ifeq ($(BOARD_SOC_CLASS), IMX5X)
+    LOCAL_CFLAGS += -DIMX5X
+ endif
+diff --git a/media/libstagefright/StagefrightMediaScanner.cpp b/media/libstagefright/StagefrightMediaScanner.cpp
+index af8186c..fcd63da 100644
+--- a/media/libstagefright/StagefrightMediaScanner.cpp
++++ b/media/libstagefright/StagefrightMediaScanner.cpp
+@@ -14,6 +14,8 @@
+  * limitations under the License.
+  */
+ 
++/* Copyright 2009-2013 Freescale Semiconductor Inc. */
++
+ //#define LOG_NDEBUG 0
+ #define LOG_TAG "StagefrightMediaScanner"
+ #include <utils/Log.h>
+@@ -43,6 +45,10 @@ static bool FileHasAcceptableExtension(const char *extension) {
+         ".wav", ".amr", ".midi", ".xmf", ".rtttl", ".rtx", ".ota",
+         ".mkv", ".mka", ".webm", ".ts", ".fl", ".flac", ".mxmf",
+         ".avi", ".mpeg", ".mpg", ".awb", ".mpga"
++#ifdef FSL_GM_PLAYER
++        , ".divx", ".mov", ".m4v", ".adts", ".asf", ".wmv", ".vob",
++        ".f4v", ".flv"
++#endif
+     };
+     static const size_t kNumValidExtensions =
+         sizeof(kValidExtensions) / sizeof(kValidExtensions[0]);
+-- 
+1.8.0
+

@@ -1,0 +1,1338 @@
+From 8f9d987cc6f5a2dcaf84fa208a9fa4d6954f13ab Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Mon, 25 Feb 2008 15:13:59 +0800
+Subject: [PATCH 008/435] ENGR00047811 Add VPU support for MX37
+
+Add VPU test programming support for MX37
+
+Signed-off-by: Robby Cai<R63905@freescale.com>
+---
+ test/mxc_vpu_test/Makefile           |   2 +-
+ test/mxc_vpu_test/configs/config_dec |   5 +-
+ test/mxc_vpu_test/configs/config_enc |   3 +
+ test/mxc_vpu_test/dec.c              | 122 +++++++++++++++++++----------------
+ test/mxc_vpu_test/display.c          |  10 +--
+ test/mxc_vpu_test/enc.c              |  81 ++++++++++++++---------
+ test/mxc_vpu_test/fb.c               |  12 ++--
+ test/mxc_vpu_test/loopback.c         |  26 ++++----
+ test/mxc_vpu_test/main.c             |  43 ++++++------
+ test/mxc_vpu_test/readme             |   3 +-
+ test/mxc_vpu_test/utils.c            |  91 +++++++++++++++++---------
+ test/mxc_vpu_test/vpu_test.h         |  12 ++--
+ 12 files changed, 246 insertions(+), 164 deletions(-)
+
+diff --git a/test/mxc_vpu_test/Makefile b/test/mxc_vpu_test/Makefile
+index dd9bd52..a04c207 100644
+--- a/test/mxc_vpu_test/Makefile
++++ b/test/mxc_vpu_test/Makefile
+@@ -11,7 +11,7 @@ OBJ = main.o \
+       loopback.o
+ 
+ # list of platforms which want this test case
+-INCLUDE_LIST:=IMX27ADS IMX31ADS MXC30031ADS
++INCLUDE_LIST:=IMX27ADS IMX31ADS IMX37_3STACK
+ 
+ ifeq ($(PLATFORM),$(findstring $(PLATFORM),$(INCLUDE_LIST)))
+ TARGET = mxc_vpu_test.out
+diff --git a/test/mxc_vpu_test/configs/config_dec b/test/mxc_vpu_test/configs/config_dec
+index f3ede3f..5d491a7 100644
+--- a/test/mxc_vpu_test/configs/config_dec
++++ b/test/mxc_vpu_test/configs/config_dec
+@@ -10,7 +10,7 @@ input=akiyo.mp4
+ # write output to file. For decode, if not specified, then default is LCD
+ output=
+ 
+-# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1
++# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, 4 - MPEG2, 5 - DIV3
+ format=0
+ 
+ # rotation angle (0, 90, 180, 270). Do not specify anything if not needed.
+@@ -22,6 +22,9 @@ count=
+ # deblocking . 1 - Enable deblock
+ deblock=
+ 
++# dering . 1 - Enable dering
++dering=
++
+ # mirroring (0, 1, 2 , 3)
+ mirror=
+ 
+diff --git a/test/mxc_vpu_test/configs/config_enc b/test/mxc_vpu_test/configs/config_enc
+index 78075f5..db2f8e8 100644
+--- a/test/mxc_vpu_test/configs/config_enc
++++ b/test/mxc_vpu_test/configs/config_enc
+@@ -22,6 +22,9 @@ count=100
+ # deblocking . 1 - Enable deblock
+ deblock=
+ 
++# dering . 1 - Enable dering
++dering=
++
+ # mirroring (0, 1, 2 , 3)
+ mirror=
+ 
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 14bf45c..5b74c3f 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -27,13 +27,10 @@ extern int quitflag;
+ 
+ /* Fill the bitstream ring buffer
+  *
+- * Returns:
+- * 
+- * -ve on error
+  */
+-int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd, 
+-		u32 bs_va_startaddr, u32 bs_va_endaddr, 
+-		u32 bs_pa_startaddr, int defaultsize, 
++int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
++		u32 bs_va_startaddr, u32 bs_va_endaddr,
++		u32 bs_pa_startaddr, int defaultsize,
+ 		int *eos, int *fill_end_bs)
+ {
+ 	RetCode ret;
+@@ -88,7 +85,7 @@ int dec_fill_bsbuffer(DecHandle handle, struct cmd_line *cmd,
+ 
+ 			/* read the remaining */
+ 			space = nread;
+-			nread = vpu_read(cmd, (void *)bs_va_startaddr, 
++			nread = vpu_read(cmd, (void *)bs_va_startaddr,
+ 					(size - room));
+ 			if (nread <= 0) {
+ 				/* EOF or error */
+@@ -129,7 +126,7 @@ update:
+ 		*fill_end_bs = 0;
+ 	} else {
+ 		if (!*fill_end_bs) {
+-			ret = vpu_DecUpdateBitstreamBuffer(handle, 
++			ret = vpu_DecUpdateBitstreamBuffer(handle,
+ 					STREAM_END_SIZE);
+ 			if (ret != RETCODE_SUCCESS) {
+ 				printf("vpu_DecUpdateBitstreamBuffer failed\n");
+@@ -175,7 +172,7 @@ write_to_file(struct decode *dec, u8 *buf)
+ 	}
+ }
+ 
+-int 
++int
+ decoder_start(struct decode *dec)
+ {
+ 	DecHandle handle = dec->handle;
+@@ -183,6 +180,7 @@ decoder_start(struct decode *dec)
+ 	DecParam decparam = {0};
+ 	int rot_en = dec->cmdl->rot_en, rot_stride, fwidth, fheight;
+ 	int mp4dblk_en = dec->cmdl->mp4dblk_en;
++	int dering_en = dec->cmdl->dering_en;
+ 	FrameBuffer *rot_fb = NULL;
+ 	FrameBuffer *mp4dblk_fb = NULL;
+ 	FrameBuffer *fb = dec->fb;
+@@ -198,7 +196,7 @@ decoder_start(struct decode *dec)
+ 	int rotid = 0, dblkid = 0, mirror;
+ 	int count = dec->cmdl->count;
+ 
+-	if (rot_en) {
++	if (rot_en || dering_en) {
+ 		rotid = dec->fbcount;
+ 		if (mp4dblk_en) {
+ 			dblkid = dec->fbcount + 1;
+@@ -212,19 +210,19 @@ decoder_start(struct decode *dec)
+ 	fwidth = ((dec->picwidth + 15) & ~15);
+ 	fheight = ((dec->picheight + 15) & ~15);
+ 
+-	if (rot_en) {
++	if (rot_en || dering_en) {
+ 		rot_fb = &fb[rotid];
+ 
+ 		lock(dec->cmdl);
+-		vpu_DecGiveCommand(handle, SET_ROTATION_ANGLE, 
++		vpu_DecGiveCommand(handle, SET_ROTATION_ANGLE,
+ 					&dec->cmdl->rot_angle);
+ 
+ 		mirror = dec->cmdl->mirror;
+-		vpu_DecGiveCommand(handle, SET_MIRROR_DIRECTION, 
++		vpu_DecGiveCommand(handle, SET_MIRROR_DIRECTION,
+ 					&mirror);
+ 
+-		rot_stride = (dec->cmdl->rot_angle == 90 || 
+-				dec->cmdl->rot_angle == 270) ? fheight : 
++		rot_stride = (dec->cmdl->rot_angle == 90 ||
++				dec->cmdl->rot_angle == 270) ? fheight :
+ 				fwidth;
+ 
+ 		vpu_DecGiveCommand(handle, SET_ROTATOR_STRIDE, &rot_stride);
+@@ -239,7 +237,7 @@ decoder_start(struct decode *dec)
+ 		img_size = dec->stride * dec->picheight;
+ 	} else {
+ 		img_size = dec->picwidth * dec->picheight * 3 / 2;
+-		if (rot_en) {
++		if (rot_en || dering_en) {
+ 			pfb = pfbpool[rotid];
+ 			rot_fb->bufY = pfb->addrY;
+ 			rot_fb->bufCb = pfb->addrCb;
+@@ -255,12 +253,20 @@ decoder_start(struct decode *dec)
+ 	while (1) {
+ 		lock(dec->cmdl);
+ 		
+-		if (rot_en) {
++		if (rot_en || dering_en) {
+ 			vpu_DecGiveCommand(handle, SET_ROTATOR_OUTPUT,
+ 						(void *)rot_fb);
+ 			if (frame_id == 0) {
+-				vpu_DecGiveCommand(handle, ENABLE_ROTATION, 0);
+-				vpu_DecGiveCommand(handle, ENABLE_MIRRORING,0);
++				if (rot_en) {
++					vpu_DecGiveCommand(handle,
++							ENABLE_ROTATION, 0);
++					vpu_DecGiveCommand(handle,
++							ENABLE_MIRRORING,0);
++				}
++				if (dering_en) {
++					vpu_DecGiveCommand(handle,
++							ENABLE_DERING, 0);
++				}
+ 			}
+ 		}
+ 		
+@@ -283,10 +289,10 @@ decoder_start(struct decode *dec)
+ 
+ 		gettimeofday(&tbegin, NULL);
+ 		while (vpu_IsBusy()) {
+-			err = dec_fill_bsbuffer(handle, dec->cmdl, 
++			err = dec_fill_bsbuffer(handle, dec->cmdl,
+ 				      dec->virt_bsbuf_addr,
+ 				      (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
+-				      dec->phy_bsbuf_addr, STREAM_FILL_SIZE, 
++				      dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
+ 				      &eos, &fill_end_bs);
+ 			
+ 			if (err < 0) {
+@@ -340,7 +346,7 @@ decoder_start(struct decode *dec)
+ 		if (decodefinish)
+ 			break;
+ 		
+-		if (outinfo.prescanresult == 0) { 
++		if (outinfo.prescanresult == 0) {
+ 			if (eos) {
+ 				break;
+ 			} else {
+@@ -352,10 +358,10 @@ decoder_start(struct decode *dec)
+ 					printf("Prescan: not enough bs data\n");
+ 
+ 				dec->cmdl->complete = 1;
+-				err = dec_fill_bsbuffer(handle, 
+-						dec->cmdl, 
++				err = dec_fill_bsbuffer(handle,
++						dec->cmdl,
+ 					        dec->virt_bsbuf_addr,
+-					        (dec->virt_bsbuf_addr + 
++					        (dec->virt_bsbuf_addr +
+ 						 STREAM_BUF_SIZE),
+ 					        dec->phy_bsbuf_addr, fillsize,
+ 					        &eos, &fill_end_bs);
+@@ -376,22 +382,22 @@ decoder_start(struct decode *dec)
+ 			break;
+ 
+ 		/* BIT don't have picture to be displayed */
+-		if ((outinfo.indexFrameDisplay == -3) || 
++		if ((outinfo.indexFrameDisplay == -3) ||
+ 				(outinfo.indexFrameDisplay == -2))
+ 			continue;
+ 
+ 		if (dec->cmdl->dst_scheme == PATH_V4L2) {
+-			if (rot_en) {
+-				rot_fb->bufY = 
++			if (rot_en || dering_en) {
++				rot_fb->bufY =
+ 					disp->buffers[disp->buf.index]->offset;
+ 				rot_fb->bufCb = rot_fb->bufY + img_size;
+-				rot_fb->bufCr = rot_fb->bufCb + 
++				rot_fb->bufCr = rot_fb->bufCb +
+ 						(img_size >> 2);
+ 			} else if (mp4dblk_en) {
+-				mp4dblk_fb->bufY = 
++				mp4dblk_fb->bufY =
+ 					disp->buffers[disp->buf.index]->offset;
+ 				mp4dblk_fb->bufCb = mp4dblk_fb->bufY + img_size;
+-				mp4dblk_fb->bufCr = mp4dblk_fb->bufCb + 
++				mp4dblk_fb->bufCr = mp4dblk_fb->bufCb +
+ 							(img_size >> 2);
+ 			}
+ 			
+@@ -400,18 +406,18 @@ decoder_start(struct decode *dec)
+ 				return -1;
+ 
+ 		} else {
+-			if ((rot_en == 0 && mp4dblk_en == 0)) {
++			if (rot_en == 0 && mp4dblk_en == 0 && dering_en == 0) {
+ 				pfb = pfbpool[outinfo.indexFrameDisplay];
+ 			}
+ 			
+-			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr - 
++			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr -
+ 					pfb->desc.phy_addr;
+ 		
+ 			
+ 			if (platform_is_mxc30031()) {
+ 				write_to_file(dec, (u8 *)yuv_addr);
+ 			} else {
+-				fwriten(dec->cmdl->dst_fd, (u8 *)yuv_addr, 
++				fwriten(dec->cmdl->dst_fd, (u8 *)yuv_addr,
+ 						img_size);
+ 			}
+ 		}
+@@ -421,7 +427,7 @@ decoder_start(struct decode *dec)
+ 			break;
+ 		
+ 		if (dec->cmdl->src_scheme == PATH_NET) {
+-			err = dec_fill_bsbuffer(handle,	dec->cmdl, 
++			err = dec_fill_bsbuffer(handle,	dec->cmdl,
+ 				      dec->virt_bsbuf_addr,
+ 				      (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
+ 				      dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
+@@ -433,7 +439,7 @@ decoder_start(struct decode *dec)
+ 		}
+ 	}
+ 
+-	printf("%d frames took %d microseconds\n", (int)frame_id, 
++	printf("%d frames took %d microseconds\n", (int)frame_id,
+ 						(int)total_time);
+ 	printf("fps = %.2f\n", (frame_id / (total_time / 1000000)));
+ 	return 0;
+@@ -449,8 +455,9 @@ decoder_free_framebuffer(struct decode *dec)
+ 	}
+ 
+ 	if ((dec->cmdl->dst_scheme != PATH_V4L2) ||
+-			((dec->cmdl->dst_scheme == PATH_V4L2) && 
+-			 (dec->cmdl->rot_en || dec->cmdl->mp4dblk_en))) {
++			((dec->cmdl->dst_scheme == PATH_V4L2) &&
++			 (dec->cmdl->rot_en || dec->cmdl->mp4dblk_en ||
++			 (platform_is_mx37() && dec->cmdl->dering_en)))) {
+ 		totalfb = dec->fbcount + dec->extrafb;
+ 		for (i = 0; i < totalfb; i++) {
+ 			framebuf_free(dec->pfbpool[i]);
+@@ -458,8 +465,8 @@ decoder_free_framebuffer(struct decode *dec)
+ 	}
+ 
+ 	free(dec->fb);
+-	free(dec->pfbpool);	
+-	return;	
++	free(dec->pfbpool);
++	return;
+ }
+ 
+ int
+@@ -469,6 +476,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	int i, fbcount = dec->fbcount, rotation, extrafb = 0, totalfb, img_size;
+        	int dst_scheme = dec->cmdl->dst_scheme, rot_en = dec->cmdl->rot_en;
+ 	int mp4dblk_en = dec->cmdl->mp4dblk_en;
++	int dering_en = dec->cmdl->dering_en;
+ 	RetCode ret;
+ 	DecHandle handle = dec->handle;
+ 	FrameBuffer *fb;
+@@ -476,8 +484,8 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	struct vpu_display *disp = NULL;
+ 	int stride;
+ 
+-	/* 1 extra fb for rotation */
+-	if (rot_en) {
++	/* 1 extra fb for rotation(or dering) */
++	if (rot_en || dering_en) {
+ 		extrafb++;
+ 		dec->extrafb++;
+ 	}
+@@ -504,7 +512,8 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	}
+ 	
+ 	if ((dst_scheme != PATH_V4L2) ||
+-		((dst_scheme == PATH_V4L2) && (rot_en || mp4dblk_en))) {
++		((dst_scheme == PATH_V4L2) && (rot_en || mp4dblk_en ||
++			(platform_is_mx37() && dering_en)))) {
+ 
+ 		for (i = 0; i < totalfb; i++) {
+ 			pfbpool[i] = framebuf_alloc(dec->stride,
+@@ -517,25 +526,29 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			fb[i].bufY = pfbpool[i]->addrY;
+ 			fb[i].bufCb = pfbpool[i]->addrCb;
+ 			fb[i].bufCr = pfbpool[i]->addrCr;
++			if (platform_is_mx37()) {
++				fb[i].bufMvCol = pfbpool[i]->mvColBuf;
++			}
+ 		}
+ 	}
+ 	
+ 	if (dst_scheme == PATH_V4L2) {
+-		rotation = (dec->cmdl->rot_angle == 90 || 
++		rotation = (dec->cmdl->rot_angle == 90 ||
+ 				dec->cmdl->rot_angle == 270) ? 1 : 0;
+ 
+-		disp = v4l_display_open(dec->picwidth, dec->picheight, 
++		disp = v4l_display_open(dec->picwidth, dec->picheight,
+ 					fbcount, rotation, dec->stride);
+ 		if (disp == NULL) {
+ 			goto err;
+ 		}
+ 
+-		if ((rot_en == 0) && (mp4dblk_en == 0)) {
++		if ((rot_en == 0) && (mp4dblk_en == 0) && (dering_en == 0)) {
+ 			img_size = dec->stride * dec->picheight;
+ 			for (i = 0; i < fbcount; i++) {
+ 				fb[i].bufY = disp->buffers[i]->offset;
+ 				fb[i].bufCb = fb[i].bufY + img_size;
+ 				fb[i].bufCr = fb[i].bufCb + (img_size >> 2);
++				/* TODO: bufMvCol */
+ 			}
+ 		}
+ 	}
+@@ -562,15 +575,16 @@ err1:
+ 
+ err:
+ 	if ((dst_scheme != PATH_V4L2) ||
+-		       ((dst_scheme == PATH_V4L2) && (rot_en || mp4dblk_en))) {
++		((dst_scheme == PATH_V4L2) && (rot_en || mp4dblk_en ||
++			(platform_is_mx37() && dering_en)))) {
+ 		for (i = 0; i < totalfb; i++) {
+ 			framebuf_free(pfbpool[i]);
+ 		}
+ 	}
+ 
+ 	free(fb);
+-	free(pfbpool);	
+-	return -1;	
++	free(pfbpool);
++	return -1;
+ }
+ 
+ static void
+@@ -601,7 +615,7 @@ decoder_parse(struct decode *dec)
+ 	/* Parse bitstream and get width/height/framerate etc */
+ 	lock(dec->cmdl);
+ 	vpu_DecSetEscSeqInit(handle, 1);
+-	ret = vpu_DecGetInitialInfo(handle, &initinfo);	
++	ret = vpu_DecGetInitialInfo(handle, &initinfo);
+ 	vpu_DecSetEscSeqInit(handle, 0);
+ 	unlock(dec->cmdl);
+ 	if (ret != RETCODE_SUCCESS) {
+@@ -610,7 +624,7 @@ decoder_parse(struct decode *dec)
+ 	}
+ 
+ 	printf("Decoder: width = %d, height = %d, fps = %lu, count = %u\n",
+-			initinfo.picWidth, initinfo.picHeight, 
++			initinfo.picWidth, initinfo.picHeight,
+ 			initinfo.frameRateInfo,
+ 			initinfo.minFrameBufferCount);
+ 
+@@ -710,7 +724,7 @@ decode_test(void *arg)
+ 		goto err;
+ 
+ 	cmdl->complete = 1;
+-	ret = dec_fill_bsbuffer(dec->handle, cmdl, 
++	ret = dec_fill_bsbuffer(dec->handle, cmdl,
+ 			dec->virt_bsbuf_addr,
+ 		        (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
+ 			dec->phy_bsbuf_addr, 0, &eos, &fill_end_bs);
+@@ -746,7 +760,7 @@ err1:
+ 
+ 	lock(cmdl);
+ 	vpu_DecClose(dec->handle);
+-	unlock(cmdl);	
++	unlock(cmdl);
+ err:
+ 	IOFreeVirtMem(&mem_desc);
+ 	IOFreePhyMem(&mem_desc);
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index c74402a..93bb3aa 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -70,7 +70,7 @@ calculate_ratio(int width, int height, int maxwidth, int maxheight)
+ 	return ratio;
+ }
+ 
+-struct vpu_display * 
++struct vpu_display *
+ v4l_display_open(int width, int height, int nframes, int rot, int stride)
+ {
+ 	int fd, err, out, i;
+@@ -120,7 +120,7 @@ v4l_display_open(int width, int height, int nframes, int rot, int stride)
+ 		goto err;
+ 	}
+ 
+-	ratio = calculate_ratio(width, height, cropcap.bounds.width, 
++	ratio = calculate_ratio(width, height, cropcap.bounds.width,
+ 				cropcap.bounds.height);
+ 
+ 	crop.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+@@ -230,7 +230,7 @@ void v4l_display_close(struct vpu_display *disp)
+ 	int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 	ioctl(disp->fd, VIDIOC_STREAMOFF, &type);
+ 	v4l_free_bufs(disp->nframes, disp);
+-	close(disp->fd);	
++	close(disp->fd);
+ 	free(disp);
+ }
+ 
+@@ -298,6 +298,6 @@ int v4l_put_data(struct vpu_display *disp)
+ 	return 0;
+ 
+ err:
+-	return -1;	
++	return -1;
+ }
+ 
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index f22e47a..bdc9f95 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -32,8 +32,8 @@ extern int quitflag;
+ 
+ #if STREAM_ENC_PIC_RESET == 0
+ static int
+-enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd, 
+-		u32 bs_va_startaddr, u32 bs_va_endaddr, u32 bs_pa_startaddr, 
++enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd,
++		u32 bs_va_startaddr, u32 bs_va_endaddr, u32 bs_pa_startaddr,
+ 		int defaultsize)
+ {
+ 	RetCode ret;
+@@ -188,7 +188,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		return -1;
+ 	}
+ 	
+-	pfbpool = enc->pfbpool = calloc(fbcount + 1, 
++	pfbpool = enc->pfbpool = calloc(fbcount + 1,
+ 					sizeof(struct frame_buf *));
+ 	if (pfbpool == NULL) {
+ 		printf("Failed to allocate enc->pfbpool\n");
+@@ -226,7 +226,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		}
+ 	} else {
+ 		/* Allocate a single frame buffer for source frame */
+-		pfbpool[src_fbid] = framebuf_alloc(enc->picwidth, 
++		pfbpool[src_fbid] = framebuf_alloc(enc->picwidth,
+ 						   enc->picheight);
+ 		if (pfbpool[src_fbid] == NULL) {
+ 			printf("failed to allocate single framebuf\n");
+@@ -308,12 +308,12 @@ encoder_start(struct encode *enc)
+ 			}
+ 			
+ 			fb[src_fbid].bufY = cap_buffers[v4l2_buf.index].offset;
+-			fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size; 
+-			fb[src_fbid].bufCr = fb[src_fbid].bufCb + 
+-						(img_size >> 2); 
++			fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size;
++			fb[src_fbid].bufCr = fb[src_fbid].bufCb +
++						(img_size >> 2);
+ 		} else {
+ 			pfb = pfbpool[src_fbid];
+-			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr - 
++			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr -
+ 					pfb->desc.phy_addr;
+ 			ret = freadn(src_fd, (void *)yuv_addr, img_size);
+ 			if (ret <= 0)
+@@ -339,13 +339,13 @@ encoder_start(struct encode *enc)
+ 		while (vpu_IsBusy()) {
+ #if STREAM_ENC_PIC_RESET == 0
+ 			ret = enc_readbs_ring_buffer(handle, enc->cmdl,
+-					virt_bsbuf_start, virt_bsbuf_end, 
++					virt_bsbuf_start, virt_bsbuf_end,
+ 					phy_bsbuf_start, STREAM_READ_SIZE);
+ 			if (ret < 0) {
+ 				unlock(enc->cmdl);
+ 				goto err2;
+ 			}
+-#endif			
++#endif
+ 			vpu_WaitForInt(200);
+ 		}
+ 
+@@ -364,7 +364,7 @@ encoder_start(struct encode *enc)
+ 			break;
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (enc->virt_bsbuf_addr + outinfo.bitstreamBuffer 
++		vbuf = (enc->virt_bsbuf_addr + outinfo.bitstreamBuffer
+ 					- enc->phy_bsbuf_addr);
+ 		ret = vpu_write(enc->cmdl, (void *)vbuf, outinfo.bitstreamSize);
+ 		if (ret < 0) {
+@@ -378,7 +378,7 @@ encoder_start(struct encode *enc)
+ 	}
+ 
+ #if STREAM_ENC_PIC_RESET == 0
+-	enc_readbs_ring_buffer(handle, enc->cmdl, virt_bsbuf_start, 
++	enc_readbs_ring_buffer(handle, enc->cmdl, virt_bsbuf_start,
+ 			virt_bsbuf_end, phy_bsbuf_start, 0);
+ #endif
+ 
+@@ -386,7 +386,7 @@ encoder_start(struct encode *enc)
+ err2:
+ 	if (src_scheme == PATH_V4L2) {
+ 		v4l_stop_capturing();
+-	}	
++	}
+ 
+ 	/* Inform the other end that no more frames will be sent */
+ 	if (enc->cmdl->dst_scheme == PATH_NET) {
+@@ -412,8 +412,8 @@ encoder_configure(struct encode *enc)
+ 	if (platform_is_mx27()) {
+ 		search_pa.searchRamAddr = 0xFFFF4C00;
+ 	} else if (platform_is_mxc30031()) {
+-		search_pa.searchRamAddr = 0xD0000000; 
+-		search_pa.SearchRamSize = 
++		search_pa.searchRamAddr = 0xD0000000;
++		search_pa.SearchRamSize =
+ 			((enc->picwidth + 15) & ~15) * 36 + 2048;
+ 	}
+ 
+@@ -428,7 +428,7 @@ encoder_configure(struct encode *enc)
+ 	if (enc->cmdl->rot_en) {
+ 		vpu_EncGiveCommand(handle, ENABLE_ROTATION, 0);
+ 		vpu_EncGiveCommand(handle, ENABLE_MIRRORING, 0);
+-		vpu_EncGiveCommand(handle, SET_ROTATION_ANGLE, 
++		vpu_EncGiveCommand(handle, SET_ROTATION_ANGLE,
+ 					&enc->cmdl->rot_angle);
+ 		mirror = enc->cmdl->mirror;
+ 		vpu_EncGiveCommand(handle, SET_MIRROR_DIRECTION, &mirror);
+@@ -462,7 +462,7 @@ encoder_configure(struct encode *enc)
+ 	return 0;
+ }
+ 
+-void 
++void
+ encoder_close(struct encode *enc)
+ {
+ 	EncOutputInfo outinfo = {0};
+@@ -477,7 +477,7 @@ encoder_close(struct encode *enc)
+ 	unlock(enc->cmdl);
+ }
+ 
+-int 
++int
+ encoder_open(struct encode *enc)
+ {
+ 	EncHandle handle = {0};
+@@ -499,7 +499,7 @@ encoder_open(struct encode *enc)
+ 		encop.picWidth = enc->picheight;
+ 		encop.picHeight = enc->picwidth;
+ 	} else {
+-		encop.picWidth = enc->picwidth;	
++		encop.picWidth = enc->picwidth;
+ 		encop.picHeight = enc->picheight;
+ 	}
+ 
+@@ -510,13 +510,34 @@ encoder_open(struct encode *enc)
+ 	encop.slicemode.sliceSizeMode = 0;
+ 	encop.slicemode.sliceSize = 4000;
+ 
+-	if (enc->cmdl->format == STD_H263) {
+-		if (encop.EncStdParam.h263Param.h263_annexJEnable == 0 &&
+-		    encop.EncStdParam.h263Param.h263_annexKEnable == 0 &&
+-			encop.EncStdParam.h263Param.h263_annexTEnable == 0 ) {
+-			encop.frameRateInfo = 0x3E87530;
+-		}
++	encop.initialDelay = 0;
++	encop.vbvBufferSize = 0;        /* 0 = ignore 8 */
++	encop.enableAutoSkip = 1;
++	encop.intraRefresh = 0;
++	encop.sliceReport = 0;
++	encop.mbReport = 0;
++	encop.mbQpReport = 0;
++	encop.rcIntraQp = -1;
++	encop.ringBufferEnable = 0;
++	encop.dynamicAllocEnable = 0;
++
++	if (enc->cmdl->format == STD_MPEG4) {
++		encop.EncStdParam.mp4Param.mp4_dataPartitionEnable = 0;
++		encop.EncStdParam.mp4Param.mp4_reversibleVlcEnable = 0;
++		encop.EncStdParam.mp4Param.mp4_intraDcVlcThr = 0;
++		encop.EncStdParam.mp4Param.mp4_hecEnable = 0;
++		encop.EncStdParam.mp4Param.mp4_verid = 2;
++	} else if ( enc->cmdl->format == STD_H263) {
++		encop.EncStdParam.h263Param.h263_annexJEnable = 0;
++		encop.EncStdParam.h263Param.h263_annexKEnable = 0;
++		encop.EncStdParam.h263Param.h263_annexTEnable = 0;
+ 	} else if (enc->cmdl->format == STD_AVC) {
++		encop.EncStdParam.avcParam.avc_constrainedIntraPredFlag = 0;
++		encop.EncStdParam.avcParam.avc_disableDeblk = 0;
++		encop.EncStdParam.avcParam.avc_deblkFilterOffsetAlpha = 0;
++		encop.EncStdParam.avcParam.avc_deblkFilterOffsetBeta = 0;
++		encop.EncStdParam.avcParam.avc_chromaQpOffset = 0;
++		encop.EncStdParam.avcParam.avc_audEnable = 0;
+ 		encop.EncStdParam.avcParam.avc_fmoEnable = 0;
+ 		encop.EncStdParam.avcParam.avc_fmoType = 0;
+ 		encop.EncStdParam.avcParam.avc_fmoSliceNum = 0;
+@@ -545,7 +566,7 @@ encode_test(void *arg)
+ 		sleep(10);
+ 	}
+ 
+-	/* allocate memory for must remember stuff */	
++	/* allocate memory for must remember stuff */
+ 	enc = (struct encode *)calloc(1, sizeof(struct encode));
+ 	if (enc == NULL) {
+ 		printf("Failed to allocate encode structure\n");
+@@ -559,7 +580,7 @@ encode_test(void *arg)
+ 		printf("Unable to obtain physical memory\n");
+ 		free(enc);
+ 		return -1;
+-	}	
++	}
+ 
+ 	/* mmap that physical buffer */
+ 	enc->virt_bsbuf_addr = IOGetVirtMem(&mem_desc);
+@@ -575,7 +596,7 @@ encode_test(void *arg)
+ 
+ 	/* open the encoder */
+ 	ret = encoder_open(enc);
+-	if (ret) 
++	if (ret)
+ 		goto err;
+ 
+ 	/* configure the encoder */
+@@ -588,7 +609,7 @@ encode_test(void *arg)
+ 	if (ret)
+ 		goto err1;
+ 
+-	/* start encoding */	
++	/* start encoding */
+ 	ret = encoder_start(enc);
+ 	
+ 	/* free the allocated framebuffers */
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index 5320198..5c46c5f 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -1,6 +1,5 @@
+-
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -27,7 +26,7 @@
+ #include <stdio.h>
+ #include "vpu_test.h"
+ 
+-#define NUM_FRAME_BUFS	32	
++#define NUM_FRAME_BUFS	32
+ #define FB_INDEX_MASK	(NUM_FRAME_BUFS - 1)
+ 
+ static int fb_index;
+@@ -53,7 +52,7 @@ struct frame_buf *get_framebuf()
+ 	++fb_index;
+ 	fb_index &= FB_INDEX_MASK;
+ 
+-	return fb;	
++	return fb;
+ }
+ 
+ void put_framebuf(struct frame_buf *fb)
+@@ -75,6 +74,8 @@ struct frame_buf *framebuf_alloc(int strideY, int height)
+ 
+ 	memset(&(fb->desc), 0, sizeof(vpu_mem_desc));
+ 	fb->desc.size = (strideY * height * 3 / 2);
++	if (platform_is_mx37())
++		fb->desc.size += strideY * height / 4;
+ 	
+ 	err = IOGetPhyMem(&fb->desc);
+ 	if (err) {
+@@ -86,6 +87,9 @@ struct frame_buf *framebuf_alloc(int strideY, int height)
+ 	fb->addrY = fb->desc.phy_addr;
+ 	fb->addrCb = fb->addrY + strideY * height;
+ 	fb->addrCr = fb->addrCb + strideY / 2 * height / 2;
++	if (platform_is_mx37()) {
++		fb->mvColBuf = fb->addrCr + strideY / 2 * height / 2;
++	}
+ 	fb->desc.virt_uaddr = IOGetVirtMem(&(fb->desc));
+ 	if (fb->desc.virt_uaddr <= 0) {
+ 		IOFreePhyMem(&fb->desc);
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 348c396..be2d68e 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -29,7 +29,7 @@ struct decode *dec;
+ extern int quitflag;
+ extern struct capture_testbuffer cap_buffers[];
+ 
+-static int 
++static int
+ decode()
+ {
+ 	DecHandle handle = dec->handle;
+@@ -68,7 +68,7 @@ decode()
+ 		return -1;
+ 	}
+ 			
+-	if ((outinfo.indexFrameDisplay == -1) || 
++	if ((outinfo.indexFrameDisplay == -1) ||
+ 			(outinfo.indexFrameDisplay > dec->fbcount))
+ 		return -1;
+ 
+@@ -111,7 +111,7 @@ dec_fill_bsbuffer(char *buf, int size)
+ 	if (space < size)
+ 		return 0;
+ 
+-	/* Fill the bitstream buffer */	
++	/* Fill the bitstream buffer */
+ 	target_addr = bs_va_startaddr + (pa_write_ptr - bs_pa_startaddr);
+ 	if ( (target_addr + size) > bs_va_endaddr) {
+ 		room = bs_va_endaddr - target_addr;
+@@ -205,7 +205,7 @@ encode()
+ 
+ 	img_size = enc->picwidth * enc->picheight;
+ 	fb[src_fbid].bufY = cap_buffers[v4l2_buf.index].offset;
+-	fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size; 
++	fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size;
+ 	fb[src_fbid].bufCr = fb[src_fbid].bufCb + (img_size >> 2);
+ 
+ 	enc_param.sourceFrame = &enc->fb[src_fbid];
+@@ -230,7 +230,7 @@ encode()
+ 	}
+ 
+ 	v4l_put_capture_data(&v4l2_buf);
+-	vbuf = (enc->virt_bsbuf_addr + outinfo.bitstreamBuffer 
++	vbuf = (enc->virt_bsbuf_addr + outinfo.bitstreamBuffer
+ 				- enc->phy_bsbuf_addr);
+ 	ret = dec_fill_bsbuffer((void *)vbuf, outinfo.bitstreamSize);
+ 	if (ret < 0) {
+@@ -259,7 +259,7 @@ encdec_test(void *arg)
+ 	return 0;
+ #endif
+ 
+-	/* allocate memory for must remember stuff */	
++	/* allocate memory for must remember stuff */
+ 	enc = (struct encode *)calloc(1, sizeof(struct encode));
+ 	if (enc == NULL) {
+ 		printf("Failed to allocate encode structure\n");
+@@ -273,7 +273,7 @@ encdec_test(void *arg)
+ 		printf("Unable to obtain physical memory\n");
+ 		free(enc);
+ 		return -1;
+-	}	
++	}
+ 
+ 	/* mmap that physical buffer */
+ 	enc->virt_bsbuf_addr = IOGetVirtMem(&enc_mem_desc);
+@@ -336,7 +336,7 @@ encdec_test(void *arg)
+ 
+ 	/* open the encoder */
+ 	ret = encoder_open(enc);
+-	if (ret) 
++	if (ret)
+ 		goto err1;
+ 
+ 	/* configure the encoder */
+@@ -360,7 +360,7 @@ encdec_test(void *arg)
+ 		goto err4;
+ 	}
+ 
+-	/* start capture */	
++	/* start capture */
+ 	ret = v4l_start_capturing();
+ 	if (ret < 0) {
+ 		printf("v4l2 start failed\n");
+@@ -407,17 +407,17 @@ encdec_test(void *arg)
+ 
+ 	/* free the frame buffers */
+ 	decoder_free_framebuffer(dec);
+-err5:	
++err5:
+ 	v4l_stop_capturing();
+ err4:
+ 	vpu_DecClose(dec->handle);
+-err3:	
++err3:
+ 	/* free the allocated framebuffers */
+ 	encoder_free_framebuffer(enc);
+ err2:
+ 	/* close the encoder */
+ 	encoder_close(enc);
+-err1:	
++err1:
+ 	if (cmdl->format == STD_AVC) {
+ 		IOFreeVirtMem(&ps_mem_desc);
+ 		IOFreePhyMem(&slice_mem_desc);
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index c6bc8d5..cfe271a 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -1,6 +1,5 @@
+-
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -36,13 +35,16 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	If no input file is specified, default is network \n "\
+ 	       "  -o <output file> Write output to file \n "\
+ 	       "	If no output is specified, default is LCD \n "\
+-	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1 \n "\
++	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, \n "\
++	       "	4 - MPEG2, 5 - DIVX, \n "\
+ 	       "	If no format specified, default is 0 (MPEG4) \n "\
+ 	       "  -p <port number> UDP port number to bind \n "\
+ 	       "	If no port number is secified, 5555 is used \n "\
+ 	       "  -c <count> Number of frames to decode \n "\
+-	       "  -d <deblocking> Enable deblock - 1. Not for MX27 \n "\
++	       "  -d <deblocking> Enable deblock - 1. enabled \n "\
+ 	       "	default deblock is disabled (0). \n "\
++	       "  -e <dering> Enable dering - 1. enabled \n "\
++	       "	default dering is disabled (0). \n "\
+ 	       "  -r <rotation angle> 0, 90, 180, 270 \n "\
+ 	       "	default rotation is disabled (0) \n "\
+ 	       "  -m <mirror direction> 0, 1, 2, 3 \n "\
+@@ -86,7 +88,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ struct input_argument {
+ 	int mode;
+ 	pthread_t tid;
+-	char line[128];
++	char line[256];
+ 	struct cmd_line cmd;
+ };
+ 
+@@ -106,9 +108,9 @@ int encdec_test(void *arg);
+ static char *mainopts = "HE:D:L:C:";
+ 
+ /* Options for encode and decode */
+-static char *options = "i:o:n:p:r:f:c:w:h:g:b:d:m:";
++static char *options = "i:o:n:p:r:f:c:w:h:g:b:d:e:m:";
+ 
+-int 
++int
+ parse_config_file(char *file_name)
+ {
+ 	FILE *fp;
+@@ -130,7 +132,7 @@ parse_config_file(char *file_name)
+ 
+ 		ptr = skip_unwanted(line);
+ 
+-		end = parse_options(ptr, &input_arg[instance].cmd, 
++		end = parse_options(ptr, &input_arg[instance].cmd,
+ 					&input_arg[instance].mode);
+ 		if (end == 100) {
+ 			instance++;
+@@ -141,7 +143,7 @@ parse_config_file(char *file_name)
+ 	return 0;
+ }
+ 
+-int 
++int
+ parse_main_args(int argc, char *argv[])
+ {
+ 	int status = 0, opt;
+@@ -195,7 +197,7 @@ parse_main_args(int argc, char *argv[])
+ 	return status;
+ }
+ 
+-int 
++int
+ parse_args(int argc, char *argv[], int i)
+ {
+ 	int status = 0, opt;
+@@ -214,13 +216,13 @@ parse_args(int argc, char *argv[], int i)
+ 				break;
+ 			}
+ 			strncpy(input_arg[i].cmd.output, optarg, 64);
+-			input_arg[i].cmd.dst_scheme = PATH_FILE; 
++			input_arg[i].cmd.dst_scheme = PATH_FILE;
+ 			break;
+ 		case 'n':
+ 			if (input_arg[i].mode == ENCODE) {
+ 				/* contains the ip address */
+ 				strncpy(input_arg[i].cmd.output, optarg, 64);
+-				input_arg[i].cmd.dst_scheme = PATH_NET; 
++				input_arg[i].cmd.dst_scheme = PATH_NET;
+ 			} else {
+ 				printf("Warn:-n option used only for encode\n");
+ 			}
+@@ -251,10 +253,13 @@ parse_args(int argc, char *argv[], int i)
+ 			input_arg[i].cmd.bitrate = atoi(optarg);
+ 			break;
+ 		case 'd':
+-			input_arg[i].cmd.mp4dblk_en = 1; 
++			input_arg[i].cmd.mp4dblk_en = 1;
++			break;
++		case 'e':
++			input_arg[i].cmd.dering_en = 1;
+ 			break;
+ 		case 'm':
+-			input_arg[i].cmd.mirror = atoi(optarg); 
++			input_arg[i].cmd.mirror = atoi(optarg);
+ 			break;
+ 		case -1:
+ 			break;
+@@ -268,7 +273,7 @@ parse_args(int argc, char *argv[], int i)
+ 	return status;
+ }
+ 
+-static int 
++static int
+ signal_thread(void *arg)
+ {
+ 	int sig, err;
+@@ -289,7 +294,7 @@ signal_thread(void *arg)
+ 	return 0;
+ }
+ 
+-int 
++int
+ main(int argc, char *argv[])
+ {
+ 	int err, nargc, i, ret = 0;
+@@ -344,7 +349,7 @@ main(int argc, char *argv[])
+ 				}
+ 			}
+ 
+-			if (check_params(&input_arg[i].cmd, 
++			if (check_params(&input_arg[i].cmd,
+ 						input_arg[i].mode) == 0) {
+ 				if (open_files(&input_arg[i].cmd) == 0) {
+ 					input_arg[i].cmd.mutex = &fastmutex;
+@@ -353,10 +358,10 @@ main(int argc, char *argv[])
+ 						   NULL,
+ 						   (void *)&decode_test,
+ 						   (void *)&input_arg[i].cmd);
+-					} else if (input_arg[i].mode == 
++					} else if (input_arg[i].mode ==
+ 							ENCODE) {
+ 					     pthread_create(&input_arg[i].tid,
+-						   NULL, 
++						   NULL,
+ 						   (void *)&encode_test,
+ 						   (void *)&input_arg[i].cmd);
+ 					}
+diff --git a/test/mxc_vpu_test/readme b/test/mxc_vpu_test/readme
+index 58785ab..18efb45 100755
+--- a/test/mxc_vpu_test/readme
++++ b/test/mxc_vpu_test/readme
+@@ -34,7 +34,8 @@ decode options
+         If no input file is specified, default is network
+    -o <output file> Write output to file
+         If no output is specified, default is LCD
+-   -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1
++   -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1,
++	4 - MPEG2, 5 - DIVX (4, 5 for MX37)
+         If no format specified, default is 0 (MPEG4)
+    -p <port number> UDP port number to bind
+         If no port number is secified, 5555 is used
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index 6d8723b..b91254a 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -100,8 +100,7 @@ udp_recv(struct cmd_line *cmd, int sd, char *buf, int n)
+ 			return 0;
+ 		}
+ 
+-		/* 
+-		 * There was some data pending from the previous recvfrom.
++		/* There was some data pending from the previous recvfrom.
+ 		 * copy that data into the buffer
+ 		 */
+ 		if (cmd->nlen > n) {
+@@ -154,7 +153,7 @@ udp_recv(struct cmd_line *cmd, int sd, char *buf, int n)
+ 			break;
+ 		}
+ 
+-		nread = recvfrom(sd, cmd->nbuf, DEFAULT_PKT_SIZE, 0, 
++		nread = recvfrom(sd, cmd->nbuf, DEFAULT_PKT_SIZE, 0,
+ 					NULL, NULL);
+ 		if (nread < 0) {
+ 			perror("recvfrom");
+@@ -186,7 +185,7 @@ udp_recv(struct cmd_line *cmd, int sd, char *buf, int n)
+ 
+ 		/* check if there is space in user buffer to copy all the
+ 		 * received data
+-		 */		
++		 */
+ 		if (nactual > nleft) {
+ 			nremain = nleft;
+ 			cmd->nlen = nactual - nleft;
+@@ -219,7 +218,7 @@ udp_send(struct cmd_line *cmd, int sd, char *buf, int n)
+ 	}
+ 	
+ 	if (n == 0) {
+-		net_h.seqno = -1; 
++		net_h.seqno = -1;
+ 		net_h.len = 0;
+ 		memcpy(cmd->nbuf, (char *)&net_h, hdrlen);
+ 	} else {
+@@ -235,7 +234,7 @@ udp_send(struct cmd_line *cmd, int sd, char *buf, int n)
+ 	addr.sin_port = htons(cmd->port);
+ 	addr.sin_addr.s_addr = inet_addr(cmd->output);
+ 	
+-	nwrite = sendto(sd, cmd->nbuf, n, 0, (struct sockaddr *)&addr, 
++	nwrite = sendto(sd, cmd->nbuf, n, 0, (struct sockaddr *)&addr,
+ 				sizeof(addr));
+ 	if (nwrite != n) {
+ 		printf("sendto: error\n");
+@@ -272,11 +271,11 @@ static char*
+ skip(char *ptr)
+ {
+ 	switch (*ptr) {
+-	case    '\0':   
++	case    '\0':
+ 	case    ' ':
+-	case    '\t':   
++	case    '\t':
+ 	case    '\n':
+-		break ;
++		break;
+ 	case    '\"':
+ 		ptr++;
+ 		while ((*ptr != '\"') && (*ptr != '\0') && (*ptr != '\n')) {
+@@ -285,8 +284,8 @@ skip(char *ptr)
+ 		if (*ptr != '\0') {
+ 			*ptr++ = '\0';
+ 		}
+-		break ;
+-	default :   
++		break;
++	default :
+ 		while ((*ptr != ' ') && (*ptr != '\t')
+ 			&& (*ptr != '\0') && (*ptr != '\n')) {
+ 			ptr++;
+@@ -294,7 +293,7 @@ skip(char *ptr)
+ 		if (*ptr != '\0') {
+ 			*ptr++ = '\0';
+ 		}
+-		break ;
++		break;
+ 	}
+ 	
+ 	while ((*ptr == ' ') || (*ptr == '\t') || (*ptr == '\n')) {
+@@ -304,7 +303,7 @@ skip(char *ptr)
+ 	return (ptr);
+ }
+ 
+-void 
++void
+ get_arg(char *buf, int *argc, char *argv[])
+ {
+ 	char *ptr;
+@@ -323,7 +322,7 @@ get_arg(char *buf, int *argc, char *argv[])
+ 	argv[*argc] = NULL;
+ }
+ 
+-static int 
++static int
+ udp_open(struct cmd_line *cmd)
+ {
+ 	int sd;
+@@ -362,7 +361,7 @@ udp_open(struct cmd_line *cmd)
+ 	return sd;
+ }
+ 
+-int 
++int
+ open_files(struct cmd_line *cmd)
+ {
+ 	if (cmd->src_scheme == PATH_FILE) {
+@@ -378,11 +377,11 @@ open_files(struct cmd_line *cmd)
+ 			return -1;
+ 		}
+ 		
+-		printf("decoder listening on port %d\n", cmd->port); 
++		printf("decoder listening on port %d\n", cmd->port);
+ 	}
+ 	
+ 	if (cmd->dst_scheme == PATH_FILE) {
+-		cmd->dst_fd = open(cmd->output, O_CREAT | O_RDWR, S_IRWXU | 
++		cmd->dst_fd = open(cmd->output, O_CREAT | O_RDWR, S_IRWXU |
+ 					S_IRWXG | S_IRWXO);
+ 		if (cmd->dst_fd < 0) {
+ 			perror("file open");
+@@ -401,7 +400,7 @@ open_files(struct cmd_line *cmd)
+ 			return -1;
+ 		}
+ 		
+-		printf("encoder sending on port %d\n", cmd->port); 
++		printf("encoder sending on port %d\n", cmd->port);
+ 	}
+ 
+ 	return 0;
+@@ -429,16 +428,31 @@ close_files(struct cmd_line *cmd)
+ int
+ check_params(struct cmd_line *cmd, int op)
+ {
+-	if (cmd->format != STD_MPEG4 && cmd->format != STD_H263 && 
+-			cmd->format != STD_AVC && (platform_is_mx27() || 
+-				cmd->format != STD_VC1)) {
+-		printf("Invalid format\n");
+-		return -1;
+-	}
+-
+-	printf("Format: %s\n", (cmd->format != STD_MPEG4) ? 
+-		       ((cmd->format != STD_H263) ? ((cmd->format != STD_AVC) ?
+-			"STD_VC1" : "STD_AVC") : "STD_H263") : "STD_MPEG4");
++	printf("Format: ");
++	switch (cmd->format) {
++	case STD_MPEG4:
++		printf("STD_MPEG4");
++		break;
++	case STD_H263:
++		printf("STD_H263");
++		break;
++	case STD_AVC:
++		printf("STD_AVC");
++		break;
++	case STD_VC1:
++		printf("STD_VC1");
++		break;
++	case STD_MPEG2:
++		printf("STD_MPEG2");
++		break;
++	case STD_DIV3:
++		printf("STD_DIV3");
++		break;
++	default:
++		printf("Unsupported Format!");
++		break;
++	}
++	printf("\n");
+ 
+ 	if (cmd->port == 0) {
+ 		cmd->port = DEFAULT_PORT;
+@@ -505,7 +519,9 @@ check_params(struct cmd_line *cmd, int op)
+ 		cmd->mirror = 0;
+ 	}
+ 
+-	if (cmd->format != STD_MPEG4 && cmd->mp4dblk_en) {
++	if (!(cmd->format == STD_MPEG4 || cmd->format == STD_H263 ||
++	    cmd->format == STD_MPEG2 || cmd->format == STD_DIV3) &&
++	    cmd->mp4dblk_en) {
+ 		printf("Warn: Deblocking only for MPEG4. Disabled!\n");
+ 		cmd->mp4dblk_en = 0;
+ 	}
+@@ -524,7 +540,7 @@ skip_unwanted(char *ptr)
+ 			continue;
+ 		}
+ 
+-		if (*ptr == '#') 
++		if (*ptr == '#')
+ 			break;
+ 		
+ 		buf[i++] = *ptr;
+@@ -665,6 +681,19 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode)
+ 		return 0;
+ 	}
+ 
++	str = strstr(buf, "dering");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				cmd->dering_en = strtol(str, NULL, 10);
++			}
++		}
++		
++		return 0;
++	}
++
+ 	str = strstr(buf, "mirror");
+ 	if (str != NULL) {
+ 		str = index(buf, '=');
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 081c956..0eece7a 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2007 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -29,7 +29,7 @@ typedef signed int s32;
+ typedef signed short s16;
+ typedef signed char s8;
+ 
+-#define STREAM_BUF_SIZE		0x40000	
++#define STREAM_BUF_SIZE		0x40000
+ #define STREAM_FILL_SIZE	0x8000
+ #define STREAM_READ_SIZE	(512 * 4)
+ #define STREAM_END_SIZE		0
+@@ -54,13 +54,14 @@ struct frame_buf {
+ 	int addrY;
+ 	int addrCb;
+ 	int addrCr;
++	int mvColBuf;
+ 	vpu_mem_desc desc;
+ };
+ 
+ struct v4l_buf {
+ 	void *start;
+ 	off_t offset;
+-	size_t length;	
++	size_t length;
+ };
+ 
+ struct vpu_display {
+@@ -82,7 +83,7 @@ struct capture_testbuffer {
+ struct cmd_line {
+ 	char input[MAX_PATH];	/* Input file name */
+ 	char output[MAX_PATH];  /* Output file name */
+-	int src_scheme;	
++	int src_scheme;
+ 	int dst_scheme;
+ 	int src_fd;
+ 	int dst_fd;
+@@ -90,6 +91,7 @@ struct cmd_line {
+ 	int height;
+ 	int format;
+ 	int mp4dblk_en;
++	int dering_en;
+ 	int rot_en;
+ 	int rot_angle;
+ 	int mirror;
+@@ -149,7 +151,7 @@ int check_params(struct cmd_line *cmd, int op);
+ char*skip_unwanted(char *ptr);
+ int parse_options(char *buf, struct cmd_line *cmd, int *mode);
+ 
+-struct vpu_display *v4l_display_open(int width, int height, int nframes, 
++struct vpu_display *v4l_display_open(int width, int height, int nframes,
+ 					int rot, int stride);
+ 
+ int v4l_put_data(struct vpu_display *disp);
+-- 
+1.8.0
+

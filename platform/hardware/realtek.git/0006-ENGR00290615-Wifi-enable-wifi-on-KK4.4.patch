@@ -1,0 +1,491 @@
+From dd1599aae3da3b1d4e9aa4e47b9ad979a9cc7cea Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Wed, 4 Dec 2013 11:52:05 +0800
+Subject: [PATCH 6/6] ENGR00290615 Wifi:enable wifi on KK4.4
+
+Update wpa_supplicant private lib which comes from Realtek.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ wlan/config/Android.mk                         |  29 ---
+ wlan/config/android_dhcpcd.conf                |   9 -
+ wlan/wpa_supplicant_8_lib/driver_cmd_nl80211.c | 245 +------------------------
+ wlan/wpa_supplicant_8_lib/driver_nl80211.h     |  28 ++-
+ wlan/wpa_supplicant_8_lib/rtw_version.h        |   4 +
+ 5 files changed, 31 insertions(+), 284 deletions(-)
+ delete mode 100755 wlan/config/Android.mk
+ delete mode 100755 wlan/config/android_dhcpcd.conf
+ create mode 100755 wlan/wpa_supplicant_8_lib/rtw_version.h
+
+diff --git a/wlan/config/Android.mk b/wlan/config/Android.mk
+deleted file mode 100755
+index 1353afb..0000000
+--- a/wlan/config/Android.mk
++++ /dev/null
+@@ -1,29 +0,0 @@
+-#
+-# Copyright (C) 2008 The Android Open Source Project
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#      http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-LOCAL_PATH := $(call my-dir)
+-ifneq ($(WPA_SUPPLICANT_VERSION),VER_0_8_UNITE)
+-########################
+-
+-include $(CLEAR_VARS)
+-LOCAL_MODULE := dhcpcd.conf
+-LOCAL_MODULE_TAGS := optional
+-LOCAL_MODULE_CLASS := ETC
+-LOCAL_MODULE_PATH := $(TARGET_OUT_ETC)/dhcpcd
+-LOCAL_SRC_FILES := android_dhcpcd.conf
+-include $(BUILD_PREBUILT)
+-
+-########################
+-endif
+diff --git a/wlan/config/android_dhcpcd.conf b/wlan/config/android_dhcpcd.conf
+deleted file mode 100755
+index e6b4414..0000000
+--- a/wlan/config/android_dhcpcd.conf
++++ /dev/null
+@@ -1,9 +0,0 @@
+-# dhcpcd configuration for Android Wi-Fi interface
+-# See dhcpcd.conf(5) for details.
+-
+-# Disable solicitation of IPv6 Router Advertisements
+-noipv6rs
+-
+-interface wlan0
+-# dhcpcd-run-hooks uses these options.
+-option subnet_mask, routers, domain_name_servers
+diff --git a/wlan/wpa_supplicant_8_lib/driver_cmd_nl80211.c b/wlan/wpa_supplicant_8_lib/driver_cmd_nl80211.c
+index 14b463b..bf16b1f 100755
+--- a/wlan/wpa_supplicant_8_lib/driver_cmd_nl80211.c
++++ b/wlan/wpa_supplicant_8_lib/driver_cmd_nl80211.c
+@@ -17,9 +17,6 @@
+ #include "android_drv.h"
+ #endif
+ 
+-#define WPA_PS_ENABLED		0
+-#define WPA_PS_DISABLED		1
+-
+ #define MAX_WPSP2PIE_CMD_SIZE		512
+ 
+ typedef struct android_wifi_priv_cmd {
+@@ -28,10 +25,6 @@ typedef struct android_wifi_priv_cmd {
+ 	int total_len;
+ } android_wifi_priv_cmd;
+ 
+-int send_and_recv_msgs(struct wpa_driver_nl80211_data *drv, struct nl_msg *msg,
+-		       int (*valid_handler)(struct nl_msg *, void *),
+-		       void *valid_data);
+-
+ static int drv_errors = 0;
+ 
+ static void wpa_driver_send_hang_msg(struct wpa_driver_nl80211_data *drv)
+@@ -43,166 +36,6 @@ static void wpa_driver_send_hang_msg(struct wpa_driver_nl80211_data *drv)
+ 	}
+ }
+ 
+-static int wpa_driver_set_power_save(void *priv, int state)
+-{
+-	struct i802_bss *bss = priv;
+-	struct wpa_driver_nl80211_data *drv = bss->drv;
+-	struct nl_msg *msg;
+-	int ret = -1;
+-	enum nl80211_ps_state ps_state;
+-
+-	msg = nlmsg_alloc();
+-	if (!msg)
+-		return -1;
+-
+-	genlmsg_put(msg, 0, 0, drv->global->nl80211_id, 0, 0,
+-		    NL80211_CMD_SET_POWER_SAVE, 0);
+-
+-	if (state == WPA_PS_ENABLED)
+-		ps_state = NL80211_PS_ENABLED;
+-	else
+-		ps_state = NL80211_PS_DISABLED;
+-
+-	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, drv->ifindex);
+-	NLA_PUT_U32(msg, NL80211_ATTR_PS_STATE, ps_state);
+-
+-	ret = send_and_recv_msgs(drv, msg, NULL, NULL);
+-	msg = NULL;
+-	if (ret < 0)
+-		wpa_printf(MSG_ERROR, "nl80211: Set power mode fail: %d", ret);
+-nla_put_failure:
+-	nlmsg_free(msg);
+-	return ret;
+-}
+-
+-static int get_power_mode_handler(struct nl_msg *msg, void *arg)
+-{
+-	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+-	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+-	int *state = (int *)arg;
+-
+-	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+-		  genlmsg_attrlen(gnlh, 0), NULL);
+-
+-	if (!tb[NL80211_ATTR_PS_STATE])
+-		return NL_SKIP;
+-
+-	if (state) {
+-		*state = (int)nla_get_u32(tb[NL80211_ATTR_PS_STATE]);
+-		wpa_printf(MSG_DEBUG, "nl80211: Get power mode = %d", *state);
+-		*state = (*state == NL80211_PS_ENABLED) ?
+-				WPA_PS_ENABLED : WPA_PS_DISABLED;
+-	}
+-
+-	return NL_SKIP;
+-}
+-
+-static int wpa_driver_get_power_save(void *priv, int *state)
+-{
+-	struct i802_bss *bss = priv;
+-	struct wpa_driver_nl80211_data *drv = bss->drv;
+-	struct nl_msg *msg;
+-	int ret = -1;
+-	enum nl80211_ps_state ps_state;
+-
+-	msg = nlmsg_alloc();
+-	if (!msg)
+-		return -1;
+-
+-	genlmsg_put(msg, 0, 0, drv->global->nl80211_id, 0, 0,
+-		    NL80211_CMD_GET_POWER_SAVE, 0);
+-
+-	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, drv->ifindex);
+-
+-	ret = send_and_recv_msgs(drv, msg, get_power_mode_handler, state);
+-	msg = NULL;
+-	if (ret < 0)
+-		wpa_printf(MSG_ERROR, "nl80211: Get power mode fail: %d", ret);
+-nla_put_failure:
+-	nlmsg_free(msg);
+-	return ret;
+-}
+-
+-static int wpa_driver_set_backgroundscan_params(void *priv)
+-{
+-	struct i802_bss *bss = priv;
+-	struct wpa_driver_nl80211_data *drv = bss->drv;
+-	struct wpa_supplicant *wpa_s;
+-	struct ifreq ifr;
+-	android_wifi_priv_cmd priv_cmd;
+-	int ret = 0, i = 0, bp;
+-	char buf[WEXT_PNO_MAX_COMMAND_SIZE];
+-	struct wpa_ssid *ssid_conf;
+-
+-	if (drv == NULL) {
+-		wpa_printf(MSG_ERROR, "%s: drv is NULL. Exiting", __func__);
+-		return -1;
+-	}
+-	if (drv->ctx == NULL) {
+-		wpa_printf(MSG_ERROR, "%s: drv->ctx is NULL. Exiting", __func__);
+-		return -1;
+-	}
+-	wpa_s = (struct wpa_supplicant *)(drv->ctx);
+-	if (wpa_s->conf == NULL) {
+-		wpa_printf(MSG_ERROR, "%s: wpa_s->conf is NULL. Exiting", __func__);
+-		return -1;
+-	}
+-	ssid_conf = wpa_s->conf->ssid;
+-
+-	bp = WEXT_PNOSETUP_HEADER_SIZE;
+-	os_memcpy(buf, WEXT_PNOSETUP_HEADER, bp);
+-	buf[bp++] = WEXT_PNO_TLV_PREFIX;
+-	buf[bp++] = WEXT_PNO_TLV_VERSION;
+-	buf[bp++] = WEXT_PNO_TLV_SUBVERSION;
+-	buf[bp++] = WEXT_PNO_TLV_RESERVED;
+-
+-	while ((i < WEXT_PNO_AMOUNT) && (ssid_conf != NULL)) {
+-		/* Check that there is enough space needed for 1 more SSID, the other sections and null termination */
+-		if ((bp + WEXT_PNO_SSID_HEADER_SIZE + MAX_SSID_LEN + WEXT_PNO_NONSSID_SECTIONS_SIZE + 1) >= (int)sizeof(buf))
+-			break;
+-		if ((!ssid_conf->disabled) && (ssid_conf->ssid_len <= MAX_SSID_LEN)){
+-			wpa_printf(MSG_DEBUG, "For PNO Scan: %s", ssid_conf->ssid);
+-			buf[bp++] = WEXT_PNO_SSID_SECTION;
+-			buf[bp++] = ssid_conf->ssid_len;
+-			os_memcpy(&buf[bp], ssid_conf->ssid, ssid_conf->ssid_len);
+-			bp += ssid_conf->ssid_len;
+-			i++;
+-		}
+-		ssid_conf = ssid_conf->next;
+-	}
+-
+-	buf[bp++] = WEXT_PNO_SCAN_INTERVAL_SECTION;
+-	os_snprintf(&buf[bp], WEXT_PNO_SCAN_INTERVAL_LENGTH + 1, "%x", WEXT_PNO_SCAN_INTERVAL);
+-	bp += WEXT_PNO_SCAN_INTERVAL_LENGTH;
+-
+-	buf[bp++] = WEXT_PNO_REPEAT_SECTION;
+-	os_snprintf(&buf[bp], WEXT_PNO_REPEAT_LENGTH + 1, "%x", WEXT_PNO_REPEAT);
+-	bp += WEXT_PNO_REPEAT_LENGTH;
+-
+-	buf[bp++] = WEXT_PNO_MAX_REPEAT_SECTION;
+-	os_snprintf(&buf[bp], WEXT_PNO_MAX_REPEAT_LENGTH + 1, "%x", WEXT_PNO_MAX_REPEAT);
+-	bp += WEXT_PNO_MAX_REPEAT_LENGTH + 1;
+-
+-	memset(&ifr, 0, sizeof(ifr));
+-	memset(&priv_cmd, 0, sizeof(priv_cmd));
+-	os_strncpy(ifr.ifr_name, bss->ifname, IFNAMSIZ);
+-
+-	priv_cmd.buf = buf;
+-	priv_cmd.used_len = bp;
+-	priv_cmd.total_len = bp;
+-	ifr.ifr_data = &priv_cmd;
+-
+-	ret = ioctl(drv->global->ioctl_sock, SIOCDEVPRIVATE + 1, &ifr);
+-
+-	if (ret < 0) {
+-		wpa_printf(MSG_ERROR, "ioctl[SIOCDEVPRIVATE+1] (pnosetup): %d", ret);
+-		wpa_driver_send_hang_msg(drv);
+-	} else {
+-		drv_errors = 0;
+-	}
+-	return ret;
+-}
+-
+ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
+ 				  size_t buf_len )
+ {
+@@ -225,59 +58,8 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
+ 		if (!ret)
+ 			ret = os_snprintf(buf, buf_len,
+ 					  "Macaddr = " MACSTR "\n", MAC2STR(macaddr));
+-	} else if (os_strcasecmp(cmd, "RELOAD") == 0) {
+-		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "HANGED");
+-	} else if (os_strncasecmp(cmd, "POWERMODE ", 10) == 0) {
+-		int state;
+-
+-		state = atoi(cmd + 10);
+-		ret = wpa_driver_set_power_save(priv, state);
+-		if (ret < 0)
+-			wpa_driver_send_hang_msg(drv);
+-		else
+-			drv_errors = 0;
+-	} else if (os_strncasecmp(cmd, "GETPOWER", 8) == 0) {
+-		int state = -1;
+-
+-		ret = wpa_driver_get_power_save(priv, &state);
+-		if (!ret && (state != -1)) {
+-			ret = os_snprintf(buf, buf_len, "POWERMODE = %d\n", state);
+-			drv_errors = 0;
+-		} else {
+-			wpa_driver_send_hang_msg(drv);
+-		}
+ 	} else { /* Use private command */
+-		if (os_strcasecmp(cmd, "BGSCAN-START") == 0) {
+-			ret = wpa_driver_set_backgroundscan_params(priv);
+-			if (ret < 0) {
+-				return ret;
+-			}
+-			os_memcpy(buf, "PNOFORCE 1", 11);
+-		} else if (os_strcasecmp(cmd, "BGSCAN-STOP") == 0) {
+-			os_memcpy(buf, "PNOFORCE 0", 11);
+-
+-		/*** for CONFIG_WFD ***/
+-		} else if (os_strcasecmp(cmd, "WFD-SET-TCPPORT") == 0) {
+-			char tmp[ 10 ] = { 0x00 };
+-			sprintf( tmp, "%s", buf );
+-			sprintf( buf, "%s = %s", cmd, tmp );
+-			wpa_printf(MSG_DEBUG, "WFD: %s", buf);
+-		} else if (os_strcasecmp(cmd, "WFD-SET-MAXTPUT") == 0) {
+-			char tmp[ 10 ] = { 0x00 };
+-			sprintf( tmp, "%s", buf );
+-			sprintf( buf, "%s = %s", cmd, tmp );
+-			wpa_printf(MSG_DEBUG, "WFD: %s", buf);
+-		} else if (os_strcasecmp(cmd, "WFD-SET-DEVTYPE") == 0) {
+-			char tmp[ 10 ] = { 0x00 };
+-			sprintf( tmp, "%s", buf );
+-			sprintf( buf, "%s = %s", cmd, tmp );
+-			wpa_printf(MSG_DEBUG, "WFD: %s", buf);
+-		/*** for CONFIG_WFD ***/
+-
+-		} else {
+-			os_memcpy(buf, cmd, strlen(cmd) + 1);
+-			wpa_printf(MSG_DEBUG, "%s %d buf = %s, len = %d", __func__, __LINE__, buf, strlen(buf));
+-		}
++		os_memcpy(buf, cmd, strlen(cmd) + 1);
+ 		memset(&ifr, 0, sizeof(ifr));
+ 		memset(&priv_cmd, 0, sizeof(priv_cmd));
+ 		os_strncpy(ifr.ifr_name, bss->ifname, IFNAMSIZ);
+@@ -285,7 +67,7 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
+ 		priv_cmd.buf = buf;
+ 		priv_cmd.used_len = buf_len;
+ 		priv_cmd.total_len = buf_len;
+-		ifr.ifr_data = &priv_cmd;
++		ifr.ifr_data = (void *)&priv_cmd;
+ 
+ 		if ((ret = ioctl(drv->global->ioctl_sock, SIOCDEVPRIVATE + 1, &ifr)) < 0) {
+ 			wpa_printf(MSG_ERROR, "%s: failed to issue private commands\n", __func__);
+@@ -296,9 +78,10 @@ int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
+ 			if ((os_strcasecmp(cmd, "LINKSPEED") == 0) ||
+ 			    (os_strcasecmp(cmd, "RSSI") == 0) ||
+ 			    (os_strcasecmp(cmd, "GETBAND") == 0) ||
+-			    (os_strcasecmp(cmd, "P2P_GET_NOA") == 0))
++			    (os_strncasecmp(cmd, "WLS_BATCHING", 12) == 0))
+ 				ret = strlen(buf);
+-			else if (os_strcasecmp(cmd, "COUNTRY") == 0)
++			else if ((os_strncasecmp(cmd, "COUNTRY", 7) == 0) ||
++				 (os_strncasecmp(cmd, "SETBAND", 7) == 0))
+ 				wpa_supplicant_event(drv->ctx,
+ 					EVENT_CHANNEL_LIST_CHANGED, NULL);
+ 			wpa_printf(MSG_DEBUG, "%s %s len = %d, %d", __func__, buf, ret, strlen(buf));
+@@ -319,20 +102,8 @@ int wpa_driver_set_p2p_noa(void *priv, u8 count, int start, int duration)
+ 
+ int wpa_driver_get_p2p_noa(void *priv, u8 *buf, size_t len)
+ {
+-	char rbuf[MAX_DRV_CMD_SIZE];
+-	char *cmd = "P2P_GET_NOA";
+-	int ret;
+-
+-	wpa_printf(MSG_DEBUG, "%s: Entry", __func__);
+-	os_memset(buf, 0, len);
+-	ret = wpa_driver_nl80211_driver_cmd(priv, cmd, rbuf, sizeof(rbuf));
+-	if (ret <= 0)
+-		return 0;
+-	ret >>= 1;
+-	if (ret > (int)len)
+-		ret = (int)len;
+-	hexstr2bin(rbuf, buf, ret);
+-	return ret;
++	/* Return 0 till we handle p2p_presence request completely in the driver */
++	return 0;
+ }
+ 
+ int wpa_driver_set_p2p_ps(void *priv, int legacy_ps, int opp_ps, int ctwindow)
+@@ -391,7 +162,7 @@ int wpa_driver_set_ap_wps_p2p_ie(void *priv, const struct wpabuf *beacon,
+ 				os_memcpy(pbuf, wpabuf_head(ap_wps_p2p_ie), wpabuf_len(ap_wps_p2p_ie));
+ 				ret = wpa_driver_nl80211_driver_cmd(priv, buf, buf,
+ 					strlen(_cmd) + 3 + wpabuf_len(ap_wps_p2p_ie));
+-				
++
+ 				os_free(buf);				
+ 			} else {
+ 				wpa_printf(MSG_ERROR, "%s: os_zalloc fail", __func__);
+diff --git a/wlan/wpa_supplicant_8_lib/driver_nl80211.h b/wlan/wpa_supplicant_8_lib/driver_nl80211.h
+index 941eea9..ba1ba0f 100755
+--- a/wlan/wpa_supplicant_8_lib/driver_nl80211.h
++++ b/wlan/wpa_supplicant_8_lib/driver_nl80211.h
+@@ -1,19 +1,13 @@
+ /*
+  * Driver interaction with Linux nl80211/cfg80211
+- * Copyright (c) 2002-2010, Jouni Malinen <j@w1.fi>
++ * Copyright (c) 2002-2012, Jouni Malinen <j@w1.fi>
+  * Copyright (c) 2003-2004, Instant802 Networks, Inc.
+  * Copyright (c) 2005-2006, Devicescape Software, Inc.
+  * Copyright (c) 2007, Johannes Berg <johannes@sipsolutions.net>
+  * Copyright (c) 2009-2010, Atheros Communications
+  *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+- *
+- * Alternatively, this software may be distributed under the terms of BSD
+- * license.
+- *
+- * See README and COPYING for more details.
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
+  */
+ 
+ #ifndef _DRIVER_NL80211_H_
+@@ -31,12 +25,15 @@
+ #include <linux/rtnetlink.h>
+ #include <netpacket/packet.h>
+ #include <linux/filter.h>
++#include <linux/errqueue.h>
+ #include "nl80211_copy.h"
+ 
+ #include "common.h"
+ #include "eloop.h"
+ #include "utils/list.h"
+ #include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
++#include "l2_packet/l2_packet.h"
+ #include "netlink.h"
+ #include "linux_ioctl.h"
+ #include "radiotap.h"
+@@ -68,6 +65,8 @@
+ struct nl80211_global {
+ 	struct dl_list interfaces;
+ 	int if_add_ifindex;
++	u64 if_add_wdevid;
++	int if_add_wdevid_set;
+ 	struct netlink_data *netlink;
+ 	struct nl_cb *nl_cb;
+ 	struct nl_handle *nl;
+@@ -92,16 +91,21 @@ struct i802_bss {
+ 	struct wpa_driver_nl80211_data *drv;
+ 	struct i802_bss *next;
+ 	int ifindex;
++	u64 wdev_id;
+ 	char ifname[IFNAMSIZ + 1];
+ 	char brname[IFNAMSIZ];
+ 	unsigned int beacon_set:1;
+ 	unsigned int added_if_into_bridge:1;
+ 	unsigned int added_bridge:1;
++	unsigned int in_deinit:1;
++	unsigned int wdev_id_set:1;
+ 
+ 	u8 addr[ETH_ALEN];
+ 
+ 	int freq;
++	int if_dynamic;
+ 
++	void *ctx;
+ 	struct nl_handle *nl_preq, *nl_mgmt;
+ 	struct nl_cb *nl_cb;
+ 
+@@ -121,6 +125,8 @@ struct wpa_driver_nl80211_data {
+ 	int ignore_if_down_event;
+ 	struct rfkill_data *rfkill;
+ 	struct wpa_driver_capa capa;
++	u8 *extended_capa, *extended_capa_mask;
++	unsigned int extended_capa_len;
+ 	int has_capability;
+ 
+ 	int operstate;
+@@ -130,7 +136,9 @@ struct wpa_driver_nl80211_data {
+ 	struct nl_cb *nl_cb;
+ 
+ 	u8 auth_bssid[ETH_ALEN];
++	u8 auth_attempt_bssid[ETH_ALEN];
+ 	u8 bssid[ETH_ALEN];
++	u8 prev_bssid[ETH_ALEN];
+ 	int associated;
+ 	u8 ssid[32];
+ 	size_t ssid_len;
+@@ -151,6 +159,8 @@ struct wpa_driver_nl80211_data {
+ 	unsigned int scan_for_auth:1;
+ 	unsigned int retry_auth:1;
+ 	unsigned int use_monitor:1;
++	unsigned int ignore_next_local_disconnect:1;
++	unsigned int allow_p2p_device:1;
+ 
+ 	u64 remain_on_chan_cookie;
+ 	u64 send_action_cookie;
+diff --git a/wlan/wpa_supplicant_8_lib/rtw_version.h b/wlan/wpa_supplicant_8_lib/rtw_version.h
+new file mode 100755
+index 0000000..eb73857
+--- /dev/null
++++ b/wlan/wpa_supplicant_8_lib/rtw_version.h
+@@ -0,0 +1,4 @@
++#ifndef RTW_VERSION_H
++	#define RTW_VERSION_H
++	#define RTW_VERSION "rtw_r9640.20131122"
++#endif /* RTW_VERSION_H */
+-- 
+1.8.0
+

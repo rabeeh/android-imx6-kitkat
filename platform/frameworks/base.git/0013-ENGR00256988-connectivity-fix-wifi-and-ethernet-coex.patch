@@ -1,0 +1,78 @@
+From 942751d9deaf663f7ee2ed35b42c584a662425e2 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Fri, 19 Apr 2013 13:55:38 +0800
+Subject: [PATCH 13/32] ENGR00256988 connectivity:fix wifi and ethernet
+ coexist bug
+
+enable wifi and connect to a AP while ethernet cable plugged in. wifi
+will be teared down.But driver is not stopped.After unplug ethernet cable.
+It will failed to auto reconnect wifi.fix it here.
+
+Change-Id: I1b0156cf89f26747ce67ebad2b4138e8d61f30df
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ wifi/java/android/net/wifi/WifiStateMachine.java | 28 ++++++++++++++++++------
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/wifi/java/android/net/wifi/WifiStateMachine.java b/wifi/java/android/net/wifi/WifiStateMachine.java
+index eedd66f..3a03a0c 100644
+--- a/wifi/java/android/net/wifi/WifiStateMachine.java
++++ b/wifi/java/android/net/wifi/WifiStateMachine.java
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2010 The Android Open Source Project
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -2420,6 +2421,16 @@ public class WifiStateMachine extends StateMachine {
+         mWifiNative.reconnect();
+     }
+ 
++    private void handleStopDriverCmd() {
++        if (getCurrentState() != mDisconnectedState) {
++            mWifiNative.disconnect();
++            handleNetworkDisconnect();
++        }
++        mWakeLock.acquire();
++        mWifiNative.stopDriver();
++        mWakeLock.release();
++	}
++
+     /* Current design is to not set the config on a running hostapd but instead
+      * stop and start tethering when user changes config on a running access point
+      *
+@@ -3160,13 +3171,7 @@ public class WifiStateMachine extends StateMachine {
+                 case CMD_DELAYED_STOP_DRIVER:
+                     if (DBG) log("delayed stop " + message.arg1 + " " + mDelayedStopCounter);
+                     if (message.arg1 != mDelayedStopCounter) break;
+-                    if (getCurrentState() != mDisconnectedState) {
+-                        mWifiNative.disconnect();
+-                        handleNetworkDisconnect();
+-                    }
+-                    mWakeLock.acquire();
+-                    mWifiNative.stopDriver();
+-                    mWakeLock.release();
++                    handleStopDriverCmd();
+                     if (mP2pSupported) {
+                         transitionTo(mWaitForP2pDisableState);
+                     } else {
+@@ -3843,6 +3848,15 @@ public class WifiStateMachine extends StateMachine {
+                     sendNetworkStateChangeBroadcast(mLastBssid);
+                     transitionTo(mConnectedState);
+                     break;
++                case CMD_STOP_DRIVER:
++                    handleStopDriverCmd();
++                    if (mP2pSupported) {
++                        transitionTo(mWaitForP2pDisableState);
++                    } else {
++                        transitionTo(mDriverStoppingState);
++                    }
++                    break;
++
+                 default:
+                     return NOT_HANDLED;
+             }
+-- 
+1.8.0
+

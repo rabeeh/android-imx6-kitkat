@@ -1,0 +1,104 @@
+From fff4695f01828f1d731da82ad93f8cb118c3b357 Mon Sep 17 00:00:00 2001
+From: Shengjiu Wang <b02247@freescale.com>
+Date: Mon, 30 Dec 2013 17:19:07 +0800
+Subject: [PATCH 486/486] ENGR00293617 implement api
+ get_presentation_position.
+
+implement api get_presentation_position in audio HAL.
+
+Change-Id: Iea47f41d8c40c9a7187eef1fb606ff1a27d2f35b
+Signed-off-by: Shengjiu Wang <b02247@freescale.com>
+---
+ alsa/audio_hardware.h |  1 +
+ alsa/tinyalsa_hal.c   | 35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/alsa/audio_hardware.h b/alsa/audio_hardware.h
+index 19f11fd..f0476cd 100644
+--- a/alsa/audio_hardware.h
++++ b/alsa/audio_hardware.h
+@@ -131,6 +131,7 @@ struct imx_stream_out {
+     int write_flags[PCM_TOTAL];
+     int device;
+     size_t buffer_frames;
++    uint64_t written;
+     audio_channel_mask_t channel_mask;
+     audio_channel_mask_t sup_channel_masks[3];
+     int sup_rates[MAX_SUP_RATE_NUM];
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index cb57878..5084138 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -1217,6 +1217,7 @@ static ssize_t out_write_primary(struct audio_stream_out *stream, const void* bu
+                 break;
+         }
+    }
++   if (ret == 0)  out->written += bytes / frame_size;
+ 
+ exit:
+     pthread_mutex_unlock(&out->lock);
+@@ -1268,6 +1269,7 @@ static ssize_t out_write_hdmi(struct audio_stream_out *stream, const void* buffe
+     /* do not allow more than out->write_threshold frames in kernel pcm driver buffer */
+ 
+     ret = pcm_write_wrapper(out->pcm[PCM_HDMI], (void *)buffer, bytes, out->write_flags[PCM_HDMI]);
++    if (ret == 0)  out->written += bytes / frame_size;
+ 
+ exit:
+     pthread_mutex_unlock(&out->lock);
+@@ -1361,6 +1363,7 @@ static ssize_t out_write_esai(struct audio_stream_out *stream, const void* buffe
+ 
+     convert_output_for_esai(buffer, bytes, out->config[PCM_ESAI].channels);
+     ret = pcm_write_wrapper(out->pcm[PCM_ESAI], (void *)buffer, bytes, out->write_flags[PCM_ESAI]);
++    if (ret == 0)  out->written += bytes / frame_size;
+ 
+ exit:
+     pthread_mutex_unlock(&out->lock);
+@@ -1391,6 +1394,37 @@ static int out_remove_audio_effect(const struct audio_stream *stream, effect_han
+     return 0;
+ }
+ 
++static int out_get_presentation_position(const struct audio_stream_out *stream,
++                                   uint64_t *frames, struct timespec *timestamp)
++{
++    struct imx_stream_out *out = (struct imx_stream_out *)stream;
++    struct imx_audio_device *adev = out->dev;
++    int ret = -1;
++    int i;
++
++    pthread_mutex_lock(&out->lock);
++
++    for (i = 0; i < PCM_TOTAL; i++)
++        if (out->pcm[i]) {
++            size_t avail;
++            if (pcm_get_htimestamp(out->pcm[i], &avail, timestamp) == 0) {
++                size_t kernel_buffer_size = out->config[i].period_size * out->config[i].period_count;
++		/*Actually we have no case for adev->default_rate != out->config[i].rate */
++                int64_t signed_frames = out->written - (kernel_buffer_size - avail) * adev->default_rate / out->config[i].rate;
++
++                if (signed_frames >= 0) {
++                    *frames = signed_frames;
++                    ret = 0;
++                }
++                break;
++            }
++        }
++
++    pthread_mutex_unlock(&out->lock);
++
++    return ret;
++}
++
+ /** audio_stream_in implementation **/
+ 
+ /* must be called with hw device and input stream mutexes locked */
+@@ -2683,6 +2717,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
+     out->stream.common.remove_audio_effect  = out_remove_audio_effect;
+     out->stream.set_volume                  = out_set_volume;
+     out->stream.get_render_position         = out_get_render_position;
++    out->stream.get_presentation_position   = out_get_presentation_position;
+ 
+     out->dev = ladev;
+     out->standby = 1;
+-- 
+1.8.0
+

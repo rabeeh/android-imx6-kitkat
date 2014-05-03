@@ -1,0 +1,833 @@
+From 5887f52ce6ac1538817d11483b4f4a8b4b0c9cf3 Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Mon, 28 Jun 2010 11:14:49 +0800
+Subject: [PATCH 115/249] ENGR00124665 ipu lib: add 4-stripe resizing support
+
+To support 1080p output.
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ ipu/mxc_ipu_hl_lib.c | 496 ++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 374 insertions(+), 122 deletions(-)
+
+diff --git a/ipu/mxc_ipu_hl_lib.c b/ipu/mxc_ipu_hl_lib.c
+index 13f8808..be020ba 100644
+--- a/ipu/mxc_ipu_hl_lib.c
++++ b/ipu/mxc_ipu_hl_lib.c
+@@ -74,9 +74,18 @@ enum {
+ 	VDI_IC_VF = 0x40,
+ };
+ 
++/* spilt modes */
+ enum {
+-	LEFT_STRIPE,
+-	RIGHT_STRIPE,
++	SPLIT_MODE_NONE = 0,
++	SPLIT_MODE_RL = 0x1, /* right-left */
++	SPLIT_MODE_UD = 0x2, /* up-down */
++};
++
++enum {
++	LEFT_STRIPE = 0x1,
++	RIGHT_STRIPE = 0x2,
++	UP_STRIPE = 0x4,
++	DOWN_STRIPE = 0x8,
+ };
+ 
+ typedef enum {
+@@ -106,12 +115,9 @@ typedef struct {
+         ipu_mem_info ov_minfo[2];
+ 	ipu_mem_info ov_alpha_minfo[2];
+ 
+-	/* org input param */
+-	int input_width;
+-	int input_height;
+-	int input_fmt;
+-	int input_stride;
+ 	/* input param after cropping */
++	int ifmt;
++	int istride;
+ 	int iwidth;
+ 	int iheight;
+ 	int i_off;
+@@ -131,6 +137,8 @@ typedef struct {
+ 	int split_mode;
+ 	struct stripe_param left_stripe;
+ 	struct stripe_param right_stripe;
++	struct stripe_param up_stripe;
++	struct stripe_param down_stripe;
+ 
+ 	ipu_motion_sel motion_sel;
+ 	dma_addr_t last_inbuf_paddr;
+@@ -158,13 +166,9 @@ typedef struct {
+ 		int screen_size;
+ 		ipu_channel_t fb_chan;
+ 
+-		/* org output param */
+-		int output_width;
+-		int output_height;
+-		int output_fmt;
+-		int output_stride;
+-
+ 		/* output param after cropping */
++		int ofmt;
++		int ostride;
+ 		int owidth;
+ 		int oheight;
+ 		int o_off;
+@@ -310,6 +314,21 @@ static int _ipu_get_arch_rot_begin()
+ 		return IPU_ROTATE_90_RIGHT;
+ }
+ 
++static int _ipu_get_arch_ic_out_max_height()
++{
++	unsigned int system_rev, arch;
++
++	if (get_system_rev(&system_rev) < 0)
++		return 1024;
++
++	arch = system_rev & 0xff000;
++	/* for ipuv3 */
++	if ((arch == 0x37000) || (arch == 0x51000)
++		|| (arch == 0x53000))
++		return 1024;
++	return 1024;
++}
++
+ static int _ipu_get_arch_ic_out_max_width()
+ {
+ 	unsigned int system_rev, arch;
+@@ -319,7 +338,8 @@ static int _ipu_get_arch_ic_out_max_width()
+ 
+ 	arch = system_rev & 0xff000;
+ 	/* for ipuv3 */
+-	if ((arch == 0x37000) || (arch == 0x51000))
++	if ((arch == 0x37000) || (arch == 0x51000)
++		|| (arch == 0x53000))
+ 		return 1024;
+ 	return 1024;
+ }
+@@ -409,50 +429,123 @@ static void _ipu_update_offset(unsigned int fmt, unsigned int width, unsigned in
+ int _ipu_split_mode_set_stripe(ipu_lib_priv_handle_t * ipu_priv_handle, dma_addr_t in_buf_paddr,
+ 				dma_addr_t out_buf_paddr, int stripe, int select_buf)
+ {
+-	int i_off, o_off;
+-	int buf_idx, ret = 0;
+-
+-	if (stripe == LEFT_STRIPE) {
+-		dbg(DBG_DEBUG, "split mode set buffer for left stripe!\n");
++	int i_hoff = 0, i_voff = 0, o_hoff = 0, o_voff = 0, i_eoff = 0, o_eoff = 0;
++	int buf_idx = 0, ret = 0;
++
++	if (stripe & LEFT_STRIPE) {
++		dbg(DBG_DEBUG, "split mode set buffer for left\n");
++		i_hoff = ipu_priv_handle->left_stripe.input_column *
++			bytes_per_pixel(ipu_priv_handle->ifmt);
++		o_hoff = ipu_priv_handle->left_stripe.output_column *
++			bytes_per_pixel(ipu_priv_handle->output.ofmt);
++		if (stripe & UP_STRIPE) {
++			dbg(DBG_DEBUG, "-up stripe!\n");
++			buf_idx = 0;
++			i_eoff = i_hoff + ipu_priv_handle->up_stripe.input_column *
++				ipu_priv_handle->istride;
++			o_eoff = o_hoff + ipu_priv_handle->up_stripe.output_column *
++				ipu_priv_handle->output.ostride;
++			i_voff = ipu_priv_handle->up_stripe.input_column;
++			o_voff = ipu_priv_handle->up_stripe.output_column;
++		} else if (stripe & DOWN_STRIPE) {
++			dbg(DBG_DEBUG, "-down stripe!\n");
++			buf_idx = 1;
++			i_eoff = i_hoff +
++				ipu_priv_handle->down_stripe.input_column *
++				ipu_priv_handle->istride;
++			o_eoff = o_hoff + ipu_priv_handle->down_stripe.output_column *
++				ipu_priv_handle->output.ostride;
++			i_voff = ipu_priv_handle->down_stripe.input_column;
++			o_voff = ipu_priv_handle->down_stripe.output_column;
++		} else {
++			dbg(DBG_DEBUG, "stripe!\n");
++			buf_idx = 0;
++			i_eoff = i_hoff;
++			o_eoff = o_hoff;
++			i_voff = o_voff = 0;
++		}
++	} else if (stripe & RIGHT_STRIPE){
++		dbg(DBG_DEBUG, "split mode set buffer for right\n");
++		i_hoff = ipu_priv_handle->right_stripe.input_column *
++			bytes_per_pixel(ipu_priv_handle->ifmt);
++		o_hoff = ipu_priv_handle->right_stripe.output_column *
++			bytes_per_pixel(ipu_priv_handle->output.ofmt);
++		if (stripe & UP_STRIPE) {
++			dbg(DBG_DEBUG, "-up stripe!\n");
++			buf_idx = 0;
++			i_eoff = i_hoff + ipu_priv_handle->up_stripe.input_column *
++				ipu_priv_handle->istride;
++			o_eoff = o_hoff + ipu_priv_handle->up_stripe.output_column *
++				ipu_priv_handle->output.ostride;
++			i_voff = ipu_priv_handle->up_stripe.input_column;
++			o_voff = ipu_priv_handle->up_stripe.output_column;
++		} else if (stripe & DOWN_STRIPE) {
++			dbg(DBG_DEBUG, "-down stripe!\n");
++			buf_idx = 1;
++			i_eoff = i_hoff + ipu_priv_handle->down_stripe.input_column *
++				ipu_priv_handle->istride;
++			o_eoff = o_hoff + ipu_priv_handle->down_stripe.output_column *
++				ipu_priv_handle->output.ostride;
++			i_voff = ipu_priv_handle->down_stripe.input_column;
++			o_voff = ipu_priv_handle->down_stripe.output_column;
++		} else {
++			dbg(DBG_DEBUG, "stripe!\n");
++			buf_idx = 1;
++			i_eoff = i_hoff;
++			o_eoff = o_hoff;
++			i_voff = o_voff = 0;
++		}
++	} else if (stripe & UP_STRIPE){
++		dbg(DBG_DEBUG, "split mode set buffer for up stripe!\n");
+ 		buf_idx = 0;
+-		i_off = ipu_priv_handle->left_stripe.input_column;
+-		o_off = ipu_priv_handle->left_stripe.output_column;
+-	} else {
+-		dbg(DBG_DEBUG, "split mode set buffer for right stripe!\n");
++		i_hoff = o_hoff = 0;
++		i_eoff = ipu_priv_handle->up_stripe.input_column *
++			ipu_priv_handle->istride;
++		o_eoff = ipu_priv_handle->up_stripe.output_column *
++			ipu_priv_handle->output.ostride;
++		i_voff = ipu_priv_handle->up_stripe.input_column;
++		o_voff = ipu_priv_handle->up_stripe.output_column;
++	} else if (stripe & DOWN_STRIPE){
++		dbg(DBG_DEBUG, "split mode set buffer for down stripe!\n");
+ 		buf_idx = 1;
+-		i_off = ipu_priv_handle->right_stripe.input_column;
+-		o_off = ipu_priv_handle->right_stripe.output_column;
++		i_hoff = o_hoff = 0;
++		i_eoff = ipu_priv_handle->down_stripe.input_column *
++			ipu_priv_handle->istride;
++		o_eoff = ipu_priv_handle->down_stripe.output_column *
++			ipu_priv_handle->output.ostride;
++		i_voff = ipu_priv_handle->down_stripe.input_column;
++		o_voff = ipu_priv_handle->down_stripe.output_column;
+ 	}
+ 
+ 	ret = ipu_update_channel_buffer(ipu_priv_handle->output.ic_chan,
+ 			IPU_OUTPUT_BUFFER,
+ 			buf_idx,
+ 			out_buf_paddr + ipu_priv_handle->output.o_off +
+-			o_off);
++			o_eoff);
+ 	ret += ipu_update_channel_offset(ipu_priv_handle->output.ic_chan,
+ 			IPU_OUTPUT_BUFFER,
+-			ipu_priv_handle->output.output_fmt,
++			ipu_priv_handle->output.ofmt,
+ 			ipu_priv_handle->output.owidth,
+ 			ipu_priv_handle->output.oheight,
+-			ipu_priv_handle->output.output_stride,
++			ipu_priv_handle->output.ostride,
+ 			ipu_priv_handle->output.o_uoff,
+ 			ipu_priv_handle->output.o_voff,
+-			0,
+-			o_off);
++			o_voff,
++			o_hoff);
+ 	ret += ipu_update_channel_buffer(ipu_priv_handle->output.ic_chan,
+ 			IPU_INPUT_BUFFER,
+ 			buf_idx,
+-			in_buf_paddr + ipu_priv_handle->i_off + i_off);
++			in_buf_paddr + ipu_priv_handle->i_off + i_eoff);
+ 	ret += ipu_update_channel_offset(ipu_priv_handle->output.ic_chan,
+ 			IPU_INPUT_BUFFER,
+-			ipu_priv_handle->input_fmt,
++			ipu_priv_handle->ifmt,
+ 			ipu_priv_handle->iwidth,
+ 			ipu_priv_handle->iheight,
+-			ipu_priv_handle->input_stride,
++			ipu_priv_handle->istride,
+ 			ipu_priv_handle->i_uoff,
+ 			ipu_priv_handle->i_voff,
+-			0,
+-			i_off);
++			i_voff,
++			i_hoff);
+ 	if (ret < 0) {
+ 		dbg(DBG_ERR, "_ipu_split_mode_set_stripe failed!\n");
+ 		return ret;
+@@ -542,9 +635,7 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 		goto done;
+ 	}
+ 
+-	ipu_priv_handle->input_width = input->width;
+-	ipu_priv_handle->input_height = input->height;
+-	ipu_priv_handle->input_fmt = input->fmt;
++	ipu_priv_handle->ifmt = input->fmt;
+ 	ipu_priv_handle->motion_sel = input->motion_sel;
+ 	if ((input->input_crop_win.win_w > 0) || (input->input_crop_win.win_h > 0)) {
+ 		if ((input->input_crop_win.win_w + input->input_crop_win.pos.x) > input->width)
+@@ -598,9 +689,7 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 		}
+ 	}
+ 
+-	ipu_priv_handle->output.output_width = output->width;
+-	ipu_priv_handle->output.output_height = output->height;
+-	ipu_priv_handle->output.output_fmt = output->fmt;
++	ipu_priv_handle->output.ofmt = output->fmt;
+ 	if ((output->output_win.win_w > 0) || (output->output_win.win_h > 0)) {
+ 		if ((output->output_win.win_w + output->output_win.pos.x) > output->width)
+ 			output->output_win.win_w = output->width - output->output_win.pos.x;
+@@ -629,7 +718,9 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 	}
+ 	/* whether output size is too big, if so, enable split mode */
+ 	if (ipu_priv_handle->output.owidth > _ipu_get_arch_ic_out_max_width())
+-		ipu_priv_handle->split_mode = 1;
++		ipu_priv_handle->split_mode |= SPLIT_MODE_RL;
++	if (ipu_priv_handle->output.oheight > _ipu_get_arch_ic_out_max_height())
++		ipu_priv_handle->split_mode |= SPLIT_MODE_UD;
+ 
+ 	if (overlay) {
+ 		if ((ipu_priv_handle->ovwidth != ipu_priv_handle->output.owidth) ||
+@@ -665,7 +756,8 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 			ret = -1;
+ 			goto done;
+ 		}
+-		ipu_calc_stripes_sizes(ipu_priv_handle->iwidth,
++		if (ipu_priv_handle->split_mode & SPLIT_MODE_RL)
++			ipu_calc_stripes_sizes(ipu_priv_handle->iwidth,
+ 					ipu_priv_handle->output.owidth,
+ 					_ipu_get_arch_ic_out_max_width(),
+ 					(((unsigned long long)1) << 32), /* 32bit for fractional*/
+@@ -674,6 +766,16 @@ static int _ipu_task_check(ipu_lib_input_param_t * input,
+ 					output->fmt,
+ 					&ipu_priv_handle->left_stripe,
+ 					&ipu_priv_handle->right_stripe);
++		if (ipu_priv_handle->split_mode & SPLIT_MODE_UD)
++			ipu_calc_stripes_sizes(ipu_priv_handle->iheight,
++					ipu_priv_handle->output.oheight,
++					_ipu_get_arch_ic_out_max_height(),
++					(((unsigned long long)1) << 32), /* 32bit for fractional*/
++					1, /* equal stripes */
++					input->fmt,
++					output->fmt,
++					&ipu_priv_handle->up_stripe,
++					&ipu_priv_handle->down_stripe);
+ 	}
+ 
+ 	if (ipu_priv_handle->output.task_mode == NULL_MODE) {
+@@ -1326,8 +1428,8 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 	dbg(DBG_INFO, "\t\tbuf1 0x%x\n", ipu_priv_handle->output.o_minfo[1].paddr);
+ 	dbg(DBG_INFO, "\t\tbuf2 0x%x\n", ipu_priv_handle->output.o_minfo[2].paddr);
+ 
+-	if (ipu_priv_handle->split_mode) {
+-		dbg(DBG_INFO, "\033[0;34msplit mode enable:\033[0m\n");
++	if (ipu_priv_handle->split_mode & SPLIT_MODE_RL) {
++		dbg(DBG_INFO, "\033[0;34msplit mode right-left enable:\033[0m\n");
+ 		dbg(DBG_INFO, "left stripe:\n");
+ 		dbg(DBG_INFO, "\tinput width: %d\n", ipu_priv_handle->left_stripe.input_width);
+ 		dbg(DBG_INFO, "\toutput width: %d\n", ipu_priv_handle->left_stripe.output_width);
+@@ -1340,6 +1442,20 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 		dbg(DBG_INFO, "\tinput column: %d\n", ipu_priv_handle->right_stripe.input_column);
+ 		dbg(DBG_INFO, "\toutput column: %d\n", ipu_priv_handle->right_stripe.output_column);
+ 	}
++	if (ipu_priv_handle->split_mode & SPLIT_MODE_UD) {
++		dbg(DBG_INFO, "\033[0;34msplit mode up-down enable:\033[0m\n");
++		dbg(DBG_INFO, "up stripe:\n");
++		dbg(DBG_INFO, "\tinput width: %d\n", ipu_priv_handle->up_stripe.input_width);
++		dbg(DBG_INFO, "\toutput width: %d\n", ipu_priv_handle->up_stripe.output_width);
++		dbg(DBG_INFO, "\tinput column: %d\n", ipu_priv_handle->up_stripe.input_column);
++		dbg(DBG_INFO, "\toutput column: %d\n", ipu_priv_handle->up_stripe.output_column);
++		dbg(DBG_INFO, "\tirr: %d\n", ipu_priv_handle->up_stripe.irr);
++		dbg(DBG_INFO, "down stripe:\n");
++		dbg(DBG_INFO, "\tinput width: %d\n", ipu_priv_handle->down_stripe.input_width);
++		dbg(DBG_INFO, "\toutput width: %d\n", ipu_priv_handle->down_stripe.output_width);
++		dbg(DBG_INFO, "\tinput column: %d\n", ipu_priv_handle->down_stripe.input_column);
++		dbg(DBG_INFO, "\toutput column: %d\n", ipu_priv_handle->down_stripe.output_column);
++	}
+ 
+ 	dbg(DBG_INFO, "\033[0;34mEnabling:\033[0m\n");
+ 	/*Setup ipu channel*/
+@@ -1373,19 +1489,23 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 
+ 		memset(&params, 0, sizeof (params));
+ 
+-		if (ipu_priv_handle->split_mode)
++		if (ipu_priv_handle->split_mode & SPLIT_MODE_RL) {
+ 			params.mem_prp_vf_mem.in_width = ipu_priv_handle->left_stripe.input_width;
+-		else
+-			params.mem_prp_vf_mem.in_width = ipu_priv_handle->iwidth;
+-		params.mem_prp_vf_mem.in_height = ipu_priv_handle->iheight;
+-		params.mem_prp_vf_mem.in_pixel_fmt = input->fmt;
+-
+-		if (ipu_priv_handle->split_mode) {
+ 			params.mem_prp_vf_mem.out_width = ipu_priv_handle->left_stripe.output_width;
+ 			params.mem_prp_vf_mem.outh_resize_ratio = ipu_priv_handle->left_stripe.irr;
+-		} else
++		} else {
++			params.mem_prp_vf_mem.in_width = ipu_priv_handle->iwidth;
+ 			params.mem_prp_vf_mem.out_width = ipu_priv_handle->output.owidth;
+-		params.mem_prp_vf_mem.out_height = ipu_priv_handle->output.oheight;
++		}
++		if (ipu_priv_handle->split_mode & SPLIT_MODE_UD) {
++			params.mem_prp_vf_mem.in_height = ipu_priv_handle->up_stripe.input_width;
++			params.mem_prp_vf_mem.out_height = ipu_priv_handle->up_stripe.output_width;
++			params.mem_prp_vf_mem.outv_resize_ratio = ipu_priv_handle->up_stripe.irr;
++		} else {
++			params.mem_prp_vf_mem.in_height = ipu_priv_handle->iheight;
++			params.mem_prp_vf_mem.out_height = ipu_priv_handle->output.oheight;
++		}
++		params.mem_prp_vf_mem.in_pixel_fmt = input->fmt;
+ 		params.mem_prp_vf_mem.out_pixel_fmt = output->fmt;
+ 
+ 		params.mem_prp_vf_mem.motion_sel = ipu_priv_handle->motion_sel;
+@@ -1414,7 +1534,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				goto done;
+ 		}
+ 
+-		ipu_priv_handle->input_stride = input->width*bytes_per_pixel(input->fmt);
++		ipu_priv_handle->istride = input->width*bytes_per_pixel(input->fmt);
+ 		buf0 = ipu_priv_handle->i_minfo[0].paddr + ipu_priv_handle->i_off;
+ 		buf1 = ipu_priv_handle->mode & OP_STREAM_MODE ?
+ 			ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->i_off : 0;
+@@ -1423,12 +1543,12 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			buf0 = ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->i_off;
+ 			buf1 = ipu_priv_handle->mode & OP_STREAM_MODE ?
+ 			       ipu_priv_handle->i_minfo[2].paddr + ipu_priv_handle->i_off : 0;
+-			buf0_p = ipu_priv_handle->i_minfo[0].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off;
++			buf0_p = ipu_priv_handle->i_minfo[0].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off;
+ 			buf1_p = ipu_priv_handle->mode & OP_STREAM_MODE ?
+-				 ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off : 0;
+-			buf0_n = ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off;
++				 ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off : 0;
++			buf0_n = ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off;
+ 			buf1_n = ipu_priv_handle->mode & OP_STREAM_MODE ?
+-				 ipu_priv_handle->i_minfo[2].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off : 0;
++				 ipu_priv_handle->i_minfo[2].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off : 0;
+ 		}
+ 
+ 		/* split mode must use pingpang buffer, set a nonull value to enable double buf */
+@@ -1439,7 +1559,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				input->fmt,
+ 				params.mem_prp_vf_mem.in_width,
+ 				params.mem_prp_vf_mem.in_height,
+-				ipu_priv_handle->input_stride,
++				ipu_priv_handle->istride,
+ 				IPU_ROTATE_NONE,
+ 				buf0,
+ 				buf1,
+@@ -1456,7 +1576,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 					input->fmt,
+ 					params.mem_prp_vf_mem.in_width,
+ 					params.mem_prp_vf_mem.in_height,
+-					ipu_priv_handle->input_stride,
++					ipu_priv_handle->istride,
+ 					IPU_ROTATE_NONE,
+ 					buf0_p,
+ 					buf1_p,
+@@ -1471,7 +1591,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 					input->fmt,
+ 					params.mem_prp_vf_mem.in_width,
+ 					params.mem_prp_vf_mem.in_height,
+-					ipu_priv_handle->input_stride,
++					ipu_priv_handle->istride,
+ 					IPU_ROTATE_NONE,
+ 					buf0_n,
+ 					buf1_n,
+@@ -1519,9 +1639,9 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 		}
+ 
+ 		if (output->show_to_fb) {
+-			ipu_priv_handle->output.output_stride = ipu_priv_handle->output.fb_stride;
++			ipu_priv_handle->output.ostride = ipu_priv_handle->output.fb_stride;
+ 		} else
+-			ipu_priv_handle->output.output_stride = output->width*bytes_per_pixel(output->fmt);
++			ipu_priv_handle->output.ostride = output->width*bytes_per_pixel(output->fmt);
+ 
+ 		buf0 = ipu_priv_handle->output.o_minfo[0].paddr + ipu_priv_handle->output.o_off;
+ 		buf1 = ipu_priv_handle->mode & OP_STREAM_MODE ?
+@@ -1535,7 +1655,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				output->fmt,
+ 				params.mem_prp_vf_mem.out_width,
+ 				params.mem_prp_vf_mem.out_height,
+-				ipu_priv_handle->output.output_stride,
++				ipu_priv_handle->output.ostride,
+ 				output->rot,
+ 				buf0,
+ 				buf1,
+@@ -1546,15 +1666,15 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 		}
+ 
+ 		/* fix EBAs for IDMAC channels, for split mode, double buffers work out only one frame */
+-		if(ipu_priv_handle->split_mode) {
+-			ipu_priv_handle->left_stripe.input_column *= bytes_per_pixel(input->fmt);
+-			ipu_priv_handle->right_stripe.input_column *= bytes_per_pixel(input->fmt);
+-			ipu_priv_handle->left_stripe.output_column *= bytes_per_pixel(output->fmt);
+-			ipu_priv_handle->right_stripe.output_column *= bytes_per_pixel(output->fmt);
+-
++		if(ipu_priv_handle->split_mode == SPLIT_MODE_RL)
+ 			_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
+ 					ipu_priv_handle->output.o_minfo[0].paddr, LEFT_STRIPE, 0);
+-		}
++		else if(ipu_priv_handle->split_mode == SPLIT_MODE_UD)
++			_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
++					ipu_priv_handle->output.o_minfo[0].paddr, UP_STRIPE, 0);
++		else if(ipu_priv_handle->split_mode == (SPLIT_MODE_UD | SPLIT_MODE_RL))
++			_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
++					ipu_priv_handle->output.o_minfo[0].paddr, LEFT_STRIPE | UP_STRIPE, 0);
+ 
+ 		ipu_priv_handle->output.begin_chan =
+ 			ipu_priv_handle->output.end_chan =
+@@ -1580,13 +1700,13 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			goto done;
+ 		}
+ 
+-		ipu_priv_handle->input_stride = input->width*bytes_per_pixel(input->fmt);
++		ipu_priv_handle->istride = input->width*bytes_per_pixel(input->fmt);
+ 		ret = ipu_init_channel_buffer(ipu_priv_handle->output.rot_chan,
+ 				IPU_INPUT_BUFFER,
+ 				input->fmt,
+ 				ipu_priv_handle->iwidth,
+ 				ipu_priv_handle->iheight,
+-				ipu_priv_handle->input_stride,
++				ipu_priv_handle->istride,
+ 				output->rot,
+ 				ipu_priv_handle->i_minfo[0].paddr + ipu_priv_handle->i_off,
+ 				ipu_priv_handle->mode & OP_STREAM_MODE ?
+@@ -1598,16 +1718,16 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 		}
+ 
+ 		if (output->show_to_fb) {
+-			ipu_priv_handle->output.output_stride = ipu_priv_handle->output.fb_stride;
++			ipu_priv_handle->output.ostride = ipu_priv_handle->output.fb_stride;
+ 		} else
+-			ipu_priv_handle->output.output_stride = output->width*bytes_per_pixel(output->fmt);
++			ipu_priv_handle->output.ostride = output->width*bytes_per_pixel(output->fmt);
+ 
+ 		ret = ipu_init_channel_buffer(ipu_priv_handle->output.rot_chan,
+ 				IPU_OUTPUT_BUFFER,
+ 				output->fmt,
+ 				ipu_priv_handle->output.owidth,
+ 				ipu_priv_handle->output.oheight,
+-				ipu_priv_handle->output.output_stride,
++				ipu_priv_handle->output.ostride,
+ 				IPU_ROTATE_NONE,
+ 				ipu_priv_handle->output.o_minfo[0].paddr +
+ 				ipu_priv_handle->output.o_off,
+@@ -1710,7 +1830,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 				goto done;
+ 		}
+ 
+-		ipu_priv_handle->input_stride = input->width*bytes_per_pixel(input->fmt);
++		ipu_priv_handle->istride = input->width*bytes_per_pixel(input->fmt);
+ 		buf0 = ipu_priv_handle->i_minfo[0].paddr + ipu_priv_handle->i_off;
+ 		buf1 = ipu_priv_handle->mode & OP_STREAM_MODE ?
+ 			ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->i_off : 0;
+@@ -1719,19 +1839,19 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 			buf0 = ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->i_off;
+ 			buf1 = ipu_priv_handle->mode & OP_STREAM_MODE ?
+ 			       ipu_priv_handle->i_minfo[2].paddr + ipu_priv_handle->i_off : 0;
+-			buf0_p = ipu_priv_handle->i_minfo[0].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off;
++			buf0_p = ipu_priv_handle->i_minfo[0].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off;
+ 			buf1_p = ipu_priv_handle->mode & OP_STREAM_MODE ?
+-				 ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off : 0;
+-			buf0_n = ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off;
++				 ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off : 0;
++			buf0_n = ipu_priv_handle->i_minfo[1].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off;
+ 			buf1_n = ipu_priv_handle->mode & OP_STREAM_MODE ?
+-				 ipu_priv_handle->i_minfo[2].paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off : 0;
++				 ipu_priv_handle->i_minfo[2].paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off : 0;
+ 		}
+ 		ret = ipu_init_channel_buffer(ipu_priv_handle->output.ic_chan,
+ 				IPU_INPUT_BUFFER,
+ 				input->fmt,
+ 				ipu_priv_handle->iwidth,
+ 				ipu_priv_handle->iheight,
+-				ipu_priv_handle->input_stride,
++				ipu_priv_handle->istride,
+ 				IPU_ROTATE_NONE,
+ 				buf0,
+ 				buf1,
+@@ -1748,7 +1868,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 					input->fmt,
+ 					params.mem_prp_vf_mem.in_width,
+ 					params.mem_prp_vf_mem.in_height,
+-					ipu_priv_handle->input_stride,
++					ipu_priv_handle->istride,
+ 					IPU_ROTATE_NONE,
+ 					buf0_p,
+ 					buf1_p,
+@@ -1763,7 +1883,7 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 					input->fmt,
+ 					params.mem_prp_vf_mem.in_width,
+ 					params.mem_prp_vf_mem.in_height,
+-					ipu_priv_handle->input_stride,
++					ipu_priv_handle->istride,
+ 					IPU_ROTATE_NONE,
+ 					buf0_n,
+ 					buf1_n,
+@@ -1857,16 +1977,16 @@ static int _ipu_channel_setup(ipu_lib_input_param_t * input,
+ 		}
+ 
+ 		if (output->show_to_fb) {
+-			ipu_priv_handle->output.output_stride = ipu_priv_handle->output.fb_stride;
++			ipu_priv_handle->output.ostride = ipu_priv_handle->output.fb_stride;
+ 		} else
+-			ipu_priv_handle->output.output_stride = output->width*bytes_per_pixel(output->fmt);
++			ipu_priv_handle->output.ostride = output->width*bytes_per_pixel(output->fmt);
+ 
+ 		ret = ipu_init_channel_buffer(ipu_priv_handle->output.rot_chan,
+ 				IPU_OUTPUT_BUFFER,
+ 				output->fmt,
+ 				ipu_priv_handle->output.owidth,
+ 				ipu_priv_handle->output.oheight,
+-				ipu_priv_handle->output.output_stride,
++				ipu_priv_handle->output.ostride,
+ 				IPU_ROTATE_NONE,
+ 				ipu_priv_handle->output.o_minfo[0].paddr +
+ 				ipu_priv_handle->output.o_off,
+@@ -2512,8 +2632,28 @@ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+ 		}
+ 
+ 		if (ipu_priv_handle->split_mode) {
+-			_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
++			if (ipu_priv_handle->split_mode == SPLIT_MODE_RL)
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
+ 						ipu_priv_handle->output.o_minfo[0].paddr, RIGHT_STRIPE, 1);
++			else if (ipu_priv_handle->split_mode == SPLIT_MODE_UD)
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
++						ipu_priv_handle->output.o_minfo[0].paddr, DOWN_STRIPE, 1);
++			else if(ipu_priv_handle->split_mode == (SPLIT_MODE_UD | SPLIT_MODE_RL)) {
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
++						ipu_priv_handle->output.o_minfo[0].paddr, LEFT_STRIPE | DOWN_STRIPE, 1);
++				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++					return -1;
++				}
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
++						ipu_priv_handle->output.o_minfo[0].paddr, RIGHT_STRIPE | UP_STRIPE, 1);
++				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++					return -1;
++				}
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[0].paddr,
++						ipu_priv_handle->output.o_minfo[0].paddr, RIGHT_STRIPE | DOWN_STRIPE, 1);
++			}
+ 
+ 			if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
+ 				dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+@@ -2529,16 +2669,46 @@ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+ 			pan_display(ipu_priv_handle, ipu_priv_handle->output_bufnum);
+ 
+ 		if (ipu_priv_handle->split_mode && (ipu_priv_handle->mode & OP_STREAM_MODE)) {
+-			_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++			if (ipu_priv_handle->split_mode == SPLIT_MODE_RL) {
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
+ 						ipu_priv_handle->output.o_minfo[1].paddr, LEFT_STRIPE, 1);
+-
+-			if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
+-				dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+-				return -1;
+-			}
+-
+-			_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++					return -1;
++				}
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
+ 						ipu_priv_handle->output.o_minfo[1].paddr, RIGHT_STRIPE, 1);
++			} else if (ipu_priv_handle->split_mode == SPLIT_MODE_UD) {
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++						ipu_priv_handle->output.o_minfo[1].paddr, UP_STRIPE, 1);
++				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++					return -1;
++				}
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++						ipu_priv_handle->output.o_minfo[1].paddr, DOWN_STRIPE, 1);
++			} else if(ipu_priv_handle->split_mode == (SPLIT_MODE_UD | SPLIT_MODE_RL)) {
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++						ipu_priv_handle->output.o_minfo[1].paddr, LEFT_STRIPE | UP_STRIPE, 1);
++				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++					return -1;
++				}
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++						ipu_priv_handle->output.o_minfo[1].paddr, LEFT_STRIPE | DOWN_STRIPE, 1);
++				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++					return -1;
++				}
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++						ipu_priv_handle->output.o_minfo[1].paddr, RIGHT_STRIPE | UP_STRIPE, 1);
++				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++					return -1;
++				}
++				_ipu_split_mode_set_stripe(ipu_priv_handle, ipu_priv_handle->i_minfo[1].paddr,
++						ipu_priv_handle->output.o_minfo[1].paddr, RIGHT_STRIPE | DOWN_STRIPE, 1);
++			}
+ 		}
+ 
+ 		if (ipu_priv_handle->mode & OP_STREAM_MODE)
+@@ -2583,53 +2753,135 @@ int mxc_ipu_lib_task_buf_update(ipu_lib_handle_t * ipu_handle,
+ 						new_inbuf_paddr + ipu_priv_handle->i_off);
+ 				if ((ipu_priv_handle->mode & TASK_VDI_VF_MODE) && (ipu_priv_handle->motion_sel != HIGH_MOTION)) {
+ 					ipu_update_channel_buffer(ipu_priv_handle->output.vdi_ic_n_chan, IPU_INPUT_BUFFER,
+-						ipu_priv_handle->update_bufnum, new_inbuf_paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off);
++						ipu_priv_handle->update_bufnum, new_inbuf_paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off);
+ 					ipu_update_channel_buffer(ipu_priv_handle->output.vdi_ic_p_chan, IPU_INPUT_BUFFER,
+-						ipu_priv_handle->update_bufnum, ipu_priv_handle->last_inbuf_paddr + ipu_priv_handle->input_stride +
++						ipu_priv_handle->update_bufnum, ipu_priv_handle->last_inbuf_paddr + ipu_priv_handle->istride +
+ 						ipu_priv_handle->i_off);
+ 					ipu_priv_handle->last_inbuf_paddr = new_inbuf_paddr;
+ 				}
+ 			} else {
+-				_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
+-						ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
+-						LEFT_STRIPE, 1);
+-				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
+-					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+-					return -1;
++				if (ipu_priv_handle->split_mode == SPLIT_MODE_RL) {
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							LEFT_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							RIGHT_STRIPE, 1);
++				} else if (ipu_priv_handle->split_mode == SPLIT_MODE_UD) {
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							UP_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							DOWN_STRIPE, 1);
++				} else if(ipu_priv_handle->split_mode == (SPLIT_MODE_UD | SPLIT_MODE_RL)) {
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							LEFT_STRIPE | UP_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							LEFT_STRIPE | DOWN_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							RIGHT_STRIPE | UP_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							RIGHT_STRIPE | DOWN_STRIPE, 1);
+ 				}
+-				_ipu_split_mode_set_stripe(ipu_priv_handle, new_inbuf_paddr,
+-						ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
+-						RIGHT_STRIPE, 1);
+ 			}
+ 		} else if (ipu_priv_handle->split_mode) {
+-				_ipu_split_mode_set_stripe(ipu_priv_handle,
+-						ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
+-						ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
+-						LEFT_STRIPE, 1);
+-				if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
+-					dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
+-					return -1;
++				if (ipu_priv_handle->split_mode == SPLIT_MODE_RL) {
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							LEFT_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							RIGHT_STRIPE, 1);
++				} else if (ipu_priv_handle->split_mode == SPLIT_MODE_UD) {
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							UP_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							DOWN_STRIPE, 1);
++				} else if(ipu_priv_handle->split_mode == (SPLIT_MODE_UD | SPLIT_MODE_RL)) {
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							LEFT_STRIPE | UP_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							LEFT_STRIPE | DOWN_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							RIGHT_STRIPE | UP_STRIPE, 1);
++					if (_ipu_wait_for_irq(ipu_priv_handle->irq, 1)) {
++						dbg(DBG_ERR, "wait for irq %d time out!\n", ipu_priv_handle->irq);
++						return -1;
++					}
++					_ipu_split_mode_set_stripe(ipu_priv_handle,
++							ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
++							ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
++							RIGHT_STRIPE | DOWN_STRIPE, 1);
+ 				}
+-				_ipu_split_mode_set_stripe(ipu_priv_handle,
+-						ipu_priv_handle->i_minfo[ipu_priv_handle->update_bufnum].paddr,
+-						ipu_priv_handle->output.o_minfo[ipu_priv_handle->tri_output_bufnum].paddr,
+-						RIGHT_STRIPE, 1);
+ 		} else if ((ipu_priv_handle->mode & TASK_VDI_VF_MODE) && (ipu_priv_handle->motion_sel != HIGH_MOTION)) {
+ 			if (ipu_priv_handle->mode & OP_STREAM_MODE) {
+ 				ipu_update_channel_buffer(ipu_priv_handle->output.ic_chan, IPU_INPUT_BUFFER, ipu_priv_handle->update_bufnum,
+ 							  ipu_priv_handle->i_minfo[ipu_priv_handle->input_fr_cnt%3].paddr + ipu_priv_handle->i_off);
+ 				ipu_update_channel_buffer(ipu_priv_handle->output.vdi_ic_n_chan, IPU_INPUT_BUFFER, ipu_priv_handle->update_bufnum,
+-							  ipu_priv_handle->i_minfo[ipu_priv_handle->input_fr_cnt%3].paddr + ipu_priv_handle->input_stride +
++							  ipu_priv_handle->i_minfo[ipu_priv_handle->input_fr_cnt%3].paddr + ipu_priv_handle->istride +
+ 							  ipu_priv_handle->i_off);
+ 			} else {
+ 				ipu_update_channel_buffer(ipu_priv_handle->output.ic_chan, IPU_INPUT_BUFFER, ipu_priv_handle->update_bufnum,
+ 							  ipu_priv_handle->i_minfo[ipu_priv_handle->input_fr_cnt%2].paddr + ipu_priv_handle->i_off);
+ 				ipu_update_channel_buffer(ipu_priv_handle->output.vdi_ic_n_chan, IPU_INPUT_BUFFER, ipu_priv_handle->update_bufnum,
+-							  ipu_priv_handle->i_minfo[ipu_priv_handle->input_fr_cnt%2].paddr + ipu_priv_handle->input_stride +
++							  ipu_priv_handle->i_minfo[ipu_priv_handle->input_fr_cnt%2].paddr + ipu_priv_handle->istride +
+ 							  ipu_priv_handle->i_off);
+ 			}
+ 			ipu_update_channel_buffer(ipu_priv_handle->output.vdi_ic_p_chan, IPU_INPUT_BUFFER, ipu_priv_handle->update_bufnum,
+-						  ipu_priv_handle->last_inbuf_paddr + ipu_priv_handle->input_stride + ipu_priv_handle->i_off);
++						  ipu_priv_handle->last_inbuf_paddr + ipu_priv_handle->istride + ipu_priv_handle->i_off);
+ 
+ 			ipu_priv_handle->last_inbuf_paddr = (ipu_priv_handle->mode & OP_STREAM_MODE) ?
+ 								ipu_priv_handle->i_minfo[ipu_priv_handle->input_fr_cnt%3].paddr :
+-- 
+1.8.0
+

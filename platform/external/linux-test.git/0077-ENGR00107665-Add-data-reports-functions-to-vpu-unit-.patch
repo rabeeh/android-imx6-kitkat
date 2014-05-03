@@ -1,0 +1,736 @@
+From 1701fe991909d6b8be433dda332c8b7f377ced04 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Mon, 16 Feb 2009 13:13:53 +0800
+Subject: [PATCH 077/435] ENGR00107665 Add data reports functions to vpu unit
+ test
+
+Change test app due to vpu APIs changes, and add data reports
+functions to vpu unit test.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/Makefile   |   4 +-
+ test/mxc_vpu_test/dec.c      | 242 ++++++++++++++++++++++++++++++++++---------
+ test/mxc_vpu_test/display.c  |  16 +++
+ test/mxc_vpu_test/enc.c      | 175 ++++++++++++++++++++++++++++---
+ test/mxc_vpu_test/fb.c       |   4 +-
+ test/mxc_vpu_test/loopback.c |   6 +-
+ test/mxc_vpu_test/vpu_test.h |  16 ++-
+ 7 files changed, 394 insertions(+), 69 deletions(-)
+
+diff --git a/test/mxc_vpu_test/Makefile b/test/mxc_vpu_test/Makefile
+index 6da9f59..68f3da3 100644
+--- a/test/mxc_vpu_test/Makefile
++++ b/test/mxc_vpu_test/Makefile
+@@ -30,8 +30,10 @@ $(TARGET): $(OBJ)
+ 	cp ./configs/akiyo.mp4 $(OBJDIR)
+ 
+ %.o: %.c
+-	$(CC) -Wall -O2 -c $^ -o $@
++	$(CC) $(INC) -Wall -O2 -c $^ -o $@
+ 
+ .PHONY: clean
+ clean:
+ 	rm -f $(OBJDIR)/$(TARGET) $(OBJ)
++
++include ../make.rules
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 9f60de0..cb801a9 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -28,7 +28,7 @@ extern int quitflag;
+ static FILE *fpFrmStatusLogfile = 0;
+ static FILE *fpMbLogfile = 0;
+ static FILE *fpMvLogfile = 0;
+-/*static FILE *fpUserDataLogfile = 0;*/
++static FILE *fpUserDataLogfile = 0;
+ 
+ #define FN_FRAME_BUFFER_STATUS "log_FrameBufStatus.log"
+ #define FN_MB_DATA "log_MB_Para.log"
+@@ -126,6 +126,40 @@ void SaveMvPara(u8 *mvParaBuf, int size, int mvNumPerMb, int mbNumX, int DecNum)
+ 	fflush(fpMvLogfile);
+ }
+ 
++void SaveUserData(u8 *userDataBuf) {
++	int i, UserDataType, UserDataSize, userDataNum, TotalSize;
++	u8 *tmpBuf;
++
++	if(fpUserDataLogfile == 0) {
++		fpUserDataLogfile = fopen(FN_USER_DATA, "w+");
++	}
++
++	tmpBuf = userDataBuf;
++	userDataNum = (short)((tmpBuf[0]<<8) | (tmpBuf[1]<<0));
++	TotalSize = (short)((tmpBuf[2]<<8) | (tmpBuf[3]<<0));
++
++	tmpBuf = userDataBuf + 8;
++
++	for(i=0; i<userDataNum; i++) {
++		UserDataType = (short)((tmpBuf[0]<<8) | (tmpBuf[1]<<0));
++		UserDataSize = (short)((tmpBuf[2]<<8) | (tmpBuf[3]<<0));
++		fprintf(fpUserDataLogfile, "\n[Idx Type Size] : [%4d %4d %4d]",i, UserDataType, UserDataSize);
++
++		tmpBuf += 8;
++	}
++	fprintf(fpUserDataLogfile, "\n");
++
++	tmpBuf = userDataBuf + USER_DATA_INFO_OFFSET;
++	for(i=0; i<TotalSize; i++) {
++		fprintf(fpUserDataLogfile, "%02x", tmpBuf[i]);
++		if ((i&7) == 7)
++			fprintf(fpUserDataLogfile, "\n");
++	}
++	fprintf(fpUserDataLogfile, "\n");
++	fflush(fpUserDataLogfile);
++
++}
++
+ /*
+  * Fill the bitstream ring buffer
+  */
+@@ -643,12 +677,6 @@ decoder_start(struct decode *dec)
+ 	 */
+ 	decparam.iframeSearchEnable = 0;
+ 
+-	decparam.extParam.userDataEnable = 0;
+-
+-	decparam.extParam.mbParamEnable = 0;
+-	decparam.extParam.mvReportEnable = 0;
+-	decparam.extParam.frameBufStatEnable = 0;
+-
+ 	fwidth = ((dec->picwidth + 15) & ~15);
+ 	fheight = ((dec->picheight + 15) & ~15);
+ 
+@@ -719,6 +747,35 @@ decoder_start(struct decode *dec)
+ 			}
+ 		}
+ 
++		if (dec->mbInfo.enable == 1) {
++			ret = vpu_DecGiveCommand(handle,DEC_SET_REPORT_MBINFO, &dec->mbInfo);
++			if (ret != RETCODE_SUCCESS) {
++				err_msg("Failed to set MbInfo report, ret %d\n", ret);
++				return -1;
++			}
++		}
++		if (dec->mvInfo.enable == 1) {
++			ret = vpu_DecGiveCommand(handle,DEC_SET_REPORT_MVINFO, &dec->mvInfo);
++			if (ret != RETCODE_SUCCESS) {
++				err_msg("Failed to set MvInfo report, ret %d\n", ret);
++				return -1;
++			}
++		}
++		if (dec->frameBufStat.enable == 1) {
++			ret = vpu_DecGiveCommand(handle,DEC_SET_REPORT_BUFSTAT, &dec->frameBufStat);
++			if (ret != RETCODE_SUCCESS) {
++				err_msg("Failed to set frame status report, ret %d\n", ret);
++				return -1;
++			}
++		}
++		if (dec->userData.enable == 1) {
++			ret = vpu_DecGiveCommand(handle,DEC_SET_REPORT_USERDATA, &dec->userData);
++			if (ret != RETCODE_SUCCESS) {
++				err_msg("Failed to set user data report, ret %d\n", ret);
++				return -1;
++			}
++		}
++
+ 		gettimeofday(&tdec_begin, NULL);
+ 		ret = vpu_DecStartOneFrame(handle, &decparam);
+ 		if (ret != RETCODE_SUCCESS) {
+@@ -779,52 +836,59 @@ decoder_start(struct decode *dec)
+ 		}
+ 
+ 		/* Frame Buffer Status */
+-		if (decparam.extParam.frameBufStatEnable &&
+-			outinfo.outputExtData.frameBufDataSize) {
+-			int size;
+-			u8 *frameBufferStatBuf;
+-			size = (outinfo.outputExtData.frameBufDataSize+7)*8/8;
+-
+-			frameBufferStatBuf = malloc(size);
+-			memset(frameBufferStatBuf, 0, size);
+-			memcpy(frameBufferStatBuf, (void *)outinfo.outputExtData.frameBufStatDataAddr, size);
+-			SaveFrameBufStat(frameBufferStatBuf, outinfo.outputExtData.frameBufDataSize);
+-			free(frameBufferStatBuf);
++		if (outinfo.frameBufStat.enable && outinfo.frameBufStat.size) {
++			SaveFrameBufStat(outinfo.frameBufStat.addr,
++				   outinfo.frameBufStat.size);
+ 		}
+ 
+ 		/* Mb Param */
+-		if (outinfo.indexFrameDecoded >= 0 &&
+-			decparam.extParam.mbParamEnable &&
+-			outinfo.outputExtData.mbParamDataSize) {
+-			int size;
+-			u8 *mbDataBuf;
++		if (outinfo.indexFrameDecoded >= 0 && outinfo.mbInfo.enable &&
++			outinfo.mbInfo.size) {
+ 			int mbNumX = dec->picwidth / 16;
+-
+-			size = (outinfo.outputExtData.mbParamDataSize + 7) / 8 * 8;
+-			mbDataBuf = malloc(size);
+-			memset(mbDataBuf, 0, size);
+-			memcpy(mbDataBuf, (void *)outinfo.outputExtData.mbParamDataAddr, size);
+-			SaveMB_Para(mbDataBuf, outinfo.outputExtData.mbParamDataSize,
+-						mbNumX, decIndex);
+-			free(mbDataBuf);
++			SaveMB_Para(outinfo.mbInfo.addr,
++			        outinfo.mbInfo.size, mbNumX, decIndex);
+ 		}
+ 
+ 		/* Motion Vector */
+-		if (outinfo.indexFrameDecoded >= 0 &&
+-			decparam.extParam.mvReportEnable &&
+-			outinfo.outputExtData.mvDataSize) {
+-			int size;
+-			u8 *mvDataBuf;
++		if (outinfo.indexFrameDecoded >= 0 && outinfo.mvInfo.enable &&
++			outinfo.mvInfo.size) {
+ 			int mbNumX = dec->picwidth / 16;
+-			size = (outinfo.outputExtData.mvDataSize+7)/8*8;
+-			size = size*outinfo.outputExtData.mvNumPerMb*4;
+-			mvDataBuf = malloc(size);
+-			memset(mvDataBuf, 0, size);
+-			memcpy(mvDataBuf, (void *)outinfo.outputExtData.mvDataAddr, size);
+-			SaveMvPara(mvDataBuf, outinfo.outputExtData.mvDataSize,
+-				   outinfo.outputExtData.mvNumPerMb,
+-				   mbNumX, decIndex);
+-			free(mvDataBuf);
++			SaveMvPara(outinfo.mvInfo.addr, outinfo.mvInfo.size,
++			   outinfo.mvInfo.mvNumPerMb, mbNumX, decIndex);
++		}
++
++		/* User Data */
++		if (outinfo.indexFrameDecoded >= 0 &&  (dec->cmdl->format == STD_VC1) &&
++		    outinfo.userData.enable && outinfo.userData.size) {
++			if (outinfo.userData.userDataBufFull)
++				warn_msg("User Data Buffer is Full\n");
++			SaveUserData(dec->userData.addr);
++		}
++
++		if (outinfo.indexFrameDecoded >= 0) {
++			if (dec->cmdl->format == STD_VC1) {
++				if (outinfo.pictureStructure == 2)
++					info_msg("dec_idx %d : FRAME_INTERLACE\n", decIndex);
++				else if (outinfo.pictureStructure == 3)
++					info_msg("dec_idx %d : FIELD_INTERLACE\n", decIndex);
++				if (outinfo.vc1_repeatFrame)
++					info_msg("dec_idx %d : VC1 RPTFRM [%1d]\n", decIndex, outinfo.vc1_repeatFrame);
++			} else if (dec->cmdl->format == STD_AVC) {
++				if (outinfo.interlacedFrame)
++					info_msg("Top Field First flag: %d, dec_idx %d\n",
++						  outinfo.topFieldFirst, decIndex);
++			} else if ((dec->cmdl->format != STD_MPEG4) && (dec->cmdl->format != STD_RV)){
++				if (outinfo.interlacedFrame || !outinfo.progressiveFrame) {
++					if (outinfo.pictureStructure == 1)
++						info_msg("Top Field First flag: %d, dec_idx %d is top field\n",
++							 outinfo.topFieldFirst, decIndex);
++					else if (outinfo.pictureStructure == 2)
++						info_msg("Top Field First flag: %d, dec_idx %d is bottom field\n",
++							  outinfo.topFieldFirst, decIndex);
++				}
++				if (outinfo.repeatFirstField)
++					info_msg("frame_idx %d : Repeat First Field\n", decIndex);
++			}
+ 		}
+ 
+ 		decIndex++;
+@@ -949,10 +1013,10 @@ decoder_start(struct decode *dec)
+ 			disp_clr_index = outinfo.indexFrameDisplay;
+ 		}
+ 
+-		if (outinfo.numOfErrMBs[0]) {
+-			totalNumofErrMbs += outinfo.numOfErrMBs[0];
++		if (outinfo.numOfErrMBs) {
++			totalNumofErrMbs += outinfo.numOfErrMBs;
+ 			info_msg("Num of Error Mbs : %d, in Frame : %d \n",
+-					outinfo.numOfErrMBs[0], (int)frame_id);
++					outinfo.numOfErrMBs, (int)frame_id);
+ 		}
+ 
+ 		frame_id++;
+@@ -1035,6 +1099,23 @@ decoder_free_framebuffer(struct decode *dec)
+ 		free(dec->pfbpool);
+ 		dec->pfbpool = NULL;
+ 	}
++
++	if (dec->frameBufStat.addr) {
++		free(dec->frameBufStat.addr);
++	}
++
++	if (dec->mbInfo.addr) {
++		free(dec->mbInfo.addr);
++	}
++
++	if (dec->mvInfo.addr) {
++		free(dec->mvInfo.addr);
++	}
++
++	if (dec->userData.addr) {
++		free(dec->userData.addr);
++	}
++
+ 	return;
+ }
+ 
+@@ -1186,6 +1267,22 @@ err:
+ 		}
+ 	}
+ 
++	if (fpFrmStatusLogfile) {
++		fclose(fpFrmStatusLogfile);
++		fpFrmStatusLogfile = NULL;
++	}
++	if (fpMvLogfile) {
++		fclose(fpMvLogfile);
++		fpMvLogfile = NULL;
++	}
++	if (fpMbLogfile) {
++		fclose(fpMbLogfile);
++		fpMbLogfile = NULL;
++	}
++	if (fpUserDataLogfile) {
++		fclose(fpUserDataLogfile);
++		fpUserDataLogfile = NULL;
++	}
+ 	free(dec->fb);
+ 	free(dec->pfbpool);
+ 	dec->fb = NULL;
+@@ -1241,7 +1338,7 @@ decoder_parse(struct decode *dec)
+ 			else if (initinfo.profile == 2)
+ 				info_msg("VC1 Profile: Advanced\n");
+ 
+-			info_msg("Level: %d Interlace: %d PSF: %d\n",
++			info_msg("Level: %d Interlace: %d Progressive Segmented Frame: %d\n",
+ 				initinfo.level, initinfo.interlace, initinfo.vc1_psf);
+ 
+ 			if (initinfo.aspectRateInfo)
+@@ -1280,6 +1377,21 @@ decoder_parse(struct decode *dec)
+ 				info_msg("Aspect Ratio is not present.\n");
+ 
+ 			break;
++
++		case STD_RV:
++			info_msg("RV Profile: %d Level: %d\n", initinfo.profile, initinfo.level);
++			break;
++
++		case STD_H263:
++			info_msg("H263 Profile: %d Level: %d\n", initinfo.profile, initinfo.level);
++			break;
++
++		case STD_DIV3:
++			info_msg("DIV3 Profile: %d Level: %d\n", initinfo.profile, initinfo.level);
++			break;
++
++		default:
++			break;
+ 		}
+ 	}
+ 
+@@ -1329,6 +1441,29 @@ decoder_parse(struct decode *dec)
+ 	/* worstSliceSize is in kilo-byte unit */
+ 	dec->phy_slicebuf_size = initinfo.worstSliceSize * 1024;
+ 	dec->stride = dec->picwidth;
++
++	/* Allocate memory for frame status, Mb and Mv report */
++	if (dec->frameBufStat.enable) {
++		dec->frameBufStat.addr = malloc(initinfo.reportBufSize.frameBufStatBufSize);
++		if (!dec->frameBufStat.addr)
++			err_msg("malloc_error\n");
++	}
++	if (dec->mbInfo.enable) {
++		dec->mbInfo.addr = malloc(initinfo.reportBufSize.mbInfoBufSize);
++		if (!dec->mbInfo.addr)
++			err_msg("malloc_error\n");
++	}
++	if (dec->mvInfo.enable) {
++		dec->mvInfo.addr = malloc(initinfo.reportBufSize.mvInfoBufSize);
++		if (!dec->mvInfo.addr)
++			err_msg("malloc_error\n");
++	}
++	if (dec->userData.enable) {
++		dec->userData.size = SIZE_USER_BUF;
++		dec->userData.addr = malloc(SIZE_USER_BUF);
++		if (!dec->userData.addr)
++			err_msg("malloc_error\n");
++	}
+ 	return 0;
+ }
+ 
+@@ -1426,8 +1561,17 @@ decode_test(void *arg)
+ 	dec->virt_bsbuf_addr = mem_desc.virt_uaddr;
+ 
+ 	dec->reorderEnable = 1;
++
++	dec->userData.enable = 0;
++	dec->mbInfo.enable = 0;
++	dec->mvInfo.enable = 0;
++	dec->frameBufStat.enable = 0;
++
+ 	dec->cmdl = cmdl;
+ 
++	if (cmdl->format == STD_RV)
++		dec->userData.enable = 0; /* RV has no user data */
++
+ 	if (cmdl->format == STD_AVC) {
+ 		ps_mem_desc.size = PS_SAVE_SIZE;
+ 		ret = IOGetPhyMem(&ps_mem_desc);
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 563ac6d..14e4223 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -24,6 +24,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#include <linux/mxcfb.h>
+ #include "vpu_test.h"
+ 
+ #define V4L2_MXC_ROTATE_NONE                    0
+@@ -103,12 +104,27 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	struct v4l2_requestbuffers reqbuf = {0};
+ 	struct v4l2_mxc_offset off = {0};
+ 	struct vpu_display *disp;
++	int fd_fb;
++	struct mxcfb_gbl_alpha alpha;
++
+ 	int ratio = 1;
+ 
+ 	if (cpu_is_mx27()) {
+ 		out = 0;
+ 	} else {
+ 		out = 3;
++		fd_fb = open("/dev/fb0", O_RDWR, 0);
++		if (fd_fb < 0) {
++			err_msg("unable to open fb1\n");
++			return NULL;
++		}
++		alpha.alpha = 0;
++		alpha.enable = 1;
++		if (ioctl(fd_fb, MXCFB_SET_GBL_ALPHA, &alpha) < 0) {
++			err_msg("set alpha blending failed\n");
++			return NULL;
++		}
++		close(fd_fb);
+ 	}
+ 	dprintf(3, "rot_en:%d; rot_angle:%d; ipu_rot_en:%d\n", rotation.rot_en,
+ 			rotation.rot_angle, rotation.ipu_rot_en);
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 5d11f40..84b75cb 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -31,6 +31,89 @@ extern struct capture_testbuffer cap_buffers[];
+ /* When app need to exit */
+ extern int quitflag;
+ 
++#define FN_ENC_QP_DATA "enc_qp.log"
++#define FN_ENC_SLICE_BND_DATA "enc_slice_bnd.log"
++#define FN_ENC_MV_DATA "enc_mv.log"
++#define FN_ENC_SLICE_DATA "enc_slice.log"
++static FILE *fpEncSliceBndInfo = NULL;
++static FILE *fpEncQpInfo = NULL;
++static FILE *fpEncMvInfo = NULL;
++static FILE *fpEncSliceInfo = NULL;
++
++void SaveEncMbInfo(u8 *mbParaBuf, int size, int MbNumX, int EncNum)
++{
++	int i;
++	if(!fpEncQpInfo)
++		fpEncQpInfo = fopen(FN_ENC_QP_DATA, "w+");
++	if(!fpEncQpInfo)
++		return;
++
++	if(!fpEncSliceBndInfo)
++		fpEncSliceBndInfo = fopen(FN_ENC_SLICE_BND_DATA, "w+");
++	if(!fpEncSliceBndInfo)
++		return;
++
++	fprintf(fpEncQpInfo, "FRAME [%1d]\n", EncNum);
++	fprintf(fpEncSliceBndInfo, "FRAME [%1d]\n", EncNum);
++
++	for(i=0; i < size; i++) {
++		fprintf(fpEncQpInfo, "MbAddr[%4d]: MbQs[%2d]\n", i, mbParaBuf[i] & 63);
++		fprintf(fpEncSliceBndInfo, "MbAddr[%4d]: Slice Boundary Flag[%1d]\n",
++			 i, (mbParaBuf[i] >> 6) & 1);
++	}
++
++	fprintf(fpEncQpInfo, "\n");
++	fprintf(fpEncSliceBndInfo, "\n");
++	fflush(fpEncQpInfo);
++	fflush(fpEncSliceBndInfo);
++}
++
++void SaveEncMvInfo(u8 *mvParaBuf, int size, int MbNumX, int EncNum)
++{
++	int i;
++	if(!fpEncMvInfo)
++		fpEncMvInfo = fopen(FN_ENC_MV_DATA, "w+");
++	if(!fpEncMvInfo)
++		return;
++
++	fprintf(fpEncMvInfo, "FRAME [%1d]\n", EncNum);
++	for(i=0; i<size/4; i++) {
++		u16 mvX = (mvParaBuf[0] << 8) | (mvParaBuf[1]);
++		u16 mvY = (mvParaBuf[2] << 8) | (mvParaBuf[3]);
++		if(mvX & 0x8000) {
++			fprintf(fpEncMvInfo, "MbAddr[%4d:For ]: Avail[0] Mv[%5d:%5d]\n", i, 0, 0);
++		} else {
++			mvX = (mvX & 0x7FFF) | ((mvX << 1) & 0x8000);
++			fprintf(fpEncMvInfo, "MbAddr[%4d:For ]: Avail[1] Mv[%5d:%5d]\n", i, mvX, mvY);
++		}
++		mvParaBuf += 4;
++	}
++	fprintf(fpEncMvInfo, "\n");
++	fflush(fpEncMvInfo);
++}
++
++void SaveEncSliceInfo(u8 *SliceParaBuf, int size, int EncNum)
++{
++	int i, nMbAddr, nSliceBits;
++	if(!fpEncSliceInfo)
++		fpEncSliceInfo = fopen(FN_ENC_SLICE_DATA, "w+");
++	if(!fpEncSliceInfo)
++		return;
++
++	fprintf(fpEncSliceInfo, "EncFrmNum[%3d]\n", EncNum);
++
++	for(i=0; i<size / 8; i++) {
++		nMbAddr = (SliceParaBuf[2] << 8) | SliceParaBuf[3];
++		nSliceBits = (int)(SliceParaBuf[4] << 24)|(SliceParaBuf[5] << 16)|
++				(SliceParaBuf[6] << 8)|(SliceParaBuf[7]);
++		fprintf(fpEncSliceInfo, "[%2d] mbAddr.%3d, Bits.%d\n", i, nMbAddr, nSliceBits);
++		SliceParaBuf += 8;
++	}
++
++	fprintf(fpEncSliceInfo, "\n");
++	fflush(fpEncSliceInfo);
++}
++
+ #if STREAM_ENC_PIC_RESET == 0
+ static int
+ enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd,
+@@ -291,6 +374,32 @@ encoder_start(struct encode *enc)
+ 	enc_param.forceIPicture = 0;
+ 	enc_param.skipPicture = 0;
+ 
++	enc->mbInfo.enable = 0;
++	enc->mvInfo.enable = 0;
++	enc->sliceInfo.enable = 0;
++
++	/* Set report info flag */
++	if (enc->mbInfo.enable) {
++		ret = vpu_EncGiveCommand(handle, ENC_SET_REPORT_MBINFO, &enc->mbInfo);
++		if (ret != RETCODE_SUCCESS) {
++			err_msg("Failed to set MbInfo report, ret %d\n", ret);
++			return -1;
++		}
++	}
++	if (enc->mvInfo.enable) {
++		ret = vpu_EncGiveCommand(handle, ENC_SET_REPORT_MVINFO, &enc->mvInfo);
++		if (ret != RETCODE_SUCCESS) {
++			err_msg("Failed to set MvInfo report, ret %d\n", ret);
++			return -1;
++		}
++	}
++	if (enc->sliceInfo.enable) {
++		ret = vpu_EncGiveCommand(handle, ENC_SET_REPORT_SLICEINFO, &enc->sliceInfo);
++		if (ret != RETCODE_SUCCESS) {
++			err_msg("Failed to set slice info report, ret %d\n", ret);
++			return -1;
++		}
++	}
+ 	if (src_scheme == PATH_V4L2) {
+ 		ret = v4l_start_capturing();
+ 		if (ret < 0) {
+@@ -371,22 +480,23 @@ encoder_start(struct encode *enc)
+ 			goto err2;
+ 		}
+ 
+-		encop = handle->CodecInfo.encInfo.openParam;
+-		if (encop.sliceReport == 1) {
+-			int i;
+-			unsigned int *p = (unsigned int *)outinfo.sliceInfo;
+-			info_msg("Num of Slice=%d ", outinfo.numOfSlices);
++		if ((encop.ringBufferEnable == 0) &&
++		    (outinfo.bitstreamWrapAround  == 1))
++			warn_msg("BitStream buffer wrap arounded. Prepare more buffer\n");
+ 
+-			for (i = 0; i < outinfo.numOfSlices; i++) {
+-			       info_msg("%x,", *p++);
+-			}
+-			info_msg("\n");
++		if (outinfo.mbInfo.enable && outinfo.mbInfo.size && outinfo.mbInfo.addr) {
++			SaveEncMbInfo(outinfo.mbInfo.addr, outinfo.mbInfo.size,
++					 encop.picWidth/16, frame_id);
++		}
++
++		if (outinfo.mvInfo.enable && outinfo.mvInfo.size && outinfo.mvInfo.addr) {
++			SaveEncMvInfo(outinfo.mvInfo.addr, outinfo.mvInfo.size,
++					 encop.picWidth/16, frame_id);
+ 		}
+ 
+-		if ((encop.bitstreamFormat == STD_MPEG4) &&
+-					(encop.mbQpReport == 1)) {
+-                        SaveQpReport(outinfo.mbQpInfo, encop.picWidth,
+-				encop.picHeight, frame_id, "encqpreport.dat");
++		if (outinfo.sliceInfo.enable && outinfo.sliceInfo.size && outinfo.sliceInfo.addr) {
++			SaveEncSliceInfo(outinfo.sliceInfo.addr,
++					     outinfo.sliceInfo.size, frame_id);
+ 		}
+ 
+ 		if (src_scheme == PATH_V4L2) {
+@@ -438,6 +548,29 @@ err2:
+ 		vpu_write(enc->cmdl, NULL, 0);
+ 	}
+ 
++	if (enc->mbInfo.addr)
++		free(enc->mbInfo.addr);
++	if (enc->mbInfo.addr)
++		free(enc->mbInfo.addr);
++	if (enc->sliceInfo.addr)
++		free(enc->sliceInfo.addr);
++
++	if (fpEncQpInfo) {
++		fclose(fpEncQpInfo);
++		fpEncQpInfo = NULL;
++	}
++	if (fpEncSliceBndInfo) {
++		fclose(fpEncSliceBndInfo);
++		fpEncSliceBndInfo = NULL;
++	}
++	if (fpEncMvInfo) {
++		fclose(fpEncMvInfo);
++		fpEncMvInfo = NULL;
++	}
++	if (fpEncSliceInfo) {
++		fclose(fpEncSliceInfo);
++		fpEncSliceInfo = NULL;
++	}
+ 	/* For automation of test case */
+ 	if (ret > 0)
+ 		ret = 0;
+@@ -510,6 +643,22 @@ encoder_configure(struct encode *enc)
+ 		}
+ 	}
+ 
++	if (enc->mbInfo.enable) {
++		enc->mbInfo.addr = malloc(initinfo.reportBufSize.mbInfoBufSize);
++		if (!enc->mbInfo.addr)
++			err_msg("malloc_error\n");
++	}
++	if (enc->mvInfo.enable) {
++		enc->mvInfo.addr = malloc(initinfo.reportBufSize.mvInfoBufSize);
++		if (!enc->mvInfo.addr)
++			err_msg("malloc_error\n");
++	}
++	if (enc->sliceInfo.enable) {
++		enc->sliceInfo.addr = malloc(initinfo.reportBufSize.sliceInfoBufSize);
++		if (!enc->sliceInfo.addr)
++			err_msg("malloc_error\n");
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index f23f53e..e567893 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -33,7 +33,7 @@ static int fb_index;
+ static struct frame_buf *fbarray[NUM_FRAME_BUFS];
+ static struct frame_buf fbpool[NUM_FRAME_BUFS];
+ 
+-void framebuf_init()
++void framebuf_init(void)
+ {
+ 	int i;
+ 
+@@ -42,7 +42,7 @@ void framebuf_init()
+ 	}
+ }
+ 
+-struct frame_buf *get_framebuf()
++struct frame_buf *get_framebuf(void)
+ {
+ 	struct frame_buf *fb;
+ 
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 1f57a3a..2d5f54e 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -31,7 +31,7 @@ static int disp_clr_index = -1;
+ static int frame_id = 0;
+ 
+ static int
+-decode()
++decode(void)
+ {
+ 	DecHandle handle = dec->handle;
+ 	DecParam decparam = {0};
+@@ -155,7 +155,7 @@ dec_fill_bsbuffer(char *buf, int size)
+ }
+ 
+ static int
+-encoder_fill_headers()
++encoder_fill_headers(void)
+ {
+ 	EncHeaderParam enchdr_param = {0};
+ 	EncHandle handle = enc->handle;
+@@ -218,7 +218,7 @@ encoder_fill_headers()
+ }
+ 
+ static int
+-encode()
++encode(void)
+ {
+ 	EncHandle handle = enc->handle;
+ 	EncParam  enc_param = {0};
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 0c52fa4..fdb263c 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -69,6 +69,9 @@ typedef signed char s8;
+ #define DEFAULT_PORT		5555
+ #define DEFAULT_PKT_SIZE	0x28000
+ 
++#define SIZE_USER_BUF            0x1000
++#define USER_DATA_INFO_OFFSET    8*17
++
+ struct frame_buf {
+ 	int addrY;
+ 	int addrCb;
+@@ -156,6 +159,12 @@ struct decode {
+ 	vpu_mem_desc *mvcol_memdesc;
+ 	Rect picCropRect;
+ 	int reorderEnable;
++
++	DecReportInfo mbInfo;
++	DecReportInfo mvInfo;
++	DecReportInfo frameBufStat;
++	DecReportInfo userData;
++
+ 	struct cmd_line *cmdl;
+ };
+ 
+@@ -169,12 +178,17 @@ struct encode {
+ 	int src_fbid;	/* Index of frame buffer that contains YUV image */
+ 	FrameBuffer *fb; /* frame buffer base given to encoder */
+ 	struct frame_buf **pfbpool; /* allocated fb pointers are stored here */
++
++        EncReportInfo mbInfo;
++        EncReportInfo mvInfo;
++        EncReportInfo sliceInfo;
++
+ 	struct cmd_line *cmdl; /* command line */
+ 	u8 * huffTable;
+ 	u8 * qMatTable;
+ };
+ 
+-void framebuf_init();
++void framebuf_init(void);
+ int fwriten(int fd, void *vptr, size_t n);
+ int freadn(int fd, void *vptr, size_t n);
+ int vpu_read(struct cmd_line *cmd, char *buf, int n);
+-- 
+1.8.0
+

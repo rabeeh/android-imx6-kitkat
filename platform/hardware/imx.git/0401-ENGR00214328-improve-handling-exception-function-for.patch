@@ -1,0 +1,262 @@
+From 82721db795123ba6c1203390cd0ac620dfdb5cb9 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Wed, 9 Jan 2013 09:42:08 +0800
+Subject: [PATCH 401/486] ENGR00214328 improve handling exception function for
+ camera hal v2.
+
+improve handling exception function for camera hal v2.
+when exception happens, camera hal v2 can exit normally.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera2/CameraHal.cpp      | 12 +++++-------
+ mx6/libcamera2/CaptureStream.cpp  |  7 ++++---
+ mx6/libcamera2/PreviewStream.cpp  |  5 +++--
+ mx6/libcamera2/RequestManager.cpp | 22 +++++++++++++++++++++-
+ mx6/libcamera2/RequestManager.h   | 14 +++++++-------
+ mx6/libcamera2/StreamAdapter.cpp  | 10 ++++++++--
+ 6 files changed, 48 insertions(+), 22 deletions(-)
+
+diff --git a/mx6/libcamera2/CameraHal.cpp b/mx6/libcamera2/CameraHal.cpp
+index a3c6142..07f792b 100755
+--- a/mx6/libcamera2/CameraHal.cpp
++++ b/mx6/libcamera2/CameraHal.cpp
+@@ -43,16 +43,12 @@ void CameraHal::handleError(int err)
+             break;
+ 
+         case CAMERA2_MSG_ERROR_REQUEST:
+-            mNotifyCb(CAMERA_MSG_ERROR, 0, 0, 0, mNotifyUserPtr);
+-            break;
+-
+         case CAMERA2_MSG_ERROR_FRAME:
+-            break;
+-
+         case CAMERA2_MSG_ERROR_STREAM:
+-            break;
+-
+         default:
++            FLOGE("%s handle error:%d", __FUNCTION__, err);
++            mNotifyCb(CAMERA_MSG_ERROR, err, 0, 0, mNotifyUserPtr);
++
+             break;
+     }
+ }
+@@ -160,6 +156,8 @@ status_t CameraHal::initialize(CameraInfo& info)
+         return ret;
+     }
+ 
++    mRequestManager->setErrorListener(this);
++
+     return ret;
+ }
+ 
+diff --git a/mx6/libcamera2/CaptureStream.cpp b/mx6/libcamera2/CaptureStream.cpp
+index 600b1e8..f652165 100755
+--- a/mx6/libcamera2/CaptureStream.cpp
++++ b/mx6/libcamera2/CaptureStream.cpp
+@@ -170,22 +170,23 @@ int CaptureStream::processFrame(CameraFrame *frame)
+     ret = requestBuffer(&buffer);
+     if (ret != NO_ERROR) {
+         FLOGE("%s requestBuffer failed", __FUNCTION__);
+-        return ret;
++        goto exit_err;
+     }
+ 
+     ret = makeJpegImage(&buffer, frame);
+     if (ret != NO_ERROR) {
+         FLOGE("%s makeJpegImage failed", __FUNCTION__);
+-        return ret;
++        goto exit_err;
+     }
+ 
+     buffer.mTimeStamp = frame->mTimeStamp;
+     ret = renderBuffer(&buffer);
+     if (ret != NO_ERROR) {
+         FLOGE("%s renderBuffer failed", __FUNCTION__);
+-        return ret;
++        goto exit_err;
+     }
+ 
++exit_err:
+     sem_post(&mRespondSem);
+ 
+     return ret;
+diff --git a/mx6/libcamera2/PreviewStream.cpp b/mx6/libcamera2/PreviewStream.cpp
+index ec0b94e..2e670b2 100755
+--- a/mx6/libcamera2/PreviewStream.cpp
++++ b/mx6/libcamera2/PreviewStream.cpp
+@@ -213,7 +213,7 @@ int PreviewStream::processFrame(CameraFrame *frame)
+     ret = renderBuffer(frame);
+     if (ret != NO_ERROR) {
+         FLOGE("%s renderBuffer failed", __FUNCTION__);
+-        return ret;
++        goto err_exit;
+     }
+     //the frame held in service.
+     frame->addReference();
+@@ -222,7 +222,7 @@ int PreviewStream::processFrame(CameraFrame *frame)
+     ret = requestBuffer(&buffer);
+     if (ret != NO_ERROR) {
+         FLOGE("%s requestBuffer failed", __FUNCTION__);
+-        return ret;
++        goto err_exit;
+     }
+ 
+     for (int i = 0; i < mTotalBuffers; i++) {
+@@ -233,6 +233,7 @@ int PreviewStream::processFrame(CameraFrame *frame)
+         }
+     }
+ 
++err_exit:
+     mCondRespond.signal();
+ 
+     return ret;
+diff --git a/mx6/libcamera2/RequestManager.cpp b/mx6/libcamera2/RequestManager.cpp
+index e5bf798..f13c63e 100755
+--- a/mx6/libcamera2/RequestManager.cpp
++++ b/mx6/libcamera2/RequestManager.cpp
+@@ -21,6 +21,8 @@ RequestManager::RequestManager(int cameraId)
+     mRequestOperation = NULL;
+     mPendingRequests = 0;
+     mCameraId = cameraId;
++    mErrorListener = NULL;
++    mWorkInProcess = false;
+ }
+ 
+ RequestManager::~RequestManager()
+@@ -61,10 +63,27 @@ int RequestManager::initialize(CameraInfo& info)
+         return ret;
+     }
+     mPendingRequests=0;
++    mWorkInProcess = true;
+ 
+     return ret;
+ }
+ 
++void RequestManager::setErrorListener(CameraErrorListener *listener)
++{
++    mErrorListener = listener;
++    if (mDeviceAdapter.get() != NULL) {
++        mDeviceAdapter->setErrorListener(this);
++    }
++}
++
++void RequestManager::handleError(int err)
++{
++    mWorkInProcess = false;
++    if (mErrorListener != NULL) {
++        mErrorListener->handleError(err);
++    }
++}
++
+ void RequestManager::stopAllStreamsLocked()
+ {
+     FLOG_TRACE("%s running", __FUNCTION__);
+@@ -140,7 +159,7 @@ bool RequestManager::handleRequest()
+     int res;
+     camera_metadata_t *request=NULL;
+ 
+-    while(mRequestOperation) {
++    while(mRequestOperation && mWorkInProcess) {
+         FLOG_RUNTIME("%s:Dequeue request" ,__FUNCTION__);
+         mRequestOperation->dequeue_request(mRequestOperation, &request);
+         if(request == NULL) {
+@@ -376,6 +395,7 @@ int RequestManager::allocateStream(uint32_t width,
+     cameraStream->setPreviewWindow(stream_ops);
+     cameraStream->setDeviceAdapter(mDeviceAdapter);
+     cameraStream->setMetadaManager(mMetadaManager);
++    cameraStream->setErrorListener(this);
+ 
+     mStreamAdapter[sid] = cameraStream;
+     FLOG_TRACE("RequestManager %s end...", __FUNCTION__);
+diff --git a/mx6/libcamera2/RequestManager.h b/mx6/libcamera2/RequestManager.h
+index 5a2d521..35f34ca 100755
+--- a/mx6/libcamera2/RequestManager.h
++++ b/mx6/libcamera2/RequestManager.h
+@@ -43,7 +43,8 @@ using namespace android;
+ 
+ #define MAX_STREAM_NUM  6
+ 
+-class RequestManager : public LightRefBase<RequestManager>
++class RequestManager : public LightRefBase<RequestManager>,
++                       public CameraErrorListener
+ {
+ public:
+     RequestManager(int cameraId);
+@@ -67,16 +68,13 @@ public:
+     int dispatchRequest();
+     bool handleRequest();
+     void release();
++    void setErrorListener(CameraErrorListener *listener);
+ 
+     class RequestHandleThread : public Thread {
+     public:
+         RequestHandleThread(RequestManager *rm) :
+             Thread(false), mRequestManager(rm) {}
+-#if 0
+-        virtual void onFirstRef() {
+-            run("RequestHandle", PRIORITY_DEFAULT);
+-        }
+-#endif
++
+         virtual bool threadLoop() {
+             return mRequestManager->handleRequest();
+         }
+@@ -89,6 +87,7 @@ private:
+     int tryRestartStreams(int requestType);
+     void stopAllStreamsLocked();
+     bool isStreamValid(int requestType, int streamId);
++    void handleError(int err);
+ 
+ private:
+     sp<DeviceAdapter>  mDeviceAdapter;
+@@ -101,7 +100,8 @@ private:
+     mutable Mutex mStreamLock;
+     uint8_t mPendingRequests;
+     int mCameraId;
+-    //CameraHal *mCameraHal;
++    CameraErrorListener *mErrorListener;
++    bool mWorkInProcess;
+ };
+ 
+ #endif
+diff --git a/mx6/libcamera2/StreamAdapter.cpp b/mx6/libcamera2/StreamAdapter.cpp
+index 73f40ea..445d0ec 100755
+--- a/mx6/libcamera2/StreamAdapter.cpp
++++ b/mx6/libcamera2/StreamAdapter.cpp
+@@ -49,6 +49,11 @@ void StreamAdapter::setMetadaManager(sp<MetadaManager>& metaManager)
+     mMetadaManager = metaManager;
+ }
+ 
++void StreamAdapter::setErrorListener(CameraErrorListener *listener)
++{
++    mErrorListener = listener;
++}
++
+ int StreamAdapter::start()
+ {
+     FLOG_TRACE("StreamAdapter %s running", __FUNCTION__);
+@@ -201,7 +206,7 @@ int StreamAdapter::processFrame(CameraFrame *frame)
+     int err = requestBuffer(&buffer);
+     if (ret != NO_ERROR) {
+         FLOGE("%s requestBuffer failed", __FUNCTION__);
+-        return ret;
++        goto err_ext;
+     }
+ 
+     memcpy(buffer.mVirtAddr, (void *)frame->mVirtAddr, frame->mSize);
+@@ -209,9 +214,10 @@ int StreamAdapter::processFrame(CameraFrame *frame)
+     err = renderBuffer(&buffer);
+     if (ret != NO_ERROR) {
+         FLOGE("%s renderBuffer failed", __FUNCTION__);
+-        return ret;
++        goto err_ext;
+     }
+ 
++err_ext:
+     mCondRespond.signal();
+ 
+     return ret;
+-- 
+1.8.0
+

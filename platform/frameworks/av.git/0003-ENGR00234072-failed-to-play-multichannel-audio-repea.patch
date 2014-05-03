@@ -1,0 +1,263 @@
+From 7f214e5d94b640bd9255d3ab9fa650e3c3931975 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Thu, 22 Nov 2012 17:42:01 +0800
+Subject: [PATCH 03/50] ENGR00234072 failed to play multichannel audio
+ repeatly
+
+This issue caused by the gapless playback feature, which is no fit for
+multichannel audio.
+When the track use the direct output, it can not be used for recycle.
+After finishing playback , the direct output must be released, and
+in beginning of playback it will be recreated.
+In cycle playback, if the next track also need to create direct output,
+but previous one is not released, it will cause issue.
+Here we checking the output flag, if it is direct output, release
+the track first.
+
+Change-Id: I4c2c6352003c979cb626e392688e5b932f54c52f
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ include/media/AudioSystem.h                        |  7 ++-
+ include/media/AudioTrack.h                         |  2 +
+ media/libmedia/AudioSystem.cpp                     | 20 +++++++
+ media/libmedia/AudioTrack.cpp                      |  9 ++++
+ media/libmediaplayerservice/MediaPlayerService.cpp | 62 ++++++++++++++++++++++
+ services/audioflinger/AudioFlinger.cpp             |  1 +
+ services/audioflinger/Threads.cpp                  |  2 +
+ 7 files changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/include/media/AudioSystem.h b/include/media/AudioSystem.h
+index 225ef76..477a50d 100644
+--- a/include/media/AudioSystem.h
++++ b/include/media/AudioSystem.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -104,6 +105,9 @@ public:
+     static status_t getFrameCount(audio_io_handle_t output,
+                                   audio_stream_type_t stream,
+                                   size_t* frameCount);
++    static status_t getFlags(audio_io_handle_t output,
++                                  audio_stream_type_t streamType,
++                                  int* flags);
+     // returns the audio output stream latency in ms. Corresponds to
+     // audio_stream_out->get_latency()
+     static status_t getLatency(audio_io_handle_t output,
+@@ -155,13 +159,14 @@ public:
+     class OutputDescriptor {
+     public:
+         OutputDescriptor()
+-        : samplingRate(0), format(AUDIO_FORMAT_DEFAULT), channelMask(0), frameCount(0), latency(0)  {}
++        : samplingRate(0), format(AUDIO_FORMAT_DEFAULT), channelMask(0), frameCount(0), latency(0), flags(AUDIO_OUTPUT_FLAG_NONE) {}
+ 
+         uint32_t samplingRate;
+         audio_format_t format;
+         audio_channel_mask_t channelMask;
+         size_t frameCount;
+         uint32_t latency;
++        audio_output_flags_t flags;
+     };
+ 
+     // Events used to synchronize actions between audio sessions.
+diff --git a/include/media/AudioTrack.h b/include/media/AudioTrack.h
+index f379ee5..3da5cf3 100644
+--- a/include/media/AudioTrack.h
++++ b/include/media/AudioTrack.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2007 The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -453,6 +454,7 @@ public:
+      *  handle on audio hardware output
+      */
+             audio_io_handle_t    getOutput();
++            audio_io_handle_t    getCurrentOutput();
+ 
+     /* Returns the unique session ID associated with this track.
+      *
+diff --git a/media/libmedia/AudioSystem.cpp b/media/libmedia/AudioSystem.cpp
+index 8033c2c..ac380d5 100644
+--- a/media/libmedia/AudioSystem.cpp
++++ b/media/libmedia/AudioSystem.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2006-2007 The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -296,6 +297,25 @@ status_t AudioSystem::getFrameCount(audio_io_handle_t output,
+     return NO_ERROR;
+ }
+ 
++status_t AudioSystem::getFlags(audio_io_handle_t output,
++                                    audio_stream_type_t streamType,
++                                    int* flags)
++{
++    OutputDescriptor *outputDesc;
++    *flags = 0;
++
++    gLock.lock();
++    outputDesc = AudioSystem::gOutputs.valueFor(output);
++    if (outputDesc != NULL) {
++        *flags = outputDesc->flags;
++        gLock.unlock();
++    }
++
++    ALOGV("getFlags() streamType %d, output %d, flags %d", streamType, output, *flags);
++
++    return NO_ERROR;
++}
++
+ status_t AudioSystem::getOutputLatency(uint32_t* latency, audio_stream_type_t streamType)
+ {
+     audio_io_handle_t output;
+diff --git a/media/libmedia/AudioTrack.cpp b/media/libmedia/AudioTrack.cpp
+index b8a89a0..dbb2b15 100644
+--- a/media/libmedia/AudioTrack.cpp
++++ b/media/libmedia/AudioTrack.cpp
+@@ -1,6 +1,7 @@
+ /*
+ **
+ ** Copyright 2007, The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+ **
+ ** Licensed under the Apache License, Version 2.0 (the "License");
+ ** you may not use this file except in compliance with the License.
+@@ -325,6 +326,7 @@ status_t AudioTrack::set(
+     mAuxEffectId = 0;
+     mFlags = flags;
+     mCbf = cbf;
++    mOutput = output;
+ 
+     if (cbf != NULL) {
+         mAudioTrackThread = new AudioTrackThread(*this, threadCanCallJava);
+@@ -780,6 +782,13 @@ status_t AudioTrack::reload()
+     return NO_ERROR;
+ }
+ 
++audio_io_handle_t AudioTrack::getCurrentOutput()
++{
++    AutoMutex lock(mLock);
++    ALOGV("AudioTrack::getCurrentOutput %d",mOutput);
++    return mOutput;
++}
++
+ audio_io_handle_t AudioTrack::getOutput()
+ {
+     AutoMutex lock(mLock);
+diff --git a/media/libmediaplayerservice/MediaPlayerService.cpp b/media/libmediaplayerservice/MediaPlayerService.cpp
+index cd052e6..7d86672 100644
+--- a/media/libmediaplayerservice/MediaPlayerService.cpp
++++ b/media/libmediaplayerservice/MediaPlayerService.cpp
+@@ -1,6 +1,7 @@
+ /*
+ **
+ ** Copyright 2008, The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+ **
+ ** Licensed under the Apache License, Version 2.0 (the "License");
+ ** you may not use this file except in compliance with the License.
+@@ -1486,6 +1487,67 @@ status_t MediaPlayerService::AudioOutput::open(
+     // Check whether we can recycle the track
+     bool reuse = false;
+     bool bothOffloaded = false;
++    /*When the track use the direct output, it can not be used for recycle. After finishing
++      playback , the direct output must be released, and in beginning of playback it will be
++      recreated.
++      In cycle playback, if the next track also need to create direct output, but previous one is
++      not released, it will cause issue.
++      So here we checking the output flag, if it is direct output, then release it.
++    */
++    if (mRecycledTrack) {
++        int flags;
++        AudioSystem::getFlags(mRecycledTrack->getCurrentOutput(), mStreamType, &flags);
++        ALOGV("RecycledTrack getFlags %d",flags);
++        if (flags & AUDIO_OUTPUT_FLAG_DIRECT) {
++            // if we're not going to reuse the track, unblock and flush it
++            if (mCallbackData != NULL) {
++                mCallbackData->setOutput(NULL);
++                mCallbackData->endTrackSwitch();
++            }
++            mRecycledTrack->flush();
++            delete mRecycledTrack;
++            mRecycledTrack = NULL;
++            delete mCallbackData;
++            mCallbackData = NULL;
++            close();
++        }
++    }
++
++    AudioTrack *t;
++    CallbackData *newcbd = NULL;
++    if (mCallback != NULL) {
++        newcbd = new CallbackData(this);
++        t = new AudioTrack(
++                mStreamType,
++                sampleRate,
++                format,
++                channelMask,
++                frameCount,
++                flags,
++                CallbackWrapper,
++                newcbd,
++                0,  // notification frames
++                mSessionId);
++    } else {
++        t = new AudioTrack(
++                mStreamType,
++                sampleRate,
++                format,
++                channelMask,
++                frameCount,
++                flags,
++                NULL,
++                NULL,
++                0,
++                mSessionId);
++    }
++
++    if ((t == 0) || (t->initCheck() != NO_ERROR)) {
++        ALOGE("Unable to create audio track");
++        delete t;
++        delete newcbd;
++        return NO_INIT;
++    }
+ 
+     if (mRecycledTrack != 0) {
+         // check whether we are switching between two offloaded tracks
+diff --git a/services/audioflinger/AudioFlinger.cpp b/services/audioflinger/AudioFlinger.cpp
+index 3132e54..2192340 100644
+--- a/services/audioflinger/AudioFlinger.cpp
++++ b/services/audioflinger/AudioFlinger.cpp
+@@ -1,6 +1,7 @@
+ /*
+ **
+ ** Copyright 2007, The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+ **
+ ** Licensed under the Apache License, Version 2.0 (the "License");
+ ** you may not use this file except in compliance with the License.
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index bf85b51..69c2c35 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -1555,6 +1555,8 @@ void AudioFlinger::PlaybackThread::audioConfigChanged_l(int event, int param) {
+         desc.frameCount = mNormalFrameCount; // FIXME see
+                                              // AudioFlinger::frameCount(audio_io_handle_t)
+         desc.latency = latency();
++        if (mType == DIRECT)
++            desc.flags = AUDIO_OUTPUT_FLAG_DIRECT;
+         param2 = &desc;
+         break;
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,147 @@
+From 271a6d481d3e1c589bb8638440d61ad9b6c7f73b Mon Sep 17 00:00:00 2001
+From: b07117 <b07117@freescale.com>
+Date: Mon, 14 Nov 2011 15:37:36 +0800
+Subject: [PATCH 208/486] ENGR00162070 enable video playback with gralloc
+ wrapper
+
+merge gralloc code from mx5x to mx6
+enable video overlay path in gralloc wrapper
+
+Signed-off-by: xianzhong <b07117@freescale.com>
+---
+ mx6/libgralloc/framebuffer.cpp | 17 ++++++++++-------
+ mx6/libgralloc/gralloc.cpp     | 26 ++++++++++++++++++--------
+ mx6/libgralloc/mapper.cpp      |  4 ++--
+ 3 files changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/mx6/libgralloc/framebuffer.cpp b/mx6/libgralloc/framebuffer.cpp
+index 9507cbc..4b19590 100755
+--- a/mx6/libgralloc/framebuffer.cpp
++++ b/mx6/libgralloc/framebuffer.cpp
+@@ -774,7 +774,7 @@ static int set_graphics_fb_mode(int fb, int dual_disp)
+ 
+     fp_cmd = open("/proc/cmdline",O_RDONLY, 0);
+     if(fp_cmd < 0) {
+-        LOGI("Error! Cannot open /proc/cmdline");
++        LOGI("Error %d! Cannot open /proc/cmdline", fp_cmd);
+         goto set_graphics_fb_mode_error;
+     }
+ 
+@@ -793,7 +793,7 @@ static int set_graphics_fb_mode(int fb, int dual_disp)
+     sprintf(temp_name, "/sys/class/graphics/fb%d/modes", fb);
+     fp_modes = open(temp_name,O_RDONLY, 0);
+     if(fp_modes < 0) {
+-        LOGI("Error! Cannot open %s", temp_name);
++        LOGI("Error %d! Cannot open %s", fp_modes, temp_name);
+         goto set_graphics_fb_mode_error;
+     }
+ 
+@@ -821,23 +821,26 @@ static int set_graphics_fb_mode(int fb, int dual_disp)
+     sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+     fp_mode = open(temp_name,O_RDWR, 0);
+     if(fp_mode < 0) {
+-        LOGI("Error! Cannot open %s", temp_name);
++        LOGI("Error %d! Cannot open %s", fp_mode, temp_name);
+         goto set_graphics_fb_mode_error;
+     }
+ 
+     memset(fb_mode, 0, sizeof(fb_mode));
+     size = read(fp_mode, fb_mode, sizeof(fb_mode));
+-    if(size <= 0)
++    if(size < 0)
+     {
+         LOGI("Error! Cannot read %s", temp_name);
+         goto set_graphics_fb_mode_error;
+     }
+ 
+-    if(strncmp(fb_mode, disp_mode, strlen(fb_mode)))
++    if(strncmp(fb_mode, disp_mode, strlen(disp_mode)+1))
+     {
+-        write(fp_mode, disp_mode, strlen(disp_mode)+1);
++        size = write(fp_mode, disp_mode, strlen(disp_mode)+1);
++        if(size <= 0)
++        {
++           LOGI("Error! Cannot write %s", temp_name);
++        }
+     }
+-
+     close(fp_mode); fp_mode = 0;
+ 
+     return 0;
+diff --git a/mx6/libgralloc/gralloc.cpp b/mx6/libgralloc/gralloc.cpp
+index cb87a56..204a386 100755
+--- a/mx6/libgralloc/gralloc.cpp
++++ b/mx6/libgralloc/gralloc.cpp
+@@ -365,22 +365,26 @@ static int gralloc_alloc(alloc_device_t* dev,
+     if(!m)
+         return -EINVAL;
+ 
+-    if (m->gpu_device) {
++    if (m->gpu_device && !(usage & GRALLOC_USAGE_HWC_OVERLAY)) {
+        return m->gpu_device->alloc(dev, w, h, format, usage, pHandle, pStride);
+     }
+ 
+     size_t size, alignedw, alignedh;
+-    if (format == HAL_PIXEL_FORMAT_YCbCr_420_SP || 
+-            format == HAL_PIXEL_FORMAT_YCbCr_422_SP) 
++    if (format == HAL_PIXEL_FORMAT_YCbCr_420_SP || format == HAL_PIXEL_FORMAT_YCbCr_422_I ||
++            format == HAL_PIXEL_FORMAT_YCbCr_422_SP || format == HAL_PIXEL_FORMAT_YCbCr_420_I ||
++        format == HAL_PIXEL_FORMAT_YV12)
+     {
+         // FIXME: there is no way to return the alignedh
+-        alignedw = (w + 1) & ~1; 
++        alignedw = ALIGN_PIXEL_16(w);
++        alignedh = ALIGN_PIXEL_16(h);
+         switch (format) {
+-            case HAL_PIXEL_FORMAT_YCbCr_420_SP:
+-                size = alignedw * h * 2;
+-                break;
+             case HAL_PIXEL_FORMAT_YCbCr_422_SP:
+-                alignedh = (h+1) & ~1;
++            case HAL_PIXEL_FORMAT_YCbCr_422_I:
++                size = alignedw * alignedh * 2;
++                break;
++            case HAL_PIXEL_FORMAT_YCbCr_420_SP:
++            case HAL_PIXEL_FORMAT_YCbCr_420_I:
++            case HAL_PIXEL_FORMAT_YV12:
+                 size = (alignedw * alignedh) + (w/2 * h/2) * 2;
+                 break;
+             default:
+@@ -421,6 +425,12 @@ static int gralloc_alloc(alloc_device_t* dev,
+         return err;
+     }
+ 
++    private_handle_t* hnd = (private_handle_t*)(*pHandle);
++    hnd->usage = usage;
++    hnd->format = format;
++    hnd->width = alignedw;
++    hnd->height = alignedh;
++
+     *pStride = alignedw;
+     return 0;
+ }
+diff --git a/mx6/libgralloc/mapper.cpp b/mx6/libgralloc/mapper.cpp
+index 634308c..61b60e2 100755
+--- a/mx6/libgralloc/mapper.cpp
++++ b/mx6/libgralloc/mapper.cpp
+@@ -262,7 +262,7 @@ int gralloc_lock(gralloc_module_t const* module,
+ 
+     if (new_value & private_handle_t::LOCK_STATE_WRITE) {
+         // locking for write, store the tid
+-        hnd->writeOwner = gettid();
++        hnd->writeOwner = getpid();
+     }
+ 
+     if (usage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK)) {
+@@ -305,7 +305,7 @@ int gralloc_unlock(gralloc_module_t const* module,
+ 
+         if (current_value & private_handle_t::LOCK_STATE_WRITE) {
+             // locked for write
+-            if (hnd->writeOwner == gettid()) {
++            if (hnd->writeOwner == getpid()) {
+                 hnd->writeOwner = 0;
+                 new_value &= ~private_handle_t::LOCK_STATE_WRITE;
+             }
+-- 
+1.8.0
+

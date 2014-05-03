@@ -1,0 +1,122 @@
+From d924d96fea2f2d7160898cf2ad73294dfb3e548c Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Mon, 3 Dec 2012 14:55:21 +0800
+Subject: [PATCH 223/249] ENGR00235532 Reduce the possibility of multi-thread
+ vpu_semap conflict
+
+VPU lib v5.4.9
+
+Bug:
+Segmentation fault occured when 2 threads (of instances) access
+vpu_semap simultaneously (< 10%)
+
+Root cause:
+Concurrency of IOSystemInit/IOSystemShutdown may have conflict when
+accessing global variables simultaneously (vpu_fd,...). This can't
+be protected by vpu_semap, because its life cycle is shorter.
+
+Solution:
+Add EnterInit/LeaveInit as lock to IOSystemInit/IOSystemShutdown
+
+BTW, add -lpthread in Makefile to reflect the dependancy
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/Makefile  |  2 +-
+ vpu/vpu_lib.c | 23 +++++++++++++++++++++--
+ vpu/vpu_lib.h |  2 +-
+ 3 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/vpu/Makefile b/vpu/Makefile
+index dd0675e..4e460d2 100644
+--- a/vpu/Makefile
++++ b/vpu/Makefile
+@@ -36,7 +36,7 @@ endif
+ 	$(CC) -D$(PLATFORM) -Wall -O2 -fPIC -c $^ -o $@
+ 
+ $(LIBNAME).so.$(SONAMEVERSION): $(OBJ)
+-	$(CC) -shared -nostartfiles -Wl,-soname,$@ $^ -o $@
++	$(CC) -shared -nostartfiles -Wl,-soname,$@ $^ -o $@ -lpthread
+ 
+ $(LIBNAME).so: $(LIBNAME).so.$(SONAMEVERSION)
+ 	ln -s $< $@
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index bbb1e20..472cfff 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -58,6 +58,20 @@ extern void vpu_setting_iram();
+ 
+ static int decoded_pictype[32];
+ 
++static volatile int bInit=0;
++static __inline void EnterInit()
++{
++	while(bInit==1){
++		usleep(1000);
++	}
++	bInit=1;
++}
++
++static __inline void LeaveInit()
++{
++	bInit=0;
++}
++
+ static __inline int is_mx6x_mjpg_codec(int codecMode)
+ {
+ 	if (cpu_is_mx6x() && (codecMode == MJPG_DEC ||
+@@ -209,15 +223,18 @@ RetCode vpu_Init(void *cb)
+ 		vpu_lib_dbg_level = 0;
+ 
+ 	ENTER_FUNC();
+-
++	EnterInit();
+ 	err = IOSystemInit(cb);
++	LeaveInit();
+ 	if (err) {
+ 		err_msg("IOSystemInit() failure.\n");
+ 		return RETCODE_FAILURE;
+ 	}
+ 
+ 	if (!LockVpu(vpu_semap)) {
++		EnterInit();
+ 		err = IOSystemShutdown();
++		LeaveInit();
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 	}
+ 	codeBuffer = bit_work_addr.phy_addr;
+@@ -307,7 +324,9 @@ RetCode vpu_Init(void *cb)
+ 
+ void vpu_UnInit(void)
+ {
++	EnterInit();
+ 	IOSystemShutdown();
++	LeaveInit();
+ }
+ 
+ /*
+@@ -325,7 +344,7 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 
+ 	ENTER_FUNC();
+ 
+-	info_msg("vpu_SWReset");
++	info_msg("vpu_SWReset\n");
+ 	if (handle == NULL) {
+ 		if (index < 0 || index >= MAX_NUM_INSTANCE)
+ 			return RETCODE_FAILURE;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index fcab7f9..49c0aa6 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -667,7 +667,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 8)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 9)
+ 
+ extern unsigned int system_rev;
+ 
+-- 
+1.8.0
+

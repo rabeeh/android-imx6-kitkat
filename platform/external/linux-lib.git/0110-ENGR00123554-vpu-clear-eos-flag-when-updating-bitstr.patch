@@ -1,0 +1,228 @@
+From 80e7dfa37d31b215de393eb3dde6c78002c581a3 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 18 May 2010 13:27:57 +0800
+Subject: [PATCH 110/249] ENGR00123554 vpu: clear eos flag when updating
+ bitstream
+
+Clear end of stream flag in vpu_DecUpdateBitstreamBuffer function
+if updated size isn't zero.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_io.c   | 10 +++++-----
+ vpu/vpu_lib.c  | 17 +++++++++++++----
+ vpu/vpu_util.c | 26 ++++++++++++++++++++------
+ vpu/vpu_util.h | 30 +++++++++++++++++++++++++-----
+ 4 files changed, 63 insertions(+), 20 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index 3b31333..eb43ab8 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -240,7 +240,7 @@ int IOSystemInit(void *callback)
+ 		return -1;
+ 	}
+ 
+-	if (!semaphore_wait(vpu_semap)) {
++	if (!semaphore_wait(vpu_semap, API_MUTEX)) {
+ 		err_msg("Error: Unable to get mutex\n");
+ 		close (vpu_fd);
+ 		vpu_fd = -1;
+@@ -255,7 +255,7 @@ int IOSystemInit(void *callback)
+ 		err_msg("Can't map register\n");
+ 		close(vpu_fd);
+ 		vpu_fd = -1;
+-		semaphore_post(vpu_semap);
++		semaphore_post(vpu_semap, API_MUTEX);
+ 		return -1;
+ 	}
+ 
+@@ -328,7 +328,7 @@ int IOSystemShutdown(void)
+ 		return 0;
+ 	}
+ 
+-	if (!semaphore_wait(vpu_semap)) {
++	if (!semaphore_wait(vpu_semap, API_MUTEX)) {
+ 		err_msg("Unable to get mutex\n");
+ 		return -1;
+ 	}
+@@ -346,7 +346,7 @@ int IOSystemShutdown(void)
+ 
+ 	vpu_active_num--;
+ 
+-	semaphore_post(vpu_semap);
++	semaphore_post(vpu_semap, API_MUTEX);
+ 	vpu_semaphore_close(vpu_semap);
+ 
+ 	if (vpu_fd >= 0) {
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index ac61504..620ce8d 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -1900,8 +1900,10 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	VpuWriteReg(pDecInfo->frameDisplayFlagRegAddr, 0);
+ 
+ 	/* Clear stream end flag */
++	LockVpuReg(vpu_semap);
+ 	VpuWriteReg(BIT_BIT_STREAM_PARAM,
+ 		    VpuReadReg(BIT_BIT_STREAM_PARAM) & ~(1 << (instIdx + 2)));
++	UnlockVpuReg(vpu_semap);
+ 
+ 	bit_offset = cpu_is_mx37() ? (instIdx + 1) : (instIdx + 2);
+ 	val = VpuReadReg(BIT_FRAME_MEM_CTRL) & ~(1 << bit_offset);
+@@ -2501,13 +2503,20 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 	wrPtr = pDecInfo->streamWrPtr;
+ 
++	LockVpuReg(vpu_semap);
+ 	if (size == 0) {
+-		IOClkGateSet(true);
++		/* Set stream end flag */
+ 		val = VpuReadReg(BIT_BIT_STREAM_PARAM);
+-		val |= 1 << (pCodecInst->instIndex + 2);
+-		VpuWriteReg(BIT_BIT_STREAM_PARAM, val);
+-		IOClkGateSet(false);
++		VpuWriteReg(BIT_BIT_STREAM_PARAM,
++			    val |= 1 << (pCodecInst->instIndex + 2));
++		UnlockVpuReg(vpu_semap);
+ 		return RETCODE_SUCCESS;
++	} else {
++		/* Clear stream end flag */
++		val = VpuReadReg(BIT_BIT_STREAM_PARAM);
++		VpuWriteReg(BIT_BIT_STREAM_PARAM,
++			    val & ~(1 << (pCodecInst->instIndex + 2)));
++		UnlockVpuReg(vpu_semap);
+ 	}
+ 
+ 	IOClkGateSet(true);
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 6a44fef..771789f 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -936,7 +936,8 @@ semaphore_t *vpu_semaphore_open(void)
+ 	if (!semap->is_initialized) {
+ 		pthread_mutexattr_init(&psharedm);
+ 		pthread_mutexattr_setpshared(&psharedm, PTHREAD_PROCESS_SHARED);
+-		pthread_mutex_init(&semap->lock, &psharedm);
++		pthread_mutex_init(&semap->api_lock, &psharedm);
++		pthread_mutex_init(&semap->reg_lock, &psharedm);
+ 		for (i = 0; i < MAX_NUM_INSTANCE; ++i) {
+ 			pCodecInst = (CodecInst *) (&semap->codecInstPool[i]);
+ 			pCodecInst->instIndex = i;
+@@ -954,22 +955,35 @@ semaphore_t *vpu_semaphore_open(void)
+ 	return semap;
+ }
+ 
+-void semaphore_post(semaphore_t *semap)
++void semaphore_post(semaphore_t *semap, int mutex)
+ {
+-	pthread_mutex_unlock(&semap->lock);
++	if (mutex == API_MUTEX)
++		pthread_mutex_unlock(&semap->api_lock);
++	else if (mutex == REG_MUTEX)
++		pthread_mutex_unlock(&semap->reg_lock);
+ }
+ 
+-bool semaphore_wait(semaphore_t *semap)
++bool semaphore_wait(semaphore_t *semap, int mutex)
+ {
+ #ifdef ANDROID
+-	pthread_mutex_lock(&semap->lock);
++	if (mutex == API_MUTEX)
++		pthread_mutex_lock(&semap->api_lock);
++	else if (mutex == REG_MUTEX)
++		pthread_mutex_lock(&semap->reg_lock);
+ 	return true;
+ #else
+ 	struct timespec ts;
++	int ret = 0;
+ 
+ 	ts.tv_sec = time(NULL) + mutex_timeout;
+ 	ts.tv_nsec = 0;
+-	if (pthread_mutex_timedlock(&semap->lock, &ts) == ETIMEDOUT) {
++	if (mutex == API_MUTEX)
++		ret = pthread_mutex_timedlock(&semap->api_lock, &ts);
++	else if (mutex == REG_MUTEX)
++		ret = pthread_mutex_timedlock(&semap->reg_lock, &ts);
++	else
++		warn_msg("Not supported mutex\n");
++	if (ret == ETIMEDOUT) {
+ 		warn_msg("VPU mutex couldn't be locked before timeout expired\n");
+ 		return false;
+ 	}
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 346fa76..d64971f 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -146,6 +146,11 @@ enum {
+ 	FIRMWARE_GET = 0xf
+ };
+ 
++enum {
++	API_MUTEX = 0,
++	REG_MUTEX = 1
++};
++
+ typedef struct {
+ 	int useBitEnable;
+ 	int useIpEnable;
+@@ -268,7 +273,8 @@ typedef struct CodecInst {
+ 
+ typedef struct {
+ 	int is_initialized;
+-	pthread_mutex_t lock;
++	pthread_mutex_t api_lock;
++	pthread_mutex_t reg_lock;
+ 
+ 	/* VPU data for sharing */
+ 	CodecInst codecInstPool[MAX_NUM_INSTANCE];
+@@ -308,13 +314,13 @@ void SetDecSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width);
+ void SetEncSecondAXIIRAM(SecAxiUse *psecAxiIramInfo, int width);
+ 
+ semaphore_t *vpu_semaphore_open(void);
+-void semaphore_post(semaphore_t *semap);
+-bool semaphore_wait(semaphore_t *semap);
++void semaphore_post(semaphore_t *semap, int mutex);
++bool semaphore_wait(semaphore_t *semap, int mutex);
+ void vpu_semaphore_close(semaphore_t *semap);
+ 
+ static inline bool LockVpu(semaphore_t *semap)
+ {
+-	if (!semaphore_wait(semap))
++	if (!semaphore_wait(semap, API_MUTEX))
+ 		return false;
+ 	IOClkGateSet(1);
+ 	return true;
+@@ -322,7 +328,21 @@ static inline bool LockVpu(semaphore_t *semap)
+ 
+ static inline void UnlockVpu(semaphore_t *semap)
+ {
+-	semaphore_post(semap);
++	semaphore_post(semap, API_MUTEX);
++	IOClkGateSet(0);
++}
++
++static inline bool LockVpuReg(semaphore_t *semap)
++{
++	if (!semaphore_wait(semap, REG_MUTEX))
++		return false;
++	IOClkGateSet(1);
++	return true;
++}
++
++static inline void UnlockVpuReg(semaphore_t *semap)
++{
++	semaphore_post(semap, REG_MUTEX);
+ 	IOClkGateSet(0);
+ }
+ 
+-- 
+1.8.0
+

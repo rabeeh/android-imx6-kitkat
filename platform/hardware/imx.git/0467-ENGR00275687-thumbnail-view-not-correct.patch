@@ -1,0 +1,120 @@
+From 15e5b6c3a9f237c5f3e95f82c8fe8c52c824e054 Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Thu, 29 Aug 2013 15:50:34 +0800
+Subject: [PATCH 467/486] ENGR00275687 - thumbnail view not correct
+
+add codes to resize yuyv interleaved, the origin codes is for planed
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ mx6/libcamera/YuvToJpegEncoder.cpp | 55 ++++++++++++++++++++++++--------------
+ 1 file changed, 35 insertions(+), 20 deletions(-)
+
+diff --git a/mx6/libcamera/YuvToJpegEncoder.cpp b/mx6/libcamera/YuvToJpegEncoder.cpp
+index b15e8d7..d8149ff 100644
+--- a/mx6/libcamera/YuvToJpegEncoder.cpp
++++ b/mx6/libcamera/YuvToJpegEncoder.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -304,6 +304,8 @@ void Yuv422IToJpegEncoder::configSamplingFactors(jpeg_compress_struct *cinfo) {
+     cinfo->comp_info[2].v_samp_factor = 2;
+ }
+ 
++
++//interleaved
+ int Yuv422IToJpegEncoder::yuvResize(uint8_t *srcBuf,
+                                     int      srcWidth,
+                                     int      srcHeight,
+@@ -317,12 +319,10 @@ int Yuv422IToJpegEncoder::yuvResize(uint8_t *srcBuf,
+     unsigned char *ptr, cc;
+     int h_scale_ratio;
+     int v_scale_ratio;
++	int srcStride;
++	int dstStride;
+ 
+-    s = 0;
+-
+-_resize_begin:
+-
+-    if (!dstWidth) return -1;
++	if (!dstWidth) return -1;
+ 
+     if (!dstHeight) return -1;
+ 
+@@ -335,38 +335,53 @@ _resize_begin:
+     h_offset = (srcWidth - dstWidth * h_scale_ratio) / 2;
+     v_offset = (srcHeight - dstHeight * v_scale_ratio) / 2;
+ 
+-    for (i = 0; i < dstHeight * v_scale_ratio; i += v_scale_ratio)
++	srcStride = srcWidth * 2;
++	dstStride = dstWidth * 2;
++
++
++	//for Y
++	for (i = 0; i < dstHeight * v_scale_ratio; i += v_scale_ratio)
+     {
+-        for (j = 0; j < dstWidth * h_scale_ratio; j += h_scale_ratio)
++        for (j = 0; j < dstStride * h_scale_ratio; j += 2 * h_scale_ratio)
+         {
+-            ptr = srcBuf + i * srcWidth + j + v_offset * srcWidth + h_offset;
++            ptr = srcBuf + i * srcStride + j + v_offset * srcStride + h_offset * 2;
+             cc  = ptr[0];
+ 
+-            ptr    = dstBuf + (i / v_scale_ratio) * dstWidth + (j / h_scale_ratio);
++            ptr    = dstBuf + (i / v_scale_ratio) * dstStride + (j / h_scale_ratio);
+             ptr[0] = cc;
+         }
+     }
+ 
+-    srcBuf += srcWidth * srcHeight;
+-    dstBuf += dstWidth * dstHeight;
+-
+-    if (s < 2)
++	//for U
++	for (i = 0; i < dstHeight * v_scale_ratio; i += v_scale_ratio)
+     {
+-        if (!s++)
++        for (j = 0; j < dstStride * h_scale_ratio; j += 4 * h_scale_ratio)
+         {
+-            srcWidth  >>= 1;
+-            srcHeight >>= 1;
++            ptr = srcBuf + 1 + i * srcStride + j + v_offset * srcStride + h_offset * 2;
++            cc  = ptr[0];
+ 
+-            dstWidth  >>= 1;
+-            dstHeight >>= 1;
++            ptr    = dstBuf + 1 + (i / v_scale_ratio) * dstStride + (j / h_scale_ratio);
++            ptr[0] = cc;
+         }
++    }
++
++	//for V
++	for (i = 0; i < dstHeight * v_scale_ratio; i += v_scale_ratio)
++    {
++        for (j = 0; j < dstStride * h_scale_ratio; j += 4 * h_scale_ratio)
++        {
++            ptr = srcBuf + 3 + i * srcStride + j + v_offset * srcStride + h_offset * 2;
++            cc  = ptr[0];
+ 
+-        goto _resize_begin;
++            ptr    = dstBuf + 3 + (i / v_scale_ratio) * dstStride + (j / h_scale_ratio);
++            ptr[0] = cc;
++        }
+     }
+ 
+     return 0;
+ }
+ 
++
+ void jpegBuilder_error_exit(j_common_ptr cinfo)
+ {
+     jpegBuilder_error_mgr *error = (jpegBuilder_error_mgr *)cinfo->err;
+-- 
+1.8.0
+

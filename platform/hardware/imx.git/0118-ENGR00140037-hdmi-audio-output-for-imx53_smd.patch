@@ -1,0 +1,174 @@
+From 79f0c055a8cd5e036400759ea1163bebfc57b7f1 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Wed, 2 Mar 2011 13:06:17 -0500
+Subject: [PATCH 118/486] ENGR00140037 hdmi audio output for imx53_smd
+
+hdmi audio output for imx53_smd
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ modules/alsa/Android.mk     |   3 +-
+ modules/alsa/alsa_imx5x.cpp | 106 +++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 102 insertions(+), 7 deletions(-)
+
+diff --git a/modules/alsa/Android.mk b/modules/alsa/Android.mk
+index f17091c..3a90838 100755
+--- a/modules/alsa/Android.mk
++++ b/modules/alsa/Android.mk
+@@ -33,7 +33,8 @@ ifeq ($(strip $(BOARD_USES_ALSA_AUDIO)),true)
+   LOCAL_SHARED_LIBRARIES := \
+ 	libaudio \
+   	libasound \
+-  	liblog
++  	liblog   \
++    libcutils
+ 
+   LOCAL_MODULE:= alsa.$(TARGET_BOARD_PLATFORM)
+ 
+diff --git a/modules/alsa/alsa_imx5x.cpp b/modules/alsa/alsa_imx5x.cpp
+index e2d2598..36d7a42 100755
+--- a/modules/alsa/alsa_imx5x.cpp
++++ b/modules/alsa/alsa_imx5x.cpp
+@@ -21,6 +21,7 @@
+ #include "AudioHardwareALSA.h"
+ #include <media/AudioRecord.h>
+ 
++#include <cutils/properties.h>
+ //#define BLUETOOTH_SCO_DEVICE "hw:0,1"
+ //#define FM_TRANSMIT_DEVICE "hw:0,2"
+ 
+@@ -40,6 +41,10 @@ static status_t s_open(alsa_handle_t *, uint32_t, int);
+ static status_t s_close(alsa_handle_t *);
+ static status_t s_route(alsa_handle_t *, uint32_t, int);
+ 
++char spdifcardname[32];
++char sgtlcardname[32];
++    
++    
+ static hw_module_methods_t s_module_methods = {
+     open            : s_device_open
+ };
+@@ -104,6 +109,7 @@ typedef void (*AlsaControlSet)(uint32_t devices, int mode);
+         AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP | \
+         AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES | \
+         AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER | \
++        AudioSystem::DEVICE_OUT_WIRED_HDMI | \
+         AudioSystem::DEVICE_OUT_DEFAULT \
+ 	)
+ 
+@@ -143,18 +149,106 @@ static alsa_handle_t _defaults[] = {
+ 
+ // ----------------------------------------------------------------------------
+ 
+-const char *deviceName(alsa_handle_t *handle, uint32_t device, int mode)
+-{
+-    // i.mx51 only has one codec (alsa dev)
+-    return "default";
+-}
+-
+ snd_pcm_stream_t direction(alsa_handle_t *handle)
+ {
+     return (handle->devices & AudioSystem::DEVICE_OUT_ALL) ? SND_PCM_STREAM_PLAYBACK
+             : SND_PCM_STREAM_CAPTURE;
+ }
+ 
++const char *deviceName(alsa_handle_t *alsa_handle, uint32_t device, int mode)
++{
++
++	snd_ctl_t *handle;
++	int card, err, dev, idx;
++	snd_ctl_card_info_t *info;
++	snd_pcm_info_t *pcminfo;
++	snd_ctl_card_info_alloca(&info);
++	snd_pcm_info_alloca(&pcminfo);
++    int  cardnum = 0;
++    char value[PROPERTY_VALUE_MAX];
++    snd_pcm_stream_t stream = direction(alsa_handle);
++    bool havespdifdevice = false;
++    bool havesgtldevice = false;
++    
++	card = -1;
++	if (snd_card_next(&card) < 0 || card < 0) {
++		LOGD("no soundcards found...");
++		return "default";
++	}
++	LOGD("**** List of %s Hardware Devices ****\n",
++	       snd_pcm_stream_name(stream));
++	while (card >= 0) {
++		char name[32];
++		sprintf(name, "hw:%d", card);
++		if ((err = snd_ctl_open(&handle, name, 0)) < 0) {
++			LOGD("control open (%i): %s", card, snd_strerror(err));
++			goto next_card;
++		}
++		if ((err = snd_ctl_card_info(handle, info)) < 0) {
++			LOGD("control hardware info (%i): %s", card, snd_strerror(err));
++			snd_ctl_close(handle);
++			goto next_card;
++		}
++		dev = -1;
++		while (1) {
++			unsigned int count;
++			if (snd_ctl_pcm_next_device(handle, &dev)<0)
++				LOGD("snd_ctl_pcm_next_device");
++			if (dev < 0)
++				break;
++			snd_pcm_info_set_device(pcminfo, dev);
++			snd_pcm_info_set_subdevice(pcminfo, 0);
++			snd_pcm_info_set_stream(pcminfo, stream);
++			if ((err = snd_ctl_pcm_info(handle, pcminfo)) < 0) {
++				if (err != -ENOENT)
++					LOGD("control digital audio info (%i): %s", card, snd_strerror(err));
++				continue;
++			}
++			
++			LOGD("card %i: %s [%s], device %i: %s [%s]\n",
++				card, snd_ctl_card_info_get_id(info), snd_ctl_card_info_get_name(info),
++				dev,
++				snd_pcm_info_get_id(pcminfo),
++				snd_pcm_info_get_name(pcminfo));
++                			
++			if(strcmp(snd_pcm_info_get_id(pcminfo),"MXC_SPDIF")==0)
++			{
++			     sprintf(spdifcardname, "hw:%d,%d", card, dev);
++			     havespdifdevice =  true;
++            }
++            
++            if(strcmp(snd_pcm_info_get_id(pcminfo),"SGTL5000 SGTL5000-0")==0)
++            {
++			     sprintf(sgtlcardname, "hw:%d,%d", card, dev);
++			     havesgtldevice =  true;                
++            }
++			cardnum++;
++		}
++		snd_ctl_close(handle);
++	next_card:
++
++		if (snd_card_next(&card) < 0) {
++			LOGD("snd_card_next");
++			break;
++		}
++	}
++        
++
++    property_get("ro.HDMI_AUDIO_OUTPUT", value, "");
++    if((device & AudioSystem::DEVICE_OUT_WIRED_HDMI) && havespdifdevice && (strcmp(value, "1") == 0))
++    {
++        return spdifcardname;
++
++    }else if(havesgtldevice)
++    {
++        return sgtlcardname;
++    }
++    
++    return "default";
++}
++
++
++
+ const char *streamName(alsa_handle_t *handle)
+ {
+     return snd_pcm_stream_name(direction(handle));
+-- 
+1.8.0
+

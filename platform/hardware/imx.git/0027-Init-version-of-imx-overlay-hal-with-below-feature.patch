@@ -1,0 +1,3214 @@
+From da7bef8ee53e1369876827f77e4c3d9f6aed149e Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Thu, 25 Mar 2010 20:19:44 -0400
+Subject: [PATCH 027/486] Init version of imx overlay hal, with below feature:
+ 1. Max to two overlay instance support. 2. Max to
+ 32 buffer setting for each instance Please refer
+ the overlays_test.cpp for usage Signed-off-by:
+ guoyin.chen <guoyin.chen@freescale.com>
+
+---
+ liboverlay/Android.mk        |   64 ++
+ liboverlay/overlay.cpp       | 1840 ++++++++++++++++++++++++++++++++++++++++++
+ liboverlay/overlay_pmem.cpp  |  151 ++++
+ liboverlay/overlay_pmem.h    |   27 +
+ liboverlay/overlay_thread.h  |  575 +++++++++++++
+ liboverlay/overlay_utils.h   |   62 ++
+ liboverlay/overlays_test.cpp |  424 ++++++++++
+ 7 files changed, 3143 insertions(+)
+ create mode 100755 liboverlay/Android.mk
+ create mode 100755 liboverlay/overlay.cpp
+ create mode 100755 liboverlay/overlay_pmem.cpp
+ create mode 100755 liboverlay/overlay_pmem.h
+ create mode 100755 liboverlay/overlay_thread.h
+ create mode 100755 liboverlay/overlay_utils.h
+ create mode 100755 liboverlay/overlays_test.cpp
+
+diff --git a/liboverlay/Android.mk b/liboverlay/Android.mk
+new file mode 100755
+index 0000000..604094c
+--- /dev/null
++++ b/liboverlay/Android.mk
+@@ -0,0 +1,64 @@
++# Copyright (C) 2008 The Android Open Source Project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++ifeq ($(BOARD_SOC_TYPE),IMX51)
++
++LOCAL_PATH := $(call my-dir)
++
++# HAL module implemenation, not prelinked and stored in
++# hw/<OVERLAY_HARDWARE_MODULE_ID>.<ro.product.board>.so
++include $(CLEAR_VARS)
++LOCAL_PRELINK_MODULE := false
++
++LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
++
++LOCAL_SHARED_LIBRARIES:= \
++    libui \
++    libutils \
++    libcutils \
++    libc \
++    libipu
++
++LOCAL_SRC_FILES := \
++		overlay.cpp \
++		overlay_pmem.cpp
++
++LOCAL_C_INCLUDES := \
++	kernel_imx/include \
++	external/fsl_imx_lib/ipu \
++
++LOCAL_MODULE := overlay.$(TARGET_BOARD_PLATFORM)
++
++LOCAL_CFLAGS:= -DPMEM_ALLOCATOR -DMULTI_INSTANCES -DOVERLAY_DEBUG_LOGxx
++
++include $(BUILD_SHARED_LIBRARY)
++
++
++include $(CLEAR_VARS)
++
++LOCAL_SRC_FILES:= \
++	overlays_test.cpp
++
++LOCAL_SHARED_LIBRARIES := \
++	libcutils \
++	libutils \
++	libui
++
++LOCAL_MODULE:= mxc-test-overlays
++
++LOCAL_MODULE_TAGS := tests
++
++include $(BUILD_EXECUTABLE)
++
++endif
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+new file mode 100755
+index 0000000..7e531f2
+--- /dev/null
++++ b/liboverlay/overlay.cpp
+@@ -0,0 +1,1840 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <linux/videodev.h>
++#include <linux/fb.h>
++#include <sys/mman.h>
++#include <linux/mxcfb.h>
++
++extern "C" {
++#include "mxc_ipu_hl_lib.h" 
++} 
++
++#include <hardware/hardware.h>
++#include <hardware/overlay.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/ashmem.h>
++#include <cutils/atomic.h>
++#include <pthread.h>
++#include <semaphore.h>
++
++#include <utils/List.h>
++#include <ui/PixelFormat.h>
++#include "overlay_utils.h"
++#include "overlay_pmem.h"
++
++static int bits_per_pixel(int32_t format);
++
++using namespace android;
++
++/*****************************************************************************/
++class OverlayThread;
++class overlay_object;
++typedef struct
++{
++  uint32_t marker;
++  uint32_t size;
++  volatile int32_t refCnt;
++  int instance_id;
++  int crop_x;
++  int crop_y;
++  int crop_w;
++  int crop_h;
++  int num_buffer;
++  int free_count;
++  int free_head;
++  int free_tail;
++  unsigned int free_bufs[MAX_OVERLAY_BUFFER_NUM];//phy addr, FIFO queue
++  int queued_count;
++  int queued_head;
++  int queued_tail;
++  unsigned int queued_bufs[MAX_OVERLAY_BUFFER_NUM];//phy addr, FIFO queue
++  pthread_mutex_t obj_lock;
++  pthread_cond_t free_cond;
++  int wait_buf_flag;
++  unsigned int buf_showed;
++} overlay_data_shared_t;
++
++typedef struct
++{
++  uint32_t marker;
++  uint32_t size;
++  volatile int32_t refCnt;
++  sem_t overlay_sem;
++} overlay_control_shared_t;
++
++struct overlay_control_context_t {
++    struct overlay_control_device_t device;
++    /* our private state goes below here */
++    pthread_mutex_t control_lock;
++    overlay_object *overlay_intances[MAX_OVERLAY_INSTANCES];//Overlay device instance arrays
++    int overlay_instance_valid[MAX_OVERLAY_INSTANCES];
++    int overlay_number;//Overlay device instance number valid in instance arrays
++    OverlayThread *overlay_thread;//Overlay mixer thread
++    bool overlay_running;//Overlay mixer thread state
++    int control_shared_fd;
++    int control_shared_size;
++    overlay_control_shared_t *control_shared;
++    __u32 outpixelformat;
++    //foreground setting for fb0/1
++    int fb_dev;
++    int xres;//fb0/1's resolution
++    int yres;//fb0/1's resolution
++    //fb0/1's colorkey
++    int alpha_buf_size;
++    int cur_alpha_buffer;
++    OVERLAY_BUFFER alpha_buffers[DEFAULT_ALPHA_BUFFERS];//fb0/1's local alpha buffer
++
++    //tvout setting
++
++    //V4L setting
++    int v4l_id;//V4L Handler
++    bool stream_on;
++    char *v4lbuf_addr[MAX_V4L_BUFFERS];//V4L buffer arrays
++    struct v4l2_buffer v4l_buffers[MAX_V4L_BUFFERS];
++    int v4l_bufcount;//V4L buffer numbers
++    int video_frames;
++};
++
++struct handle_t;
++struct overlay_data_context_t {
++    struct overlay_data_device_t device;
++    /* our private state goes below here */
++    int control_shared_fd;//all overlay instances share the same control 
++    int control_shared_size;
++    int data_shared_fd;
++    int data_shared_size;
++    int width;
++    int height;
++    int32_t format;
++    int num_buffer;//Number of buffers for overlay
++    int buf_size;
++    int buf_queued;
++    OverlayAllocator *allocator;
++    OVERLAY_BUFFER *overlay_buffer;
++    overlay_control_shared_t  *control_shared;
++    overlay_data_shared_t  *data_shared;
++};
++
++static int overlay_device_open(const struct hw_module_t* module, const char* name,
++        struct hw_device_t** device);
++
++static struct hw_module_methods_t overlay_module_methods = {
++    open: overlay_device_open
++};
++
++struct overlay_module_t HAL_MODULE_INFO_SYM = {
++    common: {
++        tag: HARDWARE_MODULE_TAG,
++        version_major: 1,
++        version_minor: 0,
++        id: OVERLAY_HARDWARE_MODULE_ID,
++        name: "FSL i.MX Overlay module",
++        author: "The Android Open Source Project",
++        methods: &overlay_module_methods,
++    }
++};
++
++static int  create_data_shared_data(overlay_data_shared_t **shared);
++static void destroy_data_shared_data(int shared_fd, overlay_data_shared_t *shared, bool closefd);
++static int  open_data_shared_data(overlay_data_context_t *ctx);
++static void close_data_shared_data(overlay_data_context_t *ctx);
++
++static int  create_control_shared_data(overlay_control_shared_t **shared);
++static void destroy_control_shared_data(int shared_fd, overlay_control_shared_t *shared, bool closefd);
++static int  open_control_shared_data(overlay_data_context_t *ctx);
++static void close_control_shared_data(overlay_data_context_t *ctx);
++
++/*****************************************************************************/
++
++
++struct handle_t : public native_handle {
++    /* add the data fields we need here, for instance: */
++    int control_shared_fd;
++    int data_shared_fd;
++    int control_shared_size;
++    int data_shared_size;
++    int width;
++    int height;
++    int32_t format;
++    int num_buffer;//Number of buffers for overlay
++    int buf_size;
++};
++
++/*
++ * This is the overlay_t object, it is returned to the user and represents
++ * an overlay.
++ * This handles will be passed across processes and possibly given to other
++ * HAL modules (for instance video decode modules).
++ */
++
++class overlay_object : public overlay_t {
++    
++    static overlay_handle_t getHandleRef(struct overlay_t* overlay) {
++        /* returns a reference to the handle, caller doesn't take ownership */
++        overlay_handle_t retPtr = &(static_cast<overlay_object *>(overlay)->mHandle);
++        LOGI("getHandleRef return overlay_handle_t 0x%x",retPtr);
++        return retPtr;
++    }
++    
++public:
++    handle_t mHandle;
++    overlay_data_shared_t *mDataShared;
++    int rotation;
++    int outX;
++    int outY;
++    int outW;
++    int outH;
++    int zorder;//zorder for mutl-overlays
++    //Maybe need a lock here
++    int out_changed;
++
++    overlay_object(uint32_t w, uint32_t h, int32_t format,int control_fd, int control_size) {
++        OVERLAY_LOG_FUNC;
++        this->overlay_t::getHandleRef = getHandleRef;
++        this->overlay_t::format = format;
++        this->overlay_t::h = h;
++        this->overlay_t::h_stride = h;
++        this->overlay_t::w = w;
++        this->overlay_t::w_stride = w; 
++        
++        mHandle.version = sizeof(native_handle);
++        mHandle.width = w;
++        mHandle.height = h;
++        mHandle.format = format;
++        mHandle.num_buffer = DEFAULT_OVERLAY_BUFFER_NUM;
++        mHandle.numFds = 2;
++        mHandle.numInts = 7; // extra ints we have in  our handle
++        mHandle.buf_size = mHandle.width*mHandle.height*bits_per_pixel(format)/8;
++        
++        rotation = 0;
++        outX = 0;
++        outY = 0;
++        outW = 0;
++        outH = 0;
++        zorder = 0;//Should be set from Layerbase's drawing state
++
++        out_changed = 0;
++
++        //???creat share file for this obj
++        mHandle.data_shared_fd = create_data_shared_data(&mDataShared);
++        mHandle.data_shared_size = mDataShared->size;
++        //The control fd is opened in overlay hal init.
++        mHandle.control_shared_fd = control_fd;
++        mHandle.control_shared_size = control_size;
++
++        //init the crop setting
++        mDataShared->crop_x = 0;
++        mDataShared->crop_y = 0;
++        mDataShared->crop_w = mHandle.width;
++        mDataShared->crop_h = mHandle.height;
++        mDataShared->num_buffer = mHandle.num_buffer;
++        OVERLAY_LOG_INFO("num_buffer %d width %d,height %d,format %d,buf_size %d",
++         mHandle.num_buffer,mHandle.width,mHandle.height,
++         mHandle.format,mHandle.buf_size);
++
++    }
++    ~overlay_object(){
++        OVERLAY_LOG_FUNC;
++
++        //???delete this share file;
++        destroy_data_shared_data(mHandle.data_shared_fd,mDataShared,true);
++ 
++    }
++};
++
++#include "overlay_thread.h"
++
++/*
++*   Fill the rgb alpha buffer with alpha_val
++*/
++static int fill_alpha_buffer(void *alpha_buf, int buf_w,
++                             WIN_REGION *fill_region,char alpha_val);
++
++static int fill_frame_back(char * frame, int xres,
++                           int yres, unsigned int pixelformat);
++
++static int overlay_init_fbdev(struct overlay_control_context_t *dev);
++
++static int overlay_deinit_fbdev(struct overlay_control_context_t *dev);
++
++static int overlay_init_v4l(struct overlay_control_context_t *dev);
++
++static int overlay_deinit_v4l(struct overlay_control_context_t *dev);
++
++
++static int create_control_shared_data(overlay_control_shared_t **shared)
++{
++    OVERLAY_LOG_FUNC;
++    int fd;
++    // assuming sizeof(overlay_data_shared_t) < a single page
++    int size = (sizeof(overlay_control_shared_t) + getpagesize()-1) & ~(getpagesize()-1);
++    overlay_control_shared_t *p;
++
++    if ((fd = ashmem_create_region("overlay_control", size)) < 0) {
++        LOGE("Error!Failed to Create Overlay Shared control!\n");
++        return fd;
++    }
++
++    p = (overlay_control_shared_t*)mmap(NULL, size, PROT_READ | PROT_WRITE,
++                                MAP_SHARED, fd, 0);
++    if (p == MAP_FAILED) {
++        LOGE("Error!Failed to Map Overlay Shared control!\n");
++        close(fd);
++        return -1;
++    }
++
++    memset(p, 0, size);
++    p->marker = SHARED_CONTROL_MARKER;
++    p->size   = size;
++    p->refCnt = 1;
++
++    //Create the sem for control
++    if(sem_init(&p->overlay_sem, 0, 0) != 0){
++        OVERLAY_LOG_ERR("Error!init overlay_sem failed");
++        munmap(p, size);
++        close(fd);
++        return -1;
++    }
++
++    *shared = p;
++    return fd;
++}
++
++static void destroy_control_shared_data( int shared_fd, overlay_control_shared_t *shared, bool closefd )
++{
++    OVERLAY_LOG_FUNC;
++    if (shared == NULL)
++        return;
++
++    // Last side deallocated releases the mutex, otherwise the remaining
++    // side will deadlock trying to use an already released mutex
++    if (android_atomic_dec(&shared->refCnt) == 1) {
++        if (sem_destroy(&shared->overlay_sem)) {
++            OVERLAY_LOG_ERR("Error!Failed to Close Overlay control Semaphore!\n");
++        }
++        shared->marker = 0;
++    }
++
++    if (munmap(shared, shared->size)) {
++        OVERLAY_LOG_ERR("Error!Failed to Unmap Overlay Shared control!\n");
++    }
++
++    if (closefd && close(shared_fd)) {
++        OVERLAY_LOG_ERR("Error!Failed to Close Overlay Shared control!\n");
++    }
++}
++
++static int open_control_shared_data( overlay_data_context_t *ctx )
++{
++    OVERLAY_LOG_FUNC;
++    int rc   = -1;
++    int mode = PROT_READ | PROT_WRITE;
++    int fd   = ctx->control_shared_fd;
++    int size = ctx->control_shared_size;
++
++    if (ctx->control_shared != NULL) {
++        // Already open, return success
++        OVERLAY_LOG_ERR("Error!Overlay Shared Data Already Open\n");
++        return 0;
++    }
++    ctx->control_shared = (overlay_control_shared_t*)mmap(0, size, mode, MAP_SHARED, fd, 0);
++
++    if (ctx->control_shared == MAP_FAILED) {
++        OVERLAY_LOG_ERR("Error!Failed to Map Overlay Shared control!\n");
++    } else if ( ctx->control_shared->marker != SHARED_CONTROL_MARKER ) {
++        OVERLAY_LOG_ERR("Error!Invalid Overlay Shared control Marker!\n");
++        munmap( ctx->control_shared, size);
++    } else if ( (int)ctx->control_shared->size != size ) {
++        OVERLAY_LOG_ERR("Error!Invalid Overlay Shared control Size!\n");
++        munmap(ctx->control_shared, size);
++    } else {
++        android_atomic_inc(&ctx->control_shared->refCnt);
++        rc = 0;
++    }
++
++    return rc;
++}
++
++static void close_control_shared_data(overlay_data_context_t *ctx)
++{
++    OVERLAY_LOG_FUNC;
++    destroy_control_shared_data(ctx->control_shared_fd, ctx->control_shared, false);
++    ctx->control_shared = NULL;
++}
++
++static int create_data_shared_data(overlay_data_shared_t **shared)
++{
++    OVERLAY_LOG_FUNC;
++    int fd;
++    // assuming sizeof(overlay_data_shared_t) < a single page
++    int size = (sizeof(overlay_data_shared_t) + getpagesize()-1) & ~(getpagesize()-1);
++    overlay_data_shared_t *p;
++
++    if ((fd = ashmem_create_region("overlay_data", size)) < 0) {
++        OVERLAY_LOG_ERR("Error!Failed to Create Overlay Shared Data!\n");
++        return fd;
++    }
++
++    p = (overlay_data_shared_t*)mmap(NULL, size, PROT_READ | PROT_WRITE,
++                                MAP_SHARED, fd, 0);
++    if (p == MAP_FAILED) {
++        OVERLAY_LOG_ERR("Error!Failed to Map Overlay Shared Data!\n");
++        close(fd);
++        return -1;
++    }
++
++    memset(p, 0, size);
++    p->marker = SHARED_DATA_MARKER;
++    p->size   = size;
++    p->refCnt = 1;
++
++    if (pthread_mutex_init(&p->obj_lock, NULL) != 0) {
++        OVERLAY_LOG_ERR("Error!Failed to Open Overlay Lock!\n");
++        munmap(p, size);
++        close(fd);
++        return -1;
++    }
++
++    if (pthread_cond_init(&p->free_cond, NULL) != 0) {
++        OVERLAY_LOG_ERR("Error!Failed to Open Overlay Lock!\n");
++        pthread_mutex_destroy(&p->obj_lock);
++        munmap(p, size);
++        close(fd);
++        return -1;
++    }
++
++    *shared = p;
++    return fd;
++}
++
++static void destroy_data_shared_data( int shared_fd, overlay_data_shared_t *shared, bool closefd )
++{
++    OVERLAY_LOG_FUNC;
++    if (shared == NULL)
++        return;
++
++    // Last side deallocated releases the mutex, otherwise the remaining
++    // side will deadlock trying to use an already released mutex
++    if (android_atomic_dec(&shared->refCnt) == 1) {
++        if (pthread_mutex_destroy(&shared->obj_lock)) {
++            OVERLAY_LOG_ERR("Error!Failed to Close Overlay Semaphore!\n");
++        }
++        //???delete this cond;
++        if (pthread_cond_destroy(&shared->free_cond)) {
++            OVERLAY_LOG_ERR("Error!Failed to Close Overlay Semaphore!\n");
++        }
++
++        shared->marker = 0;
++    }
++
++    if (munmap(shared, shared->size)) {
++        OVERLAY_LOG_ERR("Error!Failed to Unmap Overlay Shared Data!\n");
++    }
++
++    if (closefd && close(shared_fd)) {
++        OVERLAY_LOG_ERR("Error!Failed to Close Overlay Shared Data!\n");
++    }
++}
++
++static int open_data_shared_data( overlay_data_context_t *ctx )
++{
++    OVERLAY_LOG_FUNC;
++    int rc   = -1;
++    int mode = PROT_READ | PROT_WRITE;
++    int fd   = ctx->data_shared_fd;
++    int size = ctx->data_shared_size;
++
++    if (ctx->data_shared != NULL) {
++        // Already open, return success
++        OVERLAY_LOG_ERR("Error!Overlay Shared Data Already Open\n");
++        return 0;
++    }
++    ctx->data_shared = (overlay_data_shared_t*)mmap(0, size, mode, MAP_SHARED, fd, 0);
++
++    if (ctx->data_shared == MAP_FAILED) {
++        OVERLAY_LOG_ERR("Error!Failed to Map Overlay Shared Data!\n");
++    } else if ( ctx->data_shared->marker != SHARED_DATA_MARKER ) {
++        OVERLAY_LOG_ERR("Error!Invalid Overlay Shared Marker!\n");
++        munmap( ctx->data_shared, size);
++    } else if ( (int)ctx->data_shared->size != size ) {
++        OVERLAY_LOG_ERR("Error!Invalid Overlay Shared Size!\n");
++        munmap(ctx->data_shared, size);
++    } else {
++        android_atomic_inc(&ctx->data_shared->refCnt);
++        rc = 0;
++    }
++
++    return rc;
++}
++
++static void close_data_shared_data(overlay_data_context_t *ctx)
++{
++    OVERLAY_LOG_FUNC;
++    destroy_data_shared_data(ctx->data_shared_fd, ctx->data_shared, false);
++    ctx->data_shared = NULL;
++}
++
++static int bits_per_pixel(int32_t format)
++{
++    int bits = 0;
++    switch (format) {
++        case PIXEL_FORMAT_RGB_888:
++            bits = 24;
++            break;
++        case PIXEL_FORMAT_YCbCr_422_SP:
++        case PIXEL_FORMAT_YCbCr_422_I:
++        case PIXEL_FORMAT_RGB_565:
++            bits = 16;
++            break;
++        case PIXEL_FORMAT_RGBA_8888:
++            bits = 32;
++            break;
++        case PIXEL_FORMAT_YCbCr_420_SP:
++            bits = 12;
++            break;
++        default:
++            bits = 0;
++            break;
++    }
++    return bits;
++}
++
++static int fill_alpha_buffer(void *alpha_buf, int buf_w, 
++                             WIN_REGION *fill_region,char alpha_val)
++{
++    //Check parameter
++    if((!alpha_buf)||(buf_w <0)||(!fill_region)) {
++        OVERLAY_LOG_ERR("Error!Invalid parameters in fill_alpha_buffer");
++        return -1;
++    }
++    OVERLAY_LOG_INFO("fill_alpha_buffer: buf_w %d,top %d, bottom %d, left %d,right %d",buf_w,
++         fill_region->top,fill_region->bottom,fill_region->left,fill_region->right);
++
++    char *pPointAlphaValue;
++	int x, y;
++
++	for (y = fill_region->top; y < fill_region->bottom; y++) {
++        pPointAlphaValue = (char *)alpha_buf +buf_w * y + fill_region->left;
++        memset(pPointAlphaValue,alpha_val,fill_region->right-fill_region->left);
++	}
++
++    return 0;
++}
++
++//pixelformat format for v4l2 setting
++static int fill_frame_back(char * frame,int frame_size, int xres,
++                           int yres, unsigned int pixelformat)
++{
++    int ret = 0;
++    char * base;
++    int j, screen_size;
++    short * tmp;
++    short color;
++    if((xres<=0)||(yres<=0)||(!frame)) {
++        OVERLAY_LOG_ERR("Error!Not valid parameters in fill_frame_back");
++        return -1;
++    }
++    switch(pixelformat) {
++        case V4L2_PIX_FMT_RGB565:
++            memset(frame, 0, frame_size);
++            break;
++        case V4L2_PIX_FMT_YUYV:
++        case V4L2_PIX_FMT_UYVY:
++            tmp = (short *) frame;
++            if(pixelformat == V4L2_PIX_FMT_YUYV)
++               color = 0x8000;
++            else
++               color = 0x80;
++            for(int i = 0; i < frame_size/2;i++, tmp++)
++                *tmp = color;
++            break;
++        case V4L2_PIX_FMT_YUV422P:
++            base = (char *)frame;
++            screen_size = xres * yres;
++            memset(base, 0, frame_size);
++            base += screen_size;
++            for (int i = 0; i < screen_size; i++, base++)
++                *base = 0x80;
++            break;
++        case V4L2_PIX_FMT_YUV420:
++        case V4L2_PIX_FMT_YVU420:
++        case V4L2_PIX_FMT_NV12:
++            base = (char *)frame;
++            screen_size = xres * yres;
++            memset(base, 0, frame_size);
++            base += screen_size;
++            for (int i = 0; i < screen_size/2; i++, base++)
++                 *base = 0x80;
++            break;
++        defaule:
++            OVERLAY_LOG_ERR("Error!Not supported pixel format");
++            ret = -1;
++            break;
++    }
++    return ret;
++}
++
++static int overlay_init_fbdev(struct overlay_control_context_t *dev)
++{
++    OVERLAY_LOG_FUNC;
++    //Check fb0 dev
++    dev->fb_dev  = open(FB_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
++    if(dev->fb_dev < 0) {
++        OVERLAY_LOG_ERR("Error!Open fb device %s failed",FB_DEV_NAME);
++        return -1;
++    }
++    
++    int ret = 0;
++    struct fb_var_screeninfo fb_var;
++    struct mxcfb_gbl_alpha gbl_alpha;
++
++    gbl_alpha.alpha = 128;
++    gbl_alpha.enable = 1;
++    ret = ioctl(dev->fb_dev, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
++    if(ret <0)
++    {
++        OVERLAY_LOG_ERR("Error!MXCFB_SET_GBL_ALPHA failed!");
++        return -1;
++    }
++
++
++
++    struct mxcfb_color_key key;       
++    key.enable = 1;
++    key.color_key = 0x00000000; // Black
++    ret = ioctl(dev->fb_dev, MXCFB_SET_CLR_KEY, &key);
++    if(ret <0)
++    {
++      OVERLAY_LOG_ERR("Error!Colorkey setting failed for dev %s",FB_DEV_NAME);
++      return -1;
++    }
++
++    if ( ioctl(dev->fb_dev, FBIOGET_VSCREENINFO, &fb_var) < 0) {
++        OVERLAY_LOG_ERR("Error!VSCREENINFO getting failed for dev %s",FB_DEV_NAME);
++        return -1;
++    }
++    OVERLAY_LOG_INFO("%s fb_var: bits_per_pixel %d,xres %d,yres %d,xres_virtual %d,yres_virtual %d\n",
++            FB_DEV_NAME,fb_var.bits_per_pixel,
++            fb_var.xres,fb_var.yres,
++            fb_var.xres_virtual,fb_var.yres_virtual);
++    dev->xres = fb_var.xres;
++    dev->yres = fb_var.yres;
++
++    //Setting Local alpha buffer
++#if 0
++    struct mxcfb_loc_alpha l_alpha;       
++    l_alpha.enable = 1;
++    l_alpha.alpha_phy_addr0 = 0;
++    l_alpha.alpha_phy_addr1 = 0;
++    if (ioctl(dev->fb_dev, MXCFB_SET_LOC_ALPHA,
++          &l_alpha) < 0) {
++        OVERLAY_LOG_ERR("Error!LOC_ALPHA setting failed for dev %s",FB_DEV_NAME);
++        return -1;
++    }
++    
++
++    unsigned long loc_alpha_phy_addr0 =
++            (unsigned long)(l_alpha.alpha_phy_addr0);
++    unsigned long loc_alpha_phy_addr1 =
++            (unsigned long)(l_alpha.alpha_phy_addr1);
++    OVERLAY_LOG_INFO("Phy local alpha: buffer0 0x%x buffer1 0x%x",loc_alpha_phy_addr0,loc_alpha_phy_addr1);
++    dev->alpha_buf_size = dev->xres * dev->yres;
++    
++    char *alpha_buf0 = (char *)mmap(0, dev->alpha_buf_size,
++                     PROT_READ | PROT_WRITE,
++                     MAP_SHARED, dev->fb_dev,
++                     loc_alpha_phy_addr0);
++    if ((int)alpha_buf0 == -1) {
++        OVERLAY_LOG_ERR("Error!mmap local alpha buffer 0 failed for dev %s",FB_DEV_NAME);
++        return -1;
++    }
++    
++    dev->alpha_buffers[0].vir_addr = alpha_buf0;
++    dev->alpha_buffers[0].phy_addr = loc_alpha_phy_addr0;
++    dev->alpha_buffers[0].size = dev->alpha_buf_size;
++
++    char *alpha_buf1 = (char *)mmap(0, dev->alpha_buf_size,
++                 PROT_READ | PROT_WRITE,
++                 MAP_SHARED, dev->fb_dev,
++                 loc_alpha_phy_addr1);
++    if ((int)alpha_buf1 == -1) {
++        OVERLAY_LOG_ERR("Error!mmap local alpha buffer 1 failed for dev %s",FB_DEV_NAME);
++        return -1;
++    }
++
++    dev->alpha_buffers[1].vir_addr = alpha_buf1;
++    dev->alpha_buffers[1].phy_addr = loc_alpha_phy_addr1;
++    dev->alpha_buffers[1].size = dev->alpha_buf_size;
++    OVERLAY_LOG_INFO("Vir local alpha: buffer0 0x%x buffer1 0x%x",alpha_buf0,alpha_buf1);
++
++    //Fill the alpha buffer with init alpha setting
++    WIN_REGION win_region;
++    win_region.left = 0;
++    win_region.right = dev->xres;
++    win_region.top = 0;
++    win_region.bottom = dev->yres;
++
++    fill_alpha_buffer(dev->alpha_buffers[0].vir_addr,dev->xres,&win_region,128);
++    fill_alpha_buffer(dev->alpha_buffers[1].vir_addr,dev->xres,&win_region,128);
++
++    if (ioctl(dev->fb_dev, MXCFB_SET_LOC_ALP_BUF, &dev->alpha_buffers[0].phy_addr) < 0) {
++        OVERLAY_LOG_ERR("Error!SET_LOC_ALP_BUF setting failed for dev %s",FB_DEV_NAME);
++        return -1;
++    }
++    dev->cur_alpha_buffer = 0;
++#endif
++
++    return 0;
++}
++
++static int overlay_deinit_fbdev(struct overlay_control_context_t *dev)
++{
++    OVERLAY_LOG_FUNC;
++    if(!dev) {
++        return -1;
++    }
++#if 0
++    if(dev->alpha_buffers[0].vir_addr){
++        munmap((void *)dev->alpha_buffers[0].vir_addr, dev->alpha_buffers[0].size);
++        memset(&dev->alpha_buffers[0],0,sizeof(OVERLAY_BUFFER));
++    }
++    if(dev->alpha_buffers[1].vir_addr){
++        munmap((void *)dev->alpha_buffers[1].vir_addr, dev->alpha_buffers[1].size);
++        memset(&dev->alpha_buffers[1],0,sizeof(OVERLAY_BUFFER));
++    }
++#endif    
++    if(dev->fb_dev) {
++        close(dev->fb_dev);
++        dev->fb_dev = 0;
++    }
++    return 0;
++}
++
++static int overlay_init_v4l(struct overlay_control_context_t *dev)
++{
++        OVERLAY_LOG_FUNC;
++        //Open v4l2 device
++        dev->v4l_id = open(V4L_DEV_NAME, O_RDWR, 0);
++        if(dev->v4l_id < 0) {
++            OVERLAY_LOG_ERR("Error!Open v4l device %s failed",V4L_DEV_NAME);
++            return -1;
++        }
++        int layer = DEFAULT_V4L_LAYER;
++        if ( ioctl(dev->v4l_id,VIDIOC_S_OUTPUT, &layer) < 0) {
++    	    OVERLAY_LOG_ERR("Error!VIDIOC_S_OUTPUT getting failed for dev %s",V4L_DEV_NAME);
++            return -1;
++        }
++
++        struct v4l2_cropcap cropcap;
++        memset(&cropcap, 0, sizeof(cropcap));
++        cropcap.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++        if ( ioctl(dev->v4l_id, VIDIOC_CROPCAP, &cropcap) < 0) {
++    	    OVERLAY_LOG_ERR("Error!VIDIOC_CROPCAP getting failed for dev %s",V4L_DEV_NAME);
++            return -1;
++        }
++
++
++        struct v4l2_crop crop;
++        /* set the image rectangle of the display by 
++        setting the appropriate parameters */
++        crop.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++        crop.c.width = dev->xres;
++        crop.c.height = dev->yres;
++        crop.c.top = 0;
++        crop.c.left = 0;
++        if ( ioctl(dev->v4l_id, VIDIOC_S_CROP, &crop) < 0) {
++    	    OVERLAY_LOG_ERR("Error!VIDIOC_CROPCAP getting failed for dev %s",V4L_DEV_NAME);
++            return -1;
++        }
++
++        //Set V4L format
++        struct v4l2_format fmt;
++        //struct v4l2_mxc_offset off;
++        memset(&fmt, 0, sizeof(fmt));
++        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++        fmt.fmt.pix.width = dev->xres;
++        fmt.fmt.pix.height = dev->yres;
++        fmt.fmt.pix.pixelformat = dev->outpixelformat;//in_fmt;
++        fmt.fmt.pix.bytesperline = dev->xres;
++        fmt.fmt.pix.priv = 0;
++        fmt.fmt.pix.sizeimage = 0;//dev->xres * dev->yres * 3 / 2
++
++        if ( ioctl(dev->v4l_id, VIDIOC_S_FMT, &fmt) < 0) {
++            OVERLAY_LOG_ERR("Error!VIDIOC_S_FMT setting failed for dev %s",V4L_DEV_NAME);
++            return -1;
++        }
++
++        if ( ioctl(dev->v4l_id, VIDIOC_G_FMT, &fmt) < 0) {
++            OVERLAY_LOG_ERR("Error!VIDIOC_G_FMT setting failed for dev %s",V4L_DEV_NAME);
++            return -1;
++        }
++        OVERLAY_LOG_INFO("V4L setting: format 0x%x",fmt.fmt.pix.pixelformat);
++        struct v4l2_requestbuffers buf_req;
++        dev->v4l_bufcount = DEFAULT_V4L_BUFFERS;
++        buf_req.count = dev->v4l_bufcount;
++        buf_req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++        buf_req.memory = V4L2_MEMORY_MMAP;
++        if ( ioctl(dev->v4l_id, VIDIOC_REQBUFS, &buf_req) < 0) {
++            OVERLAY_LOG_ERR("Error!VIDIOC_REQBUFS setting failed for dev %s",V4L_DEV_NAME);
++            return -1;
++        }
++
++
++        //for each buffer,get the vir/phy address
++        struct v4l2_buffer *v4lbuf = dev->v4l_buffers;
++        char * vir_addr;
++        OVERLAY_LOG_RUNTIME("dev->v4l_buffers 0x%x v4l2_buffer size %d",dev->v4l_buffers,sizeof(struct v4l2_buffer));
++        for(int buf_index=0;buf_index < dev->v4l_bufcount;buf_index++) {
++            v4lbuf->index = buf_index;
++            v4lbuf->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++            v4lbuf->memory = V4L2_MEMORY_MMAP;
++            if( ioctl(dev->v4l_id, VIDIOC_QUERYBUF, v4lbuf) < 0) {
++                OVERLAY_LOG_ERR("Error!VIDIOC_QUERYBUF getting failed for dev %s",V4L_DEV_NAME);
++                return -1;
++            }
++
++            vir_addr = (char *)mmap(NULL,v4lbuf->length,
++                            PROT_READ | PROT_WRITE, MAP_SHARED,
++                            dev->v4l_id, v4lbuf->m.offset);
++            if ((int)vir_addr == -1) {
++                OVERLAY_LOG_ERR("Error!mmap V4L buffer %d failed for dev %s",buf_index,V4L_DEV_NAME);
++                return -1;
++            }
++
++            dev->v4lbuf_addr[buf_index] = vir_addr;
++            //v4l already init this buffer to black
++            //fill the v4l to black;
++            fill_frame_back(vir_addr,v4lbuf->length,dev->xres,dev->yres,dev->outpixelformat);
++            LOGI("******0x%x 0x%x 0x%x 0x%x",*(vir_addr),*(vir_addr+1),*(vir_addr+2),*(vir_addr+3));
++            OVERLAY_LOG_INFO("v4l buf[%d] 0x%x: vir 0x%x,phy 0x%x, size %d",
++                             buf_index,v4lbuf,(unsigned int)vir_addr,v4lbuf->m.offset,v4lbuf->length);
++            v4lbuf++;
++        }
++
++        return 0;
++}
++
++static int overlay_deinit_v4l(struct overlay_control_context_t *dev)
++{
++    OVERLAY_LOG_FUNC;
++    if(!dev) {
++        return -1;
++    }
++    for(int buf_index=0;buf_index < dev->v4l_bufcount;buf_index++) {
++       if(dev->v4lbuf_addr[buf_index])
++          munmap((void *)dev->v4lbuf_addr[buf_index], dev->v4l_buffers[buf_index].length);
++       memset(&dev->v4l_buffers[buf_index],0,sizeof(v4l2_buffer));
++       dev->v4lbuf_addr[buf_index] = NULL;
++    }
++    dev->v4l_bufcount = 0;
++
++    if(dev->v4l_id) {
++       close(dev->v4l_id);
++       dev->v4l_id = 0;
++    }
++    return 0;
++}
++
++int overlay_check_parameters(struct handle_t *overlay_handle)
++{
++    OVERLAY_LOG_FUNC;
++    //Make sure the parameters are within our support, as alinement or 
++    //something else
++    return 0;
++}
++// ****************************************************************************
++// Control module
++// ****************************************************************************
++
++static int overlay_get(struct overlay_control_device_t *dev, int name) {
++    OVERLAY_LOG_FUNC;
++    int result = -1;
++    switch (name) {
++        case OVERLAY_MINIFICATION_LIMIT:
++            result = 0; // 0 = no limit
++            break;
++        case OVERLAY_MAGNIFICATION_LIMIT:
++            result = 0; // 0 = no limit
++            break;
++        case OVERLAY_SCALING_FRAC_BITS:
++            result = 0; // 0 = infinite
++            break;
++        case OVERLAY_ROTATION_STEP_DEG:
++            result = 90; // 90 rotation steps (for instance)
++            break;
++        case OVERLAY_HORIZONTAL_ALIGNMENT:
++            result = 1; // 1-pixel alignment
++            break;
++        case OVERLAY_VERTICAL_ALIGNMENT:
++            result = 1; // 1-pixel alignment
++            break;
++        case OVERLAY_WIDTH_ALIGNMENT:
++            result = 1; // 1-pixel alignment
++            break;
++        case OVERLAY_HEIGHT_ALIGNMENT:
++            result = 1; // 1-pixel alignment
++            break;
++    }
++    return result;
++}
++
++static overlay_t* overlay_createOverlay(struct overlay_control_device_t *dev,
++         uint32_t w, uint32_t h, int32_t format) 
++{
++    OVERLAY_LOG_FUNC;
++    overlay_control_context_t *ctx = (overlay_control_context_t *)dev;
++    overlay_object* overlay = NULL;
++    OVERLAY_LOG_INFO("overlay_createOverlay w %d,h %d,format %d, pid %d,,gettid() %d",w,h,format,getpid(),gettid());
++
++    if((!ctx)||(!ctx->overlay_running)){
++        OVERLAY_LOG_ERR("Error!overlay_control_device_t not in good state");
++        return NULL;
++    }
++    /* check the input params, reject if not supported or invalid */
++    switch (format) {
++        case PIXEL_FORMAT_RGB_888:
++        case PIXEL_FORMAT_RGB_565:
++        case PIXEL_FORMAT_RGBA_8888:
++        case PIXEL_FORMAT_YCbCr_422_SP:
++            OVERLAY_LOG_ERR("Error!Not a valid format for overlay");
++            return NULL;
++        case PIXEL_FORMAT_YCbCr_420_SP:
++            break;
++        case PIXEL_FORMAT_YCbCr_422_I:
++            break;
++        default:
++            OVERLAY_LOG_ERR("Error!Not a valid format for overlay");
++            return NULL;
++    }
++    
++    /* Create overlay object. Talk to the h/w here and adjust to what it can
++     * do. the overlay_t returned can  be a C++ object, subclassing overlay_t
++     * if needed.
++     * 
++     * we probably want to keep a list of the overlay_t created so they can
++     * all be cleaned up in overlay_close(). 
++     */
++
++    overlay = new overlay_object( w, h, format,ctx->control_shared_fd,ctx->control_shared_size);
++    if(overlay) {
++        int instance = 0;
++
++        pthread_mutex_lock(&ctx->control_lock);
++        while(instance < MAX_OVERLAY_INSTANCES) {
++            if(!ctx->overlay_instance_valid[instance]) {
++                ctx->overlay_instance_valid[instance] = 1;
++                ctx->overlay_intances[instance] = overlay;
++                ctx->overlay_number++;
++                OVERLAY_LOG_INFO("Create overlay instance 0x%x id %d total %d",
++                     overlay,instance,ctx->overlay_number);
++                overlay->mDataShared->instance_id = instance;
++                break;
++            }
++            instance++;
++        }
++        pthread_mutex_unlock(&ctx->control_lock);
++
++        if(instance >= MAX_OVERLAY_INSTANCES) {
++            OVERLAY_LOG_ERR("Error!Cannot have more overlay instance in system");
++            delete overlay;
++            overlay = NULL;
++        }
++    }
++    else{
++        OVERLAY_LOG_ERR("Error!overlay_object creation failed w:%d,h%d,format:%d",w,h,format);
++    }
++
++    return (overlay_t *)overlay;
++}
++
++static void overlay_destroyOverlay(struct overlay_control_device_t *dev,
++         overlay_t* overlay) 
++{
++    OVERLAY_LOG_FUNC;
++    overlay_control_context_t *ctx = (overlay_control_context_t *)dev;
++    int instance = 0;
++    overlay_object *obj = static_cast<overlay_object *>(overlay);
++
++    pthread_mutex_lock(&ctx->control_lock);
++
++    for(instance = 0;instance < MAX_OVERLAY_INSTANCES;instance++) {
++        if((ctx->overlay_instance_valid[instance])&&(ctx->overlay_intances[instance] == obj)) {
++            break;
++        }
++    }
++    
++    if(instance < MAX_OVERLAY_INSTANCES) {
++        OVERLAY_LOG_INFO("Destory the overlay instance id %d",instance);
++        ctx->overlay_number--;
++        ctx->overlay_instance_valid[instance] = 0;
++        ctx->overlay_intances[instance] = NULL;
++
++    }
++
++    if((ctx->overlay_number == 0)&& ctx->stream_on) {
++        int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++        ioctl(ctx->v4l_id, VIDIOC_STREAMOFF, &type);
++        OVERLAY_LOG_INFO("V4L STREAMON OFF");
++        ctx->video_frames = 0;
++        ctx->stream_on = false;
++        //refill the back color
++        for(int i = 0;i < ctx->v4l_bufcount;i++) {
++            fill_frame_back(ctx->v4lbuf_addr[i],ctx->v4l_buffers[i].length,
++                            ctx->xres,ctx->yres,ctx->outpixelformat);
++        }
++        
++
++    }
++
++    pthread_mutex_unlock(&ctx->control_lock);
++
++    /* free resources associated with this overlay_t */
++    delete overlay;
++}
++
++static int overlay_setPosition(struct overlay_control_device_t *dev,
++         overlay_t* overlay, 
++         int x, int y, uint32_t w, uint32_t h) {
++    OVERLAY_LOG_FUNC;
++    /* set this overlay's position (talk to the h/w) */
++    overlay_object *obj = static_cast<overlay_object *>(overlay);
++
++    //fetch the overlay obj lock
++    pthread_mutex_lock(&obj->mDataShared->obj_lock);
++    if((x!= obj->outX)||
++       (y!= obj->outY)||
++       (w!= (uint32_t)obj->outW)||
++       (h!= (uint32_t)obj->outH)) {
++        //Set out changed flag,so mixer thread will know
++        //output area changed
++        obj->out_changed = 1;
++    }
++    obj->outX = x;
++    obj->outY = y;
++    obj->outW = w;
++    obj->outH = h;
++    OVERLAY_LOG_INFO("Overlay pos set: x %d,y %d,w %d,h %d",x,y,w,h);
++    //release the overlay obj lock
++    pthread_mutex_unlock(&obj->mDataShared->obj_lock);
++
++    return 0;
++}
++
++static int overlay_getPosition(struct overlay_control_device_t *dev,
++         overlay_t* overlay, 
++         int* x, int* y, uint32_t* w, uint32_t* h) {
++    OVERLAY_LOG_FUNC;
++    /* get this overlay's position */
++    overlay_object *obj = static_cast<overlay_object *>(overlay);
++
++    //fetch the overlay obj lock
++    pthread_mutex_lock(&obj->mDataShared->obj_lock);
++    *x = obj->outX;
++    *y = obj->outY;
++    *w = obj->outW;
++    *y = obj->outH;
++    //release the overlay obj lock
++    pthread_mutex_unlock(&obj->mDataShared->obj_lock);
++
++    return -EINVAL;
++}
++
++static int overlay_setParameter(struct overlay_control_device_t *dev,
++         overlay_t* overlay, int param, int value) {
++    OVERLAY_LOG_FUNC;
++    overlay_object *obj = static_cast<overlay_object *>(overlay);
++    int result = 0;
++    /* set this overlay's parameter (talk to the h/w) */
++    OVERLAY_LOG_INFO("overlay_setParameter param %d value %d",param,value);
++    switch (param) {
++        case OVERLAY_ROTATION_DEG:
++            /* if only 90 rotations are supported, the call fails
++             * for other values */
++            OVERLAY_LOG_INFO("overlay_setParameter OVERLAY_ROTATION_DEG %d",value);
++            //fetch the overlay obj lock
++            pthread_mutex_lock(&obj->mDataShared->obj_lock);
++            obj->rotation = value;
++            //release the overlay obj lock
++            pthread_mutex_unlock(&obj->mDataShared->obj_lock);
++
++            break;
++        case OVERLAY_DITHER: 
++            break;
++        case OVERLAY_TRANSFORM: 
++            // see OVERLAY_TRANSFORM_*
++            OVERLAY_LOG_INFO("overlay_setParameter OVERLAY_TRANSFORM %d",value);
++            //fetch the overlay obj lock
++            pthread_mutex_lock(&obj->mDataShared->obj_lock);
++            obj->rotation = value;
++            //release the overlay obj lock
++            pthread_mutex_unlock(&obj->mDataShared->obj_lock);
++            break;
++        case OVERLAY_ZORDER: 
++            // see OVERLAY_ZORDER*
++            OVERLAY_LOG_INFO("overlay_setParameter OVERLAY_ZORDER %d",value);
++            //fetch the overlay obj lock
++            pthread_mutex_lock(&obj->mDataShared->obj_lock);
++            obj->zorder = value;
++            //release the overlay obj lock
++            pthread_mutex_unlock(&obj->mDataShared->obj_lock);
++            break;
++        
++        default:
++            result = -EINVAL;
++            break;
++    }
++    return result;
++}
++
++static int overlay_stage(struct overlay_control_device_t *dev,
++                          overlay_t* overlay) {
++    OVERLAY_LOG_FUNC;
++
++    return 0;
++}
++
++static int overlay_commit(struct overlay_control_device_t *dev,
++                          overlay_t* overlay) {
++    OVERLAY_LOG_FUNC;
++    return 0;
++}
++
++
++static int overlay_control_close(struct hw_device_t *dev) 
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_control_context_t* ctx = (struct overlay_control_context_t*)dev;
++    if (ctx) {
++        /* free all resources associated with this device here
++         * in particular the overlay_handle_t, outstanding overlay_t, etc...
++         */
++
++        ctx->overlay_running = false;
++        sem_post(&ctx->control_shared->overlay_sem);//post the sem to unblock overlay thread
++
++        if (ctx->overlay_thread != 0) {
++            ctx->overlay_thread->requestExitAndWait();
++        }
++        
++        //Destory all overlay instance here??, 
++        //should let it done by user
++
++        overlay_deinit_v4l(ctx);
++        overlay_deinit_fbdev(ctx);
++
++        //???delete this share file;
++        destroy_control_shared_data(ctx->control_shared_fd,ctx->control_shared,true);
++
++        pthread_mutex_destroy(&ctx->control_lock);
++
++        free(ctx);
++    }
++    return 0;
++}
++ 
++// ****************************************************************************
++// Data module
++// ****************************************************************************
++
++int overlay_data_initialize(struct overlay_data_device_t *dev,
++        overlay_handle_t handle)
++{
++    OVERLAY_LOG_FUNC;
++    struct handle_t *overlay_handle = (struct handle_t *)handle;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    OVERLAY_LOG_INFO("overlay_initialize overlay_handle 0x%x overlay_data_context_t 0x%x pid %d tid %d",
++         overlay_handle,ctx,getpid(),gettid());
++    /* 
++     * overlay_handle_t should contain all the information to "inflate" this
++     * overlay. Typically it'll have a file descriptor, informations about
++     * how many buffers are there, etc...
++     * It is also the place to mmap all buffers associated with this overlay
++     * (see getBufferAddress).
++     * 
++     * NOTE: this function doesn't take ownership of overlay_handle_t
++     * 
++     */
++    if(overlay_check_parameters(overlay_handle) < 0)
++    {
++        OVERLAY_LOG_ERR("Error!Invalid parameters in this overlay handle");
++        return -EINVAL;
++    }
++
++    OVERLAY_LOG_INFO("num_buffer %d width %d,height %d,format %d, buf_size %d",
++         overlay_handle->num_buffer,overlay_handle->width,overlay_handle->height,
++         overlay_handle->format,overlay_handle->buf_size);
++
++    ctx->control_shared_fd = overlay_handle->control_shared_fd;
++    ctx->control_shared_size = overlay_handle->control_shared_size;
++    ctx->data_shared_fd = overlay_handle->data_shared_fd;
++    ctx->data_shared_size = overlay_handle->data_shared_size;
++    ctx->width = overlay_handle->width;
++    ctx->height = overlay_handle->height;
++    ctx->format = overlay_handle->format;
++    ctx->num_buffer = overlay_handle->num_buffer;//Number of buffers for overlay
++    ctx->buf_size = overlay_handle->buf_size;
++    //Open Control Share file
++    if(open_control_shared_data(ctx) == -1)
++    {
++        OVERLAY_LOG_ERR("Error!Cannot open overlay control share file");
++        return -1;
++    }
++    //Open Data Share file
++    if(open_data_shared_data(ctx) == -1)
++    {
++        OVERLAY_LOG_ERR("Error!Cannot open overlay data share file");
++        close_control_shared_data(ctx);
++        return -1;
++    }
++    if(ctx->data_shared->num_buffer != overlay_handle->num_buffer) {
++        OVERLAY_LOG_ERR("Warning!num_buffer %d in overlay_handle is not the same as %d in data_shared",
++                        overlay_handle->num_buffer,ctx->data_shared->num_buffer);
++    }
++
++    int bufcount = overlay_handle->num_buffer;
++    int bufsize = overlay_handle->buf_size;
++    ctx->allocator = new PmemAllocator(bufcount,bufsize);
++    if(!ctx->allocator) {
++        OVERLAY_LOG_ERR("Error!Cannot create PmemAllocator");
++        close_control_shared_data(ctx);
++        close_data_shared_data(ctx);
++        return -1;
++    }
++
++    //overlay_buffer should be reallocated if num_buffer changed
++    ctx->overlay_buffer = (OVERLAY_BUFFER *)malloc(sizeof(OVERLAY_BUFFER)*bufcount);
++    if(!ctx->overlay_buffer) {
++       OVERLAY_LOG_ERR("Error!Cannot allocate overlay buffer hdr");
++       close_control_shared_data(ctx);
++       close_data_shared_data(ctx);
++       delete ctx->allocator;
++       return -1;
++    }
++    else{
++       memset(ctx->overlay_buffer,0,sizeof(OVERLAY_BUFFER)*bufcount);
++       OVERLAY_LOG_INFO("overlay_buffer 0x%x",ctx->overlay_buffer);
++    }
++
++
++    pthread_mutex_lock(&ctx->data_shared->obj_lock);
++
++    ctx->data_shared->free_count = 0;
++    ctx->data_shared->free_head = 0;
++    ctx->data_shared->free_tail = 0;
++    memset(ctx->data_shared->free_bufs, 0, sizeof(int)*MAX_OVERLAY_BUFFER_NUM);
++    ctx->data_shared->queued_count = 0;
++    ctx->data_shared->queued_head = 0;
++    ctx->data_shared->queued_tail = 0;
++    memset(ctx->data_shared->queued_bufs, 0, sizeof(int)*MAX_OVERLAY_BUFFER_NUM);
++
++    //Allocate the buffer
++    //Insert all allocated buffer into buffer freequeue
++    OVERLAY_BUFFER *pOverlayBuf = ctx->overlay_buffer;
++    for(int index =0;index < bufcount; index++) {
++        int ret = -1;
++        ret = ctx->allocator->allocate(pOverlayBuf, bufsize);
++        if(ret<0) {
++            OVERLAY_LOG_ERR("Error!Cannot allocate overlay buffer");
++            pthread_mutex_unlock(&ctx->data_shared->obj_lock);
++            close_control_shared_data(ctx);
++            close_data_shared_data(ctx);
++            delete ctx->allocator;
++            return -1;
++
++        }
++
++        OVERLAY_LOG_INFO("buffer %d: vir 0x%x, phy 0x%x",index,pOverlayBuf->vir_addr,pOverlayBuf->phy_addr);
++        ctx->data_shared->free_bufs[ctx->data_shared->free_tail] = pOverlayBuf->phy_addr;
++        ctx->data_shared->free_count++;
++        ctx->data_shared->free_tail++;
++        pOverlayBuf++;
++    }
++    pthread_mutex_unlock(&ctx->data_shared->obj_lock);
++    OVERLAY_LOG_INFO("Overlay init success for Id %d",ctx->data_shared->instance_id);
++    
++    return 0;
++}
++
++int overlay_data_dequeueBuffer(struct overlay_data_device_t *dev,
++			  overlay_buffer_t* buf) 
++{
++    OVERLAY_LOG_FUNC;
++    int ret = 0;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if(!dev||!buf||!ctx->data_shared) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for dequeuBuffer");
++       return -EINVAL;
++    }
++
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++
++    /* blocks until a buffer is available and return an opaque structure
++     * representing this buffer.
++     */
++    //Maybe we should limited the loop count
++    //to avoid block calling thread too much
++    //in case error condition
++    do{
++        pthread_mutex_lock(&data_shared->obj_lock);
++        //Check the free buffer queue
++        if(data_shared->free_count == 0)
++        {
++            OVERLAY_LOG_RUNTIME("Id %d: No buffer for dequeueBuffer,have to wait",data_shared->instance_id);
++            //pthread_cond_wait will unlock mutex firstly, before calling thread
++            //will be blocked 
++            //pthread_cond_timedwait() may be more suitable here
++            data_shared->wait_buf_flag = 1;
++            //if buffer waiting flag be setted
++            //wait buffer free semphore here
++            //the semphore be post in mixer thread, if a buffer has 
++            //been mixed, and the waint flag be setted
++            //and waiting flag should be reset in mixer thread
++            
++            //post sempore to notify mixer thread, give mixer thread a chance to free a buffer
++            if(ctx->control_shared) {
++                sem_post(&ctx->control_shared->overlay_sem);
++            }
++            pthread_cond_wait(&data_shared->free_cond, &data_shared->obj_lock);
++            if(data_shared->wait_buf_flag != 0) {
++                OVERLAY_LOG_ERR("Error!Instance %d:Cannot wait a free buffer",data_shared->instance_id);
++                ret = -EINVAL;
++            }
++        }
++
++        if(data_shared->free_count > 0) 
++        {
++            //fetch the buffer handle
++            //return the buffer handle
++            unsigned int phy_addr = data_shared->free_bufs[data_shared->free_head];
++            OVERLAY_LOG_RUNTIME("Id %d:Have free buffer %d,head %d, phy 0x%x",
++                                data_shared->instance_id,
++                                data_shared->free_count,data_shared->free_head,
++                                phy_addr);
++            data_shared->free_bufs[data_shared->free_head] = 0;
++            data_shared->free_head++;
++            data_shared->free_head = data_shared->free_head%MAX_OVERLAY_BUFFER_NUM;
++            data_shared->free_count--;
++
++            OVERLAY_BUFFER *overlay_buf = NULL;
++            for(int index = 0;index< ctx->num_buffer;index ++) {
++                if(ctx->overlay_buffer[index].phy_addr == phy_addr) {
++                    overlay_buf = &ctx->overlay_buffer[index];
++                    OVERLAY_LOG_RUNTIME("Instance %d:Dequeued a overlay buffer %d: phy 0x%x, vir 0x%x",
++                         data_shared->instance_id,
++                         index,overlay_buf->phy_addr,overlay_buf->vir_addr);
++                }
++            }
++
++            if(!overlay_buf||!overlay_buf->vir_addr) {
++                OVERLAY_LOG_ERR("Error!Instance %d:Not a valid buffer",data_shared->instance_id);
++                pthread_mutex_unlock(&data_shared->obj_lock);
++                return -1;
++            }
++            
++            *buf = (overlay_buffer_t)overlay_buf;
++
++            pthread_mutex_unlock(&data_shared->obj_lock);
++            return 0;
++        }
++
++        //If not free buffer in queue, try again
++        pthread_mutex_unlock(&data_shared->obj_lock);
++ 
++    }while (ret <0);
++ 
++    return ret;
++}
++
++int overlay_data_queueBuffer(struct overlay_data_device_t *dev,
++        overlay_buffer_t buffer)
++{
++    OVERLAY_LOG_FUNC;;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if(!dev||!buffer||!ctx->data_shared) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for dequeuBuffer");
++       return -EINVAL;
++    }
++
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++    OVERLAY_BUFFER *overlay_buf = (OVERLAY_BUFFER *)buffer;
++    //Check whether it is a valid buffer
++    //Further check maybe needed:
++    //Cannot be queued twice(not a duplicated node in display buffer queue)
++    if((overlay_buf < ctx->overlay_buffer)||
++       (overlay_buf >= (ctx->overlay_buffer+ctx->num_buffer))) {
++       OVERLAY_LOG_ERR("Error!Id %d:Not a valid overlay buffer for queueBuffer",
++                       data_shared->instance_id);
++       return -EINVAL;
++    }
++
++    pthread_mutex_lock(&data_shared->obj_lock);
++    //Insert buffer to display buffer queue
++    if(data_shared->queued_count >= ctx->num_buffer) {
++        OVERLAY_LOG_ERR("Error!Id %d:Queued overlay buffer is out of number buffers supported",
++                        data_shared->instance_id);
++        pthread_mutex_unlock(&data_shared->obj_lock);
++        return -EINVAL;
++    }
++
++    int phy_addr = overlay_buf->phy_addr;
++    OVERLAY_LOG_RUNTIME("Id %d:Queue buffer 0x%x at %d,queued count %d",
++                        data_shared->instance_id,
++                        phy_addr,data_shared->queued_tail,data_shared->queued_count+1);
++
++    data_shared->queued_bufs[data_shared->queued_tail] = phy_addr;
++    data_shared->queued_tail++;
++    data_shared->queued_tail = data_shared->queued_tail%MAX_OVERLAY_BUFFER_NUM;
++    data_shared->queued_count++;
++    ctx->buf_queued++;
++    pthread_mutex_unlock(&data_shared->obj_lock);
++
++    //post sempore to notify mixer thread, new buffer is coming for mixing
++    if(ctx->control_shared) {
++        sem_post(&ctx->control_shared->overlay_sem);
++    }
++
++    return 0;
++}
++
++void *overlay_data_getBufferAddress(struct overlay_data_device_t *dev,
++        overlay_buffer_t buffer)
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if(!dev) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for getBufferAddress");
++       return NULL;
++    }
++
++    /* this may fail (NULL) if this feature is not supported. In that case,
++     * presumably, there is some other HAL module that can fill the buffer,
++     * using a DSP for instance */
++
++    //Check it is a valid buffer
++    //return virtual addree of this buffer
++    OVERLAY_BUFFER *overlay_buf = (OVERLAY_BUFFER *)buffer;
++    //Check whether it is a valid buffer
++    //Further check maybe needed:
++    //Cannot be queued twice(not a duplicated node in display buffer queue)
++    if((overlay_buf < ctx->overlay_buffer)||
++       (overlay_buf >= (ctx->overlay_buffer+ctx->num_buffer))) {
++       OVERLAY_LOG_ERR("Error!Id %d:Not a valid overlay buffer for queueBuffer",
++                       ctx->data_shared->instance_id);
++       return NULL;
++    }
++
++    return overlay_buf->vir_addr;
++
++
++}
++
++unsigned int overlay_data_getBufferAddressPhy(struct overlay_data_device_t *dev,
++        overlay_buffer_t buffer)
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if(!dev) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for getBufferAddressPhy");
++       return NULL;
++    }
++
++    /* this may fail (NULL) if this feature is not supported. In that case,
++     * presumably, there is some other HAL module that can fill the buffer,
++     * using a DSP for instance */
++
++    //Check it is a valid buffer
++    //return virtual addree of this buffer
++    OVERLAY_BUFFER *overlay_buf = (OVERLAY_BUFFER *)buffer;
++    //Check whether it is a valid buffer
++    //Further check maybe needed:
++    //Cannot be queued twice(not a duplicated node in display buffer queue)
++    if((overlay_buf < ctx->overlay_buffer)||
++       (overlay_buf >= (ctx->overlay_buffer+ctx->num_buffer))) {
++       OVERLAY_LOG_ERR("Error!Id %d:Not a valid overlay buffer for queueBuffer",
++                       ctx->data_shared->instance_id);
++       return 0;
++    }
++
++    return overlay_buf->phy_addr;
++
++}
++
++int overlay_data_resizeInput(struct overlay_data_device_t *dev,
++            uint32_t w, uint32_t h)
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if((!dev)||(w=0)||(h=0)||
++       (w> MAX_OVERLAY_INPUT_W)||
++       (h> MAX_OVERLAY_INPUT_H)) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for overlay_data_resizeInput");
++       return -EINVAL;
++    }
++    OVERLAY_LOG_ERR("Error!overlay_data_resizeInput not supported");
++    return -1;
++#if 0
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++    pthread_mutex_lock(&data_shared->obj_lock);
++    //Deallocate the overlay buffer
++    //reallocate the overlay buffer
++    //reinit the free/queue list
++    pthread_mutex_unlock(&data_shared->obj_lock);
++    return 0;
++#endif
++}
++
++int overlay_data_setCrop(struct overlay_data_device_t *dev,
++            uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if((!dev)||
++       ((x+w)> ctx->width)||
++       ((y+h)> ctx->height)) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for overlay_data_setCrop");
++       return -EINVAL;
++    }
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++    OVERLAY_LOG_INFO("Id %d:overlay_data_setCrop %d %d %d %d",
++                     data_shared->instance_id,x,y,w,h);
++    pthread_mutex_lock(&data_shared->obj_lock);
++    //Set the  crop setting for the overlay instance
++    data_shared->crop_x = x;
++    data_shared->crop_y = y;
++    data_shared->crop_w = w;
++    data_shared->crop_h = h;
++    pthread_mutex_unlock(&data_shared->obj_lock);
++    return 0;
++}
++
++int overlay_data_getCrop(struct overlay_data_device_t *dev,
++       uint32_t* x, uint32_t* y, uint32_t* w, uint32_t* h)
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if((!dev)||(!x)||(!y)||(!w)||(!h)) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for overlay_data_getCrop");
++       return -EINVAL;
++    }
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++    pthread_mutex_lock(&data_shared->obj_lock);
++    //Get the  crop setting for the overlay instance
++    *x = data_shared->crop_x;
++    *y = data_shared->crop_y;
++    *w = data_shared->crop_w;
++    *h = data_shared->crop_h;
++    pthread_mutex_unlock(&data_shared->obj_lock);
++    return 0;
++}
++
++int overlay_data_setParameter(struct overlay_data_device_t *dev,
++            int param, int value)
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if((!dev)) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for overlay_data_setParameter");
++       return -EINVAL;
++    }
++    overlay_data_shared_t  *data_shared = ctx->data_shared;
++    switch(param) {
++        case OVERLAY_BUFNUM:
++            {
++                OVERLAY_LOG_INFO("Id %d:overlay_data_setParameter buf num %d",
++                                 data_shared->instance_id,value);
++                if(MAX_OVERLAY_BUFFER_NUM < value) {
++                    OVERLAY_LOG_ERR("Error!Id %d:Invalid vaule %d for OVERLAY_BUFNUM setting",
++                                    data_shared->instance_id,value);
++                    return -EINVAL;
++                }
++                pthread_mutex_lock(&data_shared->obj_lock);
++                if(data_shared->free_count != data_shared->num_buffer) {
++                    //The buffer may be used by mixer
++                    //should hold until all buffer are in free queue
++                    OVERLAY_LOG_ERR("Error!Id %d:There are still %d buffers been used",
++                                    data_shared->instance_id,
++                                    data_shared->num_buffer-data_shared->free_count);
++                    pthread_mutex_unlock(&data_shared->obj_lock);
++                    return -EINVAL;
++                }
++    
++                //DeAllocate all buffers
++                for(int i = 0; i< ctx->num_buffer;i++) {
++                    ctx->allocator->deAllocate(&ctx->overlay_buffer[i]);
++                }
++    
++                //DeAllocate all buffer hdr
++                if(ctx->overlay_buffer) {
++                    free(ctx->overlay_buffer);
++                }
++    
++                //Delete allocator
++                if(ctx->allocator) {
++                    delete ctx->allocator;
++                }
++    
++                data_shared->free_count = 0;
++                data_shared->free_head = 0;
++                data_shared->free_tail = 0;
++                memset(data_shared->free_bufs, 0, sizeof(int)*MAX_OVERLAY_BUFFER_NUM);
++                data_shared->queued_count = 0;
++                data_shared->queued_head = 0;
++                data_shared->queued_tail = 0;
++                memset(data_shared->queued_bufs, 0, sizeof(int)*MAX_OVERLAY_BUFFER_NUM);
++                ctx->num_buffer = value;
++                data_shared->num_buffer = value;
++    
++                int bufcount = ctx->num_buffer;
++                int bufsize = ctx->buf_size;
++                ctx->allocator = new PmemAllocator(bufcount,bufsize);
++                if(!ctx->allocator) {
++                    OVERLAY_LOG_ERR("Error!Cannot create PmemAllocator");
++                    return -1;
++                }
++            
++                //overlay_buffer should be reallocated if num_buffer changed
++                ctx->overlay_buffer = (OVERLAY_BUFFER *)malloc(sizeof(OVERLAY_BUFFER)*bufcount);
++                if(!ctx->overlay_buffer) {
++                   OVERLAY_LOG_ERR("Error!Cannot allocate overlay buffer hdr");
++                   delete ctx->allocator;
++                   ctx->allocator = NULL;
++                   pthread_mutex_unlock(&data_shared->obj_lock);
++                   return -1;
++                }
++                else{
++                   memset(ctx->overlay_buffer,0,sizeof(OVERLAY_BUFFER)*bufcount);
++                   OVERLAY_LOG_INFO("overlay_buffer 0x%x",ctx->overlay_buffer);
++                }
++                //Allocate the buffer
++                //Insert all allocated buffer into buffer freequeue
++                OVERLAY_BUFFER *pOverlayBuf = ctx->overlay_buffer;
++                for(int index =0;index < bufcount; index++) {
++                    int ret = -1;
++                    ret = ctx->allocator->allocate(pOverlayBuf, bufsize);
++                    if(ret<0) {
++                        OVERLAY_LOG_ERR("Error!Cannot allocate overlay buffer");
++                        pthread_mutex_unlock(&ctx->data_shared->obj_lock);
++                        delete ctx->allocator;
++                        return -1;
++            
++                    }
++            
++                    OVERLAY_LOG_INFO("buffer %d: vir 0x%x, phy 0x%x",index,pOverlayBuf->vir_addr,pOverlayBuf->phy_addr);
++                    ctx->data_shared->free_bufs[ctx->data_shared->free_tail] = pOverlayBuf->phy_addr;
++                    ctx->data_shared->free_count++;
++                    ctx->data_shared->free_tail++;
++                    pOverlayBuf++;
++                }
++                pthread_mutex_unlock(&data_shared->obj_lock);
++            }
++
++            break;
++        default:
++            break;
++    }
++
++    return 0;
++}
++
++int overlay_data_getBufferCount(struct overlay_data_device_t *dev)
++{
++    OVERLAY_LOG_FUNC;
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    if((!dev)) {
++       OVERLAY_LOG_ERR("Error!Invalid parameters for overlay_data_getBufferCount");
++       return 0;
++    }
++    return ctx->num_buffer;
++}
++
++static int overlay_data_close(struct hw_device_t *dev) 
++{
++    struct overlay_data_context_t* ctx = (struct overlay_data_context_t*)dev;
++    OVERLAY_LOG_FUNC;
++    if (ctx) {
++        /* free all resources associated with this device here
++         * in particular all pending overlay_buffer_t if needed.
++         * 
++         * NOTE: overlay_handle_t passed in initialize() is NOT freed and
++         * its file descriptors are not closed (this is the responsibility
++         * of the caller).
++         */
++
++        //Close the share file for data and control
++        close_data_shared_data(ctx);
++        close_control_shared_data(ctx);
++
++        //DeAllocate all buffers
++        for(int i = 0; i< ctx->num_buffer;i++) {
++            ctx->allocator->deAllocate(&ctx->overlay_buffer[i]);
++        }
++        
++        //DeAllocate all buffer hdr
++        if(ctx->overlay_buffer) {
++            free(ctx->overlay_buffer);
++        }
++
++        //Delete allocator
++        if(ctx->allocator) {
++            delete ctx->allocator;
++        }
++        free(ctx);
++    }
++    return 0;
++}
++
++/*****************************************************************************/
++
++static int overlay_device_open(const struct hw_module_t* module, const char* name,
++        struct hw_device_t** device)
++{
++    OVERLAY_LOG_FUNC;
++    int status = -EINVAL;
++    OVERLAY_LOG_INFO("overlay_device_open %s pid %d,tid %d",name,getpid(),gettid());
++    if (!strcmp(name, OVERLAY_HARDWARE_CONTROL)) {
++        
++        struct overlay_control_context_t *dev;
++
++        dev = (overlay_control_context_t*)malloc(sizeof(*dev));
++
++        /* initialize our state here */
++        memset(dev, 0, sizeof(*dev));
++
++        /* initialize the procs */
++        dev->device.common.tag = HARDWARE_DEVICE_TAG;
++        dev->device.common.version = 0;
++        dev->device.common.module = const_cast<hw_module_t*>(module);
++        dev->device.common.close = overlay_control_close;
++        
++        dev->device.get = overlay_get;
++        dev->device.createOverlay = overlay_createOverlay;
++        dev->device.destroyOverlay = overlay_destroyOverlay;
++        dev->device.setPosition = overlay_setPosition;
++        dev->device.getPosition = overlay_getPosition;
++        dev->device.setParameter = overlay_setParameter;
++        dev->device.stage = overlay_stage;
++        dev->device.commit = overlay_commit;
++
++        *device = &dev->device.common;
++        dev->outpixelformat = V4L2_PIX_FMT_UYVY;
++        //dev->outpixelformat = V4L2_PIX_FMT_YUV420;
++        if(pthread_mutex_init(&(dev->control_lock), NULL)!=0 ){
++            OVERLAY_LOG_ERR("Error!init control_lock failed");
++            goto err_control_exit;
++        }
++
++        if(overlay_init_fbdev(dev)<0){
++            OVERLAY_LOG_ERR("Error!init fbdev failed");
++            goto err_control_exit;
++        }
++
++        if(overlay_init_v4l(dev)<0){
++            OVERLAY_LOG_ERR("Error!init v4l failed");
++            goto err_control_exit;
++        }
++        dev->control_shared_fd = create_control_shared_data(&dev->control_shared);
++        dev->control_shared_size = dev->control_shared->size;
++        if(dev->control_shared_fd < 0 || !dev->control_shared){
++            OVERLAY_LOG_ERR("Error!init control share failed");
++            goto err_control_exit;
++        }
++
++        dev->overlay_running = true;
++        dev->overlay_thread = new OverlayThread(dev);
++        dev->overlay_thread->run("OverlayThread", PRIORITY_URGENT_DISPLAY);
++        status = 0;
++        OVERLAY_LOG_INFO("Overlay HAL control device Created successfully");
++        return status;
++
++err_control_exit:
++        OVERLAY_LOG_ERR("Error!init overlay_control_context_t failed");
++        if(dev) {
++            if(dev->overlay_thread) {
++                delete dev->overlay_thread;
++                dev->overlay_thread = NULL;
++            }
++
++            for(int buf_index=0;buf_index < dev->v4l_bufcount;buf_index++) {
++               if(dev->v4lbuf_addr[buf_index])
++                  munmap((void *)dev->v4lbuf_addr[buf_index], dev->v4l_buffers[buf_index].length);
++               memset(&dev->v4l_buffers[buf_index],0,sizeof(v4l2_buffer));
++               dev->v4lbuf_addr[buf_index] = NULL;
++            }
++
++            dev->v4l_bufcount = 0;
++
++            if(dev->v4l_id) {
++                close(dev->v4l_id);
++                dev->v4l_id = 0;
++            }
++
++            if(dev->alpha_buffers[0].vir_addr){
++                munmap((void *)dev->alpha_buffers[0].vir_addr, dev->alpha_buffers[0].size);
++                memset(&dev->alpha_buffers[0],0,sizeof(OVERLAY_BUFFER));
++            }
++            if(dev->alpha_buffers[1].vir_addr){
++                munmap((void *)dev->alpha_buffers[1].vir_addr, dev->alpha_buffers[1].size);
++                memset(&dev->alpha_buffers[1],0,sizeof(OVERLAY_BUFFER));
++            }
++
++            if(dev->fb_dev) {
++                close(dev->fb_dev);
++                dev->fb_dev = 0;
++            }
++
++            free(dev);
++        }
++        status = -1;
++
++    } else if (!strcmp(name, OVERLAY_HARDWARE_DATA)) {
++        struct overlay_data_context_t *dev;
++        dev = (overlay_data_context_t*)malloc(sizeof(*dev));
++
++        /* initialize our state here */
++        memset(dev, 0, sizeof(*dev));
++
++        /* initialize the procs */
++        dev->device.common.tag = HARDWARE_DEVICE_TAG;
++        dev->device.common.version = 0;
++        dev->device.common.module = const_cast<hw_module_t*>(module);
++        dev->device.common.close = overlay_data_close;
++        
++        dev->device.initialize = overlay_data_initialize;
++        dev->device.dequeueBuffer = overlay_data_dequeueBuffer;
++        dev->device.queueBuffer = overlay_data_queueBuffer;
++        dev->device.getBufferAddress = overlay_data_getBufferAddress;
++        dev->device.getBufferAddressPhy = overlay_data_getBufferAddressPhy;
++        dev->device.resizeInput = overlay_data_resizeInput;
++        dev->device.setCrop = overlay_data_setCrop;
++        dev->device.getCrop = overlay_data_getCrop;
++        dev->device.setParameter = overlay_data_setParameter;
++        dev->device.getBufferCount = overlay_data_getBufferCount;
++
++        *device = &dev->device.common;
++        status = 0;
++    }
++    return status;
++}
+diff --git a/liboverlay/overlay_pmem.cpp b/liboverlay/overlay_pmem.cpp
+new file mode 100755
+index 0000000..4b25cf6
+--- /dev/null
++++ b/liboverlay/overlay_pmem.cpp
+@@ -0,0 +1,151 @@
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <linux/videodev.h>
++#include <linux/fb.h>
++#include <sys/mman.h>
++#include <linux/mxcfb.h>
++
++extern "C" {
++#include "mxc_ipu_hl_lib.h" 
++} 
++
++
++#include <hardware/hardware.h>
++#include <hardware/overlay.h>
++
++#include <fcntl.h>
++#include <errno.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++#include <pthread.h>
++#include <semaphore.h>
++
++#include <utils/List.h>
++#include <ui/PixelFormat.h>
++#include <linux/android_pmem.h>
++#include "overlay_pmem.h"
++
++/*
++*   input parameter: 
++*/
++PmemAllocator::PmemAllocator(int bufCount, int bufSize):
++    mFD(0),mTotalSize(0),mBufCount(bufCount),mBufSize(bufSize),
++    mVirBase(NULL),mPhyBase(NULL)
++{
++    OVERLAY_LOG_FUNC;
++    memset(mSlotAllocated, 0, sizeof(bool)*MAX_SLOT);
++
++    int err;
++    struct pmem_region region;
++    mFD = open(PMEM_DEV, O_RDWR);
++    if (mFD < 0) {
++         OVERLAY_LOG_ERR("Error!PmemAllocator constructor");
++         return;
++    }
++
++    err = ioctl(mFD, PMEM_GET_TOTAL_SIZE, &region);
++    if (err == 0)
++    {
++         OVERLAY_LOG_INFO("Info!get pmem total size %d",(int)region.len);
++    }
++    else
++    {
++        OVERLAY_LOG_ERR("Error!Cannot get total length in PmemAllocator constructor");
++        return;
++    }
++    
++    mBufSize = (bufSize + DEFAULT_PMEM_ALIGN-1) & ~(DEFAULT_PMEM_ALIGN-1);
++    
++    mTotalSize = mBufSize*bufCount;
++    if((mTotalSize > region.len)||(mBufCount > MAX_SLOT)) {
++        OVERLAY_LOG_ERR("Error!Out of PmemAllocator capability");
++    }
++    else
++    {
++        uint8_t *virtualbase = (uint8_t*)mmap(0, mTotalSize,
++            PROT_READ|PROT_WRITE, MAP_SHARED, mFD, 0);
++
++        if (virtualbase == MAP_FAILED) {
++           OVERLAY_LOG_ERR("Error!mmap(fd=%d, size=%u) failed (%s)",
++                   mFD, (unsigned int)mTotalSize, strerror(errno));
++           return;
++        }
++
++        memset(&region, 0, sizeof(region));
++    
++        if (ioctl(mFD, PMEM_GET_PHYS, &region) == -1)
++        {
++          OVERLAY_LOG_ERR("Error!Failed to get physical address of source!\n");
++          munmap(virtualbase, mTotalSize);
++          return;
++        }
++        mVirBase = (void *)virtualbase;
++        mPhyBase = region.offset;
++        OVERLAY_LOG_INFO("Allocator total size %d, vir addr 0x%x, phy addr 0x%x",mTotalSize,mVirBase,mPhyBase);
++    }
++}
++
++PmemAllocator::~PmemAllocator()
++{
++    OVERLAY_LOG_FUNC;
++
++    for(int index=0;index < MAX_SLOT;index ++) {
++        if(mSlotAllocated[index]) {
++            OVERLAY_LOG_ERR("Error!Cannot deinit PmemAllocator before all memory back to allocator");
++        }
++    }
++
++    if(mVirBase) {
++        munmap(mVirBase, mTotalSize);
++    }
++    if(mFD) {
++        close(mFD);
++    }
++     
++}
++
++int PmemAllocator::allocate(struct OVERLAY_BUFFER *overlay_buf, int size)
++{
++    OVERLAY_LOG_FUNC;
++    if((!mVirBase)||(!overlay_buf)||(size>mBufSize)) {
++        OVERLAY_LOG_ERR("Error!No memory for allocator");
++        return -1;
++    }
++
++    for(int index=0;index < MAX_SLOT;index ++) {
++        if(!mSlotAllocated[index]) {
++            OVERLAY_LOG_RUNTIME("Free slot %d for allocating mBufSize %d request size %d",
++                             index,mBufSize,size);
++
++            overlay_buf->vir_addr = (void *)((char *)mVirBase+index*mBufSize); 
++            overlay_buf->phy_addr = mPhyBase+index*mBufSize;
++            overlay_buf->size = mBufSize;
++            mSlotAllocated[index] = true;
++            return 0;
++        }
++    }
++    return -1;
++}
++
++int PmemAllocator::deAllocate(OVERLAY_BUFFER *overlay_buf)
++{
++    OVERLAY_LOG_FUNC;
++    if((!mVirBase)||(!overlay_buf)) {
++        OVERLAY_LOG_ERR("Error!No memory for allocator");
++        return -1;
++    }
++    int nSlot = ((unsigned int)overlay_buf->vir_addr - (unsigned int)mVirBase)/mBufSize;
++    if((nSlot<MAX_SLOT)&&(mSlotAllocated[nSlot])) {
++        OVERLAY_LOG_RUNTIME("Info!deAllocate for slot %d",nSlot);
++        mSlotAllocated[nSlot] = false;
++        return 0;
++    }
++    else{
++        OVERLAY_LOG_ERR("Error!Not a valid buffer");
++        return -1;
++    }
++}
+diff --git a/liboverlay/overlay_pmem.h b/liboverlay/overlay_pmem.h
+new file mode 100755
+index 0000000..ff310b8
+--- /dev/null
++++ b/liboverlay/overlay_pmem.h
+@@ -0,0 +1,27 @@
++#ifndef __OVERLAY_H__
++#define __OVERLAY_H__
++
++#include "overlay_utils.h"
++#define DEFAULT_PMEM_ALIGN (4096)
++#define PMEM_DEV "/dev/pmem_adsp"
++#define MAX_SLOT 64
++
++class PmemAllocator: public OverlayAllocator
++{
++public:
++    PmemAllocator(int bufCount,int bufSize);
++    virtual ~PmemAllocator();
++    virtual int allocate(OVERLAY_BUFFER *overlay_buf, int size);
++    virtual int deAllocate(OVERLAY_BUFFER *overlay_buf);
++    virtual int getHeapID(){  return mFD;  }
++private:
++    int mFD;
++    unsigned long mTotalSize;
++    int mBufCount;
++    int mBufSize;
++    void *mVirBase;
++    unsigned int mPhyBase;
++    bool mSlotAllocated[MAX_SLOT];
++};
++
++#endif
+diff --git a/liboverlay/overlay_thread.h b/liboverlay/overlay_thread.h
+new file mode 100755
+index 0000000..cd8e793
+--- /dev/null
++++ b/liboverlay/overlay_thread.h
+@@ -0,0 +1,575 @@
++#ifndef __OVERLAY_THREAD_H__
++#define __OVERLAY_THREAD_H__
++
++#include <utils/threads.h>
++
++class OverlayThread: public Thread {
++    struct overlay_control_context_t *m_dev;
++    struct v4l2_buffer mLatestQueuedBuf;
++    ipu_lib_input_param_t mIPUInputParam;   
++    ipu_lib_output_param_t mIPUOutputParam; 
++    ipu_lib_handle_t            mIPUHandle;
++    int mIPURet;
++    public:
++    OverlayThread(struct overlay_control_context_t *dev)
++        : Thread(false),m_dev(dev){
++        memset(&mIPUInputParam,0,sizeof(mIPUInputParam));
++        memset(&mIPUOutputParam,0,sizeof(mIPUOutputParam));
++        memset(&mIPUHandle,0,sizeof(mIPUHandle));
++        memset(&mLatestQueuedBuf,0,sizeof(mLatestQueuedBuf));
++    }
++
++    virtual void onFirstRef() {
++        OVERLAY_LOG_FUNC;
++        //run("OverlayThread", PRIORITY_URGENT_DISPLAY);
++    }
++    virtual bool threadLoop() {
++        int index = 0;
++        overlay_object *overlayObj0;
++        overlay_object *overlayObj1;
++        overlay_data_shared_t *dataShared0;
++        overlay_data_shared_t *dataShared1;
++        unsigned int overlay_buf0;
++        unsigned int overlay_buf1;
++        bool outchange0;
++        bool outchange1;
++        WIN_REGION overlay0_outregion;
++        WIN_REGION overlay1_outregion;
++        int rotation0;
++        int rotation1;
++        int crop_x0 = 0,crop_y0 = 0,crop_w0 = 0,crop_h0 = 0;
++        int crop_x1 = 0,crop_y1 = 0,crop_w1 = 0,crop_h1 = 0;
++        while(m_dev&&(m_dev->overlay_running)) {
++            OVERLAY_LOG_RUNTIME("Overlay thread running pid %d tid %d", getpid(),gettid());
++
++            //Wait for semphore for overlay instance buffer queueing
++            sem_wait(&m_dev->control_shared->overlay_sem);
++            OVERLAY_LOG_RUNTIME("Get overlay semphore here pid %d tid %d",getpid(),gettid());
++            overlayObj0 = NULL;
++            overlayObj1 = NULL;
++            dataShared0 = NULL;
++            dataShared1 = NULL;
++            overlay_buf0 = NULL;
++            overlay_buf1 = NULL;
++            outchange0 = false;
++            outchange1 = false;
++            memset(&overlay0_outregion, 0, sizeof(overlay0_outregion));
++            memset(&overlay1_outregion, 0, sizeof(overlay1_outregion));
++
++            //Check current active overlay instance
++            pthread_mutex_lock(&m_dev->control_lock);
++    
++            if(m_dev->overlay_number >= 1) {
++                for(index= 0;index < MAX_OVERLAY_INSTANCES;index++) {
++                    if(m_dev->overlay_instance_valid[index]) {
++                        if(!overlayObj0) {
++                            overlayObj0 = m_dev->overlay_intances[index];
++                        }
++                        //For those small zorder, it should be drawn firstly
++                        else if(m_dev->overlay_intances[index]->zorder < overlayObj0->zorder){
++                            overlayObj1 = overlayObj0;
++                            overlayObj0 = m_dev->overlay_intances[index];
++                        }
++                        else{
++                            overlayObj1 = m_dev->overlay_intances[index];
++                        }
++                    }
++                }
++            }
++
++            pthread_mutex_unlock(&m_dev->control_lock);            
++               
++
++            if(overlayObj0) {
++                dataShared0 = overlayObj0->mDataShared;
++                OVERLAY_LOG_RUNTIME("Process obj 0 instance_id %d, dataShared0 0x%x",
++                                    dataShared0->instance_id,dataShared0);
++                pthread_mutex_lock(&dataShared0->obj_lock);
++                //Fetch one buffer from each overlay instance buffer queue
++                OVERLAY_LOG_RUNTIME("queued_count %d,queued_head %d",
++                     dataShared0->queued_count,dataShared0->queued_head);
++                if(dataShared0->queued_count > 0) 
++                {
++                    //fetch the head buffer in queued buffers
++                    overlay_buf0 = dataShared0->queued_bufs[dataShared0->queued_head];
++                    OVERLAY_LOG_RUNTIME("id %d Get queue buffer for Overlay Instance 0: 0x%x queued_count %d",
++                         dataShared0->instance_id,overlay_buf0,dataShared0->queued_count);
++                    dataShared0->queued_bufs[dataShared0->queued_head] = 0;
++                    dataShared0->queued_head ++;
++                    dataShared0->queued_head = dataShared0->queued_head%MAX_OVERLAY_BUFFER_NUM;
++                    dataShared0->queued_count --;
++                }       
++
++                //Check whether output area and zorder changing occure, so 
++                //to paint v4l2 buffer or setting fb0/1's local 
++                //alpha buffer                 
++                outchange0 = overlayObj0->out_changed;
++                if(overlay_buf0) {
++                    overlayObj0->out_changed = 0;
++                }
++                overlay0_outregion.left = overlayObj0->outX;
++                overlay0_outregion.right = overlayObj0->outX+overlayObj0->outW;
++                overlay0_outregion.top = overlayObj0->outY;
++                overlay0_outregion.bottom = overlayObj0->outY+overlayObj0->outH;
++                rotation0 = overlayObj0->rotation;
++                crop_x0 = dataShared0->crop_x;
++                crop_y0 = dataShared0->crop_y;  
++                crop_w0 = dataShared0->crop_w;
++                crop_h0 = dataShared0->crop_h;
++                pthread_mutex_unlock(&dataShared0->obj_lock); 
++            }
++
++            if(overlayObj1) {
++                dataShared1 = overlayObj1->mDataShared;
++                OVERLAY_LOG_RUNTIME("Process obj 0 instance_id %d dataShared0 0x%x",
++                                    dataShared0->instance_id,dataShared0);
++                pthread_mutex_lock(&dataShared1->obj_lock);
++                //Fetch one buffer from each overlay instance buffer queue
++                if(dataShared1->queued_count > 0) 
++                {
++                    //fetch the head buffer in queued buffers
++                    overlay_buf1 = dataShared1->queued_bufs[dataShared1->queued_head];
++                    OVERLAY_LOG_RUNTIME("Id %d Get queue buffer for Overlay Instance 1: 0x%x queued_count %d",
++                         dataShared1->instance_id,overlay_buf1,dataShared1->queued_count);
++                    dataShared1->queued_bufs[dataShared1->queued_head] = 0;
++                    dataShared1->queued_head ++;
++                    dataShared1->queued_head = dataShared1->queued_head%MAX_OVERLAY_BUFFER_NUM;
++                    dataShared1->queued_count --;
++                }       
++
++                //Check whether output area and zorder changing occure, so 
++                //to paint v4l2 buffer or setting fb0/1's local 
++                //alpha buffer                 
++                outchange1 = overlayObj1->out_changed;
++                if(overlay_buf1) {
++                    overlayObj1->out_changed = 0;
++                }
++                overlay1_outregion.left = overlayObj1->outX;
++                overlay1_outregion.right = overlayObj1->outX+overlayObj1->outW;
++                overlay1_outregion.top = overlayObj1->outY;
++                overlay1_outregion.bottom = overlayObj1->outY+overlayObj1->outH;
++                rotation1 = overlayObj1->rotation;
++                crop_x1 = dataShared1->crop_x;
++                crop_y1 = dataShared1->crop_y;  
++                crop_w1 = dataShared1->crop_w;
++                crop_h1 = dataShared1->crop_h;
++                pthread_mutex_unlock(&dataShared1->obj_lock); 
++            }
++
++            if((!overlay_buf0)&&(!overlay_buf1)) {
++                OVERLAY_LOG_RUNTIME("Nothing to do in overlay mixer thread!");
++                //It is just a loop function in the loopless of this thread
++                //So make a break here, and it will come back later
++                continue;
++            }
++            if((overlay_buf0)&&(overlay_buf1)) {
++                OVERLAY_LOG_RUNTIME("Two instance mixer needed");
++            } 
++                      
++            //Check whether refill the origin area to black
++            if(outchange0||outchange1) {
++                OVERLAY_LOG_RUNTIME("Mixer thread refill the origin area to black");
++            }
++
++            //Check whether need copy back the latest frame to current frame
++            //If only buf0  is available, copy back the overlay1's area in v4l latest buffer after show buf0
++            //to v4l current buffer
++            //If only buf1  is available, copy back the overlay1's area in v4l latest buffer before show buf1
++            //to v4l current buffer
++
++            //Dequeue a V4L2 Buffer
++            struct v4l2_buffer *pV4LBuf;
++            struct v4l2_buffer v4lbuf;
++            memset(&v4lbuf, 0, sizeof(v4l2_buffer));
++            if(m_dev->video_frames < m_dev->v4l_bufcount) {
++                pV4LBuf = &m_dev->v4l_buffers[m_dev->video_frames];
++            }
++            else{
++                v4lbuf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++                v4lbuf.memory = V4L2_MEMORY_MMAP;
++                if(ioctl(m_dev->v4l_id, VIDIOC_DQBUF, &v4lbuf) < 0){
++                    OVERLAY_LOG_ERR("Error!Cannot DQBUF a buffer from v4l");
++
++                    //stream off it,so to make it recover
++                    int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++                    ioctl(m_dev->v4l_id, VIDIOC_STREAMOFF, &type);
++                    m_dev->stream_on = false;
++                    m_dev->video_frames = 0;
++                    //reset latest queued buffer, since all buffer will start as init
++                    memset(&mLatestQueuedBuf,0,sizeof(mLatestQueuedBuf));
++                    goto free_buf_exit;
++                }
++                pV4LBuf = &v4lbuf;
++            }
++
++
++            OVERLAY_LOG_RUNTIME("DQBUF from v4l 0x%x:index %d, vir 0x%x, phy 0x%x, len %d",
++                                pV4LBuf,pV4LBuf->index,m_dev->v4lbuf_addr[pV4LBuf->index],
++                                pV4LBuf->m.offset,pV4LBuf->length);   
++                      
++            //Copyback before ipu update when two active instance, and obj0 has no buffer to update
++            //obj1 has buffer to update
++            if((overlayObj0)&&(overlayObj1)&&
++               (!overlay_buf0)&&(overlay_buf1)&&
++               (dataShared0->buf_showed))
++            {
++                OVERLAY_LOG_RUNTIME("Copyback before ipu update");
++                if((mLatestQueuedBuf.m.offset)&&
++                   (mLatestQueuedBuf.m.offset != pV4LBuf->m.offset)) {
++                    //Copy back the region of obj0 to the current v4l buffer
++                    //Setting input format
++                    mIPUInputParam.width = m_dev->xres;
++                    mIPUInputParam.height = m_dev->yres;
++
++                    mIPUInputParam.input_crop_win.pos.x = overlay0_outregion.left;
++                    mIPUInputParam.input_crop_win.pos.y = overlay0_outregion.top;  
++                    mIPUInputParam.input_crop_win.win_w = overlay0_outregion.right - overlay0_outregion.left;
++                    mIPUInputParam.input_crop_win.win_h = overlay0_outregion.bottom - overlay0_outregion.top;
++                    mIPUInputParam.fmt = m_dev->outpixelformat;
++                    mIPUInputParam.user_def_paddr[0] = mLatestQueuedBuf.m.offset;
++    
++                    //Setting output format
++                    //Should align with v4l
++                    mIPUOutputParam.fmt = m_dev->outpixelformat;
++                    mIPUOutputParam.width = m_dev->xres;
++                    mIPUOutputParam.height = m_dev->yres;   
++                    mIPUOutputParam.show_to_fb = 0;
++                    //Output param should be same as input, since no resize,crop
++                    mIPUOutputParam.output_win.pos.x = mIPUInputParam.input_crop_win.pos.x;
++                    mIPUOutputParam.output_win.pos.y = mIPUInputParam.input_crop_win.pos.y;
++                    mIPUOutputParam.output_win.win_w = mIPUInputParam.input_crop_win.win_w;
++                    mIPUOutputParam.output_win.win_h = mIPUInputParam.input_crop_win.win_h;
++                    mIPUOutputParam.rot = 0;
++                    mIPUOutputParam.user_def_paddr[0] = pV4LBuf->m.offset;
++                    OVERLAY_LOG_RUNTIME("Copyback(before) Output param: width %d,height %d, pos.x %d, pos.y %d,win_w %d,win_h %d,rot %d",
++                          mIPUOutputParam.width,
++                          mIPUOutputParam.height,
++                          mIPUOutputParam.output_win.pos.x,
++                          mIPUOutputParam.output_win.pos.y,
++                          mIPUOutputParam.output_win.win_w,
++                          mIPUOutputParam.output_win.win_h,
++                          mIPUOutputParam.rot);
++                                     
++                    OVERLAY_LOG_RUNTIME("Copyback(before) Input param: width %d, height %d, fmt %d, crop_win pos x %d, crop_win pos y %d, crop_win win_w %d,crop_win win_h %d",
++                                     mIPUInputParam.width,
++                                     mIPUInputParam.height,
++                                     mIPUInputParam.fmt,
++                                     mIPUInputParam.input_crop_win.pos.x,
++                                     mIPUInputParam.input_crop_win.pos.y,
++                                     mIPUInputParam.input_crop_win.win_w,
++                                     mIPUInputParam.input_crop_win.win_h);     
++    
++                    mIPURet =  mxc_ipu_lib_task_init(&mIPUInputParam,NULL,&mIPUOutputParam,NULL,OP_NORMAL_MODE|TASK_PP_MODE,&mIPUHandle);
++                    if (mIPURet < 0) {
++                       OVERLAY_LOG_ERR("Error!Copyback(before) mxc_ipu_lib_task_init failed mIPURet %d!",mIPURet);
++                       goto queue_buf_exit;
++                    }  
++                    OVERLAY_LOG_RUNTIME("Copyback(before) mxc_ipu_lib_task_init success");
++                    mIPURet = mxc_ipu_lib_task_buf_update(&mIPUHandle,overlay_buf0,pV4LBuf->m.offset,NULL,NULL,NULL);
++                    if (mIPURet < 0) {
++                          OVERLAY_LOG_ERR("Error!Copyback(before) mxc_ipu_lib_task_buf_update failed mIPURet %d!",mIPURet);
++                          mxc_ipu_lib_task_uninit(&mIPUHandle);
++                          memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++                          goto queue_buf_exit;
++                    }
++                    OVERLAY_LOG_RUNTIME("Copyback(before) mxc_ipu_lib_task_buf_update success");
++                    mxc_ipu_lib_task_uninit(&mIPUHandle);
++                    memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++                }
++                else{
++                    OVERLAY_LOG_ERR("Error!Cannot Copyback before ipu update last buf 0x%x,curr buf 0x%x",
++                                    mLatestQueuedBuf.m.offset,
++                                    pV4LBuf->m.offset);
++                }
++            }
++
++            //Mixer the first buffer from overlay instance0 to V4L2 Buffer
++            if(overlay_buf0) {
++                //Setting input format
++                mIPUInputParam.width = overlayObj0->mHandle.width;
++                mIPUInputParam.height = overlayObj0->mHandle.height;
++                mIPUInputParam.input_crop_win.pos.x = crop_x0;
++                mIPUInputParam.input_crop_win.pos.y = crop_y0;  
++                mIPUInputParam.input_crop_win.win_w = crop_w0;
++                mIPUInputParam.input_crop_win.win_h = crop_h0;
++
++                if(overlayObj0->mHandle.format == PIXEL_FORMAT_YCbCr_420_SP) {
++                    mIPUInputParam.fmt = v4l2_fourcc('I', '4', '2', '0');
++                }
++                else{
++                    OVERLAY_LOG_ERR("Error!Not supported input format %d",overlayObj0->mHandle.format);
++                    goto queue_buf_exit;
++                }
++                mIPUInputParam.user_def_paddr[0] = overlay_buf0;
++
++                //Setting output format
++                //Should align with v4l
++                mIPUOutputParam.fmt = m_dev->outpixelformat;
++                mIPUOutputParam.width = m_dev->xres;
++                mIPUOutputParam.height = m_dev->yres;   
++                mIPUOutputParam.show_to_fb = 0;
++                mIPUOutputParam.output_win.pos.x = overlayObj0->outX;
++                mIPUOutputParam.output_win.pos.y = overlayObj0->outY;
++                mIPUOutputParam.output_win.win_w = overlayObj0->outW;
++                mIPUOutputParam.output_win.win_h = overlayObj0->outH;
++                mIPUOutputParam.rot = overlayObj0->rotation;
++                mIPUOutputParam.user_def_paddr[0] = pV4LBuf->m.offset;
++                OVERLAY_LOG_RUNTIME("Obj0 Output param: width %d,height %d, pos.x %d, pos.y %d,win_w %d,win_h %d,rot %d",
++                      mIPUOutputParam.width,
++                      mIPUOutputParam.height,
++                      mIPUOutputParam.output_win.pos.x,
++                      mIPUOutputParam.output_win.pos.y,
++                      mIPUOutputParam.output_win.win_w,
++                      mIPUOutputParam.output_win.win_h,
++                      mIPUOutputParam.rot);
++                                 
++                OVERLAY_LOG_RUNTIME("Obj0 Input param: width %d, height %d, fmt %d, crop_win pos x %d, crop_win pos y %d, crop_win win_w %d,crop_win win_h %d",
++                                 mIPUInputParam.width,
++                                 mIPUInputParam.height,
++                                 mIPUInputParam.fmt,
++                                 mIPUInputParam.input_crop_win.pos.x,
++                                 mIPUInputParam.input_crop_win.pos.y,
++                                 mIPUInputParam.input_crop_win.win_w,
++                                 mIPUInputParam.input_crop_win.win_h);     
++
++                mIPURet =  mxc_ipu_lib_task_init(&mIPUInputParam,NULL,&mIPUOutputParam,NULL,OP_NORMAL_MODE|TASK_PP_MODE,&mIPUHandle);
++                if (mIPURet < 0) {
++                   OVERLAY_LOG_ERR("Error!Obj0 mxc_ipu_lib_task_init failed mIPURet %d!",mIPURet);
++                   goto queue_buf_exit;
++                }  
++                OVERLAY_LOG_RUNTIME("Obj0 mxc_ipu_lib_task_init success");
++                mIPURet = mxc_ipu_lib_task_buf_update(&mIPUHandle,overlay_buf0,pV4LBuf->m.offset,NULL,NULL,NULL);
++                if (mIPURet < 0) {
++                      OVERLAY_LOG_ERR("Error!Obj0 mxc_ipu_lib_task_buf_update failed mIPURet %d!",mIPURet);
++                      mxc_ipu_lib_task_uninit(&mIPUHandle);
++                      memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++                      goto queue_buf_exit;
++                }
++                OVERLAY_LOG_RUNTIME("Obj0 mxc_ipu_lib_task_buf_update success");
++                mxc_ipu_lib_task_uninit(&mIPUHandle);
++                memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++            }
++
++            //Check whether we need to do another mixer, based on
++            //buffers in overlay instance1's buffer queue
++            if(overlay_buf1) {
++                //Setting input format
++                mIPUInputParam.width = overlayObj1->mHandle.width;
++                mIPUInputParam.height = overlayObj1->mHandle.height;
++                mIPUInputParam.input_crop_win.pos.x = crop_x1;
++                mIPUInputParam.input_crop_win.pos.y = crop_y1;  
++                mIPUInputParam.input_crop_win.win_w = crop_w1;
++                mIPUInputParam.input_crop_win.win_h = crop_h1;
++
++
++                if(overlayObj1->mHandle.format == PIXEL_FORMAT_YCbCr_420_SP) {
++                    mIPUInputParam.fmt = v4l2_fourcc('I', '4', '2', '0');
++                }
++                else{
++                    OVERLAY_LOG_ERR("Error!Obj1 Not supported input format %d",overlayObj1->mHandle.format);
++                    goto queue_buf_exit;
++                }
++                mIPUInputParam.user_def_paddr[0] = overlay_buf1;
++
++                //Setting output format
++                mIPUOutputParam.fmt = v4l2_fourcc('U', 'Y', 'V', 'Y');
++                mIPUOutputParam.width = m_dev->xres;
++                mIPUOutputParam.height = m_dev->yres;   
++                mIPUOutputParam.show_to_fb = 0;
++                mIPUOutputParam.output_win.pos.x = overlayObj1->outX;
++                mIPUOutputParam.output_win.pos.y = overlayObj1->outY;
++                mIPUOutputParam.output_win.win_w = overlayObj1->outW;
++                mIPUOutputParam.output_win.win_h = overlayObj1->outH;
++                mIPUOutputParam.rot = overlayObj1->rotation;
++                mIPUOutputParam.user_def_paddr[0] = pV4LBuf->m.offset;
++                OVERLAY_LOG_RUNTIME("Obj1 Output param: width %d,height %d, pos.x %d, pos.y %d,win_w %d,win_h %d,rot %d",
++                      mIPUOutputParam.width,
++                      mIPUOutputParam.height,
++                      mIPUOutputParam.output_win.pos.x,
++                      mIPUOutputParam.output_win.pos.y,
++                      mIPUOutputParam.output_win.win_w,
++                      mIPUOutputParam.output_win.win_h,
++                      mIPUOutputParam.rot);
++                                 
++                OVERLAY_LOG_RUNTIME("Obj1 Input param:width %d,height %d,fmt %d,crop_win pos x %d,crop_win pos y %d,crop_win win_w %d,crop_win win_h %d",
++                                 mIPUInputParam.width,
++                                 mIPUInputParam.height,
++                                 mIPUInputParam.fmt,
++                                 mIPUInputParam.input_crop_win.pos.x,
++                                 mIPUInputParam.input_crop_win.pos.y,
++                                 mIPUInputParam.input_crop_win.win_w,
++                                 mIPUInputParam.input_crop_win.win_h);     
++
++                mIPURet =  mxc_ipu_lib_task_init(&mIPUInputParam,NULL,&mIPUOutputParam,NULL,OP_NORMAL_MODE|TASK_PP_MODE,&mIPUHandle);
++                if (mIPURet < 0) {
++                   OVERLAY_LOG_ERR("Error!Obj1 mxc_ipu_lib_task_init failed mIPURet %d!",mIPURet);
++                   goto queue_buf_exit;
++                }  
++                OVERLAY_LOG_RUNTIME("Obj1 mxc_ipu_lib_task_init success");
++                mIPURet = mxc_ipu_lib_task_buf_update(&mIPUHandle,overlay_buf1,pV4LBuf->m.offset,NULL,NULL,NULL);
++                if (mIPURet < 0) {
++                      OVERLAY_LOG_ERR("Error!Obj1 mxc_ipu_lib_task_buf_update failed mIPURet %d!",mIPURet);
++                      mxc_ipu_lib_task_uninit(&mIPUHandle);
++                      memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++                      goto queue_buf_exit;
++                }
++                OVERLAY_LOG_RUNTIME("Obj1 mxc_ipu_lib_task_buf_update success");
++                mxc_ipu_lib_task_uninit(&mIPUHandle);
++                memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++            }
++        
++            //Copyback after ipu update when two active instance, and obj0 has one buffer to update
++            //obj0 has no buffer to update
++            if((overlayObj0)&&(overlayObj1)&&
++               (overlay_buf0)&&(!overlay_buf1)&&
++               (dataShared1->buf_showed))
++            {
++                OVERLAY_LOG_RUNTIME("Copyback after ipu update");
++                if((mLatestQueuedBuf.m.offset)&&
++                   (mLatestQueuedBuf.m.offset != pV4LBuf->m.offset)) {
++                    //Copy back the region of obj0 to the current v4l buffer
++                    //Setting input format
++                    mIPUInputParam.width = m_dev->xres;
++                    mIPUInputParam.height = m_dev->yres;
++
++                    mIPUInputParam.input_crop_win.pos.x = overlay1_outregion.left;
++                    mIPUInputParam.input_crop_win.pos.y = overlay1_outregion.top;  
++                    mIPUInputParam.input_crop_win.win_w = overlay1_outregion.right - overlay1_outregion.left;
++                    mIPUInputParam.input_crop_win.win_h = overlay1_outregion.bottom - overlay1_outregion.top;
++                    mIPUInputParam.fmt = m_dev->outpixelformat;
++                    mIPUInputParam.user_def_paddr[0] = mLatestQueuedBuf.m.offset;
++    
++                    //Setting output format
++                    //Should align with v4l
++                    mIPUOutputParam.fmt = m_dev->outpixelformat;
++                    mIPUOutputParam.width = m_dev->xres;
++                    mIPUOutputParam.height = m_dev->yres;   
++                    mIPUOutputParam.show_to_fb = 0;
++                    //Output param should be same as input, since no resize,crop
++                    mIPUOutputParam.output_win.pos.x = mIPUInputParam.input_crop_win.pos.x;
++                    mIPUOutputParam.output_win.pos.y = mIPUInputParam.input_crop_win.pos.y;
++                    mIPUOutputParam.output_win.win_w = mIPUInputParam.input_crop_win.win_w;
++                    mIPUOutputParam.output_win.win_h = mIPUInputParam.input_crop_win.win_h;
++                    mIPUOutputParam.rot = 0;
++                    mIPUOutputParam.user_def_paddr[0] = pV4LBuf->m.offset;
++                    OVERLAY_LOG_RUNTIME("Copyback(after) Output param: width %d,height %d, pos.x %d, pos.y %d,win_w %d,win_h %d,rot %d",
++                          mIPUOutputParam.width,
++                          mIPUOutputParam.height,
++                          mIPUOutputParam.output_win.pos.x,
++                          mIPUOutputParam.output_win.pos.y,
++                          mIPUOutputParam.output_win.win_w,
++                          mIPUOutputParam.output_win.win_h,
++                          mIPUOutputParam.rot);
++                                     
++                    OVERLAY_LOG_RUNTIME("Copyback(after) Input param: width %d, height %d, fmt %d, crop_win pos x %d, crop_win pos y %d, crop_win win_w %d,crop_win win_h %d",
++                                     mIPUInputParam.width,
++                                     mIPUInputParam.height,
++                                     mIPUInputParam.fmt,
++                                     mIPUInputParam.input_crop_win.pos.x,
++                                     mIPUInputParam.input_crop_win.pos.y,
++                                     mIPUInputParam.input_crop_win.win_w,
++                                     mIPUInputParam.input_crop_win.win_h);     
++    
++                    mIPURet =  mxc_ipu_lib_task_init(&mIPUInputParam,NULL,&mIPUOutputParam,NULL,OP_NORMAL_MODE|TASK_PP_MODE,&mIPUHandle);
++                    if (mIPURet < 0) {
++                       OVERLAY_LOG_ERR("Error!Copyback(after) mxc_ipu_lib_task_init failed mIPURet %d!",mIPURet);
++                       goto queue_buf_exit;
++                    }  
++                    OVERLAY_LOG_RUNTIME("Copyback(after) mxc_ipu_lib_task_init success");
++                    mIPURet = mxc_ipu_lib_task_buf_update(&mIPUHandle,overlay_buf0,pV4LBuf->m.offset,NULL,NULL,NULL);
++                    if (mIPURet < 0) {
++                          OVERLAY_LOG_ERR("Error!Copyback(after) mxc_ipu_lib_task_buf_update failed mIPURet %d!",mIPURet);
++                          mxc_ipu_lib_task_uninit(&mIPUHandle);
++                          memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++                          goto queue_buf_exit;
++                    }
++                    OVERLAY_LOG_RUNTIME("Copyback(after) mxc_ipu_lib_task_buf_update success");
++                    mxc_ipu_lib_task_uninit(&mIPUHandle);
++                    memset(&mIPUHandle, 0, sizeof(ipu_lib_handle_t));
++                }
++                else{
++                    OVERLAY_LOG_ERR("Error!Cannot Copyback before ipu update last buf 0x%x,curr buf 0x%x",
++                                    mLatestQueuedBuf.m.offset,
++                                    pV4LBuf->m.offset);
++                }
++            }
++
++queue_buf_exit:
++            //Queue the mixed V4L2 Buffer for display
++            gettimeofday(&pV4LBuf->timestamp, 0);
++            if(ioctl(m_dev->v4l_id, VIDIOC_QBUF, pV4LBuf) < 0){
++                OVERLAY_LOG_ERR("Error!Cannot QBUF a buffer from v4l");
++                //reset latest queued buffer, since all buffer will start as init
++                memset(&mLatestQueuedBuf,0,sizeof(mLatestQueuedBuf));
++                goto free_buf_exit;
++            }
++            OVERLAY_LOG_RUNTIME("QBUF from v4l at frame %d:index %d, phy 0x%x at sec %d usec %d",
++                                m_dev->video_frames,pV4LBuf->index,pV4LBuf->m.offset,
++                                pV4LBuf->timestamp.tv_sec,pV4LBuf->timestamp.tv_usec); 
++
++            //record the latest buffer we queued
++            memcpy(&mLatestQueuedBuf,pV4LBuf,sizeof(mLatestQueuedBuf));
++            
++            //Only stream on after two frames queued 
++            m_dev->video_frames++;
++            if((m_dev->video_frames>=2)&&(!m_dev->stream_on)) {
++                int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
++                ioctl(m_dev->v4l_id, VIDIOC_STREAMON, &type);
++                m_dev->stream_on = true;
++                OVERLAY_LOG_INFO("V4L STREAMON NOW");
++            }
++
++free_buf_exit:
++            //push back the buffer to overlay instance0 freequeue
++            //signal instance condition if wait flag is true
++            //reset wait flag
++            //pthread_cond_signal(&cond);  
++            if((overlayObj0)&&(overlay_buf0)) {
++                pthread_mutex_lock(&dataShared0->obj_lock);
++                dataShared0->buf_showed++;
++                dataShared0->free_bufs[dataShared0->free_tail] = overlay_buf0;
++                OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x at %d free_count %d",
++                     dataShared0->instance_id,overlay_buf0,dataShared0->free_tail,dataShared0->free_count+1);
++                dataShared0->free_tail++;
++                dataShared0->free_tail = dataShared0->free_tail%MAX_OVERLAY_BUFFER_NUM;
++                dataShared0->free_count++;
++
++
++                if(dataShared0->wait_buf_flag) {
++                    dataShared0->wait_buf_flag = 0;
++                    OVERLAY_LOG_RUNTIME("Id %d Condition signal for Overlay Instance 0",dataShared0->instance_id);
++                    pthread_cond_signal(&dataShared0->free_cond);
++                }
++                pthread_mutex_unlock(&dataShared0->obj_lock);
++            }
++
++            //push back the buffer of overlay instance1 freequeue
++            //signal instance condition if wait flag is true
++            //reset wait flag
++            //pthread_cond_signal(&cond);  
++            if((overlayObj1)&&(overlay_buf1)) {
++                pthread_mutex_lock(&dataShared1->obj_lock);
++                dataShared1->buf_showed++;
++                dataShared1->free_bufs[dataShared1->free_tail] = overlay_buf1;
++                dataShared1->free_tail++;
++                dataShared1->free_tail = dataShared1->free_tail%MAX_OVERLAY_BUFFER_NUM;
++                dataShared1->free_count++;
++                OVERLAY_LOG_RUNTIME("Id %d back buffer to free queue for Overlay Instance 0: 0x%x free_count %d",
++                     dataShared1->instance_id,overlay_buf1,dataShared1->free_count);
++
++                if(dataShared1->wait_buf_flag) {
++                    dataShared1->wait_buf_flag = 0;
++                    OVERLAY_LOG_RUNTIME("Id %d Condition signal for Overlay Instance 1",
++                                        dataShared1->instance_id);
++                    pthread_cond_signal(&dataShared1->free_cond);
++                }
++                pthread_mutex_unlock(&dataShared1->obj_lock);
++            }
++            
++        }
++        // loop until we need to quit
++        return true;
++    }
++};
++
++#endif
+diff --git a/liboverlay/overlay_utils.h b/liboverlay/overlay_utils.h
+new file mode 100755
+index 0000000..446ed71
+--- /dev/null
++++ b/liboverlay/overlay_utils.h
+@@ -0,0 +1,62 @@
++
++
++#ifndef __OVERLAY_UTILS_H__
++#define __OVERLAY_UTILS_H__
++
++#define LOG_TAG "FslOverlay"
++
++#define MAX_OVERLAY_INSTANCES 2
++#define DEFAULT_OVERLAY_BUFFER_NUM 3
++#define MAX_OVERLAY_BUFFER_NUM 24
++
++#define FB_DEV_NAME "/dev/graphics/fb0"
++#define V4L_DEV_NAME "/dev/video16"
++#define DEFAULT_V4L_LAYER 3
++#define DEFAULT_ALPHA_BUFFERS 2
++#define DEFAULT_V4L_BUFFERS 3
++#define MAX_V4L_BUFFERS 3
++
++#define MAX_OVERLAY_INPUT_W 1280
++#define MAX_OVERLAY_INPUT_H 720
++
++#define FULL_TRANSPARANT_VALUE 255
++
++#define SHARED_CONTROL_MARKER             (0x4F564354) //OVCT
++#define SHARED_DATA_MARKER             (0x4F564441) //OVDA
++
++ 
++#define OVERLAY_LOG_INFO(format, ...) LOGI((format), ## __VA_ARGS__)
++#define OVERLAY_LOG_ERR(format, ...) LOGE((format), ## __VA_ARGS__)
++#define OVERLAY_LOG_WARN(format, ...) LOGW((format), ## __VA_ARGS__)
++
++#ifdef OVERLAY_DEBUG_LOG
++#define OVERLAY_LOG_RUNTIME(format, ...) LOGI((format), ## __VA_ARGS__)
++#define OVERLAY_LOG_FUNC LOGI("%s: %s",  __FILE__, __FUNCTION__)
++#else
++#define OVERLAY_LOG_RUNTIME(format, ...) 
++#define OVERLAY_LOG_FUNC
++#endif
++
++struct OVERLAY_BUFFER{
++    void *vir_addr;
++    unsigned int phy_addr;
++    unsigned int size;
++};
++
++struct WIN_REGION {
++    int left;
++    int right;
++    int top;
++    int bottom;
++};
++
++class OverlayAllocator{
++public:
++    virtual ~OverlayAllocator(){}
++    virtual int allocate(OVERLAY_BUFFER *overlay_buf, int size){ return -1;}
++    virtual int deAllocate(OVERLAY_BUFFER *overlay_buf){  return -1;  }
++    virtual int getHeapID(){  return 0;  }
++};
++
++
++#endif
+diff --git a/liboverlay/overlays_test.cpp b/liboverlay/overlays_test.cpp
+new file mode 100755
+index 0000000..eee451e
+--- /dev/null
++++ b/liboverlay/overlays_test.cpp
+@@ -0,0 +1,424 @@
++#include <binder/IPCThreadState.h>
++#include <binder/ProcessState.h>
++#include <binder/IServiceManager.h>
++#include <utils/Log.h>
++
++#include <ui/Surface.h>
++#include <ui/ISurface.h>
++#include <ui/Overlay.h>
++#include <ui/SurfaceComposerClient.h>
++
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/ioctl.h>
++#include <sys/time.h>
++#include <linux/fb.h>
++#include <linux/videodev.h>
++
++#define LOG_TAG "overlay_test"
++
++/*
++       Y = R *  .299 + G *  .587 + B *  .114;
++       U = R * -.169 + G * -.332 + B *  .500 + 128.;
++       V = R *  .500 + G * -.419 + B * -.0813 + 128.;*/
++
++#define red(x) (((x & 0xE0) >> 5) * 0x24)
++#define green(x) (((x & 0x1C) >> 2) * 0x24)
++#define blue(x) ((x & 0x3) * 0x55)
++#define y(rgb) ((red(rgb)*299L + green(rgb)*587L + blue(rgb)*114L) / 1000)
++#define u(rgb) ((((blue(rgb)*500L) - (red(rgb)*169L) - (green(rgb)*332L)) / 1000))
++#define v(rgb) (((red(rgb)*500L - green(rgb)*419L - blue(rgb)*81L) / 1000))
++
++
++
++void gen_fill_pattern(char * buf, int in_width, int in_height,int h_step, int w_step)
++{
++	int y_size = in_width * in_height;
++	//int h_step = in_height / 16;
++	//int w_step = in_width / 16;
++	int h, w;
++	uint32_t y_color = 0;
++	int32_t u_color = 0;
++	int32_t v_color = 0;
++	uint32_t rgb = 0;
++	static int32_t alpha = 0;
++	static int inc_alpha = 1;
++
++	for (h = 0; h < in_height; h++) {
++		int32_t rgb_temp = rgb;
++
++		for (w = 0; w < in_width; w++) {
++			if (w % w_step == 0) {
++				y_color = y(rgb_temp);
++				y_color = (y_color * alpha) / 255;
++
++				u_color = u(rgb_temp);
++				u_color = (u_color * alpha) / 255;
++				u_color += 128;
++
++				v_color = v(rgb_temp);
++				v_color = (v_color * alpha) / 255;
++				v_color += 128;
++
++				rgb_temp++;
++				if (rgb_temp > 255)
++					rgb_temp = 0;
++			}
++			buf[(h*in_width) + w] = y_color;
++			if (!(h & 0x1) && !(w & 0x1)) {
++				buf[y_size + (((h*in_width)/4) + (w/2)) ] = u_color;
++				buf[y_size + y_size/4 + (((h*in_width)/4) + (w/2))] = v_color;
++			}
++		}
++		if ((h > 0) && (h % h_step == 0)) {
++			rgb += 16;
++			if (rgb > 255)
++				rgb = 0;
++		}
++
++	}
++	if (inc_alpha) {
++		alpha+=4;
++		if (alpha >= 255) {
++			inc_alpha = 0;
++		}
++	} else {
++		alpha-=4;
++		if (alpha <= 0) {
++			inc_alpha = 1;
++		}
++	}
++}
++
++
++using namespace android;
++
++namespace android {
++class Test {
++public:
++    static const sp<ISurface>& getISurface(const sp<SurfaceControl>& s) {
++        return s->getISurface();
++    }
++};
++};
++typedef struct {
++    int w;
++    int h;
++    int frame_num;
++    int crop_x;
++    int crop_y;
++    int crop_w;
++    int crop_h;
++    int layer;
++    int pos_x;
++    int pos_y;
++    int win_w;
++    int win_h;
++    int show_num;
++    int step_line;
++    int performance_test;
++}OVERLAY_PARAM;
++
++
++void *overlay_instance_test(void *arg);
++bool performance_run = 0;
++int main(int argc, char** argv)
++{
++    int fd_fb = 0;
++    struct fb_var_screeninfo fb_var;
++    pthread_t thread0,thread1;
++    OVERLAY_PARAM overlay_param0;
++    OVERLAY_PARAM overlay_param1;
++    unsigned int panel_x,panel_y;
++    void *ret;
++    memset(&overlay_param0, 0 ,sizeof(OVERLAY_PARAM));
++    memset(&overlay_param1, 0 ,sizeof(OVERLAY_PARAM));
++ 
++    if ((fd_fb = open("/dev/graphics/fb1", O_RDWR, 0)) < 0) {
++       LOGI("Error!Unable to open /dev/fb1\n");
++       return 0;
++    }
++    if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
++        LOGI("Error!Get FB var info failed!\n");
++        close(fd_fb);
++        return 0;
++    }
++
++    panel_x = fb_var.xres;
++    panel_y = fb_var.yres;
++
++    overlay_param0.w = 720;
++    overlay_param0.h = 576;
++    overlay_param0.frame_num = 8;
++    overlay_param0.crop_x = 0;
++    overlay_param0.crop_y = 0;
++    overlay_param0.crop_w = 720;
++    overlay_param0.crop_h = 576;
++    overlay_param0.layer = 5;
++    overlay_param0.pos_x = 0;
++    overlay_param0.pos_y = 0;
++    overlay_param0.win_w = panel_x;
++    overlay_param0.win_h = panel_y;
++    overlay_param0.show_num = 200;
++    overlay_param0.step_line = 16;
++
++    overlay_param1.w = 320;
++    overlay_param1.h = 240;
++    overlay_param1.frame_num = 6;
++    overlay_param1.crop_x = 0;
++    overlay_param1.crop_y = 0;
++    overlay_param1.crop_w = 320;
++    overlay_param1.crop_h = 240;
++    overlay_param1.layer = 6;
++    overlay_param1.pos_x = panel_x/4;
++    overlay_param1.pos_y = panel_y/4;
++    overlay_param1.win_w = panel_x/4;
++    overlay_param1.win_h = panel_y/4;
++    overlay_param1.show_num = 200;
++    overlay_param1.step_line = 8;
++    //pthread_attr_t attr0,attr1;
++
++
++
++    LOGI("*******start main thread*******");
++    if(argc == 1) {
++        LOGI("****Run two overlay instances 720/576 & 320/240 test*****");
++        //pthread_attr_init(&attr0);
++        //pthread_attr_setdetachstate(&attr0, PTHREAD_CREATE_DETACHED);
++        pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
++    
++        //pthread_attr_init(&attr1);
++        //pthread_attr_setdetachstate(&attr1, PTHREAD_CREATE_DETACHED);
++        pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
++    
++    
++        pthread_join(thread0, &ret);
++        pthread_join(thread1, &ret);
++    }
++    else if((argc >= 2)&&(argc <=3)) {
++        if(!strcmp(argv[1],"-0")) {
++            LOGI("****Run one overlay instances 720/576 test*****");
++            //pthread_attr_init(&attr0);
++            //pthread_attr_setdetachstate(&attr0, PTHREAD_CREATE_DETACHED);
++            if(argc==3) {
++                overlay_param0.show_num = atoi(argv[2]);
++            }
++            pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
++            pthread_join(thread0, &ret);
++        }
++        else if(!strcmp(argv[1],"-1")){
++            LOGI("****Run one overlay instances 320/240 test*****");
++            //pthread_attr_init(&attr1);
++            //pthread_attr_setdetachstate(&attr1, PTHREAD_CREATE_DETACHED);
++            if(argc==3) {
++                overlay_param1.show_num = atoi(argv[2]);
++            }
++            pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
++            pthread_join(thread1, &ret);
++        }
++        else if(!strcmp(argv[1],"-2")){
++            LOGI("****Run two overlay instances 720/576 & 320/240 test*****");
++            //pthread_attr_init(&attr1);
++            //pthread_attr_setdetachstate(&attr1, PTHREAD_CREATE_DETACHED);
++            if(argc==3) {
++                overlay_param0.show_num = atoi(argv[2]);
++                overlay_param1.show_num = atoi(argv[2]);
++            }
++            pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
++            pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
++        
++            pthread_join(thread0, &ret);
++            pthread_join(thread1, &ret);
++        }
++        else if(!strcmp(argv[1],"-3")){
++            LOGI("****Run two overlay instances 720/576 & 320/240 performance test*****");
++            if(argc==3) {
++                overlay_param0.show_num = atoi(argv[2]);
++                overlay_param1.show_num = atoi(argv[2]);
++            }
++            overlay_param0.performance_test = 1;
++            overlay_param1.performance_test = 1;
++            performance_run = 1;
++            pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
++            pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
++        
++            pthread_join(thread0, &ret);
++            pthread_join(thread1, &ret);
++        }
++        else if(!strcmp(argv[1],"-4")){
++            LOGI("****Run two overlay instances 720/576 performance test*****");
++            if(argc==3) {
++                overlay_param0.show_num = atoi(argv[2]);
++            }
++            overlay_param0.performance_test = 1;
++
++            performance_run = 1;
++            pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
++            pthread_join(thread0, &ret);
++        }
++        else if(!strcmp(argv[1],"-5")){
++            LOGI("****Run two overlay instances 320/240 performance test*****");
++            if(argc==3) {
++                overlay_param1.show_num = atoi(argv[2]);
++            }
++            overlay_param1.performance_test = 1;
++            performance_run = 1;
++            pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
++            pthread_join(thread1, &ret);
++        }
++        else{
++            LOGE("Error!Not support parameters");
++            LOGE("%s [-0] [-1] [-2] [-3] [-4] [-5] [frame num]",argv[0]);
++            LOGE("  [-0] verlay instances 720/576 test");
++            LOGE("  [-1] verlay instances 320/240 test");
++            LOGE("  [-2] verlay instances 720/576&320/240 test");
++            LOGE("  [-3] verlay instances 720/576&320/240 performance test");
++            LOGE("  [-4] verlay instances 720/576 test");
++            LOGE("  [-5] verlay instances 320/240 test");
++            LOGE("  [frame num] frame count number");
++        }
++    }
++    else{
++        LOGE("Error!Not support parameters");
++        LOGE("%s [-0] [-1] [-2] [-3] [-4] [-5] [frame num]",argv[0]);
++        LOGE("  [-0] verlay instances 720/576 test");
++        LOGE("  [-1] verlay instances 320/240 test");
++        LOGE("  [-2] verlay instances 720/576&320/240 test");
++        LOGE("  [-3] verlay instances 720/576&320/240 performance test");
++        LOGE("  [-4] verlay instances 720/576 test");
++        LOGE("  [-5] verlay instances 320/240 test");
++        LOGE("  [frame num] frame count number");
++    }
++
++    LOGI("*******Exit main thread*******");
++    close(fd_fb);
++    return 0;
++}
++
++
++
++void *overlay_instance_test(void *arg)
++{
++    // set up the thread-pool
++    OVERLAY_PARAM *overlay_param = (OVERLAY_PARAM *)arg;
++
++    LOGI("FSL OVERLAY test: current pid %d uid %d",getpid(),getuid());
++    sp<ProcessState> proc(ProcessState::self());
++    ProcessState::self()->startThreadPool();
++
++    // create a client to surfaceflinger
++    sp<SurfaceComposerClient> client = new SurfaceComposerClient();
++    
++
++    // create pushbuffer surface
++    sp<SurfaceControl> surface = client->createSurface(getpid(), 0, overlay_param->win_w, overlay_param->win_h, 
++            PIXEL_FORMAT_UNKNOWN, ISurfaceComposer::ePushBuffers);
++    client->openTransaction();
++    LOGI("Set layer %d, posx %d, posy %d",
++         overlay_param->layer,overlay_param->pos_x,overlay_param->pos_y);
++    surface->setLayer(overlay_param->layer);
++    surface->setPosition(overlay_param->pos_x, overlay_param->pos_y);
++    client->closeTransaction();
++
++    // get to the isurface
++    sp<ISurface> isurface = Test::getISurface(surface);
++    LOGI("isurface = %p", isurface.get());
++  
++
++
++      
++    // now request an overlay
++    LOGI("createOverlay()");
++    sp<OverlayRef> ref = isurface->createOverlay(overlay_param->w, overlay_param->h, PIXEL_FORMAT_YCbCr_420_SP);
++    LOGI("createOverlay() AFTER");
++    LOGI("new Overlay(ref) start");
++    sp<Overlay> overlay = new Overlay(ref);
++    LOGI("Overlay(ref)()");
++    //Just to give a chance the other instance creation
++    usleep(30000);
++    int bufcount = overlay_param->frame_num;
++    int ret;
++    if(overlay->getBufferCount() != bufcount) {
++        ret = overlay->setParameter(OVERLAY_BUFNUM,bufcount);
++        if(ret < 0) {
++            LOGE("Error! Not support parameter setting for overlay");
++            return NULL;
++        }
++    }
++
++    ret = overlay->setCrop(overlay_param->crop_x,overlay_param->crop_y,
++                           overlay_param->crop_w,overlay_param->crop_h);
++    if(ret < 0) {
++        LOGE("Error! Not support parameter setting for overlay");
++        return NULL;
++    }
++
++    /*
++     * here we can use the overlay API 
++     */
++    if(!overlay_param->performance_test) {
++        overlay_buffer_t buffer; 
++        LOGI("Start queue/dequeue test");
++        for(int i = 0; i < overlay_param->show_num; i++) {
++            overlay->dequeueBuffer(&buffer);
++            //LOGI("dequeueBuffer buffer = 0x%x\n", buffer);
++
++            void* address = overlay->getBufferAddress(buffer);
++            //LOGI("getBufferAddress = 0x%x\n", address);
++            unsigned int phy_addr = overlay->getBufferAddressPhy(buffer);
++            //LOGI("getBufferAddressPhy = 0x%x\n", phy_addr);
++
++            //Draw the data to the buffer address(YUV420 format as setting)
++            gen_fill_pattern((char *)address,overlay_param->w,overlay_param->h,
++                             overlay_param->w/overlay_param->step_line,
++                             overlay_param->w/overlay_param->step_line);
++            overlay->queueBuffer(buffer);
++        }
++    }
++    else{
++        overlay_buffer_t buffer[32];
++        LOGI("Start performance queue/dequeue test");
++        memset(buffer,0,sizeof(overlay_buffer_t)*32);
++        for(int i = 0; i < overlay_param->frame_num; i++) {
++            overlay->dequeueBuffer(&buffer[i]);
++            void* address = overlay->getBufferAddress(buffer[i]);
++            gen_fill_pattern((char *)address,overlay_param->w,overlay_param->h,
++                             overlay_param->w/overlay_param->step_line,
++                             overlay_param->w/overlay_param->step_line);
++        }
++        struct timeval startTime,lastTime;
++        int frameshow = 0;
++        gettimeofday(&startTime, 0);
++        for(int i = 0; i < overlay_param->frame_num; i++) {
++            overlay->queueBuffer(buffer[i]);
++            frameshow++;
++        }
++        for(int i = 0; i < overlay_param->show_num; i++){
++            overlay->dequeueBuffer(&buffer[0]);
++            overlay->queueBuffer(buffer[0]);
++            frameshow++;
++            //Exit performance test if one instance finished testing.
++            if(!performance_run) {
++                break;
++            }
++        }
++        performance_run = 0;
++        gettimeofday(&lastTime, 0);
++        int timeInMs = (lastTime.tv_sec - startTime.tv_sec)*1000 +(lastTime.tv_usec - startTime.tv_usec)/1000;
++        float fps = 1000.0*frameshow/timeInMs;
++        LOGI("Performance test for Input %d %d, Output %d %d",
++             overlay_param->w,overlay_param->h,
++             overlay_param->win_w,overlay_param->win_h);
++        LOGI("Total frame %d, total time %d ms, fps %f",
++             frameshow,timeInMs,fps);
++    }
++
++    
++    return NULL;
++}
+-- 
+1.8.0
+

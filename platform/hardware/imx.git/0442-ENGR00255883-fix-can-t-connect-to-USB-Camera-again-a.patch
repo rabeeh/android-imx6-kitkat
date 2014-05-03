@@ -1,0 +1,163 @@
+From 2c8c15eced639fa69f122f222a1c7c7cbb59049a Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Wed, 3 Apr 2013 15:22:55 +0800
+Subject: [PATCH 442/486] ENGR00255883 fix can't connect to USB Camera again
+ after hotplug at preview.
+
+when usb camera plug out, then plug in, the dev/video node will be changed.
+so, after open open failed, get the right dev node and open again.
+add code to support when back or front camera configured as usb camera,
+app can notice it exists even if it plug out.
+it means that when system boot up without usb camera plug in, then plug in it,
+it will work successfully.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera2/CameraHal.cpp     |  6 ------
+ mx6/libcamera2/CameraModule.cpp  | 22 +++++++++++++++++++---
+ mx6/libcamera2/CameraUtil.h      |  3 +++
+ mx6/libcamera2/DeviceAdapter.cpp | 20 +++++++++++++++++---
+ mx6/libcamera2/StreamAdapter.cpp |  1 +
+ 5 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/mx6/libcamera2/CameraHal.cpp b/mx6/libcamera2/CameraHal.cpp
+index 3432619..8766843 100755
+--- a/mx6/libcamera2/CameraHal.cpp
++++ b/mx6/libcamera2/CameraHal.cpp
+@@ -35,13 +35,7 @@ void CameraHal::handleError(int err)
+ {
+     switch (err) {
+         case CAMERA2_MSG_ERROR_HARDWARE:
+-            abort();
+-            break;
+-
+         case CAMERA2_MSG_ERROR_DEVICE:
+-            abort();
+-            break;
+-
+         case CAMERA2_MSG_ERROR_REQUEST:
+         case CAMERA2_MSG_ERROR_FRAME:
+         case CAMERA2_MSG_ERROR_STREAM:
+diff --git a/mx6/libcamera2/CameraModule.cpp b/mx6/libcamera2/CameraModule.cpp
+index 2e12d99..868e70d 100755
+--- a/mx6/libcamera2/CameraModule.cpp
++++ b/mx6/libcamera2/CameraModule.cpp
+@@ -409,9 +409,9 @@ fail:
+     return rv;
+ }
+ 
+-static int GetDevPath(const char  *pCameraName,
+-                      char        *pCameraDevPath,
+-                      unsigned int pathLen)
++int GetDevPath(const char  *pCameraName,
++               char        *pCameraDevPath,
++               unsigned int pathLen)
+ {
+     int  retCode = -1;
+     int  fd      = 0;
+@@ -516,6 +516,7 @@ static void GetCameraPropery(char *pFaceBackCameraName,
+ int camera_get_number_of_cameras()
+ {
+     int back_orient = 0,  front_orient = 0;
++    int numCamera = 0;
+ 
+     if (gCameraNum == 0) {
+         char name_back[CAMERA_SENSOR_LENGTH];
+@@ -549,7 +550,15 @@ int camera_get_number_of_cameras()
+                 gCameraNum++;
+                 break;
+             }
++            if (gCameraNum == 0) {
++                if (strstr(name_back, UVC_NAME)) {
++                    strncpy(sCameraInfo[gCameraNum].name, UVC_NAME,
++                            CAMERA_SENSOR_LENGTH);
++                    gCameraNum++;
++                }
++            }
+         }
++        numCamera = gCameraNum;
+         if (name_front[0] != DEFAULT_ERROR_NAME) {
+             char *pCameraName = strtok(name_front, ",");
+             while (pCameraName != NULL) {
+@@ -575,6 +584,13 @@ int camera_get_number_of_cameras()
+                 gCameraNum++;
+                 break;
+             }
++            if (gCameraNum == numCamera) {
++                if (strstr(name_front, UVC_NAME)) {
++                    strncpy(sCameraInfo[gCameraNum].name, UVC_NAME,
++                            CAMERA_SENSOR_LENGTH);
++                    gCameraNum++;
++                }
++            }
+         }
+     }
+     return gCameraNum;
+diff --git a/mx6/libcamera2/CameraUtil.h b/mx6/libcamera2/CameraUtil.h
+index 884936c..8b6ef4d 100755
+--- a/mx6/libcamera2/CameraUtil.h
++++ b/mx6/libcamera2/CameraUtil.h
+@@ -112,6 +112,9 @@ int         convertPixelFormatToV4L2Format(PixelFormat format);
+ PixelFormat convertV4L2FormatToPixelFormat(unsigned int format);
+ int         convertStringToPixelFormat(const char *pFormat);
+ int         convertStringToV4L2Format(const char *pFormat);
++int GetDevPath(const char  *pCameraName,
++               char        *pCameraDevPath,
++               unsigned int pathLen);
+ 
+ struct VideoMetadataBuffer
+ {
+diff --git a/mx6/libcamera2/DeviceAdapter.cpp b/mx6/libcamera2/DeviceAdapter.cpp
+index 2ae3a26..465d3c3 100755
+--- a/mx6/libcamera2/DeviceAdapter.cpp
++++ b/mx6/libcamera2/DeviceAdapter.cpp
+@@ -140,10 +140,23 @@ status_t DeviceAdapter::initialize(const CameraInfo& info)
+         return BAD_VALUE;
+     }
+ 
+-    mCameraHandle = open(info.devPath, O_RDWR);
++    if (info.devPath[0] != '\0') {
++        mCameraHandle = open(info.devPath, O_RDWR);
++    }
+     if (mCameraHandle < 0) {
+-        FLOGE("can not open camera devpath:%s", info.devPath);
+-        return BAD_VALUE;
++        memset((void*)info.devPath, 0, sizeof(info.devPath));
++        GetDevPath(info.name, (char*)info.devPath, CAMAERA_FILENAME_LENGTH);
++        if (info.devPath[0] != '\0') {
++            mCameraHandle = open(info.devPath, O_RDWR);
++            if (mCameraHandle < 0) {
++                FLOGE("can not open camera devpath:%s", info.devPath);
++                return BAD_VALUE;
++            }
++        }
++        else {
++            FLOGE("can not open camera devpath:%s", info.devPath);
++            return BAD_VALUE;
++        }
+     }
+     mVideoInfo = new VideoInfo();
+     if (mVideoInfo == NULL) {
+@@ -420,6 +433,7 @@ status_t DeviceAdapter::stopDeviceLocked()
+ 
+         ret = ioctl(mCameraHandle, VIDIOC_STREAMOFF, &bufType);
+         if (ret < 0) {
++            close(mCameraHandle);
+             FLOGE("StopStreaming: Unable to stop capture: %s", strerror(errno));
+             return ret;
+         }
+diff --git a/mx6/libcamera2/StreamAdapter.cpp b/mx6/libcamera2/StreamAdapter.cpp
+index 0d003cd..bd4f361 100755
+--- a/mx6/libcamera2/StreamAdapter.cpp
++++ b/mx6/libcamera2/StreamAdapter.cpp
+@@ -132,6 +132,7 @@ bool StreamAdapter::handleStream()
+     if (msg == 0) {
+         if (mStreamState == STREAM_STARTED) {
+             FLOGI("%s: get invalid message", __FUNCTION__);
++            mCondRespond.signal();
+         }
+         return shouldLive;
+     }
+-- 
+1.8.0
+

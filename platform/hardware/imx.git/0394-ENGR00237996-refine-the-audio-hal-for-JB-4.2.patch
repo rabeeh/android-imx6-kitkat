@@ -1,0 +1,446 @@
+From 043e5d1eb59bbb1d5ba95ff01e20d32af4430040 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Thu, 27 Dec 2012 14:37:57 +0800
+Subject: [PATCH 394/486] ENGR00237996 refine the audio hal for JB 4.2
+
+The definition of audio device changed in JB 4.2,
+So use seperate supported device for in and out.
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/audio_hardware.h  |  24 +++++++----
+ alsa/config_cs42888.h  |   6 +--
+ alsa/config_hdmi.h     |   3 +-
+ alsa/config_nullcard.h |   3 +-
+ alsa/config_spdif.h    |   3 +-
+ alsa/config_usbaudio.h |   3 +-
+ alsa/config_wm8958.h   |   6 +--
+ alsa/config_wm8962.h   |   6 +--
+ alsa/tinyalsa_hal.c    | 105 ++++++++++++++++++++++++++++++-------------------
+ 9 files changed, 98 insertions(+), 61 deletions(-)
+
+diff --git a/alsa/audio_hardware.h b/alsa/audio_hardware.h
+index 6689023..22a361f 100644
+--- a/alsa/audio_hardware.h
++++ b/alsa/audio_hardware.h
+@@ -59,7 +59,8 @@ struct route_setting
+ struct audio_card{
+     char * name;
+     char * driver_name;
+-    int  supported_devices;
++    int  supported_out_devices;
++    int  supported_in_devices;
+     struct route_setting *defaults;
+     struct route_setting *bt_output;
+     struct route_setting *speaker_output;
+@@ -181,23 +182,32 @@ struct string_to_enum {
+     uint32_t value;
+ };
+ 
+-#define SUPPORTED_DEVICE_IN_MODULE               \
++#define SUPPORTED_DEVICE_OUT_MODULE               \
+           ( AUDIO_DEVICE_OUT_EARPIECE |          \
+             AUDIO_DEVICE_OUT_SPEAKER |           \
+             AUDIO_DEVICE_OUT_WIRED_HEADSET |     \
+             AUDIO_DEVICE_OUT_WIRED_HEADPHONE |   \
++            AUDIO_DEVICE_OUT_ALL_SCO |           \
+             AUDIO_DEVICE_OUT_AUX_DIGITAL |       \
+             AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET | \
+             AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET | \
+-            AUDIO_DEVICE_OUT_ALL_SCO |           \
+-            AUDIO_DEVICE_OUT_DEFAULT |           \
+-            AUDIO_DEVICE_IN_COMMUNICATION |      \
++            AUDIO_DEVICE_OUT_REMOTE_SUBMIX |     \
++            AUDIO_DEVICE_OUT_DEFAULT)
++
++#define SUPPORTED_DEVICE_IN_MODULE               \
++          ( AUDIO_DEVICE_IN_COMMUNICATION |      \
+             AUDIO_DEVICE_IN_AMBIENT |            \
+             AUDIO_DEVICE_IN_BUILTIN_MIC |        \
++            AUDIO_DEVICE_IN_ALL_SCO |            \
+             AUDIO_DEVICE_IN_WIRED_HEADSET |      \
+             AUDIO_DEVICE_IN_AUX_DIGITAL |        \
+-            AUDIO_DEVICE_IN_BACK_MIC |           \
+-            AUDIO_DEVICE_IN_ALL_SCO |            \
++            AUDIO_DEVICE_IN_VOICE_CALL   |       \
++            AUDIO_DEVICE_IN_BACK_MIC   |         \
++            AUDIO_DEVICE_IN_REMOTE_SUBMIX |      \
++            AUDIO_DEVICE_IN_ANLG_DOCK_HEADSET |  \
++            AUDIO_DEVICE_IN_DGTL_DOCK_HEADSET |  \
++            AUDIO_DEVICE_IN_USB_ACCESSORY |      \
++            AUDIO_DEVICE_IN_USB_DEVICE  |        \
+             AUDIO_DEVICE_IN_DEFAULT )
+ 
+ #endif  /* ANDROID_INCLUDE_IMX_AUDIO_HARDWARE_H */
+diff --git a/alsa/config_cs42888.h b/alsa/config_cs42888.h
+index b85d57b..c75fe20 100644
+--- a/alsa/config_cs42888.h
++++ b/alsa/config_cs42888.h
+@@ -24,15 +24,15 @@
+ static struct audio_card  cs42888_card = {
+     .name = "cs42888-audio",
+     .driver_name = "cs42888-audio",
+-    .supported_devices = (AUDIO_DEVICE_OUT_EARPIECE |
++    .supported_out_devices = (AUDIO_DEVICE_OUT_EARPIECE |
+             AUDIO_DEVICE_OUT_SPEAKER |
+             AUDIO_DEVICE_OUT_WIRED_HEADSET |
+             AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
+             AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET |
+             AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET |
+             AUDIO_DEVICE_OUT_ALL_SCO |
+-            AUDIO_DEVICE_OUT_DEFAULT |
+-            /* IN */
++            AUDIO_DEVICE_OUT_DEFAULT ),
++    .supported_in_devices = (
+             AUDIO_DEVICE_IN_COMMUNICATION |
+             AUDIO_DEVICE_IN_AMBIENT |
+             AUDIO_DEVICE_IN_BUILTIN_MIC |
+diff --git a/alsa/config_hdmi.h b/alsa/config_hdmi.h
+index 2eb7979..83dd242 100644
+--- a/alsa/config_hdmi.h
++++ b/alsa/config_hdmi.h
+@@ -24,7 +24,8 @@
+ static struct audio_card  hdmi_card = {
+     .name = "imx-hdmi-soc",
+     .driver_name = "imx-hdmi-soc",
+-    .supported_devices   = AUDIO_DEVICE_OUT_AUX_DIGITAL,
++    .supported_out_devices  = AUDIO_DEVICE_OUT_AUX_DIGITAL,
++    .supported_in_devices   = 0,
+     .defaults            = NULL,
+     .bt_output           = NULL,
+     .speaker_output      = NULL,
+diff --git a/alsa/config_nullcard.h b/alsa/config_nullcard.h
+index b3c96a0..9cd3a0a 100644
+--- a/alsa/config_nullcard.h
++++ b/alsa/config_nullcard.h
+@@ -24,7 +24,8 @@
+ static struct audio_card  null_card = {
+     .name = "null_card",
+     .driver_name = "null_card",
+-    .supported_devices   = 0,
++    .supported_out_devices  = 0,
++    .supported_in_devices   = 0,
+     .defaults            = NULL,
+     .bt_output           = NULL,
+     .speaker_output      = NULL,
+diff --git a/alsa/config_spdif.h b/alsa/config_spdif.h
+index 679e8d8..ea75d28 100644
+--- a/alsa/config_spdif.h
++++ b/alsa/config_spdif.h
+@@ -24,7 +24,8 @@
+ static struct audio_card  spdif_card = {
+     .name = "imx-spdif",
+     .driver_name = "imx-spdif",
+-    .supported_devices   = AUDIO_DEVICE_IN_AUX_DIGITAL,
++    .supported_out_devices   = 0,
++    .supported_in_devices    = AUDIO_DEVICE_IN_AUX_DIGITAL,
+     .defaults            = NULL,
+     .bt_output           = NULL,
+     .speaker_output      = NULL,
+diff --git a/alsa/config_usbaudio.h b/alsa/config_usbaudio.h
+index 14bb238..8417b79 100644
+--- a/alsa/config_usbaudio.h
++++ b/alsa/config_usbaudio.h
+@@ -25,7 +25,8 @@
+ static struct audio_card  usbaudio_card = {
+     .name = "USB Device",
+     .driver_name = "USB-Audio",
+-    .supported_devices   = AUDIO_DEVICE_IN_USB_DEVICE,
++    .supported_out_devices  = 0,
++    .supported_in_devices   = AUDIO_DEVICE_IN_USB_DEVICE,
+     .defaults            = NULL,
+     .bt_output           = NULL,
+     .speaker_output      = NULL,
+diff --git a/alsa/config_wm8958.h b/alsa/config_wm8958.h
+index 4cd5b28..1991515 100644
+--- a/alsa/config_wm8958.h
++++ b/alsa/config_wm8958.h
+@@ -474,15 +474,15 @@ static struct route_setting mm_bt_mic_input_wm8958[] = {
+ static struct audio_card  wm8958_card = {
+     .name = "wm8958-audio",
+     .driver_name = "wm8958-audio",
+-    .supported_devices = (AUDIO_DEVICE_OUT_EARPIECE |
++    .supported_out_devices = (AUDIO_DEVICE_OUT_EARPIECE |
+             AUDIO_DEVICE_OUT_SPEAKER |
+             AUDIO_DEVICE_OUT_WIRED_HEADSET |
+             AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
+             AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET |
+             AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET |
+             AUDIO_DEVICE_OUT_ALL_SCO |
+-            AUDIO_DEVICE_OUT_DEFAULT |
+-            /* IN */
++            AUDIO_DEVICE_OUT_DEFAULT),
++    .supported_in_devices = (
+             AUDIO_DEVICE_IN_COMMUNICATION |
+             AUDIO_DEVICE_IN_AMBIENT |
+             AUDIO_DEVICE_IN_BUILTIN_MIC |
+diff --git a/alsa/config_wm8962.h b/alsa/config_wm8962.h
+index f8af6ff..dbb40a4 100644
+--- a/alsa/config_wm8962.h
++++ b/alsa/config_wm8962.h
+@@ -201,15 +201,15 @@ static struct route_setting mm_bt_mic_input_wm8962[] = {
+ static struct audio_card  wm8962_card = {
+     .name = "wm8962-audio",
+     .driver_name = "wm8962-audio",
+-    .supported_devices = (AUDIO_DEVICE_OUT_EARPIECE |
++    .supported_out_devices = (AUDIO_DEVICE_OUT_EARPIECE |
+             AUDIO_DEVICE_OUT_SPEAKER |
+             AUDIO_DEVICE_OUT_WIRED_HEADSET |
+             AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
+             AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET |
+             AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET |
+             AUDIO_DEVICE_OUT_ALL_SCO |
+-            AUDIO_DEVICE_OUT_DEFAULT |
+-            /* IN */
++            AUDIO_DEVICE_OUT_DEFAULT ),
++    .supported_in_devices = (
+             AUDIO_DEVICE_IN_COMMUNICATION |
+             AUDIO_DEVICE_IN_AMBIENT |
+             AUDIO_DEVICE_IN_BUILTIN_MIC |
+diff --git a/alsa/tinyalsa_hal.c b/alsa/tinyalsa_hal.c
+index 930dfde..4b568cc 100644
+--- a/alsa/tinyalsa_hal.c
++++ b/alsa/tinyalsa_hal.c
+@@ -477,15 +477,24 @@ static void select_input_device(struct imx_audio_device *adev)
+     }
+ }
+ 
+-static int get_card_for_device(struct imx_audio_device *adev, int device)
++static int get_card_for_device(struct imx_audio_device *adev, int device, unsigned int flag)
+ {
+     int i;
+     int card = -1;
+ 
+-    for(i = 0; i < MAX_AUDIO_CARD_NUM; i++) {
+-        if(adev->card_list[i]->supported_devices & device) {
+-               card = adev->card_list[i]->card;
+-               break;
++    if (flag == PCM_OUT ) {
++        for(i = 0; i < MAX_AUDIO_CARD_NUM; i++) {
++            if(adev->card_list[i]->supported_out_devices & device) {
++                  card = adev->card_list[i]->card;
++                  break;
++            }
++        }
++    } else {
++        for(i = 0; i < MAX_AUDIO_CARD_NUM; i++) {
++            if(adev->card_list[i]->supported_in_devices & device) {
++                  card = adev->card_list[i]->card;
++                  break;
++            }
+         }
+     }
+     return card;
+@@ -514,7 +523,7 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+         out->write_threshold[PCM_NORMAL]        = PLAYBACK_LONG_PERIOD_COUNT * LONG_PERIOD_SIZE;
+         out->config[PCM_NORMAL] = pcm_config_mm_out;
+ 
+-        card = get_card_for_device(adev, pcm_device);
++        card = get_card_for_device(adev, pcm_device, PCM_OUT);
+         out->pcm[PCM_NORMAL] = pcm_open(card, port,out->write_flags[PCM_NORMAL], &out->config[PCM_NORMAL]);
+         ALOGW("card %d, port %d device 0x%x", card, port, out->device);
+         ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_NORMAL].rate, out->config[PCM_NORMAL].channels, out->config[PCM_NORMAL].period_size);
+@@ -526,7 +535,7 @@ static int start_output_stream_primary(struct imx_stream_out *out)
+         out->write_flags[PCM_HDMI]            = PCM_OUT;
+         out->write_threshold[PCM_HDMI]        = HDMI_PERIOD_SIZE * PLAYBACK_HDMI_PERIOD_COUNT;
+         out->config[PCM_HDMI] = pcm_config_mm_out;
+-        card = get_card_for_device(adev, pcm_device);
++        card = get_card_for_device(adev, pcm_device, PCM_OUT);
+         out->pcm[PCM_HDMI] = pcm_open(card, port,out->write_flags[PCM_HDMI], &out->config[PCM_HDMI]);
+         ALOGW("card %d, port %d device 0x%x", card, port, out->device);
+         ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_HDMI].rate, out->config[PCM_HDMI].channels, out->config[PCM_HDMI].period_size);
+@@ -578,7 +587,7 @@ static int start_output_stream_hdmi(struct imx_stream_out *out)
+         pthread_mutex_unlock(&p_out->lock);
+     }
+ 
+-    card = get_card_for_device(adev, out->device & AUDIO_DEVICE_OUT_AUX_DIGITAL);
++    card = get_card_for_device(adev, out->device & AUDIO_DEVICE_OUT_AUX_DIGITAL, PCM_OUT);
+     ALOGW("card %d, port %d device 0x%x", card, port, out->device);
+     ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_HDMI].rate, out->config[PCM_HDMI].channels, out->config[PCM_HDMI].period_size);
+ 
+@@ -609,7 +618,7 @@ static int start_output_stream_esai(struct imx_stream_out *out)
+         pthread_mutex_unlock(&p_out->lock);
+     }
+ 
+-    card = get_card_for_device(adev, out->device & AUDIO_DEVICE_OUT_SPEAKER);
++    card = get_card_for_device(adev, out->device & AUDIO_DEVICE_OUT_SPEAKER, PCM_OUT);
+     ALOGW("card %d, port %d device 0x%x", card, port, out->device);
+     ALOGW("rate %d, channel %d period_size 0x%x", out->config[PCM_ESAI].rate, out->config[PCM_ESAI].channels, out->config[PCM_ESAI].period_size);
+ 
+@@ -1320,7 +1329,7 @@ static int start_input_stream(struct imx_stream_in *in)
+     }
+ 
+     for(i = 0; i < MAX_AUDIO_CARD_NUM; i++) {
+-        if(adev->in_device & adev->card_list[i]->supported_devices) {
++        if(adev->in_device & adev->card_list[i]->supported_in_devices) {
+             card = adev->card_list[i]->card;
+             port = 0;
+             break;
+@@ -1337,7 +1346,7 @@ static int start_input_stream(struct imx_stream_in *in)
+     memcpy(&in->config, &pcm_config_mm_in, sizeof(pcm_config_mm_in));
+ 
+     if (in->device & AUDIO_DEVICE_IN_USB_DEVICE) {
+-        channels = adev_get_channels_for_device(adev, AUDIO_DEVICE_IN_USB_DEVICE, PCM_IN);
++        channels = adev_get_channels_for_device(adev, in->device, PCM_IN);
+         if (channels == 2){
+             in->config.channels = 2;
+         } else if (channels == 1) {
+@@ -1347,19 +1356,20 @@ static int start_input_stream(struct imx_stream_in *in)
+               return -EINVAL;
+         }
+ 
+-        rate     = adev_get_rate_for_device(adev, AUDIO_DEVICE_IN_USB_DEVICE, PCM_IN);
++        rate     = adev_get_rate_for_device(adev, in->device, PCM_IN);
+         if( rate == 0) {
+               ALOGW("can not get rate for in_device %d ", AUDIO_DEVICE_IN_USB_DEVICE);
+               return -EINVAL;
+         }
+         in->config.rate     =  rate;
+     } else if (in->device & AUDIO_DEVICE_IN_AUX_DIGITAL) {
+-        format     = adev_get_format_for_device(adev, AUDIO_DEVICE_IN_AUX_DIGITAL, PCM_IN);
++        format     = adev_get_format_for_device(adev, in->device, PCM_IN);
+         in->config.format  = format;
+     }
+ 
+     ALOGW("card %d, port %d device 0x%x", card, port, in->device);
+-    ALOGW("rate %d, channel %d period_size 0x%x", in->config.rate, in->config.channels, in->config.period_size);
++    ALOGW("rate %d, channel %d format %d, period_size 0x%x", in->config.rate, in->config.channels, 
++                                 in->config.format, in->config.period_size);
+ 
+     if (in->need_echo_reference && in->echo_reference == NULL)
+         in->echo_reference = get_echo_reference(adev,
+@@ -2496,24 +2506,19 @@ static int adev_close(hw_device_t *device)
+     return 0;
+ }
+ 
+-static uint32_t adev_get_supported_devices(const struct audio_hw_device *dev)
+-{
+-    struct imx_audio_device *adev = (struct imx_audio_device *)dev;
+-    int i;
+-    int devices = 0;
+-    for(i = 0; i < MAX_AUDIO_CARD_NUM; i++)
+-        if(adev->card_list[i])
+-            devices |= adev->card_list[i]->supported_devices;
+-
+-    return devices;            
+-}
+-
+ static int adev_get_rate_for_device(struct imx_audio_device *adev, uint32_t devices, unsigned int flag)
+ {
+      int i;
+-     for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
+-          if(adev->card_list[i]->supported_devices & devices)
+-		return (flag==PCM_OUT) ? adev->card_list[i]->out_rate:adev->card_list[i]->in_rate;
++     if (flag == PCM_OUT) {
++         for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
++                   if (adev->card_list[i]->supported_out_devices & devices)
++		       return adev->card_list[i]->out_rate;
++         }
++     } else {
++         for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
++                   if (adev->card_list[i]->supported_in_devices & devices)
++		       return adev->card_list[i]->in_rate;
++         }
+      }
+      return 0;
+ }
+@@ -2521,9 +2526,16 @@ static int adev_get_rate_for_device(struct imx_audio_device *adev, uint32_t devi
+ static int adev_get_channels_for_device(struct imx_audio_device *adev, uint32_t devices, unsigned int flag)
+ {
+      int i;
+-     for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
+-          if(adev->card_list[i]->supported_devices & devices)
+-		return (flag==PCM_OUT) ? adev->card_list[i]->out_channels:adev->card_list[i]->in_channels;
++     if (flag == PCM_OUT) {
++         for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
++                   if (adev->card_list[i]->supported_out_devices & devices)
++		       return adev->card_list[i]->out_channels;
++         }
++     } else {
++         for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
++                   if (adev->card_list[i]->supported_in_devices & devices)
++		       return adev->card_list[i]->in_channels;
++         }
+      }
+      return 0;
+ }
+@@ -2531,9 +2543,16 @@ static int adev_get_channels_for_device(struct imx_audio_device *adev, uint32_t
+ static int adev_get_format_for_device(struct imx_audio_device *adev, uint32_t devices, unsigned int flag)
+ {
+      int i;
+-     for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
+-          if(adev->card_list[i]->supported_devices & devices)
+-		return (flag==PCM_OUT) ? adev->card_list[i]->out_format:adev->card_list[i]->in_format;
++     if (flag == PCM_OUT) {
++         for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
++                   if (adev->card_list[i]->supported_out_devices & devices)
++		       return adev->card_list[i]->out_format;
++         }
++     } else {
++         for (i = 0; i < MAX_AUDIO_CARD_NUM; i ++) {
++                   if (adev->card_list[i]->supported_in_devices & devices)
++		       return adev->card_list[i]->in_format;
++         }
+      }
+      return 0;
+ }
+@@ -2545,14 +2564,16 @@ static int scan_available_device(struct imx_audio_device *adev, bool rescanusb)
+     bool found;
+     bool scanned;
+     struct control *imx_control;
+-    int left_devices = SUPPORTED_DEVICE_IN_MODULE;
++    int left_out_devices = SUPPORTED_DEVICE_OUT_MODULE;
++    int left_in_devices = SUPPORTED_DEVICE_IN_MODULE;
+     int rate, channels, format;
+     /* open the mixer for main sound card, main sound cara is like sgtl5000, wm8958, cs428888*/
+     /* note: some platform do not have main sound card, only have auxiliary card.*/
+     /* max num of supported card is 2 */
+     k = adev->audio_card_num;
+     for(i = 0; i < k; i++) {
+-        left_devices &= ~adev->card_list[i]->supported_devices;
++        left_out_devices &= ~adev->card_list[i]->supported_out_devices;
++        left_in_devices &= ~adev->card_list[i]->supported_in_devices;
+     }
+ 
+     for (i = 0; i < MAX_AUDIO_CARD_SCAN ; i ++) {
+@@ -2576,7 +2597,8 @@ static int scan_available_device(struct imx_audio_device *adev, bool rescanusb)
+                              if(strcmp(control_card_info_get_name(imx_control), adev->usb_card_name) || rescanusb) {
+                                 scanned = false;
+                                 strcpy(adev->usb_card_name, control_card_info_get_name(imx_control));
+-                                left_devices |= adev->card_list[m]->supported_devices;
++                                left_out_devices |= adev->card_list[m]->supported_out_devices;
++                                left_in_devices |= adev->card_list[m]->supported_in_devices;
+                                 if(adev->mixer[m])
+                                    mixer_close(adev->mixer[m]);
+                                 n = m;
+@@ -2628,7 +2650,8 @@ static int scan_available_device(struct imx_audio_device *adev, bool rescanusb)
+ 
+                 ALOGW("in rate %d, channels %d format %d",adev->card_list[n]->in_rate, adev->card_list[n]->in_channels, adev->card_list[n]->in_format);
+ 
+-                left_devices &= ~audio_card_list[j]->supported_devices;
++                left_out_devices &= ~audio_card_list[j]->supported_out_devices;
++                left_in_devices &= ~audio_card_list[j]->supported_in_devices;
+                 k ++;
+                 found = true;
+                 break;
+@@ -2650,7 +2673,8 @@ static int scan_available_device(struct imx_audio_device *adev, bool rescanusb)
+     while (k < MAX_AUDIO_CARD_NUM) {
+         adev->card_list[k]  = audio_card_list[SUPPORT_CARD_NUM-1];
+         /*FIXME:This is workaround for some board which only have one card, whose supported device only is not full*/
+-        adev->card_list[k]->supported_devices  = left_devices;
++        adev->card_list[k]->supported_out_devices  = left_out_devices;
++        adev->card_list[k]->supported_in_devices  = left_in_devices;
+         k++;
+     }
+ 
+@@ -2677,7 +2701,6 @@ static int adev_open(const hw_module_t* module, const char* name,
+     adev->hw_device.common.module   = (struct hw_module_t *) module;
+     adev->hw_device.common.close    = adev_close;
+ 
+-    adev->hw_device.get_supported_devices   = adev_get_supported_devices;
+     adev->hw_device.init_check              = adev_init_check;
+     adev->hw_device.set_voice_volume        = adev_set_voice_volume;
+     adev->hw_device.set_master_volume       = adev_set_master_volume;
+-- 
+1.8.0
+

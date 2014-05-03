@@ -1,0 +1,66 @@
+From 2250e92f43b2469aa8d548a482b518abe7e7c55d Mon Sep 17 00:00:00 2001
+From: Brian Liu <brian.liu@freescale.com>
+Date: Thu, 23 Jul 2009 14:40:53 +0800
+Subject: [PATCH 02/38] ENGR00114426 Support E180 3G datacard
+
+---
+ reference-ril/reference-ril.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index be1ae18..18711b9 100644
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -45,6 +45,9 @@
+ 
+ #define MAX_AT_RESPONSE 0x1000
+ 
++/* property to control the delay (in seconds) to initialize RIL */
++#define RIL_DELAY_TIME "gsm.ril.delay"
++
+ /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
+ #define PPP_TTY_PATH "ppp0"
+ #define PPP_OPERSTATE_PATH "/sys/class/net/ppp0/operstate"
+@@ -224,6 +227,7 @@ static char *sATBufferCur = NULL;
+ static const struct timeval TIMEVAL_SIMPOLL = {1,0};
+ static const struct timeval TIMEVAL_CALLSTATEPOLL = {0,500000};
+ static const struct timeval TIMEVAL_0 = {0,0};
++static struct timeval TIMEVAL_DELAYINIT = {0,0}; // will be set according to property value
+ 
+ static int s_ims_registered  = 0;        // 0==unregistered
+ static int s_ims_services    = 1;        // & 0x1 == sms over ims supported
+@@ -3361,6 +3365,8 @@ mainLoop(void *param)
+ #endif
+ #ifdef HUAWEI_MODEM
+     struct termios new_termios, old_termios;
++    char delay_init[PROPERTY_VALUE_MAX];
++    int delay;
+ #endif
+ 
+     AT_DUMP("== ", "entering mainLoop()", -1 );
+@@ -3454,7 +3460,21 @@ mainLoop(void *param)
+             return 0;
+         }
+ 
+-        RIL_requestTimedCallback(initializeCallback, NULL, &TIMEVAL_0);
++        /* Some HUAWEI USB datacards (e.g. E180) bootup and attach to network a little bit slowly(e.g. 20s). 
++           Delay RIL init so that we can always get correct network status (i.e. +COPS?).
++           FIX ME: this should be removed in future. Service layer should be responsible to handle "late" attach.
++        */
++	property_get(RIL_DELAY_TIME, delay_init, "0");
++        delay = strtol(delay_init, NULL, 10);
++        if(delay > 120) {
++	    LOGW ("Should not delay RIL init too long (%d seconds). Please set %s properly", delay, RIL_DELAY_TIME);
++            delay = 0;
++        }
++        TIMEVAL_DELAYINIT.tv_sec = delay;
++
++        LOGD ("Will delay RIL initialization for %d seconds", TIMEVAL_DELAYINIT.tv_sec); 
++
++        RIL_requestTimedCallback(initializeCallback, NULL, &TIMEVAL_DELAYINIT);
+ 
+         // Give initializeCallback a chance to dispatched, since
+         // we don't presently have a cancellation mechanism
+-- 
+1.8.0
+

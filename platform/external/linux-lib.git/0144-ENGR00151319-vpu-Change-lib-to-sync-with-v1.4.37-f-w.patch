@@ -1,0 +1,980 @@
+From 174213fd3329791330015c0d2f5bb7790ee73d71 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 22 Jun 2011 18:29:05 +0800
+Subject: [PATCH 144/249] ENGR00151319 vpu: Change lib to sync with v1.4.37
+ f/w on mx51/mx53
+
+Change lib to sync with v1.4.37 f/w on mx51 and mx53. In this f/w,
+it can support infinite instances. There is no vpu API change.
+
+Although vpu f/w can support infinite instances, MAX_NUM_INSTANCE
+macro is still needed since vpu lib needs to allocate resource
+per instance number. Current MAX_NUM_INSTANCE is 8, user can change
+the macro per the requirement. So current max supported instances
+is 8 from vpu lib view.
+
+And this change didn't consider mx27 support with max 4 instances
+support.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_io.c   |   2 +-
+ vpu/vpu_lib.c  | 257 +++++++++++++++++++++++++++++++++------------------------
+ vpu/vpu_lib.h  |   2 +-
+ vpu/vpu_reg.h  |  19 ++---
+ vpu/vpu_util.c |  99 +++++++++++++---------
+ vpu/vpu_util.h |  23 ++++--
+ 6 files changed, 229 insertions(+), 173 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index 7cbbf00..4bfd32f 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -171,7 +171,7 @@ int IOSystemInit(void *callback)
+ 	vpu_active_num++;
+ 
+ 	IOClkGateSet(true);
+-	bit_work_addr.size = WORK_BUF_SIZE + PARA_BUF_SIZE +
++	bit_work_addr.size = TEMP_BUF_SIZE + PARA_BUF_SIZE +
+ 	    					CODE_BUF_SIZE + PARA_BUF2_SIZE;
+ 
+ 	if (_IOGetPhyMem(VPU_IOC_GET_WORK_ADDR, &bit_work_addr) < 0) {
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index a3ffa20..3812b1e 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -36,26 +36,6 @@
+ #define IMAGE_ENDIAN			0
+ #define STREAM_ENDIAN			0
+ 
+-static PhysicalAddress rdPtrRegAddr[] = {
+-	BIT_RD_PTR_0,
+-	BIT_RD_PTR_1,
+-	BIT_RD_PTR_2,
+-	BIT_RD_PTR_3
+-};
+-
+-static PhysicalAddress wrPtrRegAddr[] = {
+-	BIT_WR_PTR_0,
+-	BIT_WR_PTR_1,
+-	BIT_WR_PTR_2,
+-	BIT_WR_PTR_3
+-};
+-
+-static PhysicalAddress disFlagRegAddr[] = {
+-	BIT_FRM_DIS_FLG_0,
+-	BIT_FRM_DIS_FLG_1,
+-	BIT_FRM_DIS_FLG_2,
+-	BIT_FRM_DIS_FLG_3
+-};
+ 
+ /* If a frame is started, pendingInst is set to the proper instance. */
+ static CodecInst **ppendingInst;
+@@ -114,7 +94,7 @@ RetCode vpu_Init(void *cb)
+ 	int i, err;
+ 	volatile Uint32 data;
+ 	Uint16 *bit_code = NULL;
+-	PhysicalAddress workBuffer, codeBuffer, paraBuffer;
++	PhysicalAddress tempBuffer, codeBuffer, paraBuffer;
+ 
+ 	ENTER_FUNC();
+ 
+@@ -129,14 +109,14 @@ RetCode vpu_Init(void *cb)
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 	}
+ 	codeBuffer = bit_work_addr.phy_addr;
+-	workBuffer = codeBuffer + CODE_BUF_SIZE;
+-	paraBuffer = workBuffer + WORK_BUF_SIZE + PARA_BUF2_SIZE;
++	tempBuffer = codeBuffer + CODE_BUF_SIZE;
++	paraBuffer = tempBuffer + TEMP_BUF_SIZE + PARA_BUF2_SIZE;
+ 
+ 	virt_codeBuf = (Uint32) (bit_work_addr.virt_uaddr);
+ 	virt_paraBuf = (unsigned long *)(virt_codeBuf + CODE_BUF_SIZE +
+-					 WORK_BUF_SIZE + PARA_BUF2_SIZE);
++					 TEMP_BUF_SIZE + PARA_BUF2_SIZE);
+ 	virt_paraBuf2 = (unsigned long *)(virt_codeBuf + CODE_BUF_SIZE +
+-					  WORK_BUF_SIZE);
++					  TEMP_BUF_SIZE);
+ 
+ 	ppendingInst = (CodecInst **) (&vpu_semap->pendingInst);
+ 
+@@ -150,7 +130,7 @@ RetCode vpu_Init(void *cb)
+ 		}
+ 
+ 		IOClkGateSet(true);
+-		VpuWriteReg(BIT_WORK_BUF_ADDR, workBuffer);
++		VpuWriteReg(BIT_TEMP_BUF_ADDR, tempBuffer);
+ 		VpuWriteReg(BIT_PARA_BUF_ADDR, paraBuffer);
+ 		VpuWriteReg(BIT_CODE_BUF_ADDR, codeBuffer);
+ 
+@@ -430,6 +410,12 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	instIdx = pCodecInst->instIndex;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 
++	pCodecInst->contextBufMem.size = SIZE_CONTEXT_BUF;
++	ret = IOGetPhyMem(&pCodecInst->contextBufMem);
++	if (ret) {
++		err_msg("Unable to obtain physical mem\n");
++		return RETCODE_FAILURE;
++	}
+ 	pEncInfo->openParam = *pop;
+ 
+ 	if ((pop->bitstreamFormat == STD_MPEG4) ||
+@@ -441,8 +427,6 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 		pCodecInst->codecMode = MJPG_ENC;
+ 
+ 	pEncInfo->streamRdPtr = pop->bitstreamBuffer;
+-	pEncInfo->streamRdPtrRegAddr = rdPtrRegAddr[instIdx];
+-	pEncInfo->streamWrPtrRegAddr = wrPtrRegAddr[instIdx];
+ 	pEncInfo->streamBufStartAddr = pop->bitstreamBuffer;
+ 	pEncInfo->streamBufSize = pop->bitstreamBufferSize;
+ 	pEncInfo->streamBufEndAddr =
+@@ -461,8 +445,13 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+-	VpuWriteReg(pEncInfo->streamRdPtrRegAddr, pEncInfo->streamRdPtr);
+-	VpuWriteReg(pEncInfo->streamWrPtrRegAddr, pEncInfo->streamBufStartAddr);
++	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = pEncInfo->streamRdPtr;
++	pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = pEncInfo->streamBufStartAddr;
++
++	if (instIdx == VpuReadReg(BIT_RUN_INDEX)) {
++		VpuWriteReg(BIT_RD_PTR, pEncInfo->streamRdPtr);
++		VpuWriteReg(BIT_WR_PTR, pEncInfo->streamBufStartAddr);
++	}
+ 
+ 	val = VpuReadReg(BIT_BIT_STREAM_CTRL);
+ 	val &= ~BITS_STREAMCTRL_MASK;
+@@ -479,9 +468,10 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 
+ 	VpuWriteReg(BIT_BIT_STREAM_CTRL, val);
+ 
+-	val = VpuReadReg(BIT_FRAME_MEM_CTRL) & ~(1 << (instIdx + 2));
+-	VpuWriteReg(BIT_FRAME_MEM_CTRL,
+-		    val | (pEncInfo->openParam.chromaInterleave << (instIdx + 2)));
++	val = VpuReadReg(BIT_FRAME_MEM_CTRL);
++	val &= ~(1 << 2); // clear the bit firstly
++	pCodecInst->ctxRegs[CTX_BIT_FRAME_MEM_CTRL] =
++	    val | (pEncInfo->openParam.chromaInterleave << 2);
+ 	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+@@ -520,8 +510,7 @@ RetCode vpu_EncClose(EncHandle handle)
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+ 	if (pEncInfo->initialInfoObtained) {
+-		BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-				SEQ_END);
++		BitIssueCommandEx(pCodecInst, SEQ_END);
+ 		while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	}
+ 
+@@ -534,6 +523,9 @@ RetCode vpu_EncClose(EncHandle handle)
+ 	    (pEncInfo->secAxiUse.searchRamAddr))
+ 		IOFreePhyMem(&pEncInfo->searchRamMem);
+ 
++	/* Free context buf Mem */
++	IOFreePhyMem(&pCodecInst->contextBufMem);
++
+ 	FreeCodecInstance(pCodecInst);
+ 	UnlockVpu(vpu_semap);
+ 
+@@ -740,13 +732,17 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	VpuWriteReg(CMD_ENC_SEARCH_BASE, pEncInfo->secAxiUse.searchRamAddr);
+ 	VpuWriteReg(CMD_ENC_SEARCH_SIZE, pEncInfo->secAxiUse.searchRamSize);
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, SEQ_INIT);
++	BitIssueCommandEx(pCodecInst, SEQ_INIT);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	if (VpuReadReg(RET_ENC_SEQ_SUCCESS) == 0) {
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_FAILURE;
+ 	}
++
++	/* Backup wr pointer to ctx */
++	pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = VpuReadReg(BIT_WR_PTR);
++
+ 	UnlockVpu(vpu_semap);
+ 
+ 	if (pCodecInst->codecMode == MJPG_ENC)
+@@ -864,8 +860,7 @@ RetCode vpu_EncRegisterFrameBuffer(EncHandle handle, FrameBuffer * bufArray,
+ 		VpuWriteReg(CMD_SET_FRAME_AXI_OVL_ADDR, pEncInfo->secAxiUse.bufOvlUse);
+ 	}
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			SET_FRAME_BUF);
++	BitIssueCommandEx(pCodecInst, SET_FRAME_BUF);
+ 
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	UnlockVpu(vpu_semap);
+@@ -881,6 +876,7 @@ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle,
+ 	EncInfo *pEncInfo;
+ 	PhysicalAddress rdPtr;
+ 	PhysicalAddress wrPtr;
++	int instIndex;
+ 	Uint32 room;
+ 	RetCode ret;
+ 
+@@ -897,9 +893,15 @@ RetCode vpu_EncGetBitstreamBuffer(EncHandle handle,
+ 	pCodecInst = handle;
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 	rdPtr = pEncInfo->streamRdPtr;
+-	IOClkGateSet(true);
+-	wrPtr = VpuReadReg(pEncInfo->streamWrPtrRegAddr);
+-	IOClkGateSet(false);
++
++	LockVpuReg(vpu_semap);
++	/* Check current instance is in running or not, if not
++	   Get the pointer from back context regs */
++	instIndex = VpuReadReg(BIT_RUN_INDEX);
++	wrPtr = (pCodecInst->instIndex == instIndex) ?
++		    VpuReadReg(BIT_WR_PTR) :
++		    pCodecInst->ctxRegs[CTX_BIT_WR_PTR];
++	UnlockVpuReg(vpu_semap);
+ 
+ 	if (pEncInfo->ringBufferEnable == 1) {
+ 		if (wrPtr >= rdPtr) {
+@@ -929,7 +931,7 @@ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size)
+ 	PhysicalAddress wrPtr;
+ 	PhysicalAddress rdPtr;
+ 	RetCode ret;
+-	int room = 0;
++	int room = 0, instIndex;
+ 
+ 	ENTER_FUNC();
+ 
+@@ -941,9 +943,13 @@ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size)
+ 	pEncInfo = &pCodecInst->CodecInfo.encInfo;
+ 	rdPtr = pEncInfo->streamRdPtr;
+ 
+-	IOClkGateSet(true);
+-	wrPtr = VpuReadReg(pEncInfo->streamWrPtrRegAddr);
+-	IOClkGateSet(false);
++	LockVpuReg(vpu_semap);
++	instIndex = VpuReadReg(BIT_RUN_INDEX);
++	wrPtr = (pCodecInst->instIndex == instIndex) ?
++		    VpuReadReg(BIT_WR_PTR) :
++		    pCodecInst->ctxRegs[CTX_BIT_WR_PTR];
++	UnlockVpuReg(vpu_semap);
++
+ 	if (rdPtr < wrPtr) {
+ 		if (rdPtr + size > wrPtr)
+ 			return RETCODE_INVALID_PARAM;
+@@ -965,9 +971,13 @@ RetCode vpu_EncUpdateBitstreamBuffer(EncHandle handle, Uint32 size)
+ 
+ 	pEncInfo->streamRdPtr = rdPtr;
+ 
+-	IOClkGateSet(true);
+-	VpuWriteReg(pEncInfo->streamRdPtrRegAddr, rdPtr);
+-	IOClkGateSet(false);
++	LockVpuReg(vpu_semap);
++	instIndex = VpuReadReg(BIT_RUN_INDEX);
++	if (pCodecInst->instIndex == instIndex)
++		VpuWriteReg(BIT_RD_PTR, wrPtr);
++	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = rdPtr;
++	UnlockVpuReg(vpu_semap);
++
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -1150,7 +1160,7 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	       pEncInfo->secAxiUse.useHostOvlEnable << 10 | pEncInfo->secAxiUse.useHostMeEnable << 11);
+ 	VpuWriteReg(BIT_AXI_SRAM_USE, val);
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
++	BitIssueCommandEx(pCodecInst, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+ 
+@@ -1213,7 +1223,7 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 			rdPtr = pEncInfo->streamBufStartAddr;
+ 		}
+ 
+-		wrPtr = VpuReadReg(pEncInfo->streamWrPtrRegAddr);
++		wrPtr = VpuReadReg(BIT_WR_PTR);
+ 		info->bitstreamBuffer = rdPtr;
+ 		info->bitstreamSize = wrPtr - rdPtr;
+ 	}
+@@ -1315,6 +1325,9 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 		}
+ 	}
+ 
++	/* Backup context regs */
++	pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = VpuReadReg(BIT_WR_PTR);
++	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = VpuReadReg(BIT_BIT_STREAM_PARAM);
+ 	*ppendingInst = 0;
+ 	UnlockVpu(vpu_semap);
+ 
+@@ -1794,7 +1807,7 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ {
+ 	CodecInst *pCodecInst;
+ 	DecInfo *pDecInfo;
+-	int instIdx, bit_offset = 0;
++	int instIdx;
+ 	Uint32 val;
+ 	RetCode ret;
+ 
+@@ -1824,6 +1837,14 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	instIdx = pCodecInst->instIndex;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
++	/* Allocate context buffer */
++	pCodecInst->contextBufMem.size = SIZE_CONTEXT_BUF;
++	ret = IOGetPhyMem(&pCodecInst->contextBufMem);
++	if (ret) {
++		err_msg("Unable to obtain physical mem\n");
++		return RETCODE_FAILURE;
++	}
++
+ 	pDecInfo->openParam = *pop;
+ 
+ 	if (cpu_is_mx27()) {
+@@ -1848,9 +1869,6 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	}
+ 
+ 	pDecInfo->streamWrPtr = pop->bitstreamBuffer;
+-	pDecInfo->streamRdPtrRegAddr = rdPtrRegAddr[instIdx];
+-	pDecInfo->streamWrPtrRegAddr = wrPtrRegAddr[instIdx];
+-	pDecInfo->frameDisplayFlagRegAddr = disFlagRegAddr[instIdx];
+ 	pDecInfo->streamBufStartAddr = pop->bitstreamBuffer;
+ 	pDecInfo->streamBufSize = pop->bitstreamBufferSize;
+ 	pDecInfo->streamBufEndAddr =
+@@ -1884,20 +1902,23 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+-	VpuWriteReg(pDecInfo->streamRdPtrRegAddr, pDecInfo->streamBufStartAddr);
+-	VpuWriteReg(pDecInfo->streamWrPtrRegAddr, pDecInfo->streamWrPtr);
+-	VpuWriteReg(pDecInfo->frameDisplayFlagRegAddr, 0);
++	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = pDecInfo->streamBufStartAddr;
++	pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = pDecInfo->streamWrPtr;
++	pCodecInst->ctxRegs[CTX_BIT_FRM_DIS_FLG] = 0;
++	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = 0;
+ 
+-	/* Clear stream end flag */
+ 	LockVpuReg(vpu_semap);
+-	VpuWriteReg(BIT_BIT_STREAM_PARAM,
+-		    VpuReadReg(BIT_BIT_STREAM_PARAM) & ~(1 << (instIdx + 2)));
++	if (instIdx == VpuReadReg(BIT_RUN_INDEX)) {
++		VpuWriteReg(BIT_RD_PTR, pDecInfo->streamBufStartAddr);
++		VpuWriteReg(BIT_WR_PTR, pDecInfo->streamWrPtr);
++		VpuWriteReg(BIT_FRM_DIS_FLG, 0);
++	}
+ 	UnlockVpuReg(vpu_semap);
+ 
+-	bit_offset = instIdx + 2;
+-	val = VpuReadReg(BIT_FRAME_MEM_CTRL) & ~(1 << bit_offset);
+-	VpuWriteReg(BIT_FRAME_MEM_CTRL,
+-		    val | (pDecInfo->openParam.chromaInterleave << bit_offset));
++	val = VpuReadReg(BIT_FRAME_MEM_CTRL);
++	val &= ~(1 << 2); // clear the bit firstly
++	pCodecInst->ctxRegs[CTX_BIT_FRAME_MEM_CTRL] =
++		    val | (pDecInfo->openParam.chromaInterleave << 2);
+ 	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+@@ -1942,8 +1963,7 @@ RetCode vpu_DecClose(DecHandle handle)
+ 			else
+ 				VpuWriteReg(BIT_RUN_AUX_STD, 0);
+ 		}
+-		BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-				SEQ_END);
++		BitIssueCommandEx(pCodecInst, SEQ_END);
+ 		while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	}
+ 
+@@ -1952,6 +1972,8 @@ RetCode vpu_DecClose(DecHandle handle)
+ 	IOFreePhyMem(&pDecInfo->picParaBaseMem);
+ 	IOFreeVirtMem(&pDecInfo->userDataBufMem);
+ 	IOFreePhyMem(&pDecInfo->userDataBufMem);
++	/* Free context buf Mem */
++	IOFreePhyMem(&pCodecInst->contextBufMem);
+ 
+ 	FreeCodecInstance(pCodecInst);
+ 	UnlockVpu(vpu_semap);
+@@ -1978,11 +2000,10 @@ RetCode vpu_DecSetEscSeqInit(DecHandle handle, int escape)
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+ 	if (escape == 0)
+-		VpuWriteReg(CMD_DEC_SEQ_INIT_ESCAPE,
+-			    VpuReadReg(CMD_DEC_SEQ_INIT_ESCAPE) & ~0x01);
++		pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] &= ~0x01;
+ 	else
+-		VpuWriteReg(CMD_DEC_SEQ_INIT_ESCAPE,
+-			    VpuReadReg(CMD_DEC_SEQ_INIT_ESCAPE) | 0x01);
++		pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] |= 0x01;
++
+ 	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+@@ -2031,7 +2052,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+-	if (DecBitstreamBufEmpty(pDecInfo)) {
++	if (DecBitstreamBufEmpty(handle)) {
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_WRONG_CALL_SEQUENCE;
+ 	}
+@@ -2110,7 +2131,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 			VpuWriteReg(BIT_RUN_AUX_STD, 0);
+ 	}
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, SEQ_INIT);
++	BitIssueCommandEx(pCodecInst, SEQ_INIT);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	if (VpuReadReg(RET_DEC_SEQ_SUCCESS) == 0) {
+@@ -2236,6 +2257,10 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	else
+ 		info->streamInfoObtained = 0;
+ 
++	/* Backup rd pointer to ctx */
++	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = VpuReadReg(BIT_RD_PTR);
++	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = VpuReadReg(BIT_BIT_STREAM_PARAM);
++
+ 	UnlockVpu(vpu_semap);
+ 
+ 	pDecInfo->initialInfo = *info;
+@@ -2276,6 +2301,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ {
+ 	CodecInst *pCodecInst;
+ 	DecInfo *pDecInfo;
++	int temp_baseAddr;
+ 	int i;
+ 	RetCode ret;
+ 
+@@ -2363,8 +2389,8 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 		VpuWriteReg(BIT_AXI_SRAM_USE, 0);       /* not use SRAM */
+ 
+ 	if (pCodecInst->codecMode == AVC_DEC) {
+-		VpuWriteReg(CMD_SET_FRAME_SLICE_BB_START,
+-			    pBufInfo->avcSliceBufInfo.sliceSaveBuffer);
++		temp_baseAddr = VpuReadReg(BIT_TEMP_BUF_ADDR);
++		VpuWriteReg(CMD_SET_FRAME_SLICE_BB_START, temp_baseAddr + 0x18300);
+ 		VpuWriteReg(CMD_SET_FRAME_SLICE_BB_SIZE,
+ 			    (pBufInfo->avcSliceBufInfo.sliceSaveBufferSize /
+ 			     1024));
+@@ -2381,8 +2407,7 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 		else
+ 			VpuWriteReg(BIT_RUN_AUX_STD, 0);
+ 	}
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			SET_FRAME_BUF);
++	BitIssueCommandEx(pCodecInst, SET_FRAME_BUF);
+ 
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	UnlockVpu(vpu_semap);
+@@ -2410,6 +2435,7 @@ RetCode vpu_DecGetBitstreamBuffer(DecHandle handle,
+ 	DecInfo *pDecInfo;
+ 	PhysicalAddress rdPtr;
+ 	PhysicalAddress wrPtr;
++	int instIndex;
+ 	Uint32 room;
+ 	RetCode ret;
+ 
+@@ -2426,9 +2452,14 @@ RetCode vpu_DecGetBitstreamBuffer(DecHandle handle,
+ 	pCodecInst = handle;
+ 	pDecInfo = &pCodecInst->CodecInfo.decInfo;
+ 
+-	IOClkGateSet(true);
+-	rdPtr = VpuReadReg(pDecInfo->streamRdPtrRegAddr);
+-	IOClkGateSet(false);
++	LockVpuReg(vpu_semap);
++	/* Check current instance is in running or not, if not
++	   Get the pointer from back context regs */
++	instIndex = VpuReadReg(BIT_RUN_INDEX);
++	rdPtr = (pCodecInst->instIndex == instIndex) ?
++		    VpuReadReg(BIT_RD_PTR) :
++		    pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
++	UnlockVpuReg(vpu_semap);
+ 	wrPtr = pDecInfo->streamWrPtr;
+ 
+ 	if (wrPtr < rdPtr) {
+@@ -2463,7 +2494,7 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 	PhysicalAddress wrPtr;
+ 	PhysicalAddress rdPtr;
+ 	RetCode ret;
+-	int room = 0, val = 0;
++	int room = 0, val = 0, instIndex;
+ 
+ 	ENTER_FUNC();
+ 
+@@ -2476,27 +2507,28 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 	wrPtr = pDecInfo->streamWrPtr;
+ 
+ 	LockVpuReg(vpu_semap);
++	val = pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM];
++	/* Set stream end flag if size == 0; otherwise, clear the flag */
++	val = (size == 0) ? (val | 1 << 2) : (val & ~(1 << 2));
++	/* Backup to context reg */
++	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = val;
++
++	instIndex = VpuReadReg(BIT_RUN_INDEX);
++
++	if (pCodecInst->instIndex == instIndex)
++		VpuWriteReg(BIT_BIT_STREAM_PARAM, val); //Write to vpu hardware
++
+ 	if (size == 0) {
+-		/* Set stream end flag */
+-		val = VpuReadReg(BIT_BIT_STREAM_PARAM);
+-		VpuWriteReg(BIT_BIT_STREAM_PARAM,
+-			    val |= 1 << (pCodecInst->instIndex + 2));
+ 		UnlockVpuReg(vpu_semap);
+ 		return RETCODE_SUCCESS;
+-	} else {
+-		/* Clear stream end flag */
+-		val = VpuReadReg(BIT_BIT_STREAM_PARAM);
+-		VpuWriteReg(BIT_BIT_STREAM_PARAM,
+-			    val & ~(1 << (pCodecInst->instIndex + 2)));
+-		UnlockVpuReg(vpu_semap);
+ 	}
+ 
+-	IOClkGateSet(true);
+-
+-	rdPtr = VpuReadReg(pDecInfo->streamRdPtrRegAddr);
++	rdPtr = (pCodecInst->instIndex == instIndex) ?
++		    VpuReadReg(BIT_RD_PTR) :
++		    pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
+ 	if (wrPtr < rdPtr) {
+ 		if (rdPtr <= wrPtr + size) {
+-			IOClkGateSet(false);
++			UnlockVpuReg(vpu_semap);
+ 			return RETCODE_INVALID_PARAM;
+ 		}
+ 	}
+@@ -2516,9 +2548,11 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 	}
+ 
+ 	pDecInfo->streamWrPtr = wrPtr;
+-	VpuWriteReg(pDecInfo->streamWrPtrRegAddr, wrPtr);
+ 
+-	IOClkGateSet(false);
++	if (pCodecInst->instIndex == instIndex)
++		VpuWriteReg(BIT_WR_PTR, wrPtr);
++	pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = wrPtr;
++	UnlockVpuReg(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+@@ -2756,7 +2790,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	       pDecInfo->secAxiUse.useHostDbkEnable << 9 | pDecInfo->secAxiUse.useHostOvlEnable << 10);
+ 	VpuWriteReg(BIT_AXI_SRAM_USE, val);
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
++	BitIssueCommandEx(pCodecInst, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+ 	return RETCODE_SUCCESS;
+@@ -2786,7 +2820,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	ENTER_FUNC();
+ 
+ 	paraBuffer =
+-	    bit_work_addr.phy_addr + CODE_BUF_SIZE + WORK_BUF_SIZE +
++	    bit_work_addr.phy_addr + CODE_BUF_SIZE + TEMP_BUF_SIZE +
+ 	    PARA_BUF2_SIZE;
+ 
+ 	ret = CheckDecInstanceValidity(handle);
+@@ -3022,8 +3056,8 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			    ((decoded_pictype[info->indexFrameDisplay] >> 3) == 3 && pDecInfo->initialInfo.profile == 2)) {
+ 				/* clear buffer for not displayed B frame */
+ 				val = ~(1 << info->indexFrameDisplay);
+-				val &= VpuReadReg(pDecInfo->frameDisplayFlagRegAddr);
+-				VpuWriteReg(pDecInfo->frameDisplayFlagRegAddr, val);
++				val &= VpuReadReg(BIT_FRM_DIS_FLG);
++				VpuWriteReg(BIT_FRM_DIS_FLG, val);
+ 				info->indexFrameDisplay = -3;
+ 			} else {
+ 				pDecInfo->vc1BframeDisplayValid = 1;
+@@ -3031,6 +3065,12 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		}
+ 	}
+ 
++	/* Backup context regs, no need to save BIT_WR_PTR
++	   and BIT_FRAME_MEM_CTRL since f/w doesn't update the registers */
++	pCodecInst->ctxRegs[CTX_BIT_FRM_DIS_FLG] = VpuReadReg(BIT_FRM_DIS_FLG);
++	pCodecInst->ctxRegs[CTX_BIT_RD_PTR] = VpuReadReg(BIT_RD_PTR);
++	pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM] = VpuReadReg(BIT_BIT_STREAM_PARAM);
++
+ 	if (cpu_is_mx27()) {
+ 		if (pCodecInst->codecMode == MP4_DEC &&
+ 		    pDecInfo->openParam.qpReport == 1) {
+@@ -3112,13 +3152,14 @@ RetCode vpu_DecBitBufferFlush(DecHandle handle)
+ 			VpuWriteReg(BIT_RUN_AUX_STD, 0);
+ 	}
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			DEC_BUF_FLUSH);
+-
++	BitIssueCommandEx(pCodecInst, DEC_BUF_FLUSH);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	pDecInfo->streamWrPtr = pDecInfo->streamBufStartAddr;
+-	VpuWriteReg(pDecInfo->streamWrPtrRegAddr, pDecInfo->streamBufStartAddr);
++
++	VpuWriteReg(BIT_WR_PTR, pDecInfo->streamBufStartAddr);
++	/* Backup context reg */
++	pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = pDecInfo->streamBufStartAddr;
+ 	UnlockVpu(vpu_semap);
+ 
+ 	return RETCODE_SUCCESS;
+@@ -3146,12 +3187,8 @@ RetCode vpu_DecClrDispFlag(DecHandle handle, int index)
+ 	if ((index < 0) || (index > (pDecInfo->numFrameBuffers - 1)))
+ 		return RETCODE_INVALID_PARAM;
+ 
+-	if (!LockVpu(vpu_semap))
+-		return RETCODE_FAILURE_TIMEOUT;
+-
+-	val = (~(1 << index) & VpuReadReg(pDecInfo->frameDisplayFlagRegAddr));
+-	VpuWriteReg(pDecInfo->frameDisplayFlagRegAddr, val);
+-	UnlockVpu(vpu_semap);
++	val = (~(1 << index) & pCodecInst->ctxRegs[CTX_BIT_FRM_DIS_FLG]);
++	pCodecInst->ctxRegs[CTX_BIT_FRM_DIS_FLG] = val;
+ 
+ 	return RETCODE_SUCCESS;
+ }
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index b7d523d..0d1df5c 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -506,7 +506,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 1, 5)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 2, 0)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 4e7e975..36d92ea 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -45,27 +45,18 @@
+ #define BIT_FRAME_MEM_CTRL		0x110
+ #define CMD_DEC_DISPLAY_REORDER		0x114
+ #define BIT_BIT_STREAM_PARAM		0x114
+-
++#define BIT_TEMP_BUF_ADDR		0x118
+ #define	BIT_RESET_CTRL			0x11C
+ 
+-#define BIT_RD_PTR_0			0x120
+-#define BIT_WR_PTR_0			0x124
+-#define BIT_RD_PTR_1			0x128
+-#define BIT_WR_PTR_1			0x12C
+-#define BIT_RD_PTR_2			0x130
+-#define BIT_WR_PTR_2			0x134
+-#define BIT_RD_PTR_3			0x138
+-#define BIT_WR_PTR_3			0x13C
++#define BIT_RD_PTR			0x120
++#define BIT_WR_PTR			0x124
+ 
+ #if defined(IMX51) || defined(IMX53)
+ #define BIT_AXI_SRAM_USE                0x140
+ #define BIT_SEARCH_RAM_BASE_ADDR	0x144
+ #define BIT_SEARCH_RAM_SIZE		0x148
+ 
+-#define BIT_FRM_DIS_FLG_0               0x150
+-#define BIT_FRM_DIS_FLG_1               0x154
+-#define BIT_FRM_DIS_FLG_2               0x158
+-#define BIT_FRM_DIS_FLG_3               0x15C
++#define BIT_FRM_DIS_FLG                 0x150
+ 
+ #define CMD_SET_FRAME_AXI_BIT_ADDR	0x190
+ #define CMD_SET_FRAME_AXI_IPACDC_ADDR	0x194
+@@ -302,7 +293,7 @@
+ #elif defined(IMX51) || defined(IMX53)
+         #define CODE_BUF_SIZE			(200 * 1024) /* define max is 200k byte currently */
+         #define FMO_SLICE_SAVE_BUF_SIZE		(32)
+-        #define WORK_BUF_SIZE			(512 * 1024) + (FMO_SLICE_SAVE_BUF_SIZE * 1024 * 8)
++        #define TEMP_BUF_SIZE			(304 * 1024)
+         #define PARA_BUF2_SIZE			(2 * 1024)
+         #define PARA_BUF_SIZE			(10 * 1024)
+ #else
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index febdf65..dad86f8 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -256,14 +256,38 @@ void FreeCodecInstance(CodecInst * pCodecInst)
+ 
+ void BitIssueCommand(int instIdx, int cdcMode, int cmd)
+ {
+-	IOClkGateSet(true);
++	LockVpuReg(vpu_semap);
+ 
+ 	VpuWriteReg(BIT_BUSY_FLAG, 0x1);
+ 	VpuWriteReg(BIT_RUN_INDEX, instIdx);
+ 	VpuWriteReg(BIT_RUN_COD_STD, cdcMode);
+ 	VpuWriteReg(BIT_RUN_COMMAND, cmd);
+ 
+-	IOClkGateSet(false);
++	UnlockVpuReg(vpu_semap);
++}
++void BitIssueCommandEx(CodecInst *pCodecInst, int cmd)
++{
++	LockVpuReg(vpu_semap);
++
++	/* Save context related registers to vpu */
++	VpuWriteReg(BIT_BIT_STREAM_PARAM,
++			pCodecInst->ctxRegs[CTX_BIT_STREAM_PARAM]);
++	VpuWriteReg(BIT_FRM_DIS_FLG,
++			pCodecInst->ctxRegs[CTX_BIT_FRM_DIS_FLG]);
++	VpuWriteReg(BIT_WR_PTR,
++			pCodecInst->ctxRegs[CTX_BIT_WR_PTR]);
++	VpuWriteReg(BIT_RD_PTR,
++			pCodecInst->ctxRegs[CTX_BIT_RD_PTR]);
++	VpuWriteReg(BIT_FRAME_MEM_CTRL,
++			pCodecInst->ctxRegs[CTX_BIT_FRAME_MEM_CTRL]);
++	VpuWriteReg(BIT_WORK_BUF_ADDR, pCodecInst->contextBufMem.phy_addr);
++
++	VpuWriteReg(BIT_BUSY_FLAG, 0x1);
++	VpuWriteReg(BIT_RUN_INDEX, pCodecInst->instIndex);
++	VpuWriteReg(BIT_RUN_COD_STD, pCodecInst->codecMode);
++
++	VpuWriteReg(BIT_RUN_COMMAND, cmd);
++	UnlockVpuReg(vpu_semap);
+ }
+ 
+ RetCode CheckEncOpenParam(EncOpenParam * pop)
+@@ -474,19 +498,22 @@ void EncodeHeader(EncHandle handle, EncHeaderParam * encHeaderParam)
+ 		VpuWriteReg(CMD_ENC_HEADER_CODE, encHeaderParam->headerType); /* 0: SPS, 1: PPS */
+ 	}
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			ENCODE_HEADER);
+-
++	BitIssueCommandEx(pCodecInst, ENCODE_HEADER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
++	IOClkGateSet(false);
++
++	LockVpuReg(vpu_semap);
+ 	if (pEncInfo->dynamicAllocEnable == 1) {
+ 		rdPtr = VpuReadReg(CMD_ENC_HEADER_BB_START);
+-		wrPtr = VpuReadReg(pEncInfo->streamWrPtrRegAddr);
++		wrPtr = VpuReadReg(BIT_WR_PTR);
++		pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = wrPtr;
+ 	} else {
+-		rdPtr = VpuReadReg(pEncInfo->streamRdPtrRegAddr);
+-		wrPtr = VpuReadReg(pEncInfo->streamWrPtrRegAddr);
++		rdPtr = VpuReadReg(BIT_RD_PTR);
++		wrPtr = VpuReadReg(BIT_WR_PTR);
++		pCodecInst->ctxRegs[CTX_BIT_WR_PTR] = wrPtr;
+ 	}
+-	IOClkGateSet(false);
++	UnlockVpuReg(vpu_semap);
+ 
+ 	encHeaderParam->buf = rdPtr;
+ 	encHeaderParam->size = wrPtr - rdPtr;
+@@ -544,17 +571,26 @@ RetCode CheckDecOpenParam(DecOpenParam * pop)
+ 	return RETCODE_SUCCESS;
+ }
+ 
+-int DecBitstreamBufEmpty(DecInfo * pDecInfo)
++int DecBitstreamBufEmpty(DecHandle handle)
+ {
++	CodecInst *pCodecInst;
+ 	PhysicalAddress rdPtr;
+ 	PhysicalAddress wrPtr;
++	int instIndex;
+ 
+-	IOClkGateSet(true);
++	pCodecInst = handle;
+ 
+-	rdPtr = VpuReadReg(pDecInfo->streamRdPtrRegAddr);
+-	wrPtr = VpuReadReg(pDecInfo->streamWrPtrRegAddr);
++	LockVpuReg(vpu_semap);
++	instIndex = VpuReadReg(BIT_RUN_INDEX);
+ 
+-	IOClkGateSet(false);
++	rdPtr = (pCodecInst->instIndex == instIndex) ?
++		    VpuReadReg(BIT_RD_PTR) :
++		    pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
++	wrPtr = (pCodecInst->instIndex == instIndex) ?
++		    VpuReadReg(BIT_WR_PTR) :
++		    pCodecInst->ctxRegs[CTX_BIT_WR_PTR];
++
++	UnlockVpuReg(vpu_semap);
+ 
+ 	return rdPtr == wrPtr;
+ }
+@@ -591,8 +627,7 @@ void GetParaSet(EncHandle handle, int paraSetType, EncParamSet * para)
+ 
+ 	/* SPS: 0, PPS: 1, VOS: 1, VO: 2, VOL: 0 */
+ 	VpuWriteReg(CMD_ENC_PARA_SET_TYPE, paraSetType);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			ENC_PARA_SET);
++	BitIssueCommandEx(pCodecInst, ENC_PARA_SET);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	para->paraSet = virt_paraBuf;
+@@ -631,9 +666,7 @@ void SetParaSet(DecHandle handle, int paraSetType, DecParamSet * para)
+ 			VpuWriteReg(BIT_RUN_AUX_STD, 0);
+ 	}
+ 
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			DEC_PARA_SET);
+-
++	BitIssueCommandEx(pCodecInst, DEC_PARA_SET);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 
+ 	IOClkGateSet(false);
+@@ -651,9 +684,7 @@ RetCode SetGopNumber(EncHandle handle, Uint32 * pGopNumber)
+ 	IOClkGateSet(true);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_RC_GOP, gopNumber);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			RC_CHANGE_PARAMETER);
+-
++	BitIssueCommandEx(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+ 
+@@ -672,9 +703,7 @@ RetCode SetIntraQp(EncHandle handle, Uint32 * pIntraQp)
+ 	data = 1 << 1;
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_RC_INTRA_QP, intraQp);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			RC_CHANGE_PARAMETER);
+-
++	BitIssueCommandEx(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+ 
+@@ -693,9 +722,7 @@ RetCode SetBitrate(EncHandle handle, Uint32 * pBitrate)
+ 	data = 1 << 2;
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_RC_BITRATE, bitrate);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			RC_CHANGE_PARAMETER);
+-
++	BitIssueCommandEx(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+ 
+@@ -714,9 +741,7 @@ RetCode SetFramerate(EncHandle handle, Uint32 * pFramerate)
+ 	data = 1 << 3;
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_RC_FRAME_RATE, framerate);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			RC_CHANGE_PARAMETER);
+-
++	BitIssueCommandEx(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+ 
+@@ -735,9 +760,7 @@ RetCode SetIntraRefreshNum(EncHandle handle, Uint32 * pIntraRefreshNum)
+ 	data = 1 << 4;
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_INTRA_MB_NUM, intraRefreshNum);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			RC_CHANGE_PARAMETER);
+-
++	BitIssueCommandEx(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+ 
+@@ -759,9 +782,7 @@ RetCode SetSliceMode(EncHandle handle, EncSliceMode * pSliceMode)
+ 	data2 = 1 << 5;
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data2);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_SLICE_MODE, data);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			RC_CHANGE_PARAMETER);
+-
++	BitIssueCommandEx(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+ 
+@@ -780,9 +801,7 @@ RetCode SetHecMode(EncHandle handle, int mode)
+ 	data = 1 << 6;
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data);
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_HEC_MODE, HecMode);
+-	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode,
+-			RC_CHANGE_PARAMETER);
+-
++	BitIssueCommandEx(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+ 
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 8392884..55ffc1d 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -25,7 +25,10 @@
+ #include "vpu_io.h"
+ 
+ #define MAX_FW_BINARY_LEN		100 * 1024
+-#define MAX_NUM_INSTANCE		4
++#define MAX_NUM_INSTANCE		8
++
++#define BIT_WORK_SIZE			0x20000
++#define SIZE_CONTEXT_BUF		BIT_WORK_SIZE
+ 
+ #define SIZE_PIC_PARA_BASE_BUF          0x100
+ #define SIZE_MV_DATA                    0x20000
+@@ -90,6 +93,14 @@ enum {
+ 	REG_MUTEX = 1
+ };
+ 
++enum {
++	CTX_BIT_STREAM_PARAM = 0,
++	CTX_BIT_FRM_DIS_FLG,
++	CTX_BIT_WR_PTR,
++	CTX_BIT_RD_PTR,
++	CTX_BIT_FRAME_MEM_CTRL,
++	CTX_MAX_REGS
++};
+ typedef struct {
+ 	int useBitEnable;
+ 	int useIpEnable;
+@@ -125,8 +136,6 @@ typedef struct {
+ 	EncInitialInfo initialInfo;
+ 
+ 	PhysicalAddress streamRdPtr;
+-	PhysicalAddress streamRdPtrRegAddr;
+-	PhysicalAddress streamWrPtrRegAddr;
+ 	PhysicalAddress streamBufStartAddr;
+ 	PhysicalAddress streamBufEndAddr;
+ 	int streamBufSize;
+@@ -160,11 +169,8 @@ typedef struct {
+ 	DecInitialInfo initialInfo;
+ 
+ 	PhysicalAddress streamWrPtr;
+-	PhysicalAddress streamRdPtrRegAddr;
+-	PhysicalAddress streamWrPtrRegAddr;
+ 	PhysicalAddress streamBufStartAddr;
+ 	PhysicalAddress streamBufEndAddr;
+-	PhysicalAddress frameDisplayFlagRegAddr;
+ 	int streamBufSize;
+ 
+ 	FrameBuffer *frameBufPool;
+@@ -207,6 +213,8 @@ typedef struct CodecInst {
+ 	int instIndex;
+ 	int inUse;
+ 	int codecMode;
++	vpu_mem_desc contextBufMem; /* For context buffer */
++	unsigned long ctxRegs[CTX_MAX_REGS];
+ 	union {
+ 		EncInfo encInfo;
+ 		DecInfo decInfo;
+@@ -228,6 +236,7 @@ typedef struct {
+ } semaphore_t;
+ 
+ void BitIssueCommand(int instIdx, int cdcMode, int cmd);
++void BitIssueCommandEx(CodecInst *pCodecInst, int cmd);
+ 
+ RetCode LoadBitCodeTable(Uint16 * pBitCode, int *size);
+ RetCode DownloadBitCodeTable(unsigned long *virtCodeBuf, Uint16 *bit_code);
+@@ -244,7 +253,7 @@ void GetParaSet(EncHandle handle, int paraSetType, EncParamSet * para);
+ 
+ RetCode CheckDecInstanceValidity(DecHandle handle);
+ RetCode CheckDecOpenParam(DecOpenParam * pop);
+-int DecBitstreamBufEmpty(DecInfo * pDecInfo);
++int DecBitstreamBufEmpty(DecHandle handle);
+ void SetParaSet(DecHandle handle, int paraSetType, DecParamSet * para);
+ RetCode CopyBufferData(Uint8 *dst, Uint8 *src, int size);
+ 
+-- 
+1.8.0
+

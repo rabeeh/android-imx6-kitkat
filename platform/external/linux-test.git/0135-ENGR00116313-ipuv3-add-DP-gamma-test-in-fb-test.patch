@@ -1,0 +1,299 @@
+From 322835002e164aeb5f74373b75ea06a4b5435e43 Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Tue, 24 Nov 2009 18:50:11 +0800
+Subject: [PATCH 135/435] ENGR00116313 ipuv3: add DP gamma test in fb test
+
+Add DP gamma test in fb test which include the algorithm for gamma
+coefficient calculate.
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ test/mxc_fb_test/Makefile      |   1 +
+ test/mxc_fb_test/mxc_fb_test.c | 185 +++++++++++++++++++----------------------
+ 2 files changed, 85 insertions(+), 101 deletions(-)
+
+diff --git a/test/mxc_fb_test/Makefile b/test/mxc_fb_test/Makefile
+index 2be58e0..8b8cbc1 100644
+--- a/test/mxc_fb_test/Makefile
++++ b/test/mxc_fb_test/Makefile
+@@ -1,5 +1,6 @@
+ # list of platforms which did not want this test case
+ EXCLUDE_LIST:=
++CFLAGS += -lm
+ 
+ ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
+ OBJS = $(OBJDIR)/autorun-fb.sh $(OBJDIR)/mxc_tve_test.sh $(OBJDIR)/mxc_fb_test.out $(OBJDIR)/mxc_tvout_test.out $(OBJDIR)/mxc_fb_vsync_test.out \
+diff --git a/test/mxc_fb_test/mxc_fb_test.c b/test/mxc_fb_test/mxc_fb_test.c
+index d243ef3..afe335d 100644
+--- a/test/mxc_fb_test/mxc_fb_test.c
++++ b/test/mxc_fb_test/mxc_fb_test.c
+@@ -12,9 +12,9 @@
+  */
+ 
+ /*
+- * @file mxc_v4l2_overlay.c
++ * @file mxc_fb_test.c
+  *
+- * @brief Mxc Video For Linux 2 driver test application
++ * @brief Mxc framebuffer driver test application
+  *
+  */
+ 
+@@ -42,14 +42,6 @@ extern "C"{
+ 
+ #define TFAIL -1
+ #define TPASS 0
+-#ifdef CONFIG_SDC /* SDC */
+-#define MXCFB_SCREEN_WIDTH      240
+-#define MXCFB_SCREEN_HEIGHT     320
+-#endif
+-#ifdef CONFIG_ADC /* ADC */
+-#define MXCFB_SCREEN_WIDTH      176
+-#define MXCFB_SCREEN_HEIGHT     220
+-#endif
+ 
+ int fd_fb0 = 0;
+ int fd_fb1 = 0;
+@@ -57,80 +49,6 @@ unsigned short * fb0;
+ unsigned short * fb1;
+ int g_fb0_size;
+ int g_fb1_size;
+-int g_num_buffers;
+-
+-int g_in_width = 0;
+-int g_in_height = 0;
+-int g_display_width = 176;
+-int g_display_height = 144;
+-int g_rotate = 0;
+-int g_bmp_header = 0;
+-int g_loop_count = 1;
+-
+-#define MAX_BUFFER_NUM 5
+-
+-struct testbuffer
+-{
+-        unsigned char *start;
+-        size_t offset;
+-        unsigned int length;
+-};
+-
+-struct testbuffer buffers[5];
+-
+-#if 0
+-int process_cmdline(int argc, char **argv)
+-{
+-        int i;
+-
+-        for (i = 1; i < argc; i++) {
+-                if (strcmp(argv[i], "-iw") == 0) {
+-                        g_in_width = atoi(argv[++i]);
+-                }
+-                else if (strcmp(argv[i], "-ih") == 0) {
+-                        g_in_height = atoi(argv[++i]);
+-                }
+-                else if (strcmp(argv[i], "-ow") == 0) {
+-                        g_display_width = atoi(argv[++i]);
+-                }
+-                else if (strcmp(argv[i], "-oh") == 0) {
+-                        g_display_height = atoi(argv[++i]);
+-                }
+-                else if (strcmp(argv[i], "-r") == 0) {
+-                        g_rotate = atoi(argv[++i]);
+-                }
+-                else if (strcmp(argv[i], "-l") == 0) {
+-                        g_loop_count = atoi(argv[++i]);
+-                }
+-                else if (strcmp(argv[i], "-f") == 0) {
+-                        i++;
+-                        g_in_fmt = v4l2_fourcc(argv[i][0], argv[i][1],argv[i][2],argv[i][3]);
+-
+-                        if ( (g_in_fmt != V4L2_PIX_FMT_BGR24) &&
+-                             (g_in_fmt != V4L2_PIX_FMT_BGR32) &&
+-                             (g_in_fmt != V4L2_PIX_FMT_RGB565) &&
+-                             (g_in_fmt != 'PMBW') &&
+-                             (g_in_fmt != V4L2_PIX_FMT_YUV420) )
+-                        {
+-                                return -1;
+-                        }
+-                        if (g_in_fmt == 'PMBW') {
+-                                g_bmp_header = 1;
+-                                g_in_fmt = V4L2_PIX_FMT_BGR24;
+-                        }
+-                }
+-        }
+-
+-        printf("g_in_width = %d, g_in_height = %d\n", g_in_width, g_in_height);
+-        printf("g_display_width = %d, g_display_height = %d\n", g_display_width, g_display_height);
+-
+-        if ((g_in_width == 0) || (g_display_width == 0) || (g_in_height == 0) ||
+-            (g_display_height == 0)) {
+-                return -1;
+-        }
+-        return 0;
+-}
+-#endif
+ 
+ void fb_test_bpp(int fd, unsigned short * fb)
+ {
+@@ -194,7 +112,6 @@ void fb_test_bpp(int fd, unsigned short * fb)
+ 
+ }
+ 
+-
+ void fb_test_gbl_alpha(void)
+ {
+         int i;
+@@ -274,14 +191,14 @@ void fb_test_pan(int fd_fb, unsigned short * fb, struct fb_var_screeninfo * var)
+ 
+         printf("Pan test start.\n");
+ 
+-        for (y = 0; y < 320*2; y++) {
+-                for (x = 0; x < 240; x++) {
+-                        fb[(y*240) + x] = color;
++        for (y = 0; y < var->yres_virtual; y++) {
++                for (x = 0; x < var->xres; x++) {
++                        fb[(y*var->xres) + x] = color;
+                 }
+                 color+=4;
+         }
+ 
+-        for (y = 0; y <= 320; y++) {
++        for (y = 0; y <= var->yres; y++) {
+                 var->yoffset = y;
+                 retval = ioctl(fd_fb, FBIOPAN_DISPLAY, var);
+                 if (retval < 0)
+@@ -290,24 +207,77 @@ void fb_test_pan(int fd_fb, unsigned short * fb, struct fb_var_screeninfo * var)
+         printf("Pan test done.\n");
+ }
+ 
++void get_gamma_coeff(float gamma, int constk[], int slopek[])
++{
++	unsigned int tk[17] = {0, 2, 4, 8, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 383};
++        unsigned int k;
++        unsigned int rk[16], yk[17];
++        float center, width, start, height, t, scurve[17], gammacurve[17];
++
++        center = 32; /* nominal 32 - must be in {1,380} where is s-curve centered*/
++        width = 32; /* nominal 32 - must be in {1,380} how narrow is s-curve */
++        for(k=0;k<17;k++) {
++                t = (float)tk[k];
++                scurve[k] = (256.F/3.14159F)*((float) atan((t-center)/width));
++                gammacurve[k] = 255.F* ((float) pow(t/384.F,1.0/gamma));
++        }
++
++        start = scurve[0];
++        height = scurve[16] - start;
++        for(k=0;k<17;k++) {
++                scurve[k] = (256.F/height)*(scurve[k]-start);
++                yk[k] = (int)(scurve[k] * gammacurve[k]/256.F + 0.5) << 1;
++        }
++
++        for(k=0;k<16;k++)
++                rk[k] = yk[k+1] - yk[k];
++
++        for(k=0;k<5;k++) {
++                constk[k] = yk[k] - rk[k];
++                slopek[k] = rk[k] << (4-k);
++        }
++        for(k=5;k<16;k++) {
++                constk[k] = yk[k];
++                slopek[k] = rk[k] >> 1;
++        }
++
++	for(k=0;k<16;k++) {
++		constk[k] /= 2;
++		constk[k] &= 0x1ff;
++	}
++}
++
++void fb_test_gamma(int fd_fb)
++{
++	struct mxcfb_gamma gamma;
++	float gamma_tc[5] = {0.8, 1.0, 1.5, 2.2, 2.4};
++	int i, retval;
++
++        printf("Gamma test start.\n");
++	for (i=0;i<5;i++) {
++		printf("Gamma %f\n", gamma_tc[i]);
++		get_gamma_coeff(gamma_tc[i], gamma.constk, gamma.slopek);
++		gamma.enable = 1;
++		retval = ioctl(fd_fb, MXCFB_SET_GAMMA, &gamma);
++		if (retval < 0) {
++			printf("Ioctl MXCFB_SET_GAMMA fail!\n");
++			break;
++		}
++		sleep(3);
++	}
++
++        printf("Gamma test end.\n");
++}
++
+ int
+ main(int argc, char **argv)
+ {
+         int retval = TPASS;
+         struct mxcfb_gbl_alpha gbl_alpha;
+         struct fb_var_screeninfo screen_info;
++        struct fb_fix_screeninfo fb_fix;
+         u_int32_t screensize = 0;
+ 
+-/*
+-        if (process_cmdline(argc, argv) < 0) {
+-                printf("MXC Video4Linux Output Device Test\n\n" \
+-                       "Syntax: mxc_v4l2_output.out -iw <input width> -ih <input height>\n" \
+-                       "-ow <display width>\n -oh <display height> -r <rotate mode>\n" \
+-                       "<input YUV file>\n\n");
+-                retval = TFAIL;
+-                goto err0;
+-        }
+-*/
+         if ((fd_fb0 = open("/dev/fb0", O_RDWR, 0)) < 0)
+         {
+                 printf("Unable to open /dev/fb0\n");
+@@ -321,13 +291,26 @@ main(int argc, char **argv)
+                 retval = TFAIL;
+                 goto err0;
+         }
++	retval = ioctl(fd_fb1, FBIOGET_FSCREENINFO, &fb_fix);
++        if (retval < 0)
++        {
++                goto err1;
++        }
++	if (strcmp(fb_fix.id, "DISP3 FG") != 0) {
++		close(fd_fb1);
++		if ((fd_fb1 = open("/dev/fb2", O_RDWR, 0)) < 0)
++		{
++			printf("Unable to open /dev/fb2\n");
++			retval = TFAIL;
++			goto err0;
++		}
++	}
+         retval = ioctl(fd_fb1, FBIOBLANK, FB_BLANK_UNBLANK);
+         if (retval < 0)
+         {
+                 goto err1;
+         }
+ 
+-
+         printf("Opened fb0 and fb1\n");
+ 
+         retval = ioctl(fd_fb0, FBIOGET_VSCREENINFO, &screen_info);
+@@ -392,7 +375,6 @@ main(int argc, char **argv)
+         }
+         fb_test_pan(fd_fb1, fb1, &screen_info);
+ 
+-
+         // Set BG to visable
+         gbl_alpha.alpha = 0xFF;
+         retval = ioctl(fd_fb0, MXCFB_SET_GBL_ALPHA, &gbl_alpha);
+@@ -409,6 +391,7 @@ main(int argc, char **argv)
+         }
+         fb_test_pan(fd_fb0, fb0, &screen_info);
+ 
++        fb_test_gamma(fd_fb0);
+ err4:
+         munmap(fb1, g_fb1_size);
+ err3:
+-- 
+1.8.0
+

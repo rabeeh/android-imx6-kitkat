@@ -1,0 +1,189 @@
+From 7e5028d5545ca2e51b3215302c01f4698e8af43d Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 15 Dec 2011 00:02:37 +0800
+Subject: [PATCH 253/435] ENGR00163375 vpu: Add MVC encoder test for mx6q
+ platform
+
+Add MVC encoder from file in vpu unit test for mx6q platform.
+"-l 1" in command will enable MVC encoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/enc.c      | 56 ++++++++++++++++++++++++++++++++++++--------
+ test/mxc_vpu_test/loopback.c |  4 ++--
+ test/mxc_vpu_test/main.c     |  1 +
+ test/mxc_vpu_test/vpu_test.h |  2 ++
+ 4 files changed, 51 insertions(+), 12 deletions(-)
+
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 817684a..ab21d9c 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -168,7 +168,7 @@ enc_readbs_ring_buffer(EncHandle handle, struct cmd_line *cmd,
+ 	u32 target_addr, size;
+ 
+ 	ret = vpu_EncGetBitstreamBuffer(handle, &pa_read_ptr, &pa_write_ptr,
+-					&size);
++					(Uint32 *)&size);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("EncGetBitstreamBuffer failed\n");
+ 		return -1;
+@@ -272,12 +272,24 @@ put_mp4header:
+ 				return -1;
+ 		}
+ 	} else if (enc->cmdl->format == STD_AVC) {
+-		enchdr_param.headerType = SPS_RBSP;
+-		vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
+-		if (enc->ringBufferEnable == 0 ) {
+-			ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
+-			if (ret < 0)
+-				return -1;
++		if (!enc->mvc_extension || !enc->mvc_paraset_refresh_en) {
++			enchdr_param.headerType = SPS_RBSP;
++			vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
++			if (enc->ringBufferEnable == 0 ) {
++				ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++				if (ret < 0)
++					return -1;
++			}
++		}
++
++		if (enc->mvc_extension) {
++			enchdr_param.headerType = SPS_RBSP_MVC;
++			vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
++			if (enc->ringBufferEnable == 0 ) {
++				ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++				if (ret < 0)
++					return -1;
++			}
+ 		}
+ 
+ 		enchdr_param.headerType = PPS_RBSP;
+@@ -287,6 +299,16 @@ put_mp4header:
+ 			if (ret < 0)
+ 				return -1;
+ 		}
++
++		if (enc->mvc_extension) { /* MVC */
++			enchdr_param.headerType = PPS_RBSP_MVC;
++			vpu_EncGiveCommand(handle, ENC_PUT_AVC_HEADER, &enchdr_param);
++			if (enc->ringBufferEnable == 0 ) {
++				ret = enc_readbs_reset_buffer(enc, enchdr_param.buf, enchdr_param.size);
++				if (ret < 0)
++					return -1;
++			}
++		}
+ 	} else if (enc->cmdl->format == STD_MJPG) {
+ 		if (enc->huffTable)
+ 			free(enc->huffTable);
+@@ -300,8 +322,6 @@ put_mp4header:
+ 				vpu_EncGiveCommand(handle,ENC_GET_JPEG_HEADER, &enchdr_param);
+ 				vpu_write(enc->cmdl, (void *)enchdr_param.pParaSet, enchdr_param.size);
+ 				free(enchdr_param.pParaSet);
+-				if (ret < 0)
+-					return -1;
+ 			} else {
+ 				err_msg("memory allocate failure\n");
+ 				return -1;
+@@ -334,11 +354,15 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	RetCode ret;
+ 	FrameBuffer *fb;
+ 	PhysicalAddress subSampBaseA = 0, subSampBaseB = 0;
++	PhysicalAddress	subSampBaseAMvc = 0, subSampBaseBMvc = 0;
+ 	struct frame_buf **pfbpool;
++	EncExtBufInfo extbufinfo = {0};
+ 
+ 	if (cpu_is_mx6q())
+ 		if (enc->cmdl->format == STD_MJPG)
+ 			needFrameBufCount = fbcount + 1;
++		else if (enc->cmdl->format == STD_AVC && enc->mvc_extension) /* MVC */
++			 needFrameBufCount = fbcount + 3 + 2;
+ 		else
+ 			needFrameBufCount = fbcount + 3; /* minFrameBufferCount + Subsamp buffer [2] + Src frame */
+ 	else
+@@ -395,6 +419,12 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		subSampBaseA = fb[fbcount].bufY;
+ 		subSampBaseB = fb[fbcount + 1].bufY;
+ 		enc->fbcount += 2;
++
++		if (enc->cmdl->format == STD_AVC && enc->mvc_extension) { /* MVC */
++			extbufinfo.subSampBaseAMvc = fb[fbcount].bufY;
++			extbufinfo.subSampBaseBMvc = fb[fbcount + 1].bufY;
++			enc->fbcount += 2;
++		}
+ 	}
+ 
+ 	/* Must be a multiple of 16 */
+@@ -404,8 +434,9 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		enc_stride = (enc->enc_picwidth + 15) & ~15;
+ 	src_stride = (enc->src_picwidth + 15 ) & ~15;
+ 
++	extbufinfo.scratchBuf = enc->scratchBuf;
+ 	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, enc_stride, src_stride,
+-					    subSampBaseA, subSampBaseB, &enc->scratchBuf);
++					    subSampBaseA, subSampBaseB, &extbufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+ 		goto err1;
+@@ -990,6 +1021,11 @@ encoder_open(struct encode *enc)
+ 		encop.EncStdParam.avcParam.avc_chromaQpOffset = 10;
+ 		encop.EncStdParam.avcParam.avc_audEnable = 0;
+ 		if (cpu_is_mx6q()) {
++			encop.EncStdParam.avcParam.interview_en = 0;
++			encop.EncStdParam.avcParam.paraset_refresh_en = enc->mvc_paraset_refresh_en = 0;
++			encop.EncStdParam.avcParam.prefix_nal_en = 0;
++			encop.EncStdParam.avcParam.mvc_extension = enc->cmdl->mp4_h264Class;
++			enc->mvc_extension = enc->cmdl->mp4_h264Class;
+ 			encop.EncStdParam.avcParam.avc_frameCroppingFlag = 0;
+ 			encop.EncStdParam.avcParam.avc_frameCropLeft = 0;
+ 			encop.EncStdParam.avcParam.avc_frameCropRight = 0;
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index b19d43d..1d40f32 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -154,7 +154,7 @@ dec_fill_bsbuffer(char *buf, int size)
+ 	int room;
+ 
+ 	ret = vpu_DecGetBitstreamBuffer(handle, &pa_read_ptr, &pa_write_ptr,
+-					&space);
++					(Uint32 *)&space);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("vpu_DecGetBitstreamBuffer failed\n");
+ 		return -1;
+@@ -340,7 +340,7 @@ encode(void)
+ 	}
+ 
+ 	if (ret != outinfo.bitstreamSize) {
+-		err_msg("Oops..., ret=%d, bsSize=%d\n", ret, outinfo.bitstreamSize);
++		err_msg("Oops..., ret=%d, bsSize=%d\n", (int)ret, (int)outinfo.bitstreamSize);
+ 	}
+ 
+ 	return 0;
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 32daa8e..5ede71a 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -91,6 +91,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	If no port number is secified, 5555 is used \n "\
+ 	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, 7 - MJPG \n "\
+ 	       "	If no format specified, default is 0 (MPEG4) \n "\
++	       "  -l <h264 type> 0 - normal H.264(AVC), 1 - MVC\n "\
+ 	       "  -c <count> Number of frames to encode \n "\
+ 	       "  -r <rotation angle> 0, 90, 180, 270 \n "\
+ 	       "	default rotation is disabled (0) \n "\
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 0980dfd..ddd8769 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -238,6 +238,8 @@ struct encode {
+ 	int mp4_dataPartitionEnable;
+ 	int ringBufferEnable;
+ 	int mjpg_fmt;
++	int mvc_paraset_refresh_en;
++	int mvc_extension;
+ 
+         EncReportInfo mbInfo;
+         EncReportInfo mvInfo;
+-- 
+1.8.0
+

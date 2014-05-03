@@ -1,0 +1,174 @@
+From 86e1802838065a966caac207a44e1db79bdfda55 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Mon, 7 Nov 2011 23:38:53 +0800
+Subject: [PATCH 240/435] ENGR00161521 vpu: Update display part due to V4L
+ update on i.MX6q
+
+V4L will use different video node for background or forground device
+on 2.6.38 kernel, and some ioctl usage is updated. So change the
+interface in unit test for i.mx6q.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/display.c | 78 +++++++++++++++++++++++++++++++++++----------
+ test/mxc_vpu_test/enc.c     |  4 +--
+ 2 files changed, 64 insertions(+), 18 deletions(-)
+
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 14c9e49..6821aeb 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -498,13 +498,14 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	int disp_left =  dec->cmdl->loff;
+ 	int disp_top =  dec->cmdl->toff;
+ 	int fd = -1, err = 0, out = 0, i = 0;
+-	char v4l_device[32] = "/dev/video16";
++	char v4l_device[80];
+ 	struct v4l2_cropcap cropcap = {0};
+ 	struct v4l2_crop crop = {0};
+ 	struct v4l2_framebuffer fb = {0};
+ 	struct v4l2_format fmt = {0};
+ 	struct v4l2_requestbuffers reqbuf = {0};
+ 	struct v4l2_mxc_offset off = {0};
++	struct v4l2_rect icrop = {0};
+ 	struct vpu_display *disp;
+ 	int fd_fb;
+ 	char *tv_mode, *test_mode;
+@@ -579,16 +580,23 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		return NULL;
+ 	}
+ 
++	if (cpu_is_mx6q())
++		strcpy(v4l_device, "/dev/video17");   /* fg for mx6q */
++	else
++		strcpy(v4l_device, "/dev/video16");
++
+ 	fd = open(v4l_device, O_RDWR, 0);
+ 	if (fd < 0) {
+ 		err_msg("unable to open %s\n", v4l_device);
+ 		goto err;
+ 	}
+ 
+-	err = ioctl(fd, VIDIOC_S_OUTPUT, &out);
+-	if (err < 0) {
+-		err_msg("VIDIOC_S_OUTPUT failed\n");
+-		goto err;
++	if (!cpu_is_mx6q()) {
++		err = ioctl(fd, VIDIOC_S_OUTPUT, &out);
++		if (err < 0) {
++			err_msg("VIDIOC_S_OUTPUT failed\n");
++			goto err;
++		}
+ 	}
+ 
+ 	cropcap.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+@@ -654,7 +662,21 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		}
+ 	}
+ 
+-	if (rotation.ipu_rot_en && (rotation.rot_angle != 0)) {
++	if (cpu_is_mx6q()) {
++		/* Set rotation via new V4L2 interface on 2.6.38 kernel */
++		struct v4l2_control ctrl;
++
++		ctrl.id = V4L2_CID_ROTATE;
++		if (rotation.ipu_rot_en)
++			ctrl.value = rotation.rot_angle;
++		else
++			ctrl.value = 0;
++		err = ioctl(fd, VIDIOC_S_CTRL, &ctrl);
++		if (err < 0) {
++			err_msg("VIDIOC_S_CTRL failed\n");
++			goto err;
++		}
++	} else if (rotation.ipu_rot_en && (rotation.rot_angle != 0)) {
+ 		/* Set rotation via V4L2 i/f */
+ 		struct v4l2_control ctrl;
+ 		ctrl.id = V4L2_CID_PRIVATE_BASE;
+@@ -703,13 +725,24 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 			"top/left = %d/%d\n", top, left);
+ 		goto err;
+ 	} else if (right || bottom) {
+-		fmt.fmt.pix.width = right - left;
+-		fmt.fmt.pix.height = bottom - top;
+-		fmt.fmt.pix.bytesperline = width;
+-		off.u_offset = width * height;
+-		off.v_offset = off.u_offset + width * height / 4;
+-		fmt.fmt.pix.priv = (unsigned long) &off;
+-		fmt.fmt.pix.sizeimage = width * height * 3 / 2;
++		if (cpu_is_mx6q()) {
++			/* This is aligned with new V4L interface on 2.6.38 kernel */
++			fmt.fmt.pix.width = width;
++			fmt.fmt.pix.height = height;
++			icrop.left = left;
++			icrop.top = top;
++			icrop.width = right - left;
++			icrop.height = bottom - top;
++			fmt.fmt.pix.priv =  (unsigned long)&icrop;
++		} else {
++			fmt.fmt.pix.width = right - left;
++			fmt.fmt.pix.height = bottom - top;
++			fmt.fmt.pix.bytesperline = width;
++			off.u_offset = width * height;
++			off.v_offset = off.u_offset + width * height / 4;
++			fmt.fmt.pix.priv = (unsigned long) &off;
++			fmt.fmt.pix.sizeimage = width * height * 3 / 2;
++		}
+ 	} else {
+ 		fmt.fmt.pix.width = width;
+ 		fmt.fmt.pix.height = height;
+@@ -781,13 +814,26 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 			v4l_free_bufs(i, disp);
+ 			goto err;
+ 		}
++		buf->start = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE,
++				MAP_SHARED, fd, buffer.m.offset);
+ 
++		if (cpu_is_mx6q()) {
++			/*
++			 * Workaround for new V4L interface change, this change
++			 * will be removed after V4L driver is updated for this.
++			 * Need to call QUERYBUF ioctl again after mmap.
++			 */
++			err = ioctl(fd, VIDIOC_QUERYBUF, &buffer);
++			if (err < 0) {
++				err_msg("VIDIOC_QUERYBUF: not enough buffers\n");
++				v4l_free_bufs(i, disp);
++				goto err;
++			}
++		}
+ 		buf->offset = buffer.m.offset;
+ 		buf->length = buffer.length;
+ 		dprintf(3, "V4L2buf phy addr: %08x, size = %d\n",
+-					(unsigned int)buf->offset, buf->length);
+-		buf->start = mmap(NULL, buffer.length, PROT_READ | PROT_WRITE,
+-				MAP_SHARED, fd, buffer.m.offset);
++				    (unsigned int)buf->offset, buf->length);
+ 
+ 		if (buf->start == MAP_FAILED) {
+ 			err_msg("mmap failed\n");
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 9b1d6e1..85af3ba 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -329,7 +329,7 @@ int
+ encoder_allocate_framebuffer(struct encode *enc)
+ {
+ 	EncHandle handle = enc->handle;
+-	int i, enc_stride, src_stride, src_fbid = enc->src_fbid;
++	int i, enc_stride, src_stride, src_fbid;
+ 	int needFrameBufCount, fbcount = enc->fbcount;
+ 	RetCode ret;
+ 	FrameBuffer *fb;
+@@ -345,7 +345,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		needFrameBufCount = fbcount + 1;
+ 
+ 	/* last framebuffer is used as src frame in the test */
+-	enc->src_fbid = needFrameBufCount - 1;
++	enc->src_fbid = src_fbid = needFrameBufCount - 1;
+ 
+ 	fb = enc->fb = calloc(needFrameBufCount, sizeof(FrameBuffer));
+ 	if (fb == NULL) {
+-- 
+1.8.0
+

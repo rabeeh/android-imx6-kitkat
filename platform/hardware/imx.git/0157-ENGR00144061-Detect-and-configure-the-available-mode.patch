@@ -1,0 +1,299 @@
+From 6185ba791d0c59234b214885347c18521ec70b00 Mon Sep 17 00:00:00 2001
+From: b07117 <b07117@freescale.com>
+Date: Thu, 26 May 2011 21:40:39 +0800
+Subject: [PATCH 157/486] ENGR00144061, Detect and configure the available
+ mode for HDMI display
+
+Add this feature to avoid system freeze in 1080P TV
+
+Signed-off-by: xianzhong <b07117@freescale.com>
+---
+ libgralloc/framebuffer.cpp | 212 ++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 198 insertions(+), 14 deletions(-)
+
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index e85b848..640a65d 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -532,20 +532,188 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev)
+ }
+ 
+ /*****************************************************************************/
+-static int set_graphics_fb_mode(int fb)
++#define SINGLE_DISPLAY_CAPABILITY  (1920 * 1080 * 60)
++#define DUAL_DISPLAY_CAPABILITY    (1920 * 1080 * 30)
++
++typedef struct
++{
++	char* start;
++	char* end;
++	int width;
++	int height;
++	int freq;
++}
++disp_mode;
++
++static int str2int(char *p)
++{
++	int val = 0;
++	if(!p) return -1;
++
++	while(p[0] >= '0' && p[0] <= '9')
++	{
++		val = val * 10 + p[0] - '0';
++		p++;
++	}
++
++	return val;
++}
++
++typedef enum {
++    CHECK_NEXT_STATE,
++    FIND_WIDTH_STATE,
++    FIND_JOINT_STATE,
++    FIND_HEIGHT_STATE,
++    PREFIX_FREQ_STATE,
++    FREQUENCY_STATE,
++    FIND_NEWLINE_STATE
++}
++read_state;
++
++static disp_mode disp_mode_list[128];
++static int disp_mode_compare( const void *arg1, const void *arg2)
++{
++	disp_mode *dm1 = (disp_mode *)arg1;
++	disp_mode *dm2 = (disp_mode *)arg2;
++
++	if(dm1->width * dm1->height > dm2->width * dm2->height) return -1;
++	if(dm1->width * dm1->height == dm2->width * dm2->height)
++	{
++		return dm1->freq > dm2->freq ? -1 : 1;
++	}
++
++	return 1;
++}
++static char* find_available_mode(const char *mode_list, int dual_disp)
++{
++	int disp_threshold = 0;
++	int i,disp_mode_count = 0;
++	read_state state = CHECK_NEXT_STATE;
++	char *p = (char *)mode_list;
++
++    if(!p) return NULL;
++
++	while(p[0])
++	{
++		switch(state)
++		{
++		case CHECK_NEXT_STATE:
++			if(!strncmp(p, "D:", 2)
++				|| !strncmp(p, "S:", 2)
++				|| !strncmp(p, "U:", 2)
++				|| !strncmp(p, "V:", 2))
++			{
++				disp_mode_list[disp_mode_count].start = p;
++				state = FIND_WIDTH_STATE;
++				p+=2;
++			}
++			else p++;
++			break;
++		case FIND_WIDTH_STATE:
++			if(p[0]>='0' && p[0]<='9')
++			{
++				disp_mode_list[disp_mode_count].width = str2int(p);
++				state = FIND_JOINT_STATE;
++			}
++			p++;
++			break;
++		case FIND_JOINT_STATE:
++			if(p[0] == 'x' || p[0] == 'X')
++			{
++				state = FIND_HEIGHT_STATE;
++			}
++			p++;
++			break;
++		case FIND_HEIGHT_STATE:
++			if(p[0]>='0' && p[0]<='9')
++			{
++				disp_mode_list[disp_mode_count].height = str2int(p);
++				state = PREFIX_FREQ_STATE;
++			}
++			p++;
++			break;
++		case PREFIX_FREQ_STATE:
++			if(!strncmp(p, "p-", 2) || !strncmp(p, "i-", 2))
++			{
++				state = FREQUENCY_STATE;
++				p+=2;
++			}
++			else p++;
++			break;
++		case  FREQUENCY_STATE:
++			if(p[0]>='0' && p[0]<='9')
++			{
++				disp_mode_list[disp_mode_count].freq = str2int(p);
++				state = FIND_NEWLINE_STATE;
++			}
++			p++;
++			break;
++		case FIND_NEWLINE_STATE:
++			if(p[0] == '\n')
++			{
++				disp_mode_list[disp_mode_count++].end = p+1;
++				state = CHECK_NEXT_STATE;
++                if(disp_mode_count >= sizeof(disp_mode_list)/sizeof(disp_mode_list[0])) goto check_mode_end;
++			}
++			p++;
++			break;
++		default:
++			p++;
++			break;
++		}
++	}
++
++check_mode_end:
++
++	qsort(&disp_mode_list[0], disp_mode_count, sizeof(disp_mode), disp_mode_compare);
++
++	disp_threshold = dual_disp ? DUAL_DISPLAY_CAPABILITY : SINGLE_DISPLAY_CAPABILITY;
++
++	for(i=0; i<disp_mode_count; i++)
++	{
++		if(disp_mode_list[i].width * disp_mode_list[i].height * disp_mode_list[i].freq <= disp_threshold)
++			break;
++	}
++
++	if(disp_mode_list[i].end) disp_mode_list[i].end[0] = 0;
++
++    return disp_mode_list[i].start;
++}
++
++static int set_graphics_fb_mode(int fb, int dual_disp)
+ {
+-    int i=0;
+     int size=0;
++    int fp_cmd=0;
+     int fp_mode=0;
+     int fp_modes=0;
+     char fb_mode[256];
+-    char fb_modes[256];
++    char fb_modes[1024];
++    char cmd_line[1024];
+     char temp_name[256];
++    char *disp_mode=NULL;
+ 
+     char value[PROPERTY_VALUE_MAX];
+     property_get("ro.AUTO_CONFIG_DISPLAY", value, "0");
+     if (strcmp(value, "1") != 0)  return 0;
+ 
++    fp_cmd = open("/proc/cmdline",O_RDONLY, 0);
++    if(fp_cmd < 0) {
++        LOGI("Error! Cannot open /proc/cmdline");
++        goto set_graphics_fb_mode_error;
++    }
++
++    memset(cmd_line, 0, sizeof(cmd_line));
++    size = read(fp_cmd, cmd_line, sizeof(cmd_line));
++    if(size <= 0)
++    {
++        LOGI("Error! Cannot read /proc/cmdline");
++        goto set_graphics_fb_mode_error;
++    }
++
++    close(fp_cmd); fp_cmd = 0;
++
++    if(fb==0 && strstr(cmd_line, "di1_primary")) return 0;//XGA detected
++
+     sprintf(temp_name, "/sys/class/graphics/fb%d/modes", fb);
+     fp_modes = open(temp_name,O_RDONLY, 0);
+     if(fp_modes < 0) {
+@@ -555,13 +723,24 @@ static int set_graphics_fb_mode(int fb)
+ 
+     memset(fb_modes, 0, sizeof(fb_modes));
+     size = read(fp_modes, fb_modes, sizeof(fb_modes));
+-    while(i < size && fb_modes[i] != '\n' && fb_modes[i] != ' ')i++;
++    if(size <= 0)
++    {
++        LOGI("Error! Cannot read %s", temp_name);
++        goto set_graphics_fb_mode_error;
++    }
+ 
+-    fb_modes[i+1] = 0;
++    close(fp_modes); fp_modes = 0;
+ 
+-    LOGI("read fb%d first modes %s", fb,fb_modes);
++    if(size == sizeof(fb_modes)) fb_modes[size -1] = 0;
+ 
+-    close(fp_modes);
++    disp_mode = find_available_mode(fb_modes, dual_disp);
++    if(!disp_mode)
++    {
++        LOGI("Error! Cannot find available mode for fb%d", fb);
++        goto set_graphics_fb_mode_error;
++    }
++
++    LOGI("find fb%d available mode %s", fb,disp_mode);
+ 
+     sprintf(temp_name, "/sys/class/graphics/fb%d/mode", fb);
+     fp_mode = open(temp_name,O_RDWR, 0);
+@@ -572,14 +751,18 @@ static int set_graphics_fb_mode(int fb)
+ 
+     memset(fb_mode, 0, sizeof(fb_mode));
+     size = read(fp_mode, fb_mode, sizeof(fb_mode));
++    if(size <= 0)
++    {
++        LOGI("Error! Cannot read %s", temp_name);
++        goto set_graphics_fb_mode_error;
++    }
+ 
+-    if(strcmp(fb_mode, fb_modes))
++    if(strncmp(fb_mode, disp_mode, strlen(fb_mode)))
+     {
+-        i = write(fp_mode, fb_modes, strlen(fb_modes)+1);
+-        LOGI("write %s return %d", fb_modes, i);
++        write(fp_mode, disp_mode, strlen(disp_mode)+1);
+     }
+ 
+-    close(fp_mode);
++    close(fp_mode); fp_mode = 0;
+ 
+     return 0;
+ 
+@@ -587,6 +770,7 @@ set_graphics_fb_mode_error:
+ 
+     if(fp_modes > 0) close(fp_modes);
+     if(fp_mode > 0) close(fp_mode);
++    if(fp_cmd > 0) close(fp_cmd);
+ 
+     return -1;
+ 
+@@ -611,7 +795,7 @@ int mapFrameBufferLocked(struct private_module_t* module)
+     char value[PROPERTY_VALUE_MAX];
+     property_get("ro.UI_TVOUT_DISPLAY", value, "");
+     if (strcmp(value, "1") != 0) {
+-        set_graphics_fb_mode(0);
++        set_graphics_fb_mode(0, 0);
+         while ((fd==-1) && device_template[i]) {
+             snprintf(name, 64, device_template[i], 0);
+             fd = open(name, O_RDWR, 0);
+@@ -619,7 +803,7 @@ int mapFrameBufferLocked(struct private_module_t* module)
+         }
+     }
+     else{
+-        set_graphics_fb_mode(1);
++        set_graphics_fb_mode(1, 0);
+         while ((fd==-1) && device_template[i]) {
+             snprintf(name, 64, device_template[i], 1);
+             fd = open(name, O_RDWR, 0);
+@@ -873,7 +1057,7 @@ static int mapSecFrameBuffer(fb_context_t* ctx)
+     private_module_t* m = reinterpret_cast<private_module_t*>(
+             ctx->device.common.module);
+ 
+-    set_graphics_fb_mode(1);
++    set_graphics_fb_mode(1,1);
+ 
+     sec_fp = open("/dev/graphics/fb1",O_RDWR, 0);
+     if (sec_fp < 0){
+-- 
+1.8.0
+

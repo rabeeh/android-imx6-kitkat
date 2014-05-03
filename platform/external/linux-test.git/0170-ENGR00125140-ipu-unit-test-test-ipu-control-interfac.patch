@@ -1,0 +1,155 @@
+From 3886c935baa594e8f5a7138fd6ce87cc4959ad70 Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Thu, 15 Jul 2010 16:02:55 +0800
+Subject: [PATCH 170/435] ENGR00125140 ipu unit test: test ipu control
+ interface
+
+Test ipu lib control interface:
+
+IPU_CTL_TASK_QUERY,
+IPU_CTL_TASK_KILL,
+
+User can use ./mxc_ipudev_test.out -Q to query ipu task run by ipu lib.
+And use ./mxc_ipudev_test.out -K index to kill ipu task.
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ test/mxc_ipudev_test/mxc_ipudev_test.c | 67 ++++++++++++++++++++++++++++++++--
+ test/mxc_ipudev_test/mxc_ipudev_test.h |  3 ++
+ test/mxc_vpu_test/Makefile             |  2 +-
+ 3 files changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/test/mxc_ipudev_test/mxc_ipudev_test.c b/test/mxc_ipudev_test/mxc_ipudev_test.c
+index 8e11eed..432e540 100644
+--- a/test/mxc_ipudev_test/mxc_ipudev_test.c
++++ b/test/mxc_ipudev_test/mxc_ipudev_test.c
+@@ -65,11 +65,18 @@ int process_cmdline(int argc, char **argv, ipu_test_handle_t * test_handle)
+ 			test_handle->block_width = atoi(argv[++i]);
+ 			if (test_handle->block_width < 16)
+ 				test_handle->block_width = 16;
++		} else if (strcmp(argv[i], "-Q") == 0)
++			test_handle->query_task = 1;
++		else if (strcmp(argv[i], "-K") == 0) {
++			test_handle->kill_task = 1;
++			test_handle->kill_task_idx = atoi(argv[++i]);
+ 		}
+ 	}
+ 
+ 	if (test_handle->test_pattern)
+ 		return 0;
++	if (test_handle->query_task || test_handle->kill_task)
++		return 0;
+ 
+ 	if ((test_handle->input.width == 0) || (test_handle->input.height == 0) ||
+ 			(test_handle->output.width == 0) ||
+@@ -80,6 +87,48 @@ int process_cmdline(int argc, char **argv, ipu_test_handle_t * test_handle)
+ 	return 0;
+ }
+ 
++int query_ipu_task(void)
++{
++	int i;
++	ipu_lib_ctl_task_t task;
++
++	for (i = 0; i< MAX_TASK_NUM; i++) {
++		task.index = i;
++		mxc_ipu_lib_task_control(IPU_CTL_TASK_QUERY, (void *)(&task), NULL);
++		if (task.task_pid) {
++			printf("\ntask %d:\n", i);
++			printf("\tpid: %d\n", task.task_pid);
++			printf("\tmode:\n");
++			if (task.task_mode & IC_ENC)
++				printf("\t\tIC_ENC\n");
++			if (task.task_mode & IC_VF)
++				printf("\t\tIC_VF\n");
++			if (task.task_mode & IC_PP)
++				printf("\t\tIC_PP\n");
++			if (task.task_mode & ROT_ENC)
++				printf("\t\tROT_ENC\n");
++			if (task.task_mode & ROT_VF)
++				printf("\t\tROT_VF\n");
++			if (task.task_mode & ROT_PP)
++				printf("\t\tROT_PP\n");
++			if (task.task_mode & VDI_IC_VF)
++				printf("\t\tVDI_IC_VF\n");
++		}
++	}
++
++	return 0;
++}
++
++int kill_ipu_task(int index)
++{
++	ipu_lib_ctl_task_t task;
++
++	task.index = index;
++	mxc_ipu_lib_task_control(IPU_CTL_TASK_KILL, (void *)(&task), NULL);
++
++	return 0;
++}
++
+ int main(int argc, char *argv[])
+ {
+ 	int ret = 0, next_update_idx = 0, done_cnt = 0, first_time = 1;
+@@ -113,8 +162,12 @@ int main(int argc, char *argv[])
+ 				"-C <config file>\n" \
+ 				"-P <test pattern>\n" \
+ 				"[-bw <block width for pattern 3>]\n" \
+-				"<input raw file>\n\n", argv[0]);
+-		printf("test pattern:\n" \
++				"<input raw file>\n\n" \
++				"Query ipu task runing:\n" \
++				"-Q\n\n" \
++				"Kill ipu task:\n" \
++				"-K <task_index>\n", argv[0]);
++		printf("\ntest pattern:\n" \
+ 			"1: video pattern with user define dma buffer queue, one full-screen output\n" \
+ 			"2: hopping block screen save\n" \
+ 			"3: color bar + hopping block\n" \
+@@ -144,8 +197,14 @@ int main(int argc, char *argv[])
+ 		system("echo 0,0 > /sys/class/graphics/fb0/pan");
+ 		return ret;
+ 	} else if (argc < 4) {
+-		printf("Pls set input file\n");
+-		return -1;
++		if (test_handle.query_task)
++			return query_ipu_task();
++		else if (test_handle.kill_task)
++			return kill_ipu_task(test_handle.kill_task_idx);
++		else {
++			printf("Pls set input file\n");
++			return -1;
++		}
+ 	}
+ 
+ 	if (test_handle.mode & OP_STREAM_MODE) {
+diff --git a/test/mxc_ipudev_test/mxc_ipudev_test.h b/test/mxc_ipudev_test/mxc_ipudev_test.h
+index 7fe036b..882d185 100644
+--- a/test/mxc_ipudev_test/mxc_ipudev_test.h
++++ b/test/mxc_ipudev_test/mxc_ipudev_test.h
+@@ -33,6 +33,9 @@ typedef struct {
+ 	int mode;
+ 	int test_pattern;
+ 	int block_width;
++	int query_task;
++	int kill_task;
++	int kill_task_idx;
+ 	char outfile[128];
+ 	FILE * file_out;
+ 	ipu_lib_input_param_t input;
+diff --git a/test/mxc_vpu_test/Makefile b/test/mxc_vpu_test/Makefile
+index 8363683..44100b2 100644
+--- a/test/mxc_vpu_test/Makefile
++++ b/test/mxc_vpu_test/Makefile
+@@ -22,7 +22,7 @@ endif
+ all: $(TARGET)
+ 
+ $(TARGET): $(OBJ)
+-	$(LINK) -lpthread -o $(TARGET) $(OBJ) ${LIBS} -lvpu -lipu
++	$(LINK) -lpthread -o $(TARGET) $(OBJ) ${LIBS} -lvpu -lipu -lrt
+ 	mkdir -p $(OBJDIR)
+ 	mv $(TARGET) $(OBJDIR)
+ 	cp autorun-vpu.sh $(OBJDIR)
+-- 
+1.8.0
+

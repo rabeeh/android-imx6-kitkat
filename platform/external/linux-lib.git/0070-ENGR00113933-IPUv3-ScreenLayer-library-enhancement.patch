@@ -1,0 +1,203 @@
+From 982c4b4f558553a6416ad090817eb4e4a4a780de Mon Sep 17 00:00:00 2001
+From: Liu Ying <b17645@freescale.com>
+Date: Tue, 7 Jul 2009 18:00:59 +0800
+Subject: [PATCH 070/249] ENGR00113933 IPUv3:ScreenLayer library enhancement
+
+1) Clarify IC local alpha blending setting with separate alpha channel.
+2) Add mutex for FlipScreenLayer.
+3) Force to schedule thread after LoadScreenLayer or UpdateScreenlayer
+   is done.
+
+Signed-off-by: Liu Ying <b17645@freescale.com>
+(cherry picked from commit 677a327d5235404c55a11c2d6d0d1da3ef2f7728)
+---
+ screenlayer/ScreenLayer.c | 44 +++++++++++++++++++++++++++++---------------
+ screenlayer/ScreenLayer.h |  6 +++---
+ 2 files changed, 32 insertions(+), 18 deletions(-)
+
+diff --git a/screenlayer/ScreenLayer.c b/screenlayer/ScreenLayer.c
+index 82a6763..c3b3c11 100644
+--- a/screenlayer/ScreenLayer.c
++++ b/screenlayer/ScreenLayer.c
+@@ -51,7 +51,7 @@ typedef struct {
+ 	ScreenLayer 	* pPreLayer;
+ 	ScreenLayer 	* pNextLayer;
+ 	u8		alphaGlobalEnable;
+-	u8		alphaLocalEnable;
++	u8		sepAlphaLocalEnable;
+ 	u8		alpha;
+ 	u8		keyColorEnable;
+ 	u32		keyColor;
+@@ -102,6 +102,11 @@ static u32 fmt_to_bpp(u32 pixelformat)
+ 	return bpp;
+ }
+ 
++void yield(void)
++{
++	usleep(1);
++}
++
+ SLRetCode _MemAllocSL(ScreenLayer *pSL)
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+@@ -211,7 +216,7 @@ SLRetCode _MemAllocSL(ScreenLayer *pSL)
+ 	pSLPriv->bufMinfo = (ipu_mem_info *)malloc(pSLPriv->bufNum * sizeof(ipu_mem_info));
+ 	pSL->bufSize = width/8*height*fmt_to_bpp(pSL->fmt);
+ 	/* For local alpha blending buffers */
+-	if (pSL->supportLocalAlpha) {
++	if (pSL->supportSepLocalAlpha) {
+ 		pSL->bufAlphaPaddr = (dma_addr_t *)malloc(pSLPriv->bufNum * sizeof(dma_addr_t));
+ 		pSL->bufAlphaVaddr = (void **)malloc(pSLPriv->bufNum * sizeof(void *));
+ 		pSLPriv->bufAlphaMinfo = (ipu_mem_info *)malloc(pSLPriv->bufNum * sizeof(ipu_mem_info));
+@@ -237,7 +242,7 @@ SLRetCode _MemAllocSL(ScreenLayer *pSL)
+ 		dbg(DBG_DEBUG, "allocate %d memory paddr 0x%x, mmap to %p for current layer\n", pSLPriv->bufMinfo[i].size, pSL->bufPaddr[i], pSL->bufVaddr[i]);
+ 
+ 		/* Allocate local alpha blending buffers */
+-		if (pSL->supportLocalAlpha) {
++		if (pSL->supportSepLocalAlpha) {
+ 			pSLPriv->bufAlphaMinfo[i].size = pSL->bufAlphaSize;
+ 			if (ioctl(pSLPriv->fdIpu, IPU_ALOC_MEM,
+ 				  &(pSLPriv->bufAlphaMinfo[i])) < 0) {
+@@ -291,7 +296,7 @@ void _MemFreeSL(ScreenLayer *pSL)
+ 		ioctl(pSLPriv->fdIpu, IPU_FREE_MEM, &(pSLPriv->bufMinfo[i]));
+ 
+ 		/* Free local alpha blending buffers */
+-		if (pSL->supportLocalAlpha) {
++		if (pSL->supportSepLocalAlpha) {
+ 			dbg(DBG_DEBUG, "free %d memory paddr 0x%x, mmap to %p for local alpha blending buffers of current layer\n", pSLPriv->bufAlphaMinfo[i].size, pSL->bufAlphaPaddr[i], pSL->bufAlphaVaddr[i]);
+ 			if (pSL->bufAlphaVaddr[i])
+ 				munmap(pSL->bufAlphaVaddr[i],
+@@ -382,7 +387,7 @@ SLRetCode CreateScreenLayer(ScreenLayer *pSL, u8 nBufNum)
+ 
+ 		pSLPriv->isPrimary = 0;
+ 	} else {
+-		if (pSL->supportLocalAlpha) {
++		if (pSL->supportSepLocalAlpha) {
+ 			dbg(DBG_ERR, "primary screen layer should not support local alpha blending!\n");
+ 			ret = E_RET_PRIMARY_ERR;
+ 			goto done;
+@@ -506,6 +511,7 @@ SLRetCode LoadScreenLayer(ScreenLayer *pSL, LoadParam *pParam, u8 nBufIdx)
+ 
+ 	pthread_mutex_unlock(&SLmutex);
+ 
++	yield();
+ done:
+ 	return ret;
+ }
+@@ -514,15 +520,16 @@ SLRetCode LoadAlphaPoint(ScreenLayer *pSL, u32 x, u32 y, u8 alphaVal, u8 nBufIdx
+ {
+ 	SLRetCode ret = E_RET_SUCCESS;
+ 	ScreenLayerPriv *pSLPriv = (ScreenLayerPriv *)pSL->pPriv;
++	u8 *pPointAlphaVal;
+ 
+ 	if (nBufIdx >= pSLPriv->bufNum) {
+ 		ret = E_RET_BUFIDX_ERR;
+ 		goto err;
+ 	}
+ 
+-	if (!pSLPriv->alphaLocalEnable || !pSL->supportLocalAlpha) {
+-		dbg(DBG_ERR, "global/local alpha blending confliction!\n");
+-		ret = E_RET_ALPHA_BLENDING_DISABLE;
++	if (!pSLPriv->sepAlphaLocalEnable || !pSL->supportSepLocalAlpha) {
++		dbg(DBG_ERR, "local alpha blending is disabled!\n");
++		ret = E_RET_LOCAL_ALPHA_BLENDING_DISABLE;
+ 		goto err;
+ 	}
+ 
+@@ -532,9 +539,10 @@ SLRetCode LoadAlphaPoint(ScreenLayer *pSL, u32 x, u32 y, u8 alphaVal, u8 nBufIdx
+ 		goto err;
+ 	}
+ 
+-	memset(pSL->bufAlphaVaddr[nBufIdx] +
+-	       (pSL->screenRect.right - pSL->screenRect.left)*y + x,
+-	       alphaVal, 1);
++	pPointAlphaVal = (u8 *)(pSL->bufAlphaVaddr[nBufIdx] +
++	       (pSL->screenRect.right - pSL->screenRect.left)*y + x);
++
++	*pPointAlphaVal = alphaVal;
+ err:
+ 	return ret;
+ 
+@@ -547,8 +555,12 @@ SLRetCode FlipScreenLayerBuf(ScreenLayer *pSL, u8 nBufIdx)
+ 	if (nBufIdx >= pSLPriv->bufNum)
+ 		return E_RET_FLIP_ERR;
+ 
++	pthread_mutex_lock(&SLmutex);
++
+ 	pSLPriv->curBufIdx = nBufIdx;
+ 
++	pthread_mutex_unlock(&SLmutex);
++
+ 	return E_RET_SUCCESS;
+ }
+ 
+@@ -676,8 +688,8 @@ SLRetCode _CombScreenLayers(ScreenLayer *pBotSL, ScreenLayer *pTopSL)
+ 		overlay.fmt = pTopSL->fmt;
+ 		overlay.user_def_paddr[0] = pTopSL->bufPaddr[pTopSLPriv->curBufIdx];
+ 		overlay.global_alpha_en = pTopSLPriv->alphaGlobalEnable;
+-		if (pTopSLPriv->alphaLocalEnable &&
+-		    pTopSL->supportLocalAlpha) {
++		if (pTopSLPriv->sepAlphaLocalEnable &&
++		    pTopSL->supportSepLocalAlpha) {
+ 			overlay.local_alpha_en = 1;
+ 			overlay.user_def_alpha_paddr[0] = pTopSL->bufAlphaPaddr[pTopSLPriv->curBufIdx];
+ 		}
+@@ -795,6 +807,8 @@ SLRetCode UpdateScreenLayer(ScreenLayer *pSL)
+ 	ret = _UpdateFramebuffer(pCurSL);
+ 
+ 	pthread_mutex_unlock(&SLmutex);
++
++	yield();
+ done:
+ 	return ret;
+ }
+@@ -808,13 +822,13 @@ SLRetCode SetScreenLayer(ScreenLayer *pSL, SetMethodType eType, void *setData)
+ 	case E_SET_ALPHA:
+ 	{
+ 		MethodAlphaData *data = (MethodAlphaData *)setData;
+-		if (data->localAlphaEnable && data->globalAlphaEnable) {
++		if (data->sepLocalAlphaEnable && data->globalAlphaEnable) {
+ 			dbg(DBG_ERR, "global/local alpha blending confliction!\n");
+ 			ret = E_RET_ALPHA_BLENDING_CONFLICT;
+ 			goto err;
+ 		}
+ 		pSLPriv->alphaGlobalEnable = data->globalAlphaEnable;
+-		pSLPriv->alphaLocalEnable = data->localAlphaEnable;
++		pSLPriv->sepAlphaLocalEnable = data->sepLocalAlphaEnable;
+ 		pSLPriv->alpha = data->alpha;
+ 		break;
+ 	}
+diff --git a/screenlayer/ScreenLayer.h b/screenlayer/ScreenLayer.h
+index 86ec905..96c50a4 100644
+--- a/screenlayer/ScreenLayer.h
++++ b/screenlayer/ScreenLayer.h
+@@ -39,7 +39,7 @@ typedef enum {
+ 	E_RET_NOSUCH_METHODTYPE,
+ 	E_RET_DESTORY_PRI_WITH_SUBSL,
+ 	E_RET_ALPHA_BLENDING_CONFLICT,
+-	E_RET_ALPHA_BLENDING_DISABLE,
++	E_RET_LOCAL_ALPHA_BLENDING_DISABLE,
+ 	E_RET_ALPHA_BUF_NOT_ALLOC_ERR,
+ } SLRetCode;
+ 
+@@ -51,7 +51,7 @@ typedef enum {
+ 
+ typedef struct {
+ 	u8	globalAlphaEnable;
+-	u8	localAlphaEnable;
++	u8	sepLocalAlphaEnable;
+ 	u32	alpha;
+ } MethodAlphaData;
+ 
+@@ -72,7 +72,7 @@ typedef struct {
+ 	u32 		fmt;
+ 	u32		bufSize;
+ 	u32		bufAlphaSize;
+-	bool		supportLocalAlpha;
++	bool		supportSepLocalAlpha;
+ 	void 		** bufVaddr;
+ 	dma_addr_t 	* bufPaddr;
+ 	void 		** bufAlphaVaddr;
+-- 
+1.8.0
+

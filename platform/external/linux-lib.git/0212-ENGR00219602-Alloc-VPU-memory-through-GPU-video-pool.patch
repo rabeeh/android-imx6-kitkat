@@ -1,0 +1,126 @@
+From 191ad67036033d221c0688b1d5efe51c9a4ee931 Mon Sep 17 00:00:00 2001
+From: Xianzhong <b07117@freescale.com>
+Date: Mon, 13 Aug 2012 23:15:13 +0800
+Subject: [PATCH 212/249] ENGR00219602 Alloc VPU memory through GPU video pool
+
+Use GPU video memory interface to implement VPU memory allocator,
+Unify the reserved memory for GPU & VPU to ultize memory with max efficiency
+
+Signed-off-by: Xianzhong <b07117@freescale.com>
+---
+ vpu/Android.mk |  5 +++++
+ vpu/vpu_io.c   | 50 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/vpu/Android.mk b/vpu/Android.mk
+index 6bbfeb8..ae06155 100755
+--- a/vpu/Android.mk
++++ b/vpu/Android.mk
+@@ -14,6 +14,10 @@ LOCAL_CFLAGS += -DBUILD_FOR_ANDROID -DIMX6Q
+ else
+ LOCAL_CFLAGS += -DBUILD_FOR_ANDROID -D$(BOARD_SOC_TYPE)
+ endif
++ifeq ($(USE_GPU_ALLOCATOR), true)
++LOCAL_CFLAGS += -DUSE_GPU=1
++LOCAL_SHARED_LIBRARIES := libutils libc liblog libGAL
++else
+ ifeq ($(USE_ION_ALLOCATOR), true)
+ LOCAL_CFLAGS += -DUSE_ION
+ LOCAL_SHARED_LIBRARIES := libutils libc liblog libion
+@@ -21,6 +25,7 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../../hardware/imx/ion/
+ else
+ LOCAL_SHARED_LIBRARIES := libutils libc liblog
+ endif
++endif
+ LOCAL_C_INCLUDES += $(LOCAL_PATH)
+ LOCAL_MODULE := libvpu
+ LOCAL_LD_FLAGS += -nostartfiles
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index bceb628..ddb5052 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -41,11 +41,28 @@
+ #include "vpu_util.h"
+ 
+ #ifdef BUILD_FOR_ANDROID
+-#define LOG_TAG "vpu-ion"
+ #include <utils/Log.h>
+ #ifdef USE_ION
++#define LOG_TAG "vpu-ion"
+ #include <linux/ion.h>
+ #include <ion.h>
++#elif USE_GPU
++#undef LOG_TAG
++#define LOG_TAG "gpu-vid"
++int
++gcoOS_AllocateVideoMemory(
++    void* Os,
++    int InUserSpace,
++    int InCacheable,
++    int* Bytes,
++    int* Physical,
++    void** Logical,
++    void** Handle);
++int
++gcoOS_FreeVideoMemory(
++    void* Os,
++    void* Handle
++    );
+ #else
+ #include <linux/android_pmem.h>
+ #endif
+@@ -329,6 +346,9 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ 	struct ion_handle *handle;
+ 	int share_fd, ret = -1;
+ 	unsigned char *ptr;
++#elif USE_GPU
++        void *handle, *virt_addr;
++        int bytes, phy_addr, ret = -1;
+ #else
+ 	/* Get memory from pmem space for android */
+ 	struct pmem_region region;
+@@ -399,6 +419,22 @@ error:
+ 	close(share_fd);
+ 	ion_close(fd);
+ 	return ret;
++#elif USE_GPU
++        bytes = buff->size;
++        phy_addr = 0; virt_addr = NULL;
++        ret = gcoOS_AllocateVideoMemory(NULL, 1, 0, &bytes, &phy_addr,&virt_addr,&handle);
++        if(ret != 0) {
++            LOGE("%d, gpu allocator failed to alloc buffer with size %d", ret, buff->size);
++            return ret;
++        }
++
++        buff->virt_uaddr = (unsigned long)virt_addr;
++        buff->phy_addr = (unsigned long)phy_addr;
++        buff->cpu_addr = (unsigned long)handle;
++        LOGD("<gpu> alloc handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
++			(unsigned int)handle, (unsigned int)buff->phy_addr,
++			(unsigned int)buff->virt_uaddr);
++        return 0;
+ #else
+ 	fd = (unsigned long)open("/dev/pmem_adsp", O_RDWR | O_SYNC);
+ 	if (fd < 0) {
+@@ -502,6 +538,18 @@ int _IOFreePhyMem(int which, vpu_mem_desc * buff)
+ 
+ 	munmap((void *)buff->virt_uaddr, buff->size);
+ 	memset((void*)buff, 0, sizeof(*buff));
++#elif USE_GPU
++        int ret = -1;
++        void *handle = (void *)buff->cpu_addr;
++        if(!handle) {
++           LOGW("%s: Invalid handle 0x%x", __FUNCTION__, (unsigned int)handle);
++           return ret;
++        }
++        ret = gcoOS_FreeVideoMemory(NULL, handle);
++        if(ret != 0) {
++           LOGE("%d, gpu allocator failed to free handle 0x%x", ret, (unsigned int)handle);
++           return ret;
++        }
+ #else
+ 	int fd_pmem;
+ 
+-- 
+1.8.0
+

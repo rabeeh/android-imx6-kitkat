@@ -1,0 +1,110 @@
+From f85451c170e9f69a269cac41e5adb52657aaa5d7 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Fri, 9 Mar 2012 10:29:49 +0800
+Subject: [PATCH 250/486] ENGR00175965 no mmap for HDMI
+
+no mmap for HDMI, workround for HDMI
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/alsa_imx.cpp | 51 ++++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 34 insertions(+), 17 deletions(-)
+
+diff --git a/alsa/alsa_imx.cpp b/alsa/alsa_imx.cpp
+index 36ab78c..7b59b45 100755
+--- a/alsa/alsa_imx.cpp
++++ b/alsa/alsa_imx.cpp
+@@ -390,7 +390,7 @@ const char *streamName(alsa_handle_t *handle)
+     return snd_pcm_stream_name(direction(handle));
+ }
+ 
+-status_t setHardwareParams(alsa_handle_t *handle)
++status_t setHardwareParams(alsa_handle_t *handle, int mmap)
+ {
+     snd_pcm_hw_params_t *hardwareParams;
+     status_t err;
+@@ -422,29 +422,42 @@ status_t setHardwareParams(alsa_handle_t *handle)
+     }
+ 
+     // Set the interleaved read and write format.
+-    mask = (snd_pcm_access_mask_t *)malloc(snd_pcm_access_mask_sizeof());
+-    snd_pcm_access_mask_none(mask);
+-    snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_INTERLEAVED);
+-    snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_NONINTERLEAVED);
+-    snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_COMPLEX);
+-    err = snd_pcm_hw_params_set_access_mask(handle->handle, hardwareParams, mask);
+-
+-    if (err < 0) {
+-        LOGW("Unable to enable MMAP access for PCM: %s", snd_strerror(err));
++    if(mmap == 1){
++        mask = (snd_pcm_access_mask_t *)malloc(snd_pcm_access_mask_sizeof());
++        snd_pcm_access_mask_none(mask);
++        snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_INTERLEAVED);
++        snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_NONINTERLEAVED);
++        snd_pcm_access_mask_set(mask, SND_PCM_ACCESS_MMAP_COMPLEX);
++        err = snd_pcm_hw_params_set_access_mask(handle->handle, hardwareParams, mask);
++
++        if (err < 0 ) {
++            LOGW("Unable to enable MMAP access for PCM: %s", snd_strerror(err));
++            err = snd_pcm_hw_params_set_access(handle->handle, hardwareParams,
++                    SND_PCM_ACCESS_RW_INTERLEAVED);
++            if (err < 0) {
++                LOGE("Unable to configure PCM read/write format: %s",
++                    snd_strerror(err));
++                free(mask);
++                goto done;
++            }
++            handle->mmap = 0;
++        } else {
++            handle->mmap = 1;
++            LOGW("enable MMAP access for PCM");
++        }
++        free(mask);
++    }else
++    {
++        LOGW("Don't enable MMAP access for PCM");
+         err = snd_pcm_hw_params_set_access(handle->handle, hardwareParams,
+                 SND_PCM_ACCESS_RW_INTERLEAVED);
+         if (err < 0) {
+             LOGE("Unable to configure PCM read/write format: %s",
+                     snd_strerror(err));
+-            free(mask);
+             goto done;
+         }
+         handle->mmap = 0;
+-    } else {
+-        handle->mmap = 1;
+-        LOGW("enable MMAP access for PCM");
+     }
+-    free(mask);
+ 
+     err = snd_pcm_hw_params_set_format(handle->handle, hardwareParams,
+             handle->format);
+@@ -858,6 +871,7 @@ static status_t s_open(alsa_handle_t *handle, uint32_t devices, int mode)
+     //
+     s_close(handle);
+ 
++    int mmap = 1;
+     LOGD("open called for devices %08x in mode %d...", devices, mode);
+ 
+     const char *stream = streamName(handle);
+@@ -874,11 +888,14 @@ static status_t s_open(alsa_handle_t *handle, uint32_t devices, int mode)
+     }
+ 
+     if(strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI)==0)
+-        handle->bufferSize = 6144;
++    {
++        handle->bufferSize = 7680;
++        mmap = 0;
++    }
+     else
+         handle->bufferSize = 2048;
+ 
+-    err = setHardwareParams(handle);
++    err = setHardwareParams(handle, mmap);
+ 
+     if (err == NO_ERROR) err = setSoftwareParams(handle);
+ 
+-- 
+1.8.0
+

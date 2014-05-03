@@ -1,0 +1,568 @@
+From 3a969dfa7e22fb03f7ea75bb9920442ce3fccbf2 Mon Sep 17 00:00:00 2001
+From: Jeff Kudrick <jeff.kudrick@freescale.com>
+Date: Mon, 11 Jun 2012 13:12:21 -0500
+Subject: [PATCH 289/486] ENGR00211151: Cannot connect to Camera after
+ start/stop Camcorder many times
+
+Aligned the latest i.MX6 ICS changes in the Camera HAL into the i.MX5
+Camera HAL.
+
+Signed-off-by: Jeff Kudrick <jeff.kudrick@freescale.com>
+---
+ mx5x/libcamera/Android.mk            |  35 ++++++------
+ mx5x/libcamera/CameraHal.cpp         | 101 +++++++++++++++++++++++------------
+ mx5x/libcamera/CameraHal.h           |  34 +++++++-----
+ mx5x/libcamera/V4l2CapDeviceBase.cpp |   3 +-
+ mx5x/libcamera/V4l2CsiDevice.cpp     |  24 ++++++++-
+ mx5x/libcamera/messageQueue.cpp      |  31 ++---------
+ 6 files changed, 137 insertions(+), 91 deletions(-)
+
+diff --git a/mx5x/libcamera/Android.mk b/mx5x/libcamera/Android.mk
+index 0e6e3e3..6446ffb 100755
+--- a/mx5x/libcamera/Android.mk
++++ b/mx5x/libcamera/Android.mk
+@@ -14,19 +14,21 @@
+ 
+ ifeq ($(BOARD_SOC_CLASS),IMX5X)
+ LOCAL_PATH:= $(call my-dir)
++
+ ifeq ($(BOARD_HAVE_IMX_CAMERA),true)
++
+ include $(CLEAR_VARS)
+ 
+ LOCAL_SRC_FILES:=    \
+-    CameraHal.cpp    \
+-    CameraModule.cpp \
++	CameraHal.cpp    \
++	CameraModule.cpp \
+     Camera_pmem.cpp  \
+-    CaptureDeviceInterface.cpp \
+-    V4l2CsiDevice.cpp \
+-    V4l2CapDeviceBase.cpp  \
+-    PostProcessDeviceInterface.cpp \
+-    PP_ipulib.cpp    \
+-    JpegEncoderInterface.cpp \
++	CaptureDeviceInterface.cpp \
++	V4l2CsiDevice.cpp \
++	V4l2CapDeviceBase.cpp  \
++	PostProcessDeviceInterface.cpp \
++	PP_ipulib.cpp    \
++	JpegEncoderInterface.cpp \
+     JpegEncoderSoftware.cpp \
+     messageQueue.cpp
+ 
+@@ -42,20 +44,20 @@ LOCAL_SHARED_LIBRARIES:= \
+     libhardware_legacy \
+     libdl \
+     libc \
+-    libipu
++	libipu
+ 
+ LOCAL_C_INCLUDES += \
+-    frameworks/base/include/binder \
+-    frameworks/base/include/ui \
+-    frameworks/base/camera/libcameraservice \
+-    external/linux-lib/ipu \
+-    hardware/imx/mx5x/libgralloc
++	frameworks/base/include/binder \
++	frameworks/base/include/ui \
++	frameworks/base/camera/libcameraservice \
++	external/linux-lib/ipu \
++	hardware/imx/mx5x/libgralloc
+ 
+ ifeq ($(HAVE_FSL_IMX_CODEC),true)
+     LOCAL_SHARED_LIBRARIES += libfsl_jpeg_enc_arm11_elinux
+     LOCAL_CPPFLAGS += -DUSE_FSL_JPEG_ENC
+     LOCAL_C_INCLUDES +=	\
+-         device/fsl/proprietary/codec/ghdr
++					device/fsl/proprietary/codec/ghdr
+ endif
+ ifeq ($(BOARD_CAMERA_NV12),true)
+     LOCAL_CPPFLAGS += -DRECORDING_FORMAT_NV12
+@@ -64,7 +66,7 @@ else
+ endif
+ 
+ #Define this for switch the Camera through V4L2 MXC IOCTL
+-LOCAL_CPPFLAGS += -DV4L2_CAMERA_SWITCH
++#LOCAL_CPPFLAGS += -DV4L2_CAMERA_SWITCH
+ 
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw	
+ LOCAL_MODULE:= camera.$(TARGET_BOARD_PLATFORM)
+@@ -75,4 +77,5 @@ LOCAL_MODULE_TAGS := eng
+ 
+ include $(BUILD_SHARED_LIBRARY)
+ endif
++
+ endif
+diff --git a/mx5x/libcamera/CameraHal.cpp b/mx5x/libcamera/CameraHal.cpp
+index c6323a4..5cadab2 100755
+--- a/mx5x/libcamera/CameraHal.cpp
++++ b/mx5x/libcamera/CameraHal.cpp
+@@ -74,7 +74,7 @@ namespace android {
+         mCameraReady(false),
+         mCaptureDeviceOpen(false),
+         mPPDeviceNeed(false),
+-	bDerectInput(false),
++        bDirectInput(false),
+         mCameraid(cameraid),
+         mPPDeviceNeedForPic(false),
+         mPowerLock(false),
+@@ -93,6 +93,12 @@ namespace android {
+         CloseCaptureDevice();
+         FreeInterBuf();
+         postDestroy();
++        if(mVideoMemory != NULL) {
++            mVideoMemory->release(mVideoMemory);
++        }
++        if(mPreviewMemory != NULL) {
++            mPreviewMemory->release(mPreviewMemory);
++        }
+     }
+ 
+     void CameraHal :: release()
+@@ -894,33 +900,42 @@ namespace android {
+         return mPreviewRunning;
+     }
+ 
+-    status_t CameraHal::storeMetaDataInBuffers(bool enable)
++    //update buffer for direct input in video recorder
++    status_t CameraHal::updateDirectInput(bool bDirect)
+     {
+-        CAMERA_HAL_LOG_FUNC;
+         unsigned int i;
++        if (bDirect == true) {
++            if (!mPPDeviceNeed){
++                if(mCaptureBufNum <= 0)
++                    CAMERA_HAL_LOG_INFO("mCaptureBuf not allocated yet, will register it later");
++                
++                for(i = 0 ; i < mCaptureBufNum; i ++) {
++                    mVideoBufferPhy[i].phy_offset = mCaptureBuffers[i].phy_offset;
++                    CAMERA_HAL_LOG_INFO("Camera HAL physic address: %x", mCaptureBuffers[i].phy_offset);
++                    mVideoBufferPhy[i].length = mCaptureBuffers[i].length;
++                    memcpy((unsigned char*)mVideoMemory->data + i*mPreviewFrameSize,
++                        (void*)&mVideoBufferPhy[i], sizeof(VIDEOFRAME_BUFFER_PHY));
++                }
++            }else{
++                for(i = 0 ; i < mPPbufNum; i ++) {
++                    mVideoBufferPhy[i].phy_offset = mPPbuf[i].phy_offset;
++                    CAMERA_HAL_LOG_INFO("Camera HAL physic address: %x", mPPbuf[i].phy_offset);
++                    mVideoBufferPhy[i].length = mPPbuf[i].length;
++                    memcpy((unsigned char*)mVideoMemory->data + i*mPreviewFrameSize,
++                    (void*)&mVideoBufferPhy[i], sizeof(VIDEOFRAME_BUFFER_PHY));
++                }
++            }
++        }
+ 
+-	bDerectInput = enable;
+-	if (bDerectInput == true) {
+-		if (!mPPDeviceNeed){
+-			for(i = 0 ; i < mCaptureBufNum; i ++) {
+-				mVideoBufferPhy[i].phy_offset = mCaptureBuffers[i].phy_offset;
+-				CAMERA_HAL_LOG_INFO("Camera HAL physic address: %p", mCaptureBuffers[i].phy_offset);
+-				mVideoBufferPhy[i].length = mCaptureBuffers[i].length;
+-				memcpy((unsigned char*)mVideoMemory->data + i*mPreviewFrameSize,
+-						(void*)&mVideoBufferPhy[i], sizeof(VIDEOFRAME_BUFFER_PHY));
+-			}
+-		}else{
+-			for(i = 0 ; i < mPPbufNum; i ++) {
+-				mVideoBufferPhy[i].phy_offset = mPPbuf[i].phy_offset;
+-				CAMERA_HAL_LOG_INFO("Camera HAL physic address: %p", mPPbuf[i].phy_offset);
+-				mVideoBufferPhy[i].length = mPPbuf[i].length;
+-				memcpy((unsigned char*)mVideoMemory->data + i*mPreviewFrameSize,
+-						(void*)&mVideoBufferPhy[i], sizeof(VIDEOFRAME_BUFFER_PHY));
+-			}
+-		}
+-	}
++        return NO_ERROR;
++    }
+ 
+-	return NO_ERROR;
++    status_t CameraHal::storeMetaDataInBuffers(bool enable)
++    {
++        CAMERA_HAL_LOG_FUNC;
++        bDirectInput = enable;
++        updateDirectInput(enable);
++        return NO_ERROR;
+     }
+ #if 0
+     int32_t CameraHal::getNumberOfVideoBuffers() const
+@@ -958,7 +973,7 @@ namespace android {
+         }
+         
+            
+-        if (bDerectInput == true) {
++        if (bDirectInput == true) {
+             for(i = 0; i < mVideoBufNume; i++) {
+                 mVideoBufferUsing[i] = 0;
+             }
+@@ -992,7 +1007,7 @@ namespace android {
+         index = ((size_t)mem - (size_t)mVideoMemory->data) / mPreviewFrameSize;
+         mVideoBufferUsing[index] = 0;
+ 
+-        if (bDerectInput == true) {
++        if (bDirectInput == true) {
+             if(mCaptureBuffers[index].refCount == 0) {
+                 CAMERA_HAL_ERR("warning:%s about to release mCaptureBuffers[%d].refcount=%d-", __FUNCTION__, index, mCaptureBuffers[index].refCount);
+                 return;
+@@ -1668,7 +1683,10 @@ Pic_out:
+             CAMERA_HAL_LOG_INFO("%s :capture run", __FUNCTION__);
+             mCaptureThreadQueue.postStopMessage();
+             mCaptureRunning = false;
+-            sem_wait(&mCaptureStoppedCondition);
++            if(gettid()!= mCaptureFrameThread->mTID)
++                sem_wait(&mCaptureStoppedCondition);
++            else
++                CAMERA_HAL_LOG_INFO("Stop CaptureFrameThread in itself");
+         }else {
+             CAMERA_HAL_LOG_INFO("%s :capture not run", __FUNCTION__);
+         }
+@@ -1679,7 +1697,10 @@ Pic_out:
+         if(mPPDeviceNeed && mPreviewRunning) {
+             CAMERA_HAL_LOG_INFO("%s :postprocess run", __FUNCTION__);
+             mPostProcessThreadQueue.postStopMessage();
+-            sem_wait(&mPostProcessStoppedCondition);
++            if(gettid()!= mPostProcessThread->mTID)
++                sem_wait(&mPostProcessStoppedCondition);
++            else
++                CAMERA_HAL_LOG_INFO("Stop PostProcessThread in itself");
+         }
+         mPostProcessLock.unlock(); 
+ 
+@@ -1688,7 +1709,10 @@ Pic_out:
+             CAMERA_HAL_LOG_INFO("%s :preview run", __FUNCTION__);
+             mPreviewThreadQueue.postStopMessage();
+             mPreviewRunning = false;
+-            sem_wait(&mPreviewStoppedCondition);
++            if(gettid()!= mPreviewShowFrameThread->mTID)
++                sem_wait(&mPreviewStoppedCondition);
++            else
++                CAMERA_HAL_LOG_INFO("Stop PreviewShowThread in itself");
+         }else {
+             CAMERA_HAL_LOG_INFO("%s :preview not run", __FUNCTION__);
+         }
+@@ -2166,7 +2190,7 @@ Pic_out:
+             }
+ #endif                    
+     }
+-    
++   
+     int CameraHal ::previewshowFrameThread()
+     {
+         //CAMERA_HAL_LOG_FUNC;
+@@ -2181,9 +2205,10 @@ Pic_out:
+         sp<CMessage> msg = mPreviewThreadQueue.waitMessage();
+         if(msg == 0) {
+             CAMERA_HAL_ERR("%s: get invalide message", __FUNCTION__);
++            mPreviewRunning = false;
+             return BAD_VALUE;            
+         }
+-                
++
+         switch(msg->what) {
+             case CMESSAGE_TYPE_NORMAL:
+                 display_index = msg->arg0;
+@@ -2223,7 +2248,13 @@ Pic_out:
+                     if (mEnqueuedBufs <= 2) {
+                         return NO_ERROR;
+                     }
+-                } 
++                }
++                else {
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
++                    return BAD_VALUE;
++                }
+ 
+                 err = mNativeWindow->dequeue_buffer(mNativeWindow, &buf_h, &stride);
+                 if((err != 0) || buf_h == NULL) {
+@@ -2318,7 +2349,7 @@ Pic_out:
+ 
+                 if ((mMsgEnabled & CAMERA_MSG_VIDEO_FRAME) && mRecordRunning) {
+                     nsecs_t timeStamp = systemTime(SYSTEM_TIME_MONOTONIC);
+-                    if (bDerectInput == true) {
++                    if (bDirectInput == true) {
+ 	                    memcpy((unsigned char*)mVideoMemory->data + enc_index*mPreviewFrameSize,
+                             (void*)&mVideoBufferPhy[enc_index], sizeof(VIDEOFRAME_BUFFER_PHY));
+                     } else {
+@@ -2378,7 +2409,9 @@ Pic_out:
+         //    mVideoBuffers[i] = new MemoryBase(mVideoHeap,
+         //            mPreviewFrameSize * i, mPreviewFrameSize);
+         //}
+-
++        
++        //Make sure the buffer been updated for direct input
++        updateDirectInput(bDirectInput);
+         return ret;
+     }
+ 
+diff --git a/mx5x/libcamera/CameraHal.h b/mx5x/libcamera/CameraHal.h
+index 1de9749..1f7e22b 100755
+--- a/mx5x/libcamera/CameraHal.h
++++ b/mx5x/libcamera/CameraHal.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
++ * Copyright 2009-2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -14,11 +15,6 @@
+  * limitations under the License.
+  */
+ 
+-/*
+- * Copyright 2009-2012 Freescale Semiconductor, Inc. All Rights Reserved.
+- */
+-
+-
+ #ifndef CAMERA_HAL_BASE_H
+ #define CAMERA_HAL_BASE_H
+ 
+@@ -148,28 +144,32 @@ namespace android {
+             CameraHal* mHardware;
+         public:
+             CaptureFrameThread(CameraHal* hw)
+-                : Thread(false), mHardware(hw) { }
++                : Thread(false), mHardware(hw), mTID(0)  { }
+             virtual void onFirstRef() {
+                 run("CaptureFrameThread", PRIORITY_URGENT_DISPLAY);
+             }
+             virtual bool threadLoop() {
++                mTID = gettid();
+                 mHardware->captureframeThreadWrapper();
+                 return false;
+             }
++            int mTID;
+         };
+ 
+         class PostProcessThread : public Thread {
+             CameraHal* mHardware;
+         public:
+             PostProcessThread(CameraHal* hw)
+-                : Thread(false), mHardware(hw) { }
++                : Thread(false), mHardware(hw), mTID(0)  { }
+             virtual void onFirstRef() {
+                 run("PostProcessThread", PRIORITY_URGENT_DISPLAY);
+             }
+             virtual bool threadLoop() {
++                mTID = gettid();
+                 mHardware->postprocessThreadWrapper();
+                 return false;
+             }
++            int mTID;
+         };
+ 
+ 
+@@ -177,44 +177,50 @@ namespace android {
+             CameraHal* mHardware;
+         public:
+             PreviewShowFrameThread(CameraHal* hw)
+-                : Thread(false), mHardware(hw) { }
++                : Thread(false), mHardware(hw), mTID(0)  { }
+             virtual void onFirstRef() {
+                 run("CameraPreviewShowFrameThread", PRIORITY_URGENT_DISPLAY);
+             }
+             virtual bool threadLoop() {
++                mTID = gettid();
+                 mHardware->previewshowFrameThreadWrapper();
+                 return false;
+             }
++            int mTID;
+         };
+ 
+         class EncodeFrameThread : public Thread {
+             CameraHal* mHardware;
+         public:
+             EncodeFrameThread(CameraHal* hw)
+-                : Thread(false), mHardware(hw) { }
++                : Thread(false), mHardware(hw), mTID(0)  { }
+             virtual void onFirstRef() {
+                 run("EncodeFrameThread", PRIORITY_URGENT_DISPLAY);
+             }
+             virtual bool threadLoop() {
++                mTID = gettid();
+                 mHardware->encodeframeThreadWrapper();
+                 return true;
+             }
++            int mTID;
+         };
+ 
+         class AutoFocusThread : public Thread {
+             CameraHal* mHardware;
+         public:
+             AutoFocusThread(CameraHal* hw)
+-                : Thread(false), mHardware(hw) { }
++                : Thread(false), mHardware(hw), mTID(0)  { }
+             virtual void onFirstRef() {
+                 run("AutoFocusThread", PRIORITY_URGENT_DISPLAY);
+             }
+             virtual bool threadLoop() {
++                mTID = gettid();
+                 if (mHardware->autoFocusThread()>=0)
+                     return true;
+                 else
+                     return false;
+             }
++            int mTID;
+         };
+ 
+ 
+@@ -222,16 +228,18 @@ namespace android {
+             CameraHal* mHardware;
+         public:
+             TakePicThread(CameraHal* hw)
+-                : Thread(false), mHardware(hw) { }
++                : Thread(false), mHardware(hw), mTID(0) { }
+ #if 0
+             virtual void onFirstRef() {
+                 run("TakePicThread", PRIORITY_URGENT_DISPLAY);
+             }
+ #endif  
+             virtual bool threadLoop() {
++                mTID = gettid();
+                 mHardware->takepicThread();
+                 return false;
+             }
++            int mTID;
+         };
+ 
+         void preInit();
+@@ -287,6 +295,8 @@ namespace android {
+         void SearchBuffer(void *pNativeBuf, unsigned int *pIndex);
+         status_t freeBuffersToNativeWindow();
+         status_t PrepareCaptureBufs();
++        status_t updateDirectInput(bool bDirect);
++
+         volatile bool isCaptureBufsAllocated;
+         //volatile bool isPreviewFinsh;
+         status_t convertStringToPreviewFormat(unsigned int *pFormat);
+@@ -410,7 +420,7 @@ namespace android {
+         bool mPreviewStopped;
+         bool mRecordStopped;
+         bool mPowerLock;
+-	bool bDerectInput;
++        bool bDirectInput;
+         int mCameraid;
+ 
+         int error_status;
+diff --git a/mx5x/libcamera/V4l2CapDeviceBase.cpp b/mx5x/libcamera/V4l2CapDeviceBase.cpp
+index 6be51c2..74abc55 100755
+--- a/mx5x/libcamera/V4l2CapDeviceBase.cpp
++++ b/mx5x/libcamera/V4l2CapDeviceBase.cpp
+@@ -269,6 +269,7 @@ namespace android{
+                         fd = 0;
+                     }
+                 }
++                closedir(v4l_dir);
+             }
+             if (fd > 0){
+                 mCameraDevice = fd;
+@@ -644,7 +645,7 @@ namespace android{
+         cfilledbuffer.index = BufQueIdx;
+         ret = ioctl(mCameraDevice, VIDIOC_QBUF, &cfilledbuffer);
+         if (ret < 0) {
+-            CAMERA_HAL_ERR("Camera VIDIOC_QBUF failure, ret=%d", ret);
++            CAMERA_HAL_ERR("Camera VIDIOC_DQBUF failure, ret=%d", ret);
+             return CAPTURE_DEVICE_ERR_SYS_CALL;
+         }
+         mQueuedBufNum ++;
+diff --git a/mx5x/libcamera/V4l2CsiDevice.cpp b/mx5x/libcamera/V4l2CsiDevice.cpp
+index 9e09367..0f8da8a 100755
+--- a/mx5x/libcamera/V4l2CsiDevice.cpp
++++ b/mx5x/libcamera/V4l2CsiDevice.cpp
+@@ -64,7 +64,9 @@ namespace android{
+ 
+         if(mCameraDevice > 0)
+             return CAPTURE_DEVICE_ERR_ALRADY_OPENED;
+-        else if (mCaptureDeviceName[0] != '#'){
++
++#ifdef V4L2_CAMERA_SWITCH
++        if (mCaptureDeviceName[0] != '#'){
+             CAMERA_HAL_LOG_RUNTIME("already get the device name %s", mCaptureDeviceName);
+             mCameraDevice = open(mCaptureDeviceName, O_RDWR, O_NONBLOCK);
+             if (mCameraDevice < 0)
+@@ -109,6 +111,7 @@ namespace android{
+                         fd = 0;
+                     }
+                 }
++                closedir(v4l_dir);
+             }
+             if (fd > 0){
+                 mCameraDevice = fd;
+@@ -119,6 +122,25 @@ namespace android{
+                 return CAPTURE_DEVICE_ERR_OPEN;
+             }
+         }
++#else
++        memset((void *)dev_node, 0, CAMAERA_FILENAME_LENGTH);
++        sprintf(dev_node, "/dev/video%d", cameraId);
++        if ((fd = open(dev_node, O_RDWR, O_NONBLOCK)) < 0) {
++            CAMERA_HAL_ERR("dev_node %s:cannot be opened", dev_node);
++            return CAPTURE_DEVICE_ERR_OPEN;
++        }
++
++        if(ioctl(fd, VIDIOC_DBG_G_CHIP_IDENT, &vid_chip) < 0 ) {
++            close(fd);
++            CAMERA_HAL_ERR("dev_node %s:cannot get sensor name", dev_node);
++            return CAPTURE_DEVICE_ERR_OPEN;
++        }
++        strcpy(mCaptureDeviceName, dev_node);
++        strcpy(mInitalDeviceName, vid_chip.match.name);
++        CAMERA_HAL_LOG_INFO("device name is %s", mCaptureDeviceName);
++        CAMERA_HAL_LOG_INFO("sensor name is %s", mInitalDeviceName);
++        mCameraDevice = fd;
++#endif
+         return ret; 
+     }
+ 
+diff --git a/mx5x/libcamera/messageQueue.cpp b/mx5x/libcamera/messageQueue.cpp
+index 813f037..547816a 100644
+--- a/mx5x/libcamera/messageQueue.cpp
++++ b/mx5x/libcamera/messageQueue.cpp
+@@ -57,38 +57,15 @@ CMessageQueue::CMessageQueue()
+ 
+ CMessageQueue::~CMessageQueue()
+ {
+-        Mutex::Autolock _l(mLock);
+-    LIST::iterator curr(mMessages.begin());
+-    //sp<CMessage> tmp;
+-
+-    while(curr != mMessages.end()) {
+-        //tmp = *cur;
+-        //tmp.clear();
+-        mMessages.remove(curr);
+-        //tmp.clear();
+-        curr ++;
+-    }
++    Mutex::Autolock _l(mLock);
++    mMessages.clear();
+ }
+ 
+ void CMessageQueue::clearMessage()
+ {
+     CAMERA_HAL_ERR("-------CMessageQueue::clearMessage--------");
+-        Mutex::Autolock _l(mLock);
+-        mMessages.clear();
+-#if 0
+-    LIST::iterator icur(mMessages.begin());
+-    LIST::iterator iend(mMessages.end());
+-    //sp<CMessage> tmp;
+-
+-    while(icur != iend) {
+-    CAMERA_HAL_ERR("*********CMessageQueue::clearMessage********");
+-        //tmp = *cur;
+-        //tmp.clear();
+-        mMessages.remove(icur);
+-        //tmp.clear();i
+-        icur ++;
+-    }
+-#endif 
++    Mutex::Autolock _l(mLock);
++    mMessages.clear();
+     mStop = false;
+ }
+ 
+-- 
+1.8.0
+

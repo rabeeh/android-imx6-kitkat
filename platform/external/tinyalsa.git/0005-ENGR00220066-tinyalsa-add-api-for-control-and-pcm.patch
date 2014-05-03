@@ -1,0 +1,194 @@
+From bdf6c9096c8fd63469cb9b02801b5e347c54fddf Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Tue, 14 Aug 2012 14:05:46 +0800
+Subject: [PATCH 05/12] ENGR00220066 tinyalsa: add api for control and pcm
+
+1. add the api of get the near rate
+2. add the api of get the driver name
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ control.c                    | 11 ++++--
+ include/tinyalsa/asoundlib.h |  4 +++
+ pcm.c                        | 82 ++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 95 insertions(+), 2 deletions(-)
+
+diff --git a/control.c b/control.c
+index 17dc703..4a197b0 100644
+--- a/control.c
++++ b/control.c
+@@ -1,6 +1,7 @@
+ /* mixer.c
+ **
+ ** Copyright 2011, The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+ **
+ ** Redistribution and use in source and binary forms, with or without
+ ** modification, are permitted provided that the following conditions are met:
+@@ -25,7 +26,6 @@
+ ** OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
+ ** DAMAGE.
+ */
+-/* Copyright 2012 Freescale Semiconductor Inc. */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -195,7 +195,6 @@ void control_close(struct control *control)
+     free(control);
+ }
+ 
+-
+ const char *control_card_info_get_id(struct control *control)
+ {
+     if (!control)
+@@ -204,6 +203,14 @@ const char *control_card_info_get_id(struct control *control)
+     return (const char *)control->card_info->id;
+ }
+ 
++const char *control_card_info_get_driver(struct control *control)
++{
++    if (!control)
++        return "";
++
++    return (const char *)control->card_info->driver;
++}
++
+ const char *control_card_info_get_name(struct control *control)
+ {
+     if (!control)
+diff --git a/include/tinyalsa/asoundlib.h b/include/tinyalsa/asoundlib.h
+index 012161e..6606425 100644
+--- a/include/tinyalsa/asoundlib.h
++++ b/include/tinyalsa/asoundlib.h
+@@ -1,6 +1,7 @@
+ /* asoundlib.h
+ **
+ ** Copyright 2011, The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+ **
+ ** Redistribution and use in source and binary forms, with or without
+ ** modification, are permitted provided that the following conditions are met:
+@@ -213,6 +214,8 @@ int pcm_set_avail_min(struct pcm *pcm, int avail_min);
+ int pcm_drain(struct pcm *pcm);
+ int pcm_state(struct pcm *pcm);
+ int pcm_prepare(struct pcm *pcm);
++int pcm_get_near_rate(unsigned int card, unsigned int device,
++                     unsigned int flags, int * rate);
+ /*
+  * MIXER API
+  */
+@@ -274,6 +277,7 @@ void control_close(struct control *control);
+ /* Get info about control controls */
+ const char *control_card_info_get_id(struct control *control);
+ const char *control_card_info_get_name(struct control *control);
++const char *control_card_info_get_driver(struct control *control);
+ 
+ int control_pcm_next_device(struct control *control, int *device, int stream);
+ const char *control_pcm_info_get_id(struct control *control, unsigned int device, int stream);
+diff --git a/pcm.c b/pcm.c
+index f2d986a..6279897 100644
+--- a/pcm.c
++++ b/pcm.c
+@@ -1,6 +1,7 @@
+ /* pcm.c
+ **
+ ** Copyright 2011, The Android Open Source Project
++** Copyright (C) 2012 Freescale Semiconductor, Inc.
+ **
+ ** Redistribution and use in source and binary forms, with or without
+ ** modification, are permitted provided that the following conditions are met:
+@@ -131,6 +132,31 @@ static unsigned int param_get_int(struct snd_pcm_hw_params *p, int n)
+     return 0;
+ }
+ 
++static unsigned int param_get_min(struct snd_pcm_hw_params *p, int n)
++{
++    if (param_is_interval(n)) {
++        struct snd_interval *i = param_to_interval(p, n);
++            return i->min;
++    }
++    return 0;
++}
++
++static unsigned int param_get_max(struct snd_pcm_hw_params *p, int n)
++{
++    if (param_is_interval(n)) {
++        struct snd_interval *i = param_to_interval(p, n);
++            return i->max;
++    }
++    return 0;
++}
++
++static void param_set_int_rmask(struct snd_pcm_hw_params *p, int n)
++{
++    if (param_is_interval(n)) {
++        p->rmask |= 1 << n;
++    }
++}
++
+ static void param_init(struct snd_pcm_hw_params *p)
+ {
+     int n;
+@@ -1056,3 +1082,59 @@ int pcm_prepare(struct pcm *pcm) {
+     pcm_sync_ptr(pcm, 0);
+     return 0;
+ }
++
++int pcm_get_near_rate(unsigned int card, unsigned int device,
++                     unsigned int flags, int *rate)
++{
++    struct pcm *pcm;
++    struct snd_pcm_hw_params params;
++    char fn[256];
++    int ret = 0;
++    int min = 0, max = 0;
++    int request_rate = *rate;
++
++    pcm = calloc(1, sizeof(struct pcm));
++    if (!pcm)
++        return -1;
++
++    snprintf(fn, sizeof(fn), "/dev/snd/pcmC%uD%u%c", card, device,
++             flags & PCM_IN ? 'c' : 'p');
++
++    pcm->flags = flags;
++    pcm->fd = open(fn, O_RDWR);
++    if (pcm->fd < 0) {
++        oops(pcm, errno, "cannot open device '%s'", fn);
++        ret = -1;
++        goto fail;
++    }
++
++    param_init(&params);
++    param_set_min(&params, SNDRV_PCM_HW_PARAM_RATE, request_rate);
++    param_set_int_rmask(&params, SNDRV_PCM_HW_PARAM_RATE);
++
++    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_HW_REFINE, &params)) {
++        oops(pcm, errno, "cannot set hw params rate min");
++    } else
++        min = param_get_min(&params, SNDRV_PCM_HW_PARAM_RATE);
++
++    param_init(&params);
++    param_set_max(&params, SNDRV_PCM_HW_PARAM_RATE, request_rate);
++    param_set_int_rmask(&params, SNDRV_PCM_HW_PARAM_RATE);
++
++    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_HW_REFINE, &params)) {
++        oops(pcm, errno, "cannot set hw params rate max");
++    }
++    else
++        max = param_get_max(&params, SNDRV_PCM_HW_PARAM_RATE);
++
++    if(min > 0)       *rate = min;
++    else if(max > 0)  *rate = max;
++    else              *rate = 0;
++
++fail_close:
++    close(pcm->fd);
++    pcm->fd = -1;
++fail:
++    free(pcm);
++    return ret;
++}
+-- 
+1.8.0
+

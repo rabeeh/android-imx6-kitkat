@@ -1,0 +1,281 @@
+From bb47dbf2b0e66d2f229d5b3ea0782b9b7c614e37 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 21 Dec 2011 20:50:46 +0800
+Subject: [PATCH 259/435] ENGR00170748 vpu: Fix rotation with tiled map
+ decoder incorrect
+
+The patch will fix tiled map decoder with rotation isn't correct issue,
+ and also set correct framebuffer type in decoder and encoder.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 22 +++++++++++++++-----
+ test/mxc_vpu_test/enc.c      | 30 +++++++++++++++------------
+ test/mxc_vpu_test/fb.c       | 49 ++++++++++++++++++++++++++++++++++----------
+ test/mxc_vpu_test/vpu_test.h |  4 +++-
+ 4 files changed, 75 insertions(+), 30 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index cf755de..9945925 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -441,6 +441,12 @@ int SaveTiledYuvImageHelper(struct decode *dec, int yuvFp,
+ 		return -1;
+ 	}
+ 
++	if (dec->cmdl->rot_en && (dec->cmdl->rot_angle == 90 || dec->cmdl->rot_angle == 270)) {
++                j = picWidth;
++                picWidth = picHeight;
++                picHeight = j;
++        }
++
+ 	puc = pYuv;
+ 	nY = picHeight;
+ 	nCb = picHeight / 2;
+@@ -668,7 +674,7 @@ write_to_file(struct decode *dec, Rect cropRect, int index)
+ 	cropping = cropRect.left | cropRect.top | cropRect.bottom | cropRect.right;
+ 
+ 	if (cpu_is_mx6q() && (dec->cmdl->mapType != LINEAR_FRAME_MAP) &&
+-	    !dec->tiled2LinearEnable && !dec->cmdl->rot_en) {
++	    !dec->tiled2LinearEnable) {
+ 		SaveTiledYuvImageHelper(dec, dec->cmdl->dst_fd, stride, height, index);
+ 		goto out;
+ 	}
+@@ -1469,14 +1475,20 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 			/* decoded buffers are tiled */
+ 			for (i = 0; i < regfbcount; i++) {
+ 				pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
+-						    dec->stride, dec->picheight, 1);
++						    dec->stride, dec->picheight, 1, dec->cmdl->mapType);
+ 				if (pfbpool[i] == NULL)
+ 					goto err;
+ 			}
+-			/* deblock and rotation is linear */
++
+ 			for (i = regfbcount; i < totalfb; i++) {
+-				pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
+-						    dec->stride, dec->picheight, 1);
++				/* if tiled2LinearEnable == 1, post processing buffer is linear,
++				 * otherwise, the buffer is tiled */
++				if (dec->tiled2LinearEnable)
++					pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++							dec->stride, dec->picheight, 1);
++				else
++					pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++						    dec->stride, dec->picheight, 1, dec->cmdl->mapType);
+ 				if (pfbpool[i] == NULL)
+ 					goto err1;
+ 			}
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 286070f..3d7fcb0 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -350,7 +350,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ {
+ 	EncHandle handle = enc->handle;
+ 	int i, enc_stride, src_stride, src_fbid;
+-	int totalfb, minfbcount, srcfbcount, regfbcount;
++	int totalfb, minfbcount, srcfbcount, extrafbcount;
+ 	RetCode ret;
+ 	FrameBuffer *fb;
+ 	PhysicalAddress subSampBaseA = 0, subSampBaseB = 0;
+@@ -368,15 +368,15 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 
+ 	if (cpu_is_mx6q()) {
+ 		if (enc->cmdl->format == STD_AVC && enc->mvc_extension) /* MVC */
+-			regfbcount = minfbcount + 2 + 2; /* min + Subsamp buffer [2] */
++			extrafbcount = 2 + 2; /* Subsamp [2] + Subsamp MVC [2] */
+ 		else if (enc->cmdl->format == STD_MJPG)
+-			regfbcount = minfbcount; /* min */
++			extrafbcount = 0;
+ 		else
+-			regfbcount = minfbcount + 2; /* min +  Subsamp buffer [2] */
++			extrafbcount = 2; /* Subsamp buffer [2] */
+ 	} else
+-		regfbcount = minfbcount; /* min */
++		extrafbcount = 0;
+ 
+-	enc->totalfb = totalfb = regfbcount + srcfbcount;
++	enc->totalfb = totalfb = minfbcount + extrafbcount + srcfbcount;
+ 
+ 	/* last framebuffer is used as src frame in the test */
+ 	enc->src_fbid = src_fbid = totalfb - 1;
+@@ -397,7 +397,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 
+ 	if (enc->cmdl->mapType == LINEAR_FRAME_MAP) {
+ 		/* All buffers are linear */
+-		for (i = 0; i < regfbcount; i++) {
++		for (i = 0; i < minfbcount + extrafbcount; i++) {
+ 			pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+ 						    enc_fbwidth, enc_fbheight, 0);
+ 			if (pfbpool[i] == NULL) {
+@@ -408,20 +408,20 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		/* Encoded buffers are tiled */
+ 		for (i = 0; i < minfbcount; i++) {
+ 			pfbpool[i] = tiled_framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+-					    enc_fbwidth, enc_fbheight, 0);
++					    enc_fbwidth, enc_fbheight, 0, enc->cmdl->mapType);
+ 			if (pfbpool[i] == NULL)
+ 				goto err1;
+ 		}
+ 		/* sub frames are linear */
+-		for (i = minfbcount; i < regfbcount; i++) {
+-			pfbpool[i] = tiled_framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++		for (i = minfbcount; i < minfbcount + extrafbcount; i++) {
++			pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+ 						    enc_fbwidth, enc_fbheight, 0);
+ 			if (pfbpool[i] == NULL)
+ 				goto err1;
+ 		}
+ 	}
+ 
+-	for (i = 0; i < regfbcount; i++) {
++	for (i = 0; i < minfbcount + extrafbcount; i++) {
+ 		fb[i].myIndex = i;
+ 		fb[i].bufY = pfbpool[i]->addrY;
+ 		fb[i].bufCb = pfbpool[i]->addrCb;
+@@ -447,7 +447,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	src_stride = (enc->src_picwidth + 15 ) & ~15;
+ 
+ 	extbufinfo.scratchBuf = enc->scratchBuf;
+-	ret = vpu_EncRegisterFrameBuffer(handle, fb, regfbcount, enc_stride, src_stride,
++	ret = vpu_EncRegisterFrameBuffer(handle, fb, minfbcount, enc_stride, src_stride,
+ 					    subSampBaseA, subSampBaseB, &extbufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+@@ -1138,6 +1138,10 @@ encode_test(void *arg)
+ 	if (enc->cmdl->mapType) {
+                 enc->linear2TiledEnable = 1;
+ 		enc->cmdl->chromaInterleave = 1; /* Must be CbCrInterleave for tiled */
++		if (cmdl->format == STD_MJPG) {
++			err_msg("MJPG encoder cannot support tiled format\n");
++			return -1;
++		}
+         } else
+ 		enc->linear2TiledEnable = 0;
+ 
+@@ -1170,7 +1174,7 @@ encode_test(void *arg)
+ 
+ 	/* start encoding */
+ 	ret = encoder_start(enc);
+-	printf("222\n");
++
+ 	/* free the allocated framebuffers */
+ 	encoder_free_framebuffer(enc);
+ err1:
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index a8911f3..28a83c2 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -106,14 +106,14 @@ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int heigh
+ 	return fb;
+ }
+ 
+-struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int mvCol)
++struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int mvCol, int mapType)
+ {
+ 	struct frame_buf *fb;
+-	int err;
++	int err, align;
+ 	int divX, divY;
+ 	Uint32 lum_top_base, lum_bot_base, chr_top_base, chr_bot_base;
+ 	Uint32 lum_top_20bits, lum_bot_20bits, chr_top_20bits, chr_bot_20bits;
+-	int luma_aligned_size, chroma_aligned_size;
++	int luma_top_size, luma_bot_size, chroma_top_size, chroma_bot_size;
+ 
+ 	fb = get_framebuf();
+ 	if (fb == NULL)
+@@ -129,9 +129,24 @@ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int
+ 	 * tiled map type, and only 20bits for the address description, so we need
+ 	 * to do 4K page align for each buffer.
+ 	 */
+-	luma_aligned_size = (((strideY * height / 2 + 4095) >> 12) << 12) * 2;
+-	chroma_aligned_size = ((strideY / divX * height / divY + 4095) >> 12) << 12;
+-	fb->desc.size = luma_aligned_size + chroma_aligned_size * 2;
++	align = SZ_4K;
++	if (mapType == TILED_FRAME_MB_RASTER_MAP) {
++		/* luma_top_size means the Y size of one frame, chroma_top_size
++		 * means the interleaved UV size of one frame in frame tiled map type*/
++		luma_top_size = (strideY * height + align - 1) & ~(align - 1);
++		chroma_top_size = (strideY / divX * height / divY * 2 + align - 1) & ~(align - 1);
++		luma_bot_size = chroma_bot_size = 0;
++	} else {
++		/* This is FIELD_FRAME_MB_RASTER_MAP case, there are two fields */
++		luma_top_size = (strideY * height / 2 + align - 1) & ~(align - 1);
++		luma_bot_size = luma_top_size;
++		chroma_top_size = (strideY / divX * height / divY + align - 1) & ~(align - 1);
++		chroma_bot_size = chroma_top_size;
++	}
++	fb->desc.size = luma_top_size + chroma_top_size + luma_bot_size + chroma_bot_size;
++	/* There is possible fb->desc.phy_addr in IOGetPhyMem not 4K page align,
++	 * so add more SZ_4K byte here for alignment */
++	fb->desc.size += align - 1;
+ 
+ 	if (mvCol)
+ 		fb->desc.size += strideY / divX * height / divY;
+@@ -150,23 +165,35 @@ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int
+ 		return NULL;
+ 	}
+ 
+-	lum_top_base = fb->desc.phy_addr;
+-	lum_bot_base = lum_top_base + luma_aligned_size / 2;
+-	chr_top_base = lum_top_base + luma_aligned_size;
+-	chr_bot_base = chr_top_base + chroma_aligned_size;
++	lum_top_base = (fb->desc.phy_addr + align - 1) & ~(align -1);
++	chr_top_base = lum_top_base + luma_top_size;
++	if (mapType == TILED_FRAME_MB_RASTER_MAP) {
++		lum_bot_base = 0;
++		chr_bot_base = 0;
++	} else {
++		lum_bot_base = chr_top_base + chroma_top_size;
++		chr_bot_base = lum_bot_base + luma_bot_size;
++	}
+ 
+ 	lum_top_20bits = lum_top_base >> 12;
+ 	lum_bot_20bits = lum_bot_base >> 12;
+ 	chr_top_20bits = chr_top_base >> 12;
+ 	chr_bot_20bits = chr_bot_base >> 12;
+ 
++	/*
++	 * In tiled map format the construction of the buffer pointers is as follows:
++	 * 20bit = addrY [31:12]: lum_top_20bits
++	 * 20bit = addrY [11: 0], addrCb[31:24]: chr_top_20bits
++	 * 20bit = addrCb[23: 4]: lum_bot_20bits
++	 * 20bit = addrCb[ 3: 0], addrCr[31:16]: chr_bot_20bits
++	 */
+ 	fb->addrY = (lum_top_20bits << 12) + (chr_top_20bits >> 8);
+ 	fb->addrCb = (chr_top_20bits << 24) + (lum_bot_20bits << 4) + (chr_bot_20bits >> 16);
+ 	fb->addrCr = chr_bot_20bits << 16;
+ 	fb->strideY = strideY;
+ 	fb->strideC = strideY / divX;
+ 	if (mvCol)
+-		fb->mvColBuf = chr_bot_base + chroma_aligned_size;
++		fb->mvColBuf = chr_bot_base + chroma_bot_size;
+ 
+     return fb;
+ }
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 6aaab82..04fcb7c 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -46,6 +46,8 @@
+ typedef unsigned short u16;
+ typedef unsigned char u8;
+ 
++#define SZ_4K			4 * 1024
++
+ #define STREAM_BUF_SIZE		0x200000
+ #define STREAM_FILL_SIZE	0x40000
+ #define STREAM_READ_SIZE	(512 * 8)
+@@ -270,7 +272,7 @@ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ int v4l_put_data(struct vpu_display *disp, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol);
+-struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol);
++struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol, int mapType);
+ void framebuf_free(struct frame_buf *fb);
+ 
+ struct vpu_display *
+-- 
+1.8.0
+

@@ -1,0 +1,139 @@
+From 2f860c87f128a6534edc9a32ac5aa66d51b82084 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Fri, 24 May 2013 14:39:45 +0800
+Subject: [PATCH 234/249] ENGR00264078 Fix multiple instance bug
+
+VPU lib v5.4.14
+
+Bug: One instance(0) quited due to vpu_DecGetInitialInfo failure.
+
+Reproduce using TGE-LV-VPU-1016: VPU multiple decode test with 8 instance
+test mixed format offscreen (MPEG4+H263+H264+MJPEGx5)
+[ERR] open: rd 0x19400000, rd reg 0x0, seqinit: rd 0x19400000, rd reg 0x0
+[ERR] vpu_DecGetInitialInfo failed, ret:-10, errorcode:0
+[ERR] decoder parse failed
+
+Root cause:
+Occured in below scenario:
+- Inst 0 was not the active inst.
+- Inst 0 filled bs buffer and updated read/write pointer stored in vars.
+- Another mjpeg instance finished decoding a frame. It reset VPU in
+  vpu_DecGetOutputInfo. FW init code set BIT_RUN_INDEX to 0, thus made inst
+  0 the active inst.
+- Inst 0 called DecBitstreamBufEmpty in vpu_DecGetInitialInfo, and
+  referenced read/write pointer stored in regs. Pointers are 0, so it
+  was regarded as bs buffer empty, and returned RETCODE_WRONG_CALL_SEQUENCE.
+
+Solution:
+Recover BIT_RUN_INDEX after explict or implict reset, so that inst will
+not switch unintentionally
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c  | 8 +++++++-
+ vpu/vpu_lib.h  | 2 +-
+ vpu/vpu_util.c | 7 +++++++
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 04c4b64..fd45a86 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -366,6 +366,7 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 	int i = 0;
+ 	CodecInst *pCodecInst;
+ 	RetCode ret;
++	unsigned long instIndexSave;
+ 
+ 	ENTER_FUNC();
+ 
+@@ -413,6 +414,7 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 	}
+ 
+ 	/* Following is for mx5x platforms */
++	instIndexSave = VpuReadReg(BIT_RUN_INDEX);
+ 	for (i = 0 ; i < 64 ; i++)
+ 		regBk[i] = VpuReadReg(BIT_CODE_BUF_ADDR + (i * 4));
+ 	IOSysSWReset();
+@@ -452,6 +454,7 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 	VpuWriteReg(BIT_BUSY_FLAG, 1);
+ 	VpuWriteReg(BIT_CODE_RUN, 1);
+ 	while (vpu_IsBusy());
++	VpuWriteReg(BIT_RUN_INDEX, instIndexSave);
+ 
+ 	BitIssueCommand(NULL, VPU_WAKE);
+ 	while (vpu_IsBusy());
+@@ -2967,6 +2970,7 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 		}
+ #endif
+ 		if (pDecInfo->openParam.bitstreamMode && (val & (1 << 4))) {
++			VpuWriteReg(BIT_RUN_INDEX, pCodecInst->instIndex);
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_FAILURE;
+ 		}
+@@ -4176,8 +4180,10 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			return RETCODE_MEMORY_ACCESS_VIOLATION;
+ 		}
+ #endif
+-		if (pDecInfo->openParam.bitstreamMode && (val & (1 << 4)))
++		if (pDecInfo->openParam.bitstreamMode && (val & (1 << 4))) {
+ 			info->decodingSuccess |= 0x10;
++			VpuWriteReg(BIT_RUN_INDEX, pCodecInst->instIndex);
++		}
+ 	}
+ 
+ 	if (pCodecInst->codecMode == AVC_DEC) {
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index d51cb2f..fabe1af 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -663,7 +663,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 13)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 14)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index fcd2fb3..d584d65 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1263,7 +1263,9 @@ int vpu_mx6_swreset(int forcedReset)
+ {
+ 	volatile int i;
+ 	Uint32 cmd;
++	unsigned long instIndexSave;
+ 
++	instIndexSave = VpuReadReg(BIT_RUN_INDEX);
+ 	if (forcedReset == 0) {
+ 		VpuWriteReg(GDI_BUS_CTRL, 0x11);
+ 		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+@@ -1279,11 +1281,15 @@ int vpu_mx6_swreset(int forcedReset)
+ 	VpuWriteReg(BIT_SW_RESET, 0);
+ 	if (forcedReset == 0)
+ 		VpuWriteReg(GDI_BUS_CTRL, 0x00);
++	VpuWriteReg(BIT_RUN_INDEX, instIndexSave);
+ 	return RETCODE_SUCCESS;
+ }
+ 
+ int vpu_mx6_hwreset()
+ {
++	unsigned long instIndexSave;
++
++	instIndexSave = VpuReadReg(BIT_RUN_INDEX);
+ 	VpuWriteReg(GDI_BUS_CTRL, 0x11);
+ 	while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+ 	IOSysSWReset();
+@@ -1292,6 +1298,7 @@ int vpu_mx6_hwreset()
+ 	VpuWriteReg(BIT_BUSY_FLAG, 1);
+ 	VpuWriteReg(BIT_CODE_RUN, 1);
+ 	while (VpuReadReg(BIT_BUSY_FLAG));
++	VpuWriteReg(BIT_RUN_INDEX, instIndexSave);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+-- 
+1.8.0
+

@@ -1,0 +1,487 @@
+From 90e61d07813c376e326f9dd8b909911ad1b4e7d5 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Thu, 18 Apr 2013 16:14:26 +0800
+Subject: [PATCH 451/486] ENGR00214328 fix camera cts long time loop run with
+ random failure.
+
+class RequestHandleThread should be one created with one instance.
+because accessing the same member variables may cause race condition.
+
+replace condition with semephore to reduce time wait cost.
+because condition is invalid with prefer event.
+
+in multi-thread, the class member variable should be replaced with
+temporary variable to avoid race condition.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera2/CameraUtil.h       |   4 --
+ mx6/libcamera2/CaptureStream.cpp  |   1 -
+ mx6/libcamera2/DeviceAdapter.cpp  | 115 +++++++++++++++++++-------------------
+ mx6/libcamera2/DeviceAdapter.h    |   1 -
+ mx6/libcamera2/PreviewStream.cpp  |   2 +-
+ mx6/libcamera2/RequestManager.cpp |   7 +++
+ mx6/libcamera2/RequestManager.h   |   1 +
+ mx6/libcamera2/StreamAdapter.cpp  |   8 +--
+ mx6/libcamera2/StreamAdapter.h    |   5 +-
+ mx6/libcamera2/UvcDevice.cpp      |  30 +++++-----
+ 10 files changed, 90 insertions(+), 84 deletions(-)
+
+diff --git a/mx6/libcamera2/CameraUtil.h b/mx6/libcamera2/CameraUtil.h
+index 8b6ef4d..639c375 100755
+--- a/mx6/libcamera2/CameraUtil.h
++++ b/mx6/libcamera2/CameraUtil.h
+@@ -149,10 +149,6 @@ struct SensorInfo
+ struct VideoInfo
+ {
+     struct v4l2_capability     cap;
+-    struct v4l2_format         format;
+-    struct v4l2_streamparm     param;
+-    struct v4l2_buffer         buf;
+-    struct v4l2_requestbuffers rb;
+     bool                       isStreamOn;
+     int                        width;
+     int                        height;
+diff --git a/mx6/libcamera2/CaptureStream.cpp b/mx6/libcamera2/CaptureStream.cpp
+index e3de671..9329cd3 100755
+--- a/mx6/libcamera2/CaptureStream.cpp
++++ b/mx6/libcamera2/CaptureStream.cpp
+@@ -27,7 +27,6 @@ CaptureStream::CaptureStream(int id)
+     mActualFormat = 0;
+     mVideoSnapShot = false;
+     mPhysMemAdapter = new PhysMemAdapter();
+-    sem_init(&mRespondSem, 0, 0);
+ }
+ 
+ CaptureStream::~CaptureStream()
+diff --git a/mx6/libcamera2/DeviceAdapter.cpp b/mx6/libcamera2/DeviceAdapter.cpp
+index 465d3c3..a26d85a 100755
+--- a/mx6/libcamera2/DeviceAdapter.cpp
++++ b/mx6/libcamera2/DeviceAdapter.cpp
+@@ -53,7 +53,7 @@ sp<DeviceAdapter>DeviceAdapter::Create(const CameraInfo& info)
+ }
+ 
+ DeviceAdapter::DeviceAdapter()
+-    : mCameraHandle(-1), mQueued(0), mDequeued(0)
++    : mCameraHandle(-1), mQueued(0)
+ {}
+ 
+ DeviceAdapter::~DeviceAdapter()
+@@ -228,23 +228,27 @@ status_t DeviceAdapter::setDeviceConfig(int         width,
+     mVideoInfo->framesizeIn = (width * height << 1);
+     mVideoInfo->formatIn    = vformat;
+ 
+-    mVideoInfo->param.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    mVideoInfo->param.parm.capture.timeperframe.numerator   = 1;
+-    mVideoInfo->param.parm.capture.timeperframe.denominator = fps;
+-    mVideoInfo->param.parm.capture.capturemode = getCaptureMode(width, height);
+-    ret = ioctl(mCameraHandle, VIDIOC_S_PARM, &mVideoInfo->param);
++    struct v4l2_streamparm param;
++    memset(&param, 0, sizeof(param));
++    param.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    param.parm.capture.timeperframe.numerator   = 1;
++    param.parm.capture.timeperframe.denominator = fps;
++    param.parm.capture.capturemode = getCaptureMode(width, height);
++    ret = ioctl(mCameraHandle, VIDIOC_S_PARM, &param);
+     if (ret < 0) {
+         FLOGE("Open: VIDIOC_S_PARM Failed: %s", strerror(errno));
+         return ret;
+     }
+ 
+-    mVideoInfo->format.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    mVideoInfo->format.fmt.pix.width        = width & 0xFFFFFFF8;
+-    mVideoInfo->format.fmt.pix.height       = height & 0xFFFFFFF8;
+-    mVideoInfo->format.fmt.pix.pixelformat  = vformat;
+-    mVideoInfo->format.fmt.pix.priv         = 0;
+-    mVideoInfo->format.fmt.pix.sizeimage    = 0;
+-    mVideoInfo->format.fmt.pix.bytesperline = 0;
++    struct v4l2_format fmt;
++    memset(&fmt, 0, sizeof(fmt));
++    fmt.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    fmt.fmt.pix.width        = width & 0xFFFFFFF8;
++    fmt.fmt.pix.height       = height & 0xFFFFFFF8;
++    fmt.fmt.pix.pixelformat  = vformat;
++    fmt.fmt.pix.priv         = 0;
++    fmt.fmt.pix.sizeimage    = 0;
++    fmt.fmt.pix.bytesperline = 0;
+ 
+     // Special stride alignment for YU12
+     if (vformat == v4l2_fourcc('Y', 'U', '1', '2')){
+@@ -270,14 +274,14 @@ status_t DeviceAdapter::setDeviceConfig(int         width,
+         // IPU have the Y stride to be 2x of the UV stride alignment
+         int stride = (width+31)/32*32;
+         int c_stride = (stride/2+15)/16*16;
+-        mVideoInfo->format.fmt.pix.bytesperline = stride;
+-        mVideoInfo->format.fmt.pix.sizeimage    = stride*height+c_stride * height;
++        fmt.fmt.pix.bytesperline = stride;
++        fmt.fmt.pix.sizeimage    = stride*height+c_stride * height;
+         FLOGI("Special handling for YV12 on Stride %d, size %d",
+-            mVideoInfo->format.fmt.pix.bytesperline,
+-            mVideoInfo->format.fmt.pix.sizeimage);
++            fmt.fmt.pix.bytesperline,
++            fmt.fmt.pix.sizeimage);
+     }
+ 
+-    ret = ioctl(mCameraHandle, VIDIOC_S_FMT, &mVideoInfo->format);
++    ret = ioctl(mCameraHandle, VIDIOC_S_FMT, &fmt);
+     if (ret < 0) {
+         FLOGE("Open: VIDIOC_S_FMT Failed: %s", strerror(errno));
+         return ret;
+@@ -306,26 +310,29 @@ status_t DeviceAdapter::registerCameraBuffers(CameraFrame *pBuffer,
+         return BAD_VALUE;
+     }
+ 
+-    mVideoInfo->rb.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    mVideoInfo->rb.memory = V4L2_MEMORY_USERPTR;
+-    mVideoInfo->rb.count  = num;
++    struct v4l2_requestbuffers req;
++    memset(&req, 0, sizeof (req));
++    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    req.memory = V4L2_MEMORY_USERPTR;
++    req.count  = num;
+ 
+-    ret = ioctl(mCameraHandle, VIDIOC_REQBUFS, &mVideoInfo->rb);
++    ret = ioctl(mCameraHandle, VIDIOC_REQBUFS, &req);
+     if (ret < 0) {
+         FLOGE("VIDIOC_REQBUFS failed: %s", strerror(errno));
+         return ret;
+     }
+ 
++    struct v4l2_buffer buf;
+     for (int i = 0; i < num; i++) {
+         CameraFrame *buffer = pBuffer + i;
+-        memset(&mVideoInfo->buf, 0, sizeof(struct v4l2_buffer));
+-        mVideoInfo->buf.index    = i;
+-        mVideoInfo->buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        mVideoInfo->buf.memory   = V4L2_MEMORY_USERPTR;
+-        mVideoInfo->buf.m.offset = buffer->mPhyAddr;
+-        mVideoInfo->buf.length   = buffer->mSize;
+-
+-        ret = ioctl(mCameraHandle, VIDIOC_QUERYBUF, &mVideoInfo->buf);
++        memset(&buf, 0, sizeof (buf));
++        buf.index    = i;
++        buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        buf.memory   = V4L2_MEMORY_USERPTR;
++        buf.m.offset = buffer->mPhyAddr;
++        buf.length   = buffer->mSize;
++
++        ret = ioctl(mCameraHandle, VIDIOC_QUERYBUF, &buf);
+         if (ret < 0) {
+             FLOGE("Unable to query buffer (%s)", strerror(errno));
+             return ret;
+@@ -367,7 +374,7 @@ status_t DeviceAdapter::fillCameraFrame(CameraFrame *frame)
+         FLOGE("fillCameraFrame: VIDIOC_QBUF Failed");
+         return BAD_VALUE;
+     }
+-    mQueued++;
++    android_atomic_inc(&mQueued);
+ 
+     return ret;
+ }
+@@ -379,6 +386,7 @@ status_t DeviceAdapter::startDeviceLocked()
+     fAssert(mBufferProvider != NULL);
+ 
+     int state;
++    struct v4l2_buffer buf;
+     for (int i = 0; i < mBufferCount; i++) {
+         CameraFrame* frame = mDeviceBufs[i];
+         state = frame->getState();
+@@ -387,24 +395,23 @@ status_t DeviceAdapter::startDeviceLocked()
+         }
+         frame->setState(CameraFrame::BUFS_IN_DRIVER);
+ 
+-        mVideoInfo->buf.index    = i;
+-        mVideoInfo->buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        mVideoInfo->buf.memory   = V4L2_MEMORY_USERPTR;
+-        mVideoInfo->buf.m.offset = frame->mPhyAddr;
+-
+-        ret = ioctl(mCameraHandle, VIDIOC_QBUF, &mVideoInfo->buf);
++        memset(&buf, 0, sizeof (struct v4l2_buffer));
++        buf.index    = i;
++        buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        buf.memory   = V4L2_MEMORY_USERPTR;
++        buf.m.offset = frame->mPhyAddr;
++        ret = ioctl(mCameraHandle, VIDIOC_QBUF, &buf);
+         if (ret < 0) {
+             FLOGE("VIDIOC_QBUF Failed");
+             return BAD_VALUE;
+         }
+ 
+-        mQueued++;
++        android_atomic_inc(&mQueued);
+     }
+ 
+     enum v4l2_buf_type bufType;
+     if (!mVideoInfo->isStreamOn) {
+         bufType = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-
+         ret = ioctl(mCameraHandle, VIDIOC_STREAMON, &bufType);
+         if (ret < 0) {
+             FLOGE("VIDIOC_STREAMON failed: %s", strerror(errno));
+@@ -442,7 +449,6 @@ status_t DeviceAdapter::stopDeviceLocked()
+     }
+ 
+     mQueued   = 0;
+-    mDequeued = 0;
+     memset(mDeviceBufs, 0, sizeof(mDeviceBufs));
+ 
+     return ret;
+@@ -458,9 +464,8 @@ status_t DeviceAdapter::startPreview()
+     }
+ 
+     Mutex::Autolock lock(mBufsLock);
+-    ret = startDeviceLocked();
+-
+     mPreviewing = true;
++    ret = startDeviceLocked();
+ 
+     return ret;
+ }
+@@ -528,7 +533,7 @@ CameraFrame * DeviceAdapter::acquireCameraFrame()
+         FLOGE("GetFrame: VIDIOC_DQBUF Failed");
+         return NULL;
+     }
+-    mDequeued++;
++    android_atomic_dec(&mQueued);
+ 
+     int index = cfilledbuffer.index;
+     fAssert(index >= 0 && index < mBufferCount);
+@@ -569,22 +574,20 @@ int DeviceAdapter::deviceThread()
+ {
+     CameraFrame *frame = NULL;
+ 
++    if (mQueued <= 0) {
++        FLOGI("no buffer in v4l2, continue");
++        usleep(10000); //sleep 10ms
++        return NO_ERROR;
++    }
++    if (!mPreviewing && !mImageCapture) {
++        FLOGI("device stop, deviceThread exit");
++        return BAD_VALUE;
++    }
++
+     frame = acquireCameraFrame();
+     if (!frame) {
+-        if (mQueued - mDequeued <= 0) {
+-            // if stop preview, then exit.
+-            if (!mPreviewing) {
+-                FLOGI("preview stop, so exit device thread");
+-                return BAD_VALUE;
+-            }
+-            else {
+-                // to check buffer in another cycle.
+-                FLOGI("no buffer in v4l driver, check it next time");
+-                return NO_ERROR;
+-            }
+-        }
+         FLOGE("device thread exit with frame = null, %d buffers still in v4l",
+-              mQueued - mDequeued);
++              mQueued);
+         if (mErrorListener != NULL) {
+             mErrorListener->handleError(CAMERA2_MSG_ERROR_DEVICE);
+         }
+diff --git a/mx6/libcamera2/DeviceAdapter.h b/mx6/libcamera2/DeviceAdapter.h
+index 4f5dec3..63a5a5c 100755
+--- a/mx6/libcamera2/DeviceAdapter.h
++++ b/mx6/libcamera2/DeviceAdapter.h
+@@ -157,7 +157,6 @@ protected:
+     struct VideoInfo *mVideoInfo;
+     int mCameraHandle;
+     int mQueued;
+-    int mDequeued;
+ 
+     PixelFormat mPicturePixelFormat;
+     PixelFormat mPreviewPixelFormat;
+diff --git a/mx6/libcamera2/PreviewStream.cpp b/mx6/libcamera2/PreviewStream.cpp
+index 7ab0e11..7f9ccab 100755
+--- a/mx6/libcamera2/PreviewStream.cpp
++++ b/mx6/libcamera2/PreviewStream.cpp
+@@ -242,7 +242,7 @@ int PreviewStream::processFrame(CameraFrame *frame)
+     }
+ 
+ err_exit:
+-    mCondRespond.signal();
++    sem_post(&mRespondSem);
+ 
+     return ret;
+ }
+diff --git a/mx6/libcamera2/RequestManager.cpp b/mx6/libcamera2/RequestManager.cpp
+index 2f498d2..826c0e2 100755
+--- a/mx6/libcamera2/RequestManager.cpp
++++ b/mx6/libcamera2/RequestManager.cpp
+@@ -23,6 +23,7 @@ RequestManager::RequestManager(int cameraId)
+     mCameraId = cameraId;
+     mErrorListener = NULL;
+     mWorkInProcess = false;
++    sem_init(&mThreadExitSem, 0, 1);
+ }
+ 
+ RequestManager::~RequestManager()
+@@ -152,6 +153,7 @@ int RequestManager::CreateDefaultRequest(int request_template, camera_metadata_t
+ int RequestManager::dispatchRequest()
+ {
+     FLOG_TRACE("%s running", __FUNCTION__);
++    sem_wait(&mThreadExitSem);
+     if (mRequestThread.get() != NULL) {
+         FLOGI("RequestThread is running, request it exit");
+         mRequestThread->requestExit();
+@@ -184,7 +186,9 @@ bool RequestManager::handleRequest()
+         res = mMetadaManager->setCurrentRequest(request);
+         if (res != NO_ERROR) {
+             FLOGE("%s: setCurrentRequest failed", __FUNCTION__);
++            mRequestThread.clear();
+             mPendingRequests--;
++            sem_post(&mThreadExitSem);
+             return false;
+         }
+ 
+@@ -216,7 +220,9 @@ bool RequestManager::handleRequest()
+         res = tryRestartStreams(requestType);
+         if (res != NO_ERROR) {
+             FLOGE("%s: tryRestartStreams failed", __FUNCTION__);
++            mRequestThread.clear();
+             mPendingRequests--;
++            sem_post(&mThreadExitSem);
+             return false;
+         }
+ 
+@@ -229,6 +235,7 @@ bool RequestManager::handleRequest()
+     stopAllStreams();
+     mRequestThread.clear();
+     mPendingRequests--;
++    sem_post(&mThreadExitSem);
+     FLOG_TRACE("%s end...", __FUNCTION__);
+ 
+     return false;
+diff --git a/mx6/libcamera2/RequestManager.h b/mx6/libcamera2/RequestManager.h
+index 6444005..99db046 100755
+--- a/mx6/libcamera2/RequestManager.h
++++ b/mx6/libcamera2/RequestManager.h
+@@ -105,6 +105,7 @@ private:
+     int mCameraId;
+     CameraErrorListener *mErrorListener;
+     bool mWorkInProcess;
++    mutable sem_t mThreadExitSem;
+ };
+ 
+ #endif
+diff --git a/mx6/libcamera2/StreamAdapter.cpp b/mx6/libcamera2/StreamAdapter.cpp
+index da57492..575a783 100755
+--- a/mx6/libcamera2/StreamAdapter.cpp
++++ b/mx6/libcamera2/StreamAdapter.cpp
+@@ -22,6 +22,7 @@ StreamAdapter::StreamAdapter(int id)
+       mMaxProducerBuffers(0), mNativeWindow(NULL), mStreamState(STREAM_INVALID), mReceiveFrame(true)
+ {
+     g2dHandle = NULL;
++    sem_init(&mRespondSem, 0, 0);
+ }
+ 
+ StreamAdapter::~StreamAdapter()
+@@ -132,7 +133,7 @@ bool StreamAdapter::handleStream()
+     if (msg == 0) {
+         if (mStreamState == STREAM_STARTED) {
+             FLOGI("%s: get invalid message", __FUNCTION__);
+-            mCondRespond.signal();
++            sem_post(&mRespondSem);
+         }
+         return shouldLive;
+     }
+@@ -240,8 +241,7 @@ void StreamAdapter::handleCameraFrame(CameraFrame *frame)
+ 
+ void StreamAdapter::applyRequest()
+ {
+-    Mutex::Autolock _l(mMutexRespond);
+-    mCondRespond.wait(mMutexRespond);
++    sem_wait(&mRespondSem);
+ }
+ 
+ void StreamAdapter::convertNV12toYV12(StreamBuffer* dst, StreamBuffer* src)
+@@ -363,7 +363,7 @@ int StreamAdapter::processFrame(CameraFrame *frame)
+     }
+ 
+ err_ext:
+-    mCondRespond.signal();
++    sem_post(&mRespondSem);
+ 
+     return ret;
+ }
+diff --git a/mx6/libcamera2/StreamAdapter.h b/mx6/libcamera2/StreamAdapter.h
+index 0efaa27..b28ac00 100755
+--- a/mx6/libcamera2/StreamAdapter.h
++++ b/mx6/libcamera2/StreamAdapter.h
+@@ -120,8 +120,7 @@ protected:
+     CameraErrorListener *mErrorListener;
+ 
+     sp<MetadaManager> mMetadaManager;
+-    mutable Mutex mMutexRespond;
+-    mutable Condition mCondRespond;
++    mutable sem_t mRespondSem;
+ 
+     bool mReceiveFrame;
+     // for debug.
+@@ -183,8 +182,6 @@ private:
+     bool mVideoSnapShot;
+     PhysMemAdapter *mPhysMemAdapter;
+     sp<JpegBuilder> mJpegBuilder;
+-
+-    mutable sem_t mRespondSem;
+ };
+ 
+ #endif
+diff --git a/mx6/libcamera2/UvcDevice.cpp b/mx6/libcamera2/UvcDevice.cpp
+index 8768170..d24f336 100644
+--- a/mx6/libcamera2/UvcDevice.cpp
++++ b/mx6/libcamera2/UvcDevice.cpp
+@@ -102,24 +102,28 @@ status_t UvcDevice::setDeviceConfig(int         width,
+     mVideoInfo->framesizeIn = (width * height << 1);
+     mVideoInfo->formatIn    = vformat;
+ 
+-    mVideoInfo->param.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    mVideoInfo->param.parm.capture.timeperframe.numerator   = 1;
+-    mVideoInfo->param.parm.capture.timeperframe.denominator = fps;
+-    ret = ioctl(mCameraHandle, VIDIOC_S_PARM, &mVideoInfo->param);
++    struct v4l2_streamparm param;
++    memset(&param, 0, sizeof(param));
++    param.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    param.parm.capture.timeperframe.numerator   = 1;
++    param.parm.capture.timeperframe.denominator = fps;
++    ret = ioctl(mCameraHandle, VIDIOC_S_PARM, &param);
+     if (ret < 0) {
+         FLOGE("Open: VIDIOC_S_PARM Failed: %s", strerror(errno));
+         return ret;
+     }
+ 
+-    mVideoInfo->format.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    mVideoInfo->format.fmt.pix.width        = width & 0xFFFFFFF8;
+-    mVideoInfo->format.fmt.pix.height       = height & 0xFFFFFFF8;
+-    mVideoInfo->format.fmt.pix.pixelformat  = vformat;
+-    mVideoInfo->format.fmt.pix.priv         = 0;
+-    mVideoInfo->format.fmt.pix.sizeimage    = 0;
+-    mVideoInfo->format.fmt.pix.bytesperline = 0;
++    struct v4l2_format fmt;
++    memset(&fmt, 0, sizeof(fmt));
++    fmt.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    fmt.fmt.pix.width        = width & 0xFFFFFFF8;
++    fmt.fmt.pix.height       = height & 0xFFFFFFF8;
++    fmt.fmt.pix.pixelformat  = vformat;
++    fmt.fmt.pix.priv         = 0;
++    fmt.fmt.pix.sizeimage    = 0;
++    fmt.fmt.pix.bytesperline = 0;
+ 
+-    ret = ioctl(mCameraHandle, VIDIOC_S_FMT, &mVideoInfo->format);
++    ret = ioctl(mCameraHandle, VIDIOC_S_FMT, &fmt);
+     if (ret < 0) {
+         FLOGE("Open: VIDIOC_S_FMT Failed: %s", strerror(errno));
+         return ret;
+@@ -383,7 +387,7 @@ CameraFrame * UvcDevice::acquireCameraFrame()
+             FLOGE("Camera VIDIOC_DQBUF failure, ret=%d", rtval);
+             return camBuf;
+         }
+-        mDequeued++;
++        mQueued --;
+ 
+         int index = cfilledbuffer.index;
+         fAssert(index >= 0 && index < mBufferCount);
+-- 
+1.8.0
+

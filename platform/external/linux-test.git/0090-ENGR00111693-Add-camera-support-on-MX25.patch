@@ -1,0 +1,229 @@
+From 8c27c9356499743069ac1f9c7290fbbb07b55a9a Mon Sep 17 00:00:00 2001
+From: Xie xiaobo <X.Xie@freescale.com>
+Date: Wed, 29 Apr 2009 22:55:25 +0800
+Subject: [PATCH 090/435] ENGR00111693 Add camera support on MX25
+
+Add camera viewfinder and still capture unit test support on MX25.
+New csi_v4l2_overlay.c is created since MX25 viewfinder is simple
+and cannot reuse most ioctl as other platforms.
+mxc_v4l2_still.c can be reused with trivial changes.
+
+Signed-off-by: Guoqing Jiang <b22156@freescale.com>
+---
+ test/mxc_v4l2_test/Makefile           |   8 +-
+ test/mxc_v4l2_test/autorun-v4l2.sh    |   4 +
+ test/mxc_v4l2_test/csi_v4l2_overlay.c | 142 ++++++++++++++++++++++++++++++++++
+ test/mxc_v4l2_test/mxc_v4l2_still.c   |   4 +
+ 4 files changed, 156 insertions(+), 2 deletions(-)
+ create mode 100644 test/mxc_v4l2_test/csi_v4l2_overlay.c
+
+diff --git a/test/mxc_v4l2_test/Makefile b/test/mxc_v4l2_test/Makefile
+index 2dc60ef..e228830 100644
+--- a/test/mxc_v4l2_test/Makefile
++++ b/test/mxc_v4l2_test/Makefile
+@@ -3,11 +3,15 @@ EXCLUDE_LIST:=
+ 
+ ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
+ OBJS = 	$(OBJDIR)/autorun-v4l2.sh \
+-	$(OBJDIR)/mxc_v4l2_overlay.out \
+-	$(OBJDIR)/mxc_v4l2_capture.out \
+ 	$(OBJDIR)/mxc_v4l2_output.out \
+ 	$(OBJDIR)/mxc_v4l2_still.out \
+ 	$(OBJDIR)/mxc_v4l2_tvin.out
++ifeq ($(PLATFORM), IMX25_3STACK)
++OBJS += $(OBJDIR)/csi_v4l2_overlay.out
++else
++OBJS += $(OBJDIR)/mxc_v4l2_overlay.out \
++	$(OBJDIR)/mxc_v4l2_capture.out
++endif
+ 
+ else
+ OBJS =
+diff --git a/test/mxc_v4l2_test/autorun-v4l2.sh b/test/mxc_v4l2_test/autorun-v4l2.sh
+index 9f1b1e1..b9ffd11 100755
+--- a/test/mxc_v4l2_test/autorun-v4l2.sh
++++ b/test/mxc_v4l2_test/autorun-v4l2.sh
+@@ -64,6 +64,9 @@ fi
+ if [ $TEST_CAMERA = 1 ]; then
+ 
+ # V4L2 Capture Tests
++if [ "$(platform)" = IMX25_3STACK ]; then
++run_testcase "./csi_v4l2_overlay.out -t 10"
++else
+ run_testcase "./mxc_v4l2_overlay.out -iw 640 -ih 480 -ow 240 -oh 320 -r 4 -fr 30 -fg -t 10"
+ run_testcase "./mxc_v4l2_overlay.out -iw 640 -ih 480 -ow 240 -oh 320 -r 4 -fr 30 -t 10"
+ 
+@@ -74,6 +77,7 @@ done
+ for POS in 0 4 8 16 32 64 128; do
+ 	run_testcase "./mxc_v4l2_overlay.out -iw 640 -ih 480 -ot $POS -ol $POS -ow 80 -oh 60 -fr 30 -fg -t 5"
+ done
++fi
+ 
+ fi
+ 
+diff --git a/test/mxc_v4l2_test/csi_v4l2_overlay.c b/test/mxc_v4l2_test/csi_v4l2_overlay.c
+new file mode 100644
+index 0000000..59caa52
+--- /dev/null
++++ b/test/mxc_v4l2_test/csi_v4l2_overlay.c
+@@ -0,0 +1,142 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All rights reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*
++ * @file csi_v4l2_overlay.c
++ *
++ * @brief Mx25 Video For Linux 2 driver test application
++ *
++ */
++
++#ifdef __cplusplus
++extern "C"{
++#endif
++
++/*=======================================================================
++                                        INCLUDE FILES
++=======================================================================*/
++/* Standard Include Files */
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++
++/* Verification Test Environment Include Files */
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <asm/types.h>
++#include <linux/videodev.h>
++#include <linux/fb.h>
++#include <sys/mman.h>
++#include <math.h>
++#include <string.h>
++#include <malloc.h>
++#include <linux/mxcfb.h>
++
++#define TFAIL -1
++#define TPASS 0
++
++char v4l_device[100] = "/dev/video0";
++int fd_v4l = 0;
++int g_camera_framerate = 0;
++int g_timeout = 3600;
++
++int mxc_v4l_overlay_setup(struct v4l2_format *fmt)
++{
++	struct v4l2_streamparm parm;
++
++	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	parm.parm.capture.timeperframe.numerator = 1;
++	parm.parm.capture.timeperframe.denominator = g_camera_framerate;
++	parm.parm.capture.capturemode = 0;
++
++	if (ioctl(fd_v4l, VIDIOC_S_PARM, &parm) < 0) {
++		printf("VIDIOC_S_PARM failed\n");
++		return TFAIL;
++	}
++
++	return TPASS;
++}
++
++int process_cmdline(int argc, char **argv)
++{
++	int i;
++
++	for (i = 1; i < argc; i++) {
++		if (strcmp(argv[i], "-help") == 0) {
++			printf("MX25 Video4Linux overlay Device Test\n\n" \
++				"./mxc_v4l2_overlay -t time\n");
++		}
++		else if (strcmp(argv[i], "-t") == 0) {
++			g_timeout = atoi(argv[++i]);
++		}
++	}
++
++	return 0;
++}
++
++int main(int argc, char **argv)
++{
++	struct v4l2_format fmt;
++	char fb_device[100] = "/dev/fb0";
++	int fd_fb = 0;
++	struct fb_fix_screeninfo fix;
++	unsigned long fb0;
++
++	if (process_cmdline(argc, argv) < 0) {
++		return TFAIL;
++	}
++	if ((fd_v4l = open(v4l_device, O_RDWR, 0)) < 0) {
++		printf("Unable to open %s\n", v4l_device);
++		return TFAIL;
++	}
++	printf("open %s succeed!\n", v4l_device);
++
++	if ((fd_fb = open(fb_device, O_RDWR )) < 0) {
++		printf("Unable to open frame buffer\n");
++		return TFAIL;
++	}
++
++	if (ioctl(fd_fb, FBIOGET_FSCREENINFO, &fix) < 0) {
++		close(fd_fb);
++		printf("ioctl fb FBIOGET_FSCREENINFO failed!\n");
++		return TFAIL;
++	}
++
++	if (mxc_v4l_overlay_setup(&fmt) < 0) {
++		printf("Setup overlay failed.\n");
++		return TFAIL;
++	}
++
++	fb0 = fix.smem_start;
++	if (ioctl(fd_v4l, VIDIOC_OVERLAY, &fb0) < 0) {
++		printf("VIDIOC_OVERLAY start failed\n");
++		return TFAIL;
++	}
++	sleep(g_timeout);
++
++	fb0 = 0;
++	if (ioctl(fd_v4l, VIDIOC_OVERLAY, &fb0) < 0) {
++		printf("VIDIOC_OVERLAY start failed\n");
++		return TFAIL;
++	}
++
++	close(fd_fb);
++	close(fd_v4l);
++
++	return 0;
++}
+diff --git a/test/mxc_v4l2_test/mxc_v4l2_still.c b/test/mxc_v4l2_test/mxc_v4l2_still.c
+index 8da6e79..be2d9bd 100644
+--- a/test/mxc_v4l2_test/mxc_v4l2_still.c
++++ b/test/mxc_v4l2_test/mxc_v4l2_still.c
+@@ -263,6 +263,10 @@ int main(int argc, char **argv)
+                                 g_pixelformat = v4l2_fourcc('Y','4','4','4');
+                                 g_bpp = 32;
+                         }
++                        else if (strcmp(argv[i], "RGB565") == 0) {
++                                g_pixelformat = V4L2_PIX_FMT_RGB565;
++                                g_bpp = 16;
++                        }
+                         else {
+                                 printf("Pixel format not supported.\n");
+                                 usage();
+-- 
+1.8.0
+

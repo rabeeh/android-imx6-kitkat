@@ -1,0 +1,126 @@
+From 41eeff531a066bd3d59a73e7a634b25553042f5d Mon Sep 17 00:00:00 2001
+From: Oliver Brown <oliver.brown@freescale.com>
+Date: Tue, 6 Nov 2012 11:29:34 -0600
+Subject: [PATCH 366/486] ENGR00232651 - Need to add support for Vsync in iMX5
+ Android Jelly Bean
+
+Only glClear if needed for YUV formats.
+Added nanoslpeep to force thread to yeild its remaining timeslice.
+
+Signed-off-by: Oliver Brown <oliver.brown@freescale.com>
+---
+ mx5x/hwcomposer/hwc_context.h  |  1 +
+ mx5x/hwcomposer/hwc_vsync.cpp  | 13 +++++++++++--
+ mx5x/hwcomposer/hwcomposer.cpp | 36 ++++++++++++++++++++++++++++++++----
+ 3 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/mx5x/hwcomposer/hwc_context.h b/mx5x/hwcomposer/hwc_context.h
+index a244213..f4ad5fe 100755
+--- a/mx5x/hwcomposer/hwc_context.h
++++ b/mx5x/hwcomposer/hwc_context.h
+@@ -44,6 +44,7 @@ struct hwc_context_t {
+ 
+     int m_mainfb_fd;
+     float m_mainfb_fps;
++    nsecs_t m_frame_period_ns;
+     hwc_procs_t* m_callback;
+     bool m_vsync_enable;
+     sp<VSyncThread> m_vsync_thread;
+diff --git a/mx5x/hwcomposer/hwc_vsync.cpp b/mx5x/hwcomposer/hwc_vsync.cpp
+index b5f5d91..e46fda9 100755
+--- a/mx5x/hwcomposer/hwc_vsync.cpp
++++ b/mx5x/hwcomposer/hwc_vsync.cpp
+@@ -30,7 +30,7 @@ VSyncThread::VSyncThread(hwc_context_t *ctx)
+ 
+ void VSyncThread::onFirstRef()
+ {
+-    run("vsyncThread", PRIORITY_URGENT_DISPLAY);
++    run("vsyncThread", PRIORITY_URGENT_DISPLAY + ANDROID_PRIORITY_LESS_FAVORABLE);
+ }
+ 
+ void VSyncThread::setEnabled(bool enabled) {
+@@ -54,7 +54,7 @@ bool VSyncThread::threadLoop()
+     }
+ 
+     uint64_t timestamp = 0;
+-    uint32_t crt = (uint32_t)&timestamp; 
++    uint32_t crt = (uint32_t)&timestamp;
+ 
+     int err = ioctl(mCtx->m_mainfb_fd, MXCFB_WAIT_FOR_VSYNC, crt);
+     if ( err < 0 ) {
+@@ -71,6 +71,15 @@ bool VSyncThread::threadLoop()
+ #else
+         mCtx->m_callback->vsync(mCtx->m_callback, 0, timestamp);
+ #endif
++        {
++            struct timespec tm;
++            struct timespec ts;
++            const nsecs_t wake_up = 400000;
++
++            ts.tv_nsec =  (timestamp + mCtx->m_frame_period_ns) - (systemTime(SYSTEM_TIME_MONOTONIC) + wake_up );
++            ts.tv_sec = 0;
++            nanosleep( &ts, &tm);
++        }
+     }
+     return true;
+ }
+diff --git a/mx5x/hwcomposer/hwcomposer.cpp b/mx5x/hwcomposer/hwcomposer.cpp
+index 29b9412..ca08b5b 100755
+--- a/mx5x/hwcomposer/hwcomposer.cpp
++++ b/mx5x/hwcomposer/hwcomposer.cpp
+@@ -86,12 +86,38 @@ static int hwc_set(hwc_composer_device_t *dev,
+         hwc_layer_list_t* list)
+ {
+     struct hwc_context_t *ctx = (struct hwc_context_t *)dev;
+-
++    bool clear_needed = false;
+     EGLBoolean success;
++    int i;
+ 
+     success = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
+-    glClearColor(0, 0, 0, 0);
+-    glClear(GL_COLOR_BUFFER_BIT);
++
++    for (i =0 ; i < list->numHwLayers; i++)
++    {
++        private_handle_t *handle = (private_handle_t *)(list->hwLayers[i].handle);
++        if (handle)
++        {
++            if ((handle->format == HAL_PIXEL_FORMAT_YV12) ||
++                (handle->format == HAL_PIXEL_FORMAT_YCbCr_422_SP) ||
++                (handle->format == HAL_PIXEL_FORMAT_YCrCb_420_SP) ||
++                (handle->format == HAL_PIXEL_FORMAT_YCrCb_420_SP) ||
++                (handle->format == HAL_PIXEL_FORMAT_YCbCr_422_I) ||
++                (handle->format == HAL_PIXEL_FORMAT_YCbCr_422_P) ||
++                (handle->format == HAL_PIXEL_FORMAT_YCbCr_420_P) ||
++                (handle->format == HAL_PIXEL_FORMAT_CbYCrY_422_I) ||
++                (handle->format == HAL_PIXEL_FORMAT_YCbCr_420_SP) )
++            {
++                clear_needed = true;
++            }
++            //dump_layer(&list->hwLayers[i]);
++        }
++    }
++
++    if (clear_needed)
++    {
++        glClearColor(0, 0, 0, 0);
++        glClear(GL_COLOR_BUFFER_BIT);
++    }
+ 
+     if (!success) {
+         return HWC_EGL_ERROR;
+@@ -191,7 +217,9 @@ static int hwc_get_framebuffer_info(struct hwc_context_t* ctx)
+         refreshRate = 60 * 1000;  // 60 Hz
+ 
+     ctx->m_mainfb_fps = refreshRate / 1000.0f;
+-    ALOGI("<%s,%d> Vsync rate %0.6f fps", __FUNCTION__, __LINE__, ctx->m_mainfb_fps);
++    ctx->m_frame_period_ns = (1.0f / ctx->m_mainfb_fps) * 1000000000.0f;
++    ALOGI("<%s,%d> Vsync rate %0.6f fps, frame time %llu ns", __FUNCTION__, __LINE__,
++          ctx->m_mainfb_fps, ctx->m_frame_period_ns);
+     return 0;
+ }
+ 
+-- 
+1.8.0
+

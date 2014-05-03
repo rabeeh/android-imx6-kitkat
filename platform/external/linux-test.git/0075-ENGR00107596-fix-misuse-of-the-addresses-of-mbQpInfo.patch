@@ -1,0 +1,132 @@
+From 6e1a66feeeca0166ba4f9e82c7d65d79982ad5ad Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Mon, 16 Feb 2009 15:46:53 +0800
+Subject: [PATCH 075/435] ENGR00107596 fix misuse of the addresses of
+ mbQpInfo&sliceInfo
+
+fix_mixuse/misuse_of_virtual_and_physical_addr_for_mbQpInfo/sliceInfo
+Remove function SaveQpReport from vpu library to vpu test codes.
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/enc.c      | 19 +++++++++++++++
+ test/mxc_vpu_test/utils.c    | 57 ++++++++++++++++++++++++++++++++++++++++++++
+ test/mxc_vpu_test/vpu_test.h |  2 ++
+ 3 files changed, 78 insertions(+)
+
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 6fd0795..5d11f40 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -255,6 +255,7 @@ encoder_start(struct encode *enc)
+ {
+ 	EncHandle handle = enc->handle;
+ 	EncParam  enc_param = {0};
++	EncOpenParam encop = {0};
+ 	EncOutputInfo outinfo = {0};
+ 	RetCode ret = 0;
+ 	int src_fbid = enc->src_fbid, img_size, frame_id = 0;
+@@ -370,6 +371,24 @@ encoder_start(struct encode *enc)
+ 			goto err2;
+ 		}
+ 
++		encop = handle->CodecInfo.encInfo.openParam;
++		if (encop.sliceReport == 1) {
++			int i;
++			unsigned int *p = (unsigned int *)outinfo.sliceInfo;
++			info_msg("Num of Slice=%d ", outinfo.numOfSlices);
++
++			for (i = 0; i < outinfo.numOfSlices; i++) {
++			       info_msg("%x,", *p++);
++			}
++			info_msg("\n");
++		}
++
++		if ((encop.bitstreamFormat == STD_MPEG4) &&
++					(encop.mbQpReport == 1)) {
++                        SaveQpReport(outinfo.mbQpInfo, encop.picWidth,
++				encop.picHeight, frame_id, "encqpreport.dat");
++		}
++
+ 		if (src_scheme == PATH_V4L2) {
+ 			v4l_put_capture_data(&v4l2_buf);
+ 		}
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index b071a12..57d7566 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -809,3 +809,60 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode)
+ 	return 0;
+ }
+ 
++void SaveQpReport(Uint32 *qpReportAddr, int picWidth, int picHeight,
++		  int frameIdx, char *fileName)
++{
++	FILE *fp;
++	int i, j;
++	int MBx, MBy, MBxof4, MBxof1, MBxx;
++	Uint32 *qpAddr;
++	Uint32 qp;
++	Uint8 lastQp[4];
++
++	if (frameIdx == 0)
++		fp = fopen(fileName, "wb");
++	else
++		fp = fopen(fileName, "a+b");
++
++	if (!fp) {
++		err_msg("Can't open %s in SaveQpReport\n", fileName);
++		return;
++	}
++
++	MBx = picWidth / 16;
++	MBxof1 = MBx % 4;
++	MBxof4 = MBx - MBxof1;
++	MBy = picHeight / 16;
++	MBxx = (MBx + 3) / 4 * 4;
++	for (i = 0; i < MBy; i++) {
++		for (j = 0; j < MBxof4; j = j + 4) {
++			dprintf(3, "qpReportAddr = %lx\n", (Uint32)qpReportAddr);
++			qpAddr = (Uint32 *)((Uint32)qpReportAddr + j + MBxx * i);
++			qp = *qpAddr;
++			fprintf(fp, " %4d %4d %3d \n", frameIdx,
++				MBx * i + j + 0, (Uint8) (qp >> 24));
++			fprintf(fp, " %4d %4d %3d \n", frameIdx,
++				MBx * i + j + 1, (Uint8) (qp >> 16));
++			fprintf(fp, " %4d %4d %3d \n", frameIdx,
++				MBx * i + j + 2, (Uint8) (qp >> 8));
++			fprintf(fp, " %4d %4d %3d \n", frameIdx,
++				MBx * i + j + 3, (Uint8) qp);
++		}
++
++		if (MBxof1 > 0) {
++			qpAddr = (Uint32 *)((Uint32)qpReportAddr + MBxx * i + MBxof4);
++			qp = *qpAddr;
++			lastQp[0] = (Uint8) (qp >> 24);
++			lastQp[1] = (Uint8) (qp >> 16);
++			lastQp[2] = (Uint8) (qp >> 8);
++			lastQp[3] = (Uint8) (qp);
++		}
++
++		for (j = 0; j < MBxof1; j++) {
++			fprintf(fp, " %4d %4d %3d \n", frameIdx,
++				MBx * i + j + MBxof4, lastQp[j]);
++		}
++	}
++
++	fclose(fp);
++}
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 21e6ade..0c52fa4 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -212,4 +212,6 @@ int decoder_parse(struct decode *dec);
+ int decoder_allocate_framebuffer(struct decode *dec);
+ void decoder_free_framebuffer(struct decode *dec);
+ 
++void SaveQpReport(Uint32 *qpReportAddr, int picWidth, int picHeight,
++		  int frameIdx, char *fileName);
+ #endif
+-- 
+1.8.0
+

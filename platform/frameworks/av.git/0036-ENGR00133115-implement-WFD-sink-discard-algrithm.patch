@@ -1,0 +1,474 @@
+From 5132a1b8a8c98739144bc45f033b5d475d2ecf9d Mon Sep 17 00:00:00 2001
+From: Song Bing <b06498@freescale.com>
+Date: Wed, 16 Oct 2013 15:25:22 +0800
+Subject: [PATCH 36/50] ENGR00133115 implement WFD sink discard algrithm.
+
+implement WFD sink discard algrithm.
+
+Where introduce the latency?
+
+WFD Total: ~250 ms with latest WIFI driver.
+WFD source: 33 ms (capture one frame) + 33 ms (VPU has one frame delay) + 7 ms (encoder time) + ~30 ms (net process time) = ~100 ms
+WFD sink: ~150 ms for thread process and net jitter and avoid audio under run.
+
+Quality criteria.
+
+Discard one time media data during certain time, default is discard one time during 5 minutes.
+As different use scenario have different quality and latency requirement, so my proposal is add one adjust button like volume adjust to adjust the threshold by user in WFD sink.
+
+How to adjust latency threshold in WFD sink automatically?
+
+If user haven?t set latency threshold. The threshold will adjust automatically. Threshold will increase if discard media data within 5 minutes, or will decrease the threshold.
+
+When WFD sink can discard media data?
+
+Latency in WFD sink is jitter as net and thread process jitter. To avoid discard media data frequently, only can discard data out of jitter range. If the minimum value of WFD sink latency is bigger than threshold during the statistic interval, the media data can be discarded.
+
+When WFD sink discard video data?
+
+To avoid mosaic when discard video data, video data will be discarded only when WFD NuPlayer source buffered more than 1 second video and have discarded all audio data.
+
+Other test.
+
+Connect with Nexus 4, best latency is 250 ms. Net will jitter 500ms after a while. So delay will be 500+ ms.
+Still screen will get low latency. Vary screen will cause large jitter then cause large latency.
+
+Signed-off-by: Song Bing b06498@freescale.com
+---
+ include/media/IStreamSource.h                      |   3 +
+ media/libmediaplayerservice/nuplayer/NuPlayer.cpp  |   8 +-
+ .../nuplayer/NuPlayerRenderer.cpp                  |   2 +-
+ .../nuplayer/NuPlayerSource.h                      |   2 +
+ .../nuplayer/StreamingSource.cpp                   | 233 +++++++++++++++++++--
+ .../nuplayer/StreamingSource.h                     |  33 +++
+ 6 files changed, 262 insertions(+), 19 deletions(-)
+
+diff --git a/include/media/IStreamSource.h b/include/media/IStreamSource.h
+index 677119b..737b4e2 100644
+--- a/include/media/IStreamSource.h
++++ b/include/media/IStreamSource.h
+@@ -40,6 +40,9 @@ struct IStreamSource : public IInterface {
+ 
+         // Timestamps are in ALooper::GetNowUs() units.
+         kFlagIsRealTimeData   = 2,
++
++        // Will discard data if buffered too much data to keep low latency.
++        kFlagKeepLowLatency   = 4,
+     };
+     virtual uint32_t flags() const { return 0; }
+ };
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+index 750287f..659b566 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayer.cpp
+@@ -546,7 +546,7 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+ 
+                 if (err == -EWOULDBLOCK) {
+                     if (mSource->feedMoreTSData() == OK) {
+-                        msg->post(10000ll);
++                        msg->post(2000ll);
+                     }
+                 }
+             } else if (what == ACodec::kWhatEOS) {
+@@ -631,7 +631,7 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+                                 numChannels,
+                                 (audio_channel_mask_t)channelMask,
+                                 AUDIO_FORMAT_PCM_16_BIT,
+-                                8 /* bufferCount */,
++                                DEFAULT_AUDIOSINK_BUFFERCOUNT /* bufferCount */,
+                                 NULL,
+                                 NULL,
+                                 flags),
+@@ -755,6 +755,10 @@ void NuPlayer::onMessageReceived(const sp<AMessage> &msg) {
+ 
+                 CHECK(msg->findInt64("videoLateByUs", &mVideoLateByUs));
+ 
++                if (mSource != NULL) {
++                    mSource->setRenderPosition(positionUs);
++                }
++ 
+                 if (mDriver != NULL) {
+                     sp<NuPlayerDriver> driver = mDriver.promote();
+                     if (driver != NULL) {
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+index 3b2784b..836266e 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerRenderer.cpp
+@@ -288,7 +288,7 @@ bool NuPlayer::Renderer::onDrainAudioQueue() {
+                 mNumFramesWritten - numFramesPlayed;
+ 
+             int64_t realTimeOffsetUs =
+-                (mAudioSink->latency() / 2  /* XXX */
++                (mAudioSink->latency() / 4  /* XXX */
+                     + numFramesPendingPlayout
+                         * mAudioSink->msecsPerFrame()) * 1000ll;
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/NuPlayerSource.h b/media/libmediaplayerservice/nuplayer/NuPlayerSource.h
+index e50533a..6c16d5e 100644
+--- a/media/libmediaplayerservice/nuplayer/NuPlayerSource.h
++++ b/media/libmediaplayerservice/nuplayer/NuPlayerSource.h
+@@ -88,6 +88,8 @@ struct NuPlayer::Source : public AHandler {
+         return false;
+     }
+ 
++    virtual void setRenderPosition(int64_t positionUs) {}
++
+ protected:
+     virtual ~Source() {}
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/StreamingSource.cpp b/media/libmediaplayerservice/nuplayer/StreamingSource.cpp
+index 28f0d50..acf0aea 100644
+--- a/media/libmediaplayerservice/nuplayer/StreamingSource.cpp
++++ b/media/libmediaplayerservice/nuplayer/StreamingSource.cpp
+@@ -18,6 +18,7 @@
+ #define LOG_TAG "StreamingSource"
+ #include <utils/Log.h>
+ 
++#include <cutils/properties.h>
+ #include "StreamingSource.h"
+ 
+ #include "ATSParser.h"
+@@ -37,6 +38,16 @@ NuPlayer::StreamingSource::StreamingSource(
+         const sp<IStreamSource> &source)
+     : Source(notify),
+       mSource(source),
++      mLatencyLowest(0),
++      mStasticPeroid(0),
++      mLatencyThreshold(LATENCY_THRESHOLD_DEFAULT),
++      mDropEndTimeUs(-1),
++      mPipeLineLatencyUs(-1),
++      mResumeCheckTimeUs(-1),
++      mPrevDropTimeUs(-1),
++      mTunnelRenderLatency(-1),
++      mPositionUs(-1),
++      mAnchorTimeRealUs(-1),
+       mFinalResult(OK) {
+ }
+ 
+@@ -69,11 +80,10 @@ status_t NuPlayer::StreamingSource::feedMoreTSData() {
+         return mFinalResult;
+     }
+ 
+-    for (int32_t i = 0; i < 50; ++i) {
++    for (int32_t i = 0; i < 100; ++i) {
+         char buffer[188];
+         sp<AMessage> extra;
+         ssize_t n = mStreamListener->read(buffer, sizeof(buffer), &extra);
+-
+         if (n == 0) {
+             ALOGI("input data EOS reached.");
+             mTSParser->signalEOS(ERROR_END_OF_STREAM);
+@@ -94,8 +104,19 @@ status_t NuPlayer::StreamingSource::feedMoreTSData() {
+                 type = mask;
+             }
+ 
+-            mTSParser->signalDiscontinuity(
+-                    (ATSParser::DiscontinuityType)type, extra);
++            int64_t mTunnelRenderLatencyValue;
++            if (extra != NULL
++                    && extra->findInt64("tunnel-render-latency", &mTunnelRenderLatencyValue)) {
++                if (mTunnelRenderLatencyValue > 0) {
++                    mTunnelRenderLatency = mTunnelRenderLatencyValue;
++                }
++            }
++
++            int64_t timeUs;
++            if (extra != NULL
++                    && extra->findInt64("timeUs", &timeUs))
++                mTSParser->signalDiscontinuity(
++                        (ATSParser::DiscontinuityType)type, extra);
+         } else if (n < 0) {
+             CHECK_EQ(n, -EWOULDBLOCK);
+             break;
+@@ -152,8 +173,179 @@ sp<MetaData> NuPlayer::StreamingSource::getFormatMeta(bool audio) {
+     return source->getFormat();
+ }
+ 
++/*
++Where introduce the latency?
++
++WFD Total: ~250 ms.
++WFD source: 33 ms (capture one frame) + 33 ms (VPU has one frame delay) + 
++7 ms (encoder time) + ~30 ms (net process time) = ~100 ms
++WFD sink: ~150 ms for thread process and net jitter and avoid audio under run.
++
++Quality criteria.
++
++Discard one time media data during certain time, default is discard one time 
++during 5 minutes.
++As different use scenario have different quality and latency requirement, so my 
++proposal is add one adjust button like volume adjust to adjust the threshold by 
++user in WFD sink.
++
++How to adjust latency threshold in WFD sink automatically?
++
++If user haven?t set latency threshold. The threshold will adjust automatically.
++Threshold will increase if discard media data within 5 minutes, or will 
++decrease the threshold.
++
++When WFD sink can discard media data?
++
++Latency in WFD sink is jitter as net and thread process jitter. To avoid 
++discard media data frequently, only can discard data out of jitter range. If 
++the minimum value of WFD sink latency is bigger than threshold during the 
++statistic interval, the media data can be discarded.
++
++When WFD sink discard video data?
++
++To avoid mosaic when discard video data, video data will be discarded only 
++when WFD NuPlayer source buffered more than 1 second video and have discarded 
++all audio data.
++*/
++
++bool NuPlayer::StreamingSource::discardMediaDate(bool audio, int64_t timeUs, sp<ABuffer> *accessUnit) {
++    status_t error;
++    status_t finalResult;
++    int64_t nowUs, nowUsTemp;
++    int64_t positionUs;
++    int64_t nLatency;
++
++    ATSParser::SourceType type =
++        audio ? ATSParser::AUDIO : ATSParser::VIDEO;
++
++    sp<AnotherPacketSource> source =
++        static_cast<AnotherPacketSource *>(mTSParser->getSource(type).get());
++
++    int64_t nBufferedTimeUs = source->getBufferedDurationUs(&error);
++
++    nowUs = ALooper::GetNowUs();
++    positionUs = (nowUs - mAnchorTimeRealUs) + mPositionUs;
++ 
++    if (mDropEndTimeUs > nowUs) {
++        ALOGI("Drop media data.\n");
++        while (mTunnelRenderLatency > 0) {
++            // Avoid dead loop.
++            nowUsTemp = ALooper::GetNowUs();
++            if (nowUsTemp > nowUs + 500000)
++                break;
++
++            feedMoreTSData();
++        }
++
++        type = ATSParser::AUDIO;
++
++        source =
++            static_cast<AnotherPacketSource *>(mTSParser->getSource(type).get());
++
++        while (1) {
++            if (!source->hasBufferAvailable(&finalResult)) {
++                break;
++            }
++            source->dequeueAccessUnit(accessUnit);
++        }
++
++        type = ATSParser::VIDEO;
++
++        source =
++            static_cast<AnotherPacketSource *>(mTSParser->getSource(type).get());
++
++        nBufferedTimeUs = source->getBufferedDurationUs(&error);
++        if (nBufferedTimeUs > DROP_VIDEO_THRESHOLD) {
++            ALOGI("Drop video.");
++            while (1) {
++                if (!source->hasBufferAvailable(&finalResult)) {
++                    break;
++                }
++                source->dequeueAccessUnit(accessUnit);
++            }
++        }
++
++        return true;
++    }
++
++    if (!audio)
++        return false;
++
++    nLatency = timeUs + nBufferedTimeUs - positionUs + mTunnelRenderLatency;
++#if 0
++    {
++        static int32_t nCnt = 0;
++        nCnt ++;
++        if (nCnt % 100 == 0) {
++        ALOGI("Total latency: %lld us TunnelRenderLatency: %lld mediaTimeUs: %lld nBufferedTimeUs: %lld positionUs: %lld", \
++                nLatency, mTunnelRenderLatency, timeUs, nBufferedTimeUs, positionUs);
++        }
++    }
++#endif
++
++    bool bDrop = false;
++
++    if (mStasticPeroid > nowUs) {
++        if (mLatencyLowest > nLatency) {
++            mLatencyLowest = nLatency;
++        }
++    } else {
++        ALOGV("mLatencyLowest: %lld mLatencyThreshold: %lld", mLatencyLowest, mLatencyThreshold);
++        if (mLatencyLowest > mLatencyThreshold) {
++            bDrop = true;
++        }
++        mStasticPeroid = nowUs + STATISTIC_PERIOD;
++        mLatencyLowest = LOWEST_LATENCY_INIT;
++    }
++
++    char value[PROPERTY_VALUE_MAX];
++    int64_t nQualityCriteria = QUALITY_CATIRIA;
++    // property for adjust quality criteria in ms, shouldn't less than 2 seconds.
++    if ((property_get("rw.wifisink.quality", value, NULL))) {
++        nQualityCriteria = atoi(value) * 1000;
++    } 
++
++    // property for adjust latency threshold in ms.
++    if ((property_get("rw.wifisink.latency", value, NULL))) {
++        mLatencyThreshold = atoi(value) * 1000;
++    } else {
++        // Adjust drop threshold.
++        if (mPrevDropTimeUs > 0 && bDrop \
++                && nowUs < mPrevDropTimeUs + nQualityCriteria) {
++            mLatencyThreshold += 10000;
++            if (mLatencyThreshold > LATENCY_THRESHOLD_MAX)
++                mLatencyThreshold = LATENCY_THRESHOLD_MAX;
++        } else if (mPrevDropTimeUs > 0 \
++                && nowUs > mPrevDropTimeUs + nQualityCriteria) {
++            mLatencyThreshold -= 10000;
++            mPrevDropTimeUs = nowUs - nQualityCriteria + (nQualityCriteria >> 2);
++            if (mLatencyThreshold < LATENCY_THRESHOLD_DEFAULT)
++                mLatencyThreshold = LATENCY_THRESHOLD_DEFAULT;
++        }
++    }
++
++    if (bDrop && nowUs > mResumeCheckTimeUs) {
++        // Too long latency, discard the media data.
++        ALOGI("Too long latency: %lld us TunnelRenderLatency: %lld mediaTimeUs: %lld nBufferedTimeUs: %lld positionUs: %lld", \
++                nLatency, mTunnelRenderLatency, timeUs, nBufferedTimeUs, positionUs);
++        mDropEndTimeUs = nowUs + mPipeLineLatencyUs - REMAIN_DATA_AFTER_DROP;
++        mResumeCheckTimeUs = mDropEndTimeUs + RESUME_DROP_CHECK;
++        mPrevDropTimeUs = nowUs;
++        return true;
++    } else {
++        mPipeLineLatencyUs = timeUs - positionUs;
++        if (mPipeLineLatencyUs <= 0 || mPipeLineLatencyUs > 500000)
++            mPipeLineLatencyUs = 100000;
++        ALOGV("mPipeLineLatencyUs: %lld\n", mPipeLineLatencyUs);
++        return false;
++    }
++}
++
+ status_t NuPlayer::StreamingSource::dequeueAccessUnit(
+         bool audio, sp<ABuffer> *accessUnit) {
++    status_t err;
++    status_t finalResult;
+     ATSParser::SourceType type =
+         audio ? ATSParser::AUDIO : ATSParser::VIDEO;
+ 
+@@ -164,20 +356,24 @@ status_t NuPlayer::StreamingSource::dequeueAccessUnit(
+         return -EWOULDBLOCK;
+     }
+ 
+-    status_t finalResult;
+-    if (!source->hasBufferAvailable(&finalResult)) {
+-        return finalResult == OK ? -EWOULDBLOCK : finalResult;
+-    }
+-
+-    status_t err = source->dequeueAccessUnit(accessUnit);
++    while (1) {
++        if (!source->hasBufferAvailable(&finalResult)) {
++            return finalResult == OK ? -EWOULDBLOCK : finalResult;
++        }
+ 
+-#if !defined(LOG_NDEBUG) || LOG_NDEBUG == 0
+-    if (err == OK) {
+-        int64_t timeUs;
+-        CHECK((*accessUnit)->meta()->findInt64("timeUs", &timeUs));
+-        ALOGV("dequeueAccessUnit timeUs=%lld us", timeUs);
++        err = source->dequeueAccessUnit(accessUnit);
++        if (err == OK) {
++            int64_t timeUs;
++            CHECK((*accessUnit)->meta()->findInt64("timeUs", &timeUs));
++            ALOGV("dequeueAccessUnit timeUs=%lld us", timeUs);
++
++            if (!(mSource->flags() | IStreamSource::kFlagKeepLowLatency \
++                        && mPositionUs > 0)) 
++                break;
++            if (discardMediaDate(audio, timeUs, accessUnit) == false)
++                break;
++        }
+     }
+-#endif
+ 
+     return err;
+ }
+@@ -186,5 +382,10 @@ bool NuPlayer::StreamingSource::isRealTime() const {
+     return mSource->flags() & IStreamSource::kFlagIsRealTimeData;
+ }
+ 
++void NuPlayer::StreamingSource::setRenderPosition(int64_t positionUs) {
++    mPositionUs = positionUs;
++    mAnchorTimeRealUs = ALooper::GetNowUs();
++}
++
+ }  // namespace android
+ 
+diff --git a/media/libmediaplayerservice/nuplayer/StreamingSource.h b/media/libmediaplayerservice/nuplayer/StreamingSource.h
+index 412b6c4..89513e2 100644
+--- a/media/libmediaplayerservice/nuplayer/StreamingSource.h
++++ b/media/libmediaplayerservice/nuplayer/StreamingSource.h
+@@ -27,6 +27,26 @@ struct ABuffer;
+ struct ATSParser;
+ 
+ struct NuPlayer::StreamingSource : public NuPlayer::Source {
++
++    // Continues drop should wait below time as pipeline isn't refresh.
++    static const int RESUME_DROP_CHECK = 100000;
++    // Remain data to avoid under run after drop.
++    static const int REMAIN_DATA_AFTER_DROP = 50000;
++    // Defautl drop threshold.
++    static const int LATENCY_THRESHOLD_DEFAULT = 120000;
++    // Maximum drop threshold.
++    static const int LATENCY_THRESHOLD_MAX = 2000000;
++    // Discard one time media data within this peroid.
++    static const int QUALITY_CATIRIA = 5*60*1000000;
++    // The invertal to statistic lowest latency.
++    static const int STATISTIC_PERIOD = 5000000;
++    // Drop video threshold.
++    static const int DROP_VIDEO_THRESHOLD = 1000000;
++    // Reset statistic lowest latency value.
++    static const int LOWEST_LATENCY_INIT = 60000000;
++ 
++ 
++
+     StreamingSource(
+             const sp<AMessage> &notify,
+             const sp<IStreamSource> &source);
+@@ -40,16 +60,29 @@ struct NuPlayer::StreamingSource : public NuPlayer::Source {
+ 
+     virtual bool isRealTime() const;
+ 
++    virtual void setRenderPosition(int64_t positionUs);
++
+ protected:
+     virtual ~StreamingSource();
+ 
+     virtual sp<MetaData> getFormatMeta(bool audio);
+ 
+ private:
++    bool discardMediaDate(bool audio, int64_t timeUs, sp<ABuffer> *accessUnit);
+     sp<IStreamSource> mSource;
+     status_t mFinalResult;
+     sp<NuPlayerStreamListener> mStreamListener;
+     sp<ATSParser> mTSParser;
++    int64_t mLatencyLowest;
++    int64_t mStasticPeroid;
++    int64_t mLatencyThreshold;
++    int64_t mTunnelRenderLatency;
++    int64_t mPositionUs;
++    int64_t mAnchorTimeRealUs;
++    int64_t mDropEndTimeUs;
++    int64_t mPipeLineLatencyUs;
++    int64_t mResumeCheckTimeUs;
++    int64_t mPrevDropTimeUs;
+ 
+     DISALLOW_EVIL_CONSTRUCTORS(StreamingSource);
+ };
+-- 
+1.8.0
+

@@ -1,0 +1,193 @@
+From d705ba7bfd7ea7cdb05e2f07756c7ad0759d1358 Mon Sep 17 00:00:00 2001
+From: Liu Ying <Ying.Liu@freescale.com>
+Date: Tue, 10 Jan 2012 13:33:21 +0800
+Subject: [PATCH 227/486] ENGR00171624 MX6 libgralloc:Improve dual disp IPU
+ DEV caller
+
+This patch improves dual display IPU DEV caller performance
+by checking IPU task only for the first frame a specific
+task starts with.
+
+Signed-off-by: Liu Ying <Ying.Liu@freescale.com>
+---
+ mx6/libgralloc/framebuffer.cpp | 142 ++++++++++++++++++++++-------------------
+ 1 file changed, 76 insertions(+), 66 deletions(-)
+
+diff --git a/mx6/libgralloc/framebuffer.cpp b/mx6/libgralloc/framebuffer.cpp
+index 25e2668..8ae7ce1 100755
+--- a/mx6/libgralloc/framebuffer.cpp
++++ b/mx6/libgralloc/framebuffer.cpp
+@@ -96,6 +96,8 @@ struct fb_context_t {
+     int mRotate;
+     struct ipu_task mTask;
+     int mIpuFd;
++    bool first_frame;
++    int last_rotation;
+ #endif
+ };
+ 
+@@ -401,6 +403,7 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+                 //Init the second display
+                 if(mapSecFrameBuffer(ctx)== 0)
+                 {    
++                    ctx->first_frame = true;
+                     ctx->sec_display_inited = true;
+                //     c2dCreateContext(&ctx->c2dctx);
+                     ctx->mIpuFd = open("/dev/mxc_ipu", O_RDWR, 0);
+@@ -1341,80 +1344,87 @@ static int mapSecFrameBuffer(fb_context_t* ctx)
+ static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx)
+ {
+     private_module_t* m = reinterpret_cast<private_module_t*>(ctx->dev->common.module);
++    int status = -EINVAL;
++    int ret = IPU_CHECK_ERR_INPUT_CROP;
+ 
+     if(ctx->mIpuFd < 0){
+         LOGE("%s:%d, invalid ipu device !!!!", __FUNCTION__, __LINE__);
+         return -EINVAL;
+     }
+ 
+-    if(m->info.bits_per_pixel == 32){
+-        ctx->mTask.input.format = v4l2_fourcc('B', 'G', 'R', '4');
+-    }
+-    else {
+-        ctx->mTask.input.format = v4l2_fourcc('R', 'G', 'B', 'P');
+-    }
+-    ctx->mTask.input.width = ctx->device.width;
+-    ctx->mTask.input.height = ctx->device.height;
+-    ctx->mTask.input.crop.pos.x = 0;
+-    ctx->mTask.input.crop.pos.y = 0;
+-    ctx->mTask.input.crop.w = ctx->device.width;
+-    ctx->mTask.input.crop.h = ctx->device.height;
+-    ctx->mTask.input.paddr = phys;
+-
+-    ctx->mTask.output.format = v4l2_fourcc('R', 'G', 'B', 'P');
+-    ctx->mTask.output.width = ctx->sec_disp_w;
+-    ctx->mTask.output.height = ctx->sec_disp_h;
+-    ctx->mTask.output.crop.w = ctx->sec_disp_w;
+-    ctx->mTask.output.crop.h = ctx->sec_disp_h;
+-    
+-    if((ctx->mRotate == 0)||(ctx->mRotate == 180))
+-    {
+-        if(ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.width/ctx->device.height){
+-            ctx->mTask.output.crop.w = ctx->sec_disp_h*ctx->device.width/ctx->device.height;
+-        }
+-        else{
+-            ctx->mTask.output.crop.h = ctx->sec_disp_w*ctx->device.height/ctx->device.width;
+-        }
+-    }
+-    else{
+-        if(ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.height/ctx->device.width){
+-            ctx->mTask.output.crop.w = ctx->sec_disp_h*ctx->device.height/ctx->device.width;
+-        }
+-        else{
+-            ctx->mTask.output.crop.h = ctx->sec_disp_w*ctx->device.width/ctx->device.height;
+-        }
+-    }
+-
+-    ctx->mTask.output.crop.pos.x = (ctx->sec_disp_w - ctx->mTask.output.crop.w)/2;
+-    ctx->mTask.output.crop.pos.y = (ctx->sec_disp_h - ctx->mTask.output.crop.h)/2;
+-
+-    ctx->mTask.output.rotate = ctx->sec_rotation;
+-    ctx->mTask.output.paddr = ctx->sec_disp_phys + ctx->sec_disp_next_buf*ctx->sec_frame_size;
+-
+-    int status = -EINVAL;
+-    int ret = IPU_CHECK_ERR_INPUT_CROP;
++    if (ctx->first_frame || ctx->sec_rotation != ctx->last_rotation) {
++       if(m->info.bits_per_pixel == 32){
++           ctx->mTask.input.format = v4l2_fourcc('B', 'G', 'R', '4');
++       }
++       else {
++           ctx->mTask.input.format = v4l2_fourcc('R', 'G', 'B', 'P');
++       }
++       ctx->mTask.input.width = ctx->device.width;
++       ctx->mTask.input.height = ctx->device.height;
++       ctx->mTask.input.crop.pos.x = 0;
++       ctx->mTask.input.crop.pos.y = 0;
++       ctx->mTask.input.crop.w = ctx->device.width;
++       ctx->mTask.input.crop.h = ctx->device.height;
++       ctx->mTask.input.paddr = phys;
++
++       ctx->mTask.output.format = v4l2_fourcc('R', 'G', 'B', 'P');
++       ctx->mTask.output.width = ctx->sec_disp_w;
++       ctx->mTask.output.height = ctx->sec_disp_h;
++       ctx->mTask.output.crop.w = ctx->sec_disp_w;
++       ctx->mTask.output.crop.h = ctx->sec_disp_h;
++
++       if((ctx->mRotate == 0)||(ctx->mRotate == 180))
++       {
++           if(ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.width/ctx->device.height){
++               ctx->mTask.output.crop.w = ctx->sec_disp_h*ctx->device.width/ctx->device.height;
++           }
++           else{
++               ctx->mTask.output.crop.h = ctx->sec_disp_w*ctx->device.height/ctx->device.width;
++           }
++       }
++       else{
++           if(ctx->sec_disp_w >= ctx->sec_disp_h*ctx->device.height/ctx->device.width){
++               ctx->mTask.output.crop.w = ctx->sec_disp_h*ctx->device.height/ctx->device.width;
++           }
++           else{
++               ctx->mTask.output.crop.h = ctx->sec_disp_w*ctx->device.width/ctx->device.height;
++           }
++       }
+ 
+-    while(ret != IPU_CHECK_OK && ret > IPU_CHECK_ERR_MIN) {
+-        ret = ioctl(ctx->mIpuFd, IPU_CHECK_TASK, &ctx->mTask);
+-        switch(ret) {
+-            case IPU_CHECK_OK:
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_INPUTW_OVER:
+-                ctx->mTask.input.crop.w -= 8;
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_INPUTH_OVER:
+-                ctx->mTask.input.crop.h -= 8;
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_OUTPUTW_OVER:
+-                ctx->mTask.output.crop.w -= 8;
+-                break;
+-            case IPU_CHECK_ERR_SPLIT_OUTPUTH_OVER:
+-                ctx->mTask.output.crop.h -= 8;;
+-                break;
+-            default:
+-                return status;
+-        }
++       ctx->mTask.output.crop.pos.x = (ctx->sec_disp_w - ctx->mTask.output.crop.w)/2;
++       ctx->mTask.output.crop.pos.y = (ctx->sec_disp_h - ctx->mTask.output.crop.h)/2;
++
++       ctx->mTask.output.rotate = ctx->sec_rotation;
++       ctx->mTask.output.paddr = ctx->sec_disp_phys + ctx->sec_disp_next_buf*ctx->sec_frame_size;
++
++       while(ret != IPU_CHECK_OK && ret > IPU_CHECK_ERR_MIN) {
++           ret = ioctl(ctx->mIpuFd, IPU_CHECK_TASK, &ctx->mTask);
++           switch(ret) {
++               case IPU_CHECK_OK:
++                   break;
++               case IPU_CHECK_ERR_SPLIT_INPUTW_OVER:
++                   ctx->mTask.input.crop.w -= 8;
++                   break;
++               case IPU_CHECK_ERR_SPLIT_INPUTH_OVER:
++                   ctx->mTask.input.crop.h -= 8;
++                   break;
++               case IPU_CHECK_ERR_SPLIT_OUTPUTW_OVER:
++                   ctx->mTask.output.crop.w -= 8;
++                   break;
++               case IPU_CHECK_ERR_SPLIT_OUTPUTH_OVER:
++                   ctx->mTask.output.crop.h -= 8;;
++                   break;
++               default:
++                   return status;
++           }
++       }
++       ctx->first_frame = false;
++       ctx->last_rotation = ctx->sec_rotation;
++    } else {
++       ctx->mTask.input.paddr = phys;
++       ctx->mTask.output.paddr = ctx->sec_disp_phys + ctx->sec_disp_next_buf*ctx->sec_frame_size;
+     }
++
+     status = ioctl(ctx->mIpuFd, IPU_QUEUE_TASK, &ctx->mTask);
+     if(status < 0) {
+         LOGE("%s:%d, IPU_QUEUE_TASK failed %d", __FUNCTION__, __LINE__ ,status);
+-- 
+1.8.0
+

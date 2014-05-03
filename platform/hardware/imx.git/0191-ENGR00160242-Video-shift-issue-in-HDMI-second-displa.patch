@@ -1,0 +1,121 @@
+From 1cc980dcead48976354f1e947339b913ea231a2b Mon Sep 17 00:00:00 2001
+From: b07117 <b07117@freescale.com>
+Date: Tue, 18 Oct 2011 16:13:50 +0800
+Subject: [PATCH 191/486] ENGR00160242, Video shift issue in HDMI second
+ display
+
+Fixed this issue in hw composer
+
+Signed-off-by: xianzhong <b07117@freescale.com>
+---
+ mx5x/hwcomposer/blit_ipu.cpp   | 32 ++++++++++++++++++++++++++++++++
+ mx5x/hwcomposer/hwc_common.cpp | 28 ++++++++++++++++++++++++++++
+ mx5x/hwcomposer/hwc_common.h   |  6 +++++-
+ 3 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/mx5x/hwcomposer/blit_ipu.cpp b/mx5x/hwcomposer/blit_ipu.cpp
+index 863b126..4082874 100755
+--- a/mx5x/hwcomposer/blit_ipu.cpp
++++ b/mx5x/hwcomposer/blit_ipu.cpp
+@@ -153,6 +153,37 @@ HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= RGBP");
+ 		mIPUOutputParam.output_win.win_w = out_buf->width;
+ 		mIPUOutputParam.output_win.win_h = out_buf->height;
+     }
++    else if(out_buf->width != m_def_disp_w || out_buf->height!= m_def_disp_h){
++            int dst_w = out_buf->width;
++            int dst_h = out_buf->height;
++	    if(dst_w >= dst_h*m_def_disp_w/m_def_disp_h){
++                dst_w = dst_h*m_def_disp_w/m_def_disp_h;
++            }
++            else{
++                dst_h = dst_w*m_def_disp_h/m_def_disp_w;
++            }
++
++            mIPUOutputParam.width = out_buf->width;//disp_frame->right - disp_frame->left;
++	    mIPUOutputParam.height = out_buf->height;//disp_frame->bottom - disp_frame->top;
++            mIPUOutputParam.width = out_buf->width;//disp_frame->right - disp_frame->left;
++	    mIPUOutputParam.height = out_buf->height;//disp_frame->bottom - disp_frame->top;
++	    mIPUOutputParam.output_win.pos.x = (disp_frame->left >> 3) << 3;
++	    mIPUOutputParam.output_win.pos.y = (disp_frame->top >> 3) << 3;
++            mIPUOutputParam.output_win.win_w = ((disp_frame->right - disp_frame->left) >> 3) << 3;
++	    mIPUOutputParam.output_win.win_h = ((disp_frame->bottom - disp_frame->top) >> 3) << 3;
++
++	    mIPUOutputParam.output_win.pos.x = mIPUOutputParam.output_win.pos.x * dst_w / m_def_disp_w;
++	    mIPUOutputParam.output_win.pos.y = mIPUOutputParam.output_win.pos.y * dst_h / m_def_disp_h;
++	    mIPUOutputParam.output_win.win_w = mIPUOutputParam.output_win.win_w * dst_w / m_def_disp_w;
++	    mIPUOutputParam.output_win.win_h = mIPUOutputParam.output_win.win_h * dst_h / m_def_disp_h;
++            mIPUOutputParam.output_win.pos.x += (out_buf->width - dst_w) >> 1;
++            mIPUOutputParam.output_win.pos.y += (out_buf->height - dst_h) >> 1;
++
++            mIPUOutputParam.output_win.pos.x = (mIPUOutputParam.output_win.pos.x >> 3) << 3;
++            mIPUOutputParam.output_win.pos.y = (mIPUOutputParam.output_win.pos.y >> 3) << 3;
++            mIPUOutputParam.output_win.win_w = (mIPUOutputParam.output_win.win_w >> 3) << 3;
++            mIPUOutputParam.output_win.win_h = (mIPUOutputParam.output_win.win_h >> 3) << 3;
++    }
+     else {
+ 	    mIPUOutputParam.width = out_buf->width;//disp_frame->right - disp_frame->left;
+ 	    mIPUOutputParam.height = out_buf->height;//disp_frame->bottom - disp_frame->top;
+@@ -161,6 +192,7 @@ HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= RGBP");
+ 	    mIPUOutputParam.output_win.win_w = ((disp_frame->right - disp_frame->left) >> 3) << 3;
+ 	    mIPUOutputParam.output_win.win_h = ((disp_frame->bottom - disp_frame->top) >> 3) << 3;
+   	}
++
+ //HWCOMPOSER_LOG_ERR("^^^^^^^^out^^paddr=%x^^^^^^left=%d, top=%d, right=%d, bottom=%d", out_buf->phy_addr, disp_frame->left, disp_frame->top, disp_frame->right, disp_frame->bottom);
+     mIPUOutputParam.rot = layer->transform;
+     mIPUOutputParam.user_def_paddr[0] = out_buf->phy_addr;
+diff --git a/mx5x/hwcomposer/hwc_common.cpp b/mx5x/hwcomposer/hwc_common.cpp
+index f64fbda..66b5d81 100755
+--- a/mx5x/hwcomposer/hwc_common.cpp
++++ b/mx5x/hwcomposer/hwc_common.cpp
+@@ -229,3 +229,31 @@ int output_dev_close(output_device *dev)
+   	
+   	return 0;
+ }
++
++blit_device::blit_device()
++{
++	int fd_def;
++
++        m_def_disp_w = 0;
++        m_def_disp_h = 0;
++
++	fd_def = open(DEFAULT_FB_DEV_NAME, O_RDWR | O_NONBLOCK, 0);
++
++	if(fd_def < 0) {
++          HWCOMPOSER_LOG_ERR("Error! Open fb device %s failed!", DEFAULT_FB_DEV_NAME);
++          return;
++        }
++
++	struct fb_var_screeninfo def_info;
++        if(ioctl(fd_def, FBIOGET_VSCREENINFO, &def_info) < 0) {
++	  HWCOMPOSER_LOG_ERR("Error! FG_device::init VSCREENINFO def getting failed!");
++          return;
++        }
++
++	m_def_disp_w = def_info.xres;
++	m_def_disp_h = def_info.yres;
++
++	close(fd_def);
++
++	return;
++}
+diff --git a/mx5x/hwcomposer/hwc_common.h b/mx5x/hwcomposer/hwc_common.h
+index a1576e0..4edb8af 100755
+--- a/mx5x/hwcomposer/hwc_common.h
++++ b/mx5x/hwcomposer/hwc_common.h
+@@ -214,7 +214,11 @@ public:
+ 		static int isIPUDevice(const char *dev_name);
+ 		static int isGPUDevice(const char *dev_name);
+     virtual int blit(hwc_layer_t *layer, hwc_buffer *out_buf) = 0;
+-		virtual ~blit_device(){}
++		blit_device();
++                virtual ~blit_device(){}
++
++                int m_def_disp_w;
++	        int m_def_disp_h;
+ };
+ 
+ //int FG_init(struct output_device *dev);
+-- 
+1.8.0
+

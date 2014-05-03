@@ -1,0 +1,167 @@
+From 58afc84cf7d3052a843cd38e8933d2eaf1abea69 Mon Sep 17 00:00:00 2001
+From: Xu Mao <B34688@freescale.com>
+Date: Mon, 30 Sep 2013 18:05:18 +0800
+Subject: [PATCH 35/52] Cactus player : status wrong when mixed using 
+ ff/fw/pause/play
+
+When set to new speed from same kind of old speed in pause state, it is
+delayed and return failure . Cactus player doesn't handle this
+correctly.
+
+Signed-off-by: Xu Mao <B34688@freescale.com>
+---
+ .../com/freescale/cactusplayer/VideoPlayer.java    | 83 ++++++++++++++++------
+ 1 file changed, 62 insertions(+), 21 deletions(-)
+
+diff --git a/CactusPlayer/src/com/freescale/cactusplayer/VideoPlayer.java b/CactusPlayer/src/com/freescale/cactusplayer/VideoPlayer.java
+index 8c6c04a..2695cf5 100755
+--- a/CactusPlayer/src/com/freescale/cactusplayer/VideoPlayer.java
++++ b/CactusPlayer/src/com/freescale/cactusplayer/VideoPlayer.java
+@@ -534,7 +534,7 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+ 
+     MediaPlayer.OnPreparedListener mPreparedListener = new MediaPlayer.OnPreparedListener() {
+         public void onPrepared(MediaPlayer mp) {
+-
++            mPlaySpeed = 1;
+             start();
+         }
+     };
+@@ -712,7 +712,7 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+         if(mMediaPlayer != null) {
+             mMediaPlayer.start();
+             mPlayState = PLAYER_PLAYING;
+-            mPlaySpeed = 1;
++            //mPlaySpeed = 1;
+             if(mDuration < 0)
+                 mDuration = mMediaPlayer.getDuration();
+         	updateButtons(UPDATE_PLAYBACK_STATE, mPlayState, 0, 0);
+@@ -744,6 +744,7 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+ 
+     private void fastForward() {
+         if(mMediaPlayer != null) {
++            int savedState = -1;
+             float newSpeed;
+             int resultSpeed;
+             if(mPlaySpeed < 0)
+@@ -761,14 +762,35 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+                 newSpeed = 0.5f;
+ 
+             int[] newScale = {(int)(newSpeed * 0x10000)};
+-            mMediaPlayer.setPlaySpeed(newScale);
+ 
+-            if(newScale[0] == newSpeed * 0x10000){
+-                mPlaySpeed = newSpeed;
+-                updateButtons(UPDATE_PLAYBACK_SPEED, 0, 0, mPlaySpeed);
++            if(mPlayState == PLAYER_PLAYING){
++                mMediaPlayer.setPlaySpeed(newScale);
++
++                if(newScale[0] == newSpeed * 0x10000){
++                    mPlaySpeed = newSpeed;
++                    updateButtons(UPDATE_PLAYBACK_SPEED, 0, 0, mPlaySpeed);
++                }
++                else{
++                    Log.d(TAG,"set to new speed " + newSpeed + " failed");
++                }
++            }
++            else if(mPlayState == PLAYER_PAUSED){
++                if(newSpeed == 0.5f){
++                    mMediaPlayer.setPlaySpeed(newScale);
++                    // don't check return value , because in pause state, setting to new speed from same kind of old speed will 
++                    // be delayed in omx player and return fail
++                    mPlaySpeed = newSpeed;
++                    updateButtons(UPDATE_PLAYBACK_SPEED, 0, 0, mPlaySpeed);
++                    start();
++                }
++                else{
++                    Log.d(TAG,"set to speed " + newSpeed + " from pause state is wrong!");
++                }
++            }
++            else{
++                Log.d(TAG,"wrong state " + mPlayState + " to ff");
+             }
+ 
+-            //mHandler.sendEmptyMessage(SHOW_PROGRESS);
+         }
+     }
+ 
+@@ -776,6 +798,7 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+         Log.d(TAG,"fastBackward");
+ 
+ 		if(mMediaPlayer != null) {
++            int savedState = -1;
+             float newSpeed;
+             int resultSpeed;
+ 			if(mPlaySpeed > -2)
+@@ -786,14 +809,25 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+             if(newSpeed < -16)
+                 newSpeed = -2;
+ 
+-            int[] newScale = {(int)(newSpeed * 0x10000)};
+-            mMediaPlayer.setPlaySpeed(newScale);
++            if(mPlayState == PLAYER_PLAYING || mPlayState == PLAYER_PAUSED){
++                int[] newScale = {(int)(newSpeed * 0x10000)};
++                mMediaPlayer.setPlaySpeed(newScale);
+ 
+-            if(newScale[0] == newSpeed * 0x10000){
+-                mPlaySpeed = newSpeed;
+-                updateButtons(UPDATE_PLAYBACK_SPEED, 0, 0, mPlaySpeed);
++                if(newScale[0] == newSpeed * 0x10000){
++                    // success
++                    mPlaySpeed = newSpeed;
++                    updateButtons(UPDATE_PLAYBACK_SPEED, 0, 0, mPlaySpeed);
++                    if(mPlayState == PLAYER_PAUSED)
++                        start();
++                }
++                else{
++                    Log.d(TAG,"set to new speed " + newSpeed + " failed");
++                }
+             }
+-            //mHandler.sendEmptyMessage(SHOW_PROGRESS);
++            else{
++                Log.d(TAG,"wrong state to fw");
++            }
++
+ 		}
+ 	}
+ 
+@@ -937,9 +971,16 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+ 			else if(view == mBtnPlayPause)
+ 			{
+ 				if(mPlayState == PLAYER_PLAYING){
+-    				pause();
+-                    if(mPlaySpeed != 1)
++                    if(mPlaySpeed > 0 && mPlaySpeed < 2){
++                        if(mPlaySpeed != 1)
++                            setNormalSpeed();
++        				pause();
++                        // if pause firstly, setting to new speed from same kind of old speed will be delayed in omx player
++                    }
++                    else{
++        				pause();
+                         setNormalSpeed();
++                    }
+                 }
+                 else if(mPlayState == PLAYER_PAUSED)
+                     start();
+@@ -952,12 +993,12 @@ public class VideoPlayer extends Activity implements SeekBar.OnSeekBarChangeList
+ 			    if(mPlayState != PLAYER_PLAYING && mPlayState != PLAYER_PAUSED)
+                     return;
+ 
+-			    if(mPlayState == PLAYER_PAUSED)
+-                    start();
+-				fastForward();
+-			}
+-		}
+-	};
++                //if(mPlayState == PLAYER_PAUSED)
++                //    start();
++                fastForward();
++            }
++        }
++    };
+ 
+     /** Seekbar messages
+      */
+-- 
+1.8.0
+

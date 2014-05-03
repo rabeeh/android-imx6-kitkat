@@ -1,0 +1,140 @@
+From 5e86afe1feec107043aa1f7e98cd4dc7abfd9ae4 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Mon, 9 Jul 2012 17:13:37 +0800
+Subject: [PATCH 304/486] ENGR00216174 Add workaround to bypass the 1080p 30
+ fps setting for csi camera
+
+Limit the max preview setting for csi camera to 720p
+Hardcode the capture setting of 1080p to 15fps
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp            | 46 ++++++++++++++++++++++++----------
+ mx6/libcamera/CameraHal.h              |  6 +++--
+ mx6/libcamera/CaptureDeviceInterface.h |  4 +++
+ mx6/libcamera/V4l2CapDeviceBase.h      |  4 ---
+ 4 files changed, 41 insertions(+), 19 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 501ca8d..1b73e6f 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -369,9 +369,22 @@ namespace android {
+             pictureCnt ++;
+ 
+             //Limite the FPS and resolution for preview setting
+-            //Typically only max to 1080p resolution, and minum 15 fps need for preview
++            //Typically only max to 1080p for mipi, 720p for csi,
++            //and minum 15 fps need for preview.
++            unsigned int max_preview_w, max_preview_h;
++            char device_name[CAMAERA_SENSOR_LENGTH];
++            memset(device_name, 0, CAMAERA_SENSOR_LENGTH);
++            mCaptureDevice->GetDevName(device_name);
++            if(strstr(device_name, "mipi")) {
++                max_preview_w = MAX_MIPI_PREVIEW_W;
++                max_preview_h = MAX_MIPI_PREVIEW_H;
++            } else {
++                max_preview_w = MAX_CSI_PREVIEW_W;
++                max_preview_h = MAX_CSI_PREVIEW_H;
++            }
++
+             if ((CaptureSizeFps.tv.denominator/CaptureSizeFps.tv.numerator >= 15)&&
+-                (CaptureSizeFps.width <= MAX_PREVIEW_W)&&(CaptureSizeFps.height <= MAX_PREVIEW_H)){
++                (CaptureSizeFps.width <= max_preview_w)&&(CaptureSizeFps.height <= max_preview_h)){
+                 if (previewCnt == 0)
+                     strncpy((char*) mSupportedPreviewSizes, TmpStr, CAMER_PARAM_BUFFER_SIZE);
+                 else{
+@@ -1113,17 +1126,24 @@ namespace android {
+         if (strstr(mCameraSensorName, "uvc") == NULL){
+             //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
+             // so here just a walkaround, if the app set the FpsRange, will follow this FpsRange.
+-            mParameters.getPreviewFpsRange(&min_fps, &max_fps);
+-            if (max_fps < 1000 || min_fps < 1000 || max_fps > 33000 || min_fps > 33000){
+-                if (mParameters.getPreviewFrameRate() >= 15){
+-                    mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
+-                    CAMERA_LOG_INFO("Set Capture Fps %d", mParameters.getPreviewFrameRate());
++            if((strstr(mCameraSensorName, "mipi") == NULL)&&
++                (mCaptureDeviceCfg.width == 1920)&&
++                (mCaptureDeviceCfg.height == 1080)) {
++                //Workaround for 1080p setting for csi camera, which only 15fps is valid
++                mCaptureDeviceCfg.tv.denominator = 15;
++            } else {
++                mParameters.getPreviewFpsRange(&min_fps, &max_fps);
++                if (max_fps < 1000 || min_fps < 1000 || max_fps > 33000 || min_fps > 33000){
++                    if (mParameters.getPreviewFrameRate() >= 15){
++                        mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++                        CAMERA_LOG_INFO("Set Capture Fps %d", mParameters.getPreviewFrameRate());
++                    }
++                }
++                else{
++                    CAMERA_LOG_INFO("Set Capture Fps Range %d - %d",min_fps, max_fps);
++                    actual_fps = min_fps > 15000? 30:15;
++                    mCaptureDeviceCfg.tv.denominator = actual_fps;
+                 }
+-            }
+-            else{
+-                CAMERA_LOG_INFO("Set Capture Fps Range %d - %d",min_fps, max_fps);
+-                actual_fps = min_fps > 15000? 30:15;
+-                mCaptureDeviceCfg.tv.denominator = actual_fps;
+             }
+         }else{
+                 mCaptureDeviceCfg.tv.denominator = 15;
+@@ -1283,7 +1303,7 @@ Pic_out:
+                     if (mCaptureSupportedFormat[i] == mEncoderSupportedFormat[j]){
+                         mPictureEncodeFormat= mCaptureSupportedFormat[i];
+ 
+-                        CAMERA_LOG_INFO(" Get the mPictureEncodeFormat :%c%c%c%c\n",
++                        CAMERA_LOG_INFO("Get the mPictureEncodeFormat :%c%c%c%c\n",
+                                 mPictureEncodeFormat & 0xFF, (mPictureEncodeFormat >> 8) & 0xFF,
+                                 (mPictureEncodeFormat >> 16) & 0xFF, (mPictureEncodeFormat >> 24) & 0xFF);
+                         break;
+diff --git a/mx6/libcamera/CameraHal.h b/mx6/libcamera/CameraHal.h
+index 7e6cb3e..bb24432 100755
+--- a/mx6/libcamera/CameraHal.h
++++ b/mx6/libcamera/CameraHal.h
+@@ -66,8 +66,10 @@
+ #define DEFAULT_PREVIEW_FPS (15)
+ #define DEFAULT_PREVIEW_W   (640)
+ #define DEFAULT_PREVIEW_H   (480)
+-#define MAX_PREVIEW_W       (1920)
+-#define MAX_PREVIEW_H       (1080)
++#define MAX_MIPI_PREVIEW_W       (1920)
++#define MAX_MIPI_PREVIEW_H       (1080)
++#define MAX_CSI_PREVIEW_W       (1280)
++#define MAX_CSI_PREVIEW_H       (720)
+ #define DEFAULT_PICTURE_W   (640)
+ #define DEFAULT_PICTURE_H   (480)
+ 
+diff --git a/mx6/libcamera/CaptureDeviceInterface.h b/mx6/libcamera/CaptureDeviceInterface.h
+index 9fa52a1..b71a224 100755
+--- a/mx6/libcamera/CaptureDeviceInterface.h
++++ b/mx6/libcamera/CaptureDeviceInterface.h
+@@ -25,6 +25,10 @@
+ #include "Camera_utils.h"
+ 
+ 
++#define CAMAERA_FILENAME_LENGTH     256
++#define MAX_CAPTURE_BUF_QUE_NUM     6
++#define CAMAERA_SENSOR_LENGTH       32
++
+ namespace android {
+ #define UVC_NAME_STRING "uvc"
+ 
+diff --git a/mx6/libcamera/V4l2CapDeviceBase.h b/mx6/libcamera/V4l2CapDeviceBase.h
+index 597547e..16a1915 100755
+--- a/mx6/libcamera/V4l2CapDeviceBase.h
++++ b/mx6/libcamera/V4l2CapDeviceBase.h
+@@ -23,10 +23,6 @@
+ 
+ #include "CaptureDeviceInterface.h"
+ 
+-#define CAMAERA_FILENAME_LENGTH     256
+-#define MAX_CAPTURE_BUF_QUE_NUM     6
+-#define CAMAERA_SENSOR_LENGTH       32
+-
+ namespace android{
+ 
+     class V4l2CapDeviceBase : public CaptureDeviceInterface{
+-- 
+1.8.0
+

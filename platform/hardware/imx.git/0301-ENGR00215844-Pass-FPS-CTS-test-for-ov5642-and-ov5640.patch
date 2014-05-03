@@ -1,0 +1,266 @@
+From 08ea50e262ba0f96e640e8aa12544a7f689f6067 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Thu, 5 Jul 2012 14:34:21 +0800
+Subject: [PATCH 301/486] ENGR00215844 Pass FPS CTS test for ov5642 and ov5640
+
+Remove the hardcode for FPS setting
+Add FPS range setting for 15fps and 30fps
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp     | 61 +++++++++++++++++++++++++++--------------
+ mx6/libcamera/CameraHal.h       |  9 ++++++
+ mx6/libcamera/CameraModule.cpp  |  1 -
+ mx6/libcamera/V4l2CsiDevice.cpp | 19 ++-----------
+ 4 files changed, 52 insertions(+), 38 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 6195acb..501ca8d 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -360,7 +360,7 @@ namespace android {
+             memset(TmpStr, 0, 20);
+             sprintf(TmpStr, "%dx%d", CaptureSizeFps.width,CaptureSizeFps.height);
+             CAMERA_LOG_INFO("Size: %s , Framerate: %d supported", TmpStr, (CaptureSizeFps.tv.denominator/CaptureSizeFps.tv.numerator));
+-            if (previewCnt == 0)
++            if (pictureCnt == 0)
+                 strncpy((char*) mSupportedPictureSizes, TmpStr, CAMER_PARAM_BUFFER_SIZE);
+             else{
+                 strncat(mSupportedPictureSizes,  PARAMS_DELIMITER, CAMER_PARAM_BUFFER_SIZE);
+@@ -368,7 +368,10 @@ namespace android {
+             }
+             pictureCnt ++;
+ 
+-            if (CaptureSizeFps.tv.denominator/CaptureSizeFps.tv.numerator >= 15){
++            //Limite the FPS and resolution for preview setting
++            //Typically only max to 1080p resolution, and minum 15 fps need for preview
++            if ((CaptureSizeFps.tv.denominator/CaptureSizeFps.tv.numerator >= 15)&&
++                (CaptureSizeFps.width <= MAX_PREVIEW_W)&&(CaptureSizeFps.height <= MAX_PREVIEW_H)){
+                 if (previewCnt == 0)
+                     strncpy((char*) mSupportedPreviewSizes, TmpStr, CAMER_PARAM_BUFFER_SIZE);
+                 else{
+@@ -388,12 +391,12 @@ namespace android {
+         pParam->set(CameraParameters::KEY_SUPPORTED_PICTURE_SIZES, mSupportedPictureSizes);
+         pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_SIZES, mSupportedPreviewSizes);
+         pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_FRAME_RATES, mSupportedFPS);
+-        pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE, "(15000,15000),(30000,30000)");
+-        pParam->set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "30000,30000");
++        pParam->set(CameraParameters::KEY_SUPPORTED_PREVIEW_FPS_RANGE, "(12000,17000),(25000,33000)");
++        pParam->set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "25000,33000");
+ 
+-        pParam->setPreviewSize(640, 480);
+-        pParam->setPictureSize(640, 480);
+-        pParam->setPreviewFrameRate(5);
++        pParam->setPreviewSize(DEFAULT_PREVIEW_W, DEFAULT_PREVIEW_H);
++        pParam->setPictureSize(DEFAULT_PICTURE_W, DEFAULT_PICTURE_H);
++        pParam->setPreviewFrameRate(DEFAULT_PREVIEW_FPS);
+ 
+         return CAMERA_HAL_ERR_NONE;
+ 
+@@ -655,7 +658,7 @@ namespace android {
+ 
+         params.getPreviewFpsRange(&min_fps, &max_fps);
+         CAMERA_LOG_INFO("FPS range: %d - %d",min_fps, max_fps);
+-        if (max_fps < 1000 || min_fps < 1000 || max_fps > 30000 || min_fps > 30000){
++        if (max_fps < 1000 || min_fps < 1000 || max_fps > 33000 || min_fps > 33000){
+             CAMERA_LOG_ERR("The fps range from %d to %d is error", min_fps, max_fps);
+             return BAD_VALUE;
+         }
+@@ -1096,23 +1099,31 @@ namespace android {
+         camera_memory_t *RawMemBase = NULL;
+ 
+         int  max_fps, min_fps;
++        int actual_fps = 15;
+ 
+         if (mJpegEncoder == NULL){
+             CAMERA_LOG_ERR("the jpeg encoder is NULL");
+             return BAD_VALUE;
+         }
+         mParameters.getPictureSize((int *)&(mCaptureDeviceCfg.width),(int *)&(mCaptureDeviceCfg.height));
++        //Default setting is 15FPS
+         mCaptureDeviceCfg.tv.numerator = 1;
++        mCaptureDeviceCfg.tv.denominator = 15;
+         mCaptureDevice->GetDevName(mCameraSensorName);
+         if (strstr(mCameraSensorName, "uvc") == NULL){
+             //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
+-            // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
+-            if (mParameters.getPreviewFrameRate() >= 15)
+-                mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++            // so here just a walkaround, if the app set the FpsRange, will follow this FpsRange.
++            mParameters.getPreviewFpsRange(&min_fps, &max_fps);
++            if (max_fps < 1000 || min_fps < 1000 || max_fps > 33000 || min_fps > 33000){
++                if (mParameters.getPreviewFrameRate() >= 15){
++                    mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++                    CAMERA_LOG_INFO("Set Capture Fps %d", mParameters.getPreviewFrameRate());
++                }
++            }
+             else{
+-                mParameters.getPreviewFpsRange(&min_fps, &max_fps);
+-                CAMERA_LOG_INFO("###start the preview the fps is %d###", max_fps);
+-                mCaptureDeviceCfg.tv.denominator = max_fps/1000;
++                CAMERA_LOG_INFO("Set Capture Fps Range %d - %d",min_fps, max_fps);
++                actual_fps = min_fps > 15000? 30:15;
++                mCaptureDeviceCfg.tv.denominator = actual_fps;
+             }
+         }else{
+                 mCaptureDeviceCfg.tv.denominator = 15;
+@@ -1581,6 +1592,7 @@ Pic_out:
+         CAMERA_LOG_FUNC;
+         status_t ret = NO_ERROR;
+         int  max_fps, min_fps;
++        int actual_fps = 15;
+ 
+         mParameters.getPreviewSize((int *)&(mCaptureDeviceCfg.width),(int *)&(mCaptureDeviceCfg.height));
+ 
+@@ -1592,17 +1604,24 @@ Pic_out:
+         mCaptureDeviceCfg.fmt = mPreviewCapturedFormat;
+         CAMERA_LOG_RUNTIME("*********%s,mCaptureDeviceCfg.fmt=%x************", __FUNCTION__, mCaptureDeviceCfg.fmt);
+         mCaptureDeviceCfg.rotate = (SENSOR_PREVIEW_ROTATE)mPreviewRotate;
++        //Default setting is 15FPS
+         mCaptureDeviceCfg.tv.numerator = 1;
++        mCaptureDeviceCfg.tv.denominator = 15;
+         mCaptureDevice->GetDevName(mCameraSensorName);
+         if (strstr(mCameraSensorName, "uvc") == NULL){
+             //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
+-            // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
+-            if (mParameters.getPreviewFrameRate() >= 15)
+-                mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++            // so here just a walkaround, if the app set the FpsRange, will follow this FpsRange.
++            mParameters.getPreviewFpsRange(&min_fps, &max_fps);
++            if (max_fps < 1000 || min_fps < 1000 || max_fps > 33000 || min_fps > 33000){
++                if (mParameters.getPreviewFrameRate() >= 15){
++                    mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++                    CAMERA_LOG_INFO("Set Preview Fps %d", mParameters.getPreviewFrameRate());
++                }
++            }
+             else{
+-                mParameters.getPreviewFpsRange(&min_fps, &max_fps);
+-                CAMERA_LOG_INFO("###start the capture the fps is %d###", max_fps);
+-                mCaptureDeviceCfg.tv.denominator = max_fps/1000;
++                CAMERA_LOG_INFO("Set Preview Fps Range %d - %d",min_fps, max_fps);
++                actual_fps = min_fps > 15000? 30:15;
++                mCaptureDeviceCfg.tv.denominator = actual_fps;
+             }
+         }else{
+                 mCaptureDeviceCfg.tv.denominator = 15;
+@@ -1913,6 +1932,7 @@ Pic_out:
+                         CAMERA_LOG_ERR("The Capture device queue buf error !!!!");
+                         return INVALID_OPERATION;
+                     }
++                    CAMERA_LOG_RUNTIME("Return buffer %d to Capture Device", buf_index);
+                     mCaptureBuffers[buf_index].refCount = 0;
+                     nCameraBuffersQueued++;
+                     mEnqueuedBufs --;
+@@ -1977,6 +1997,7 @@ Pic_out:
+                     sem_post(&mCaptureStoppedCondition);
+                     return NO_ERROR;
+                 }
++                CAMERA_LOG_RUNTIME("Get buffer %d from Capture Device", bufIndex);
+                 //handle the normal return.
+                 if(!mPPDeviceNeed) {
+                     getBufferCount(&mCaptureBuffers[bufIndex]);
+diff --git a/mx6/libcamera/CameraHal.h b/mx6/libcamera/CameraHal.h
+index 8e82557..7e6cb3e 100755
+--- a/mx6/libcamera/CameraHal.h
++++ b/mx6/libcamera/CameraHal.h
+@@ -63,6 +63,15 @@
+ #define PREVIEW_CAPTURE_BUFFER_NUM 5
+ #define PICTURE_CAPTURE_BUFFER_NUM 3
+ 
++#define DEFAULT_PREVIEW_FPS (15)
++#define DEFAULT_PREVIEW_W   (640)
++#define DEFAULT_PREVIEW_H   (480)
++#define MAX_PREVIEW_W       (1920)
++#define MAX_PREVIEW_H       (1080)
++#define DEFAULT_PICTURE_W   (640)
++#define DEFAULT_PICTURE_H   (480)
++
++
+ namespace android {
+ 
+     typedef enum{
+diff --git a/mx6/libcamera/CameraModule.cpp b/mx6/libcamera/CameraModule.cpp
+index af46453..4dabfdc 100755
+--- a/mx6/libcamera/CameraModule.cpp
++++ b/mx6/libcamera/CameraModule.cpp
+@@ -654,7 +654,6 @@ static void GetCameraPropery(char * pFaceBackCameraName, char *pFaceFrontCameraN
+         *pFaceFrontOrient = atoi(orientStr);
+ 
+     LOGI("Face Front Camera is %s, orient is %d", pFaceFrontCameraName, *pFaceFrontOrient);
+-
+ }
+ 
+ int camera_get_number_of_cameras()
+diff --git a/mx6/libcamera/V4l2CsiDevice.cpp b/mx6/libcamera/V4l2CsiDevice.cpp
+index 6e0dd92..afe100e 100755
+--- a/mx6/libcamera/V4l2CsiDevice.cpp
++++ b/mx6/libcamera/V4l2CsiDevice.cpp
+@@ -260,7 +260,6 @@ namespace android{
+             pCapcfg->tv.numerator = 1;
+             pCapcfg->tv.denominator = 30;
+         }
+-        CAMERA_LOG_RUNTIME("the fps is %d", pCapcfg->tv.denominator);
+ 
+         parm.parm.capture.timeperframe.numerator = pCapcfg->tv.numerator;
+         parm.parm.capture.timeperframe.denominator = pCapcfg->tv.denominator;
+@@ -280,6 +279,8 @@ namespace android{
+             }
+         }
+ 
++        CAMERA_LOG_INFO("Set FPS %d to Capture device",
++                parm.parm.capture.timeperframe.denominator);
+ 
+         fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+         fmt.fmt.pix.pixelformat = pCapcfg->fmt;
+@@ -335,34 +336,22 @@ namespace android{
+             pic_waite_buf_num = 6;
+             if (capturewidth == 640 && captureheight == 480) {
+                 capturemode = 0;	/* VGA mode */
+-                pTimeFrame->numerator = 1;
+-                pTimeFrame->denominator = 30;
+             }
+             else if (capturewidth == 320 && captureheight == 240) {
+                 capturemode = 1;	/* QVGA mode */
+-                pTimeFrame->numerator = 1;
+-                pTimeFrame->denominator = 30;
+             }
+             else if (capturewidth == 720 && captureheight == 480) {
+                 capturemode = 2;	/* PAL mode */
+-                pTimeFrame->numerator = 1;
+-                pTimeFrame->denominator = 30;
+             }
+             else if (capturewidth == 720 && captureheight == 576) {
+                 capturemode = 3;	/* PAL mode */
+-                pTimeFrame->numerator = 1;
+-                pTimeFrame->denominator = 30;
+             }
+             else if (capturewidth == 1280 && captureheight == 720) {
+                 capturemode = 4;	/* 720P mode */
+-                pTimeFrame->numerator = 1;
+-                pTimeFrame->denominator = 30;
+             }
+             else if (capturewidth == 1920 && captureheight == 1080){
+                 pic_waite_buf_num = 3;
+                 capturemode = 5;	/* 1080P mode */
+-                pTimeFrame->numerator = 1;
+-                pTimeFrame->denominator = 15;
+             }
+             else if (capturewidth == 2592 && captureheight == 1944) {
+                 pic_waite_buf_num =3;
+@@ -372,13 +361,9 @@ namespace android{
+             }
+             else if (capturewidth == 176 && captureheight == 144) {
+                 capturemode = 7;       /* QCIF mode */
+-                //pTimeFrame->numerator = 1;
+-                //pTimeFrame->denominator = 30;
+             }
+             else if (capturewidth == 1024 && captureheight == 768) {
+                 capturemode = 8;       /* XGA mode */
+-                //pTimeFrame->numerator = 1;
+-                //pTimeFrame->denominator = 30;
+             }
+             else{
+                 CAMERA_LOG_ERR("The camera mode is not supported!!!!");
+-- 
+1.8.0
+

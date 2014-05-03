@@ -1,0 +1,190 @@
+From 8210eff3506a910717c65d750dfdcd4afb7141cd Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Thu, 9 Jun 2011 22:38:12 +0800
+Subject: [PATCH 13/38] ENGR00151320 restart activateDataCall when pppd
+ ternination
+
+report inactive pdp context to RILJ
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ reference-ril/atchannel.c     | 91 +++++++++++++++++++++++++++++++++++++++++++
+ reference-ril/reference-ril.c | 25 ++++++++++++
+ 2 files changed, 116 insertions(+)
+
+diff --git a/reference-ril/atchannel.c b/reference-ril/atchannel.c
+index ee13f19..07887eb 100644
+--- a/reference-ril/atchannel.c
++++ b/reference-ril/atchannel.c
+@@ -18,6 +18,7 @@
+ #include "atchannel.h"
+ #include "at_tok.h"
+ 
++#include <cutils/sockets.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <pthread.h>
+@@ -28,6 +29,9 @@
+ #include <sys/time.h>
+ #include <time.h>
+ #include <unistd.h>
++#include <sys/un.h>
++#include <netinet/in.h>
++#include <linux/if.h>
+ 
+ #define LOG_NDEBUG 0
+ #define LOG_TAG "AT"
+@@ -52,6 +56,8 @@
+ #define HANDSHAKE_TIMEOUT_MSEC 250
+ 
+ static pthread_t s_tid_reader;
++static pthread_t s_tid_pppcheck;
++
+ static int s_fd = -1;    /* fd of the AT channel */
+ static ATUnsolHandler s_unsolHandler;
+ 
+@@ -434,6 +440,82 @@ static void onReaderClosed()
+     }
+ }
+ 
++#define MAX_PPPD_MSG_LEN (32)
++#define PPPD_MSG_PPP_DOWN "ppp-down"
++
++#define SOCKET_NAME_RIL_PPP "rild-ppp"
++
++extern void onDeactiveDataCallList();
++
++static void *pppcheckLoop(void *arg)
++{
++    int acceptFD;
++    struct sockaddr_un peeraddr;
++    socklen_t socklen = sizeof (peeraddr);
++    int number;
++    int s_fdPPP;
++    char buf[MAX_PPPD_MSG_LEN];
++    int ret;
++
++    LOGD("pppcheckLoop start");
++    s_fdPPP = android_get_control_socket(SOCKET_NAME_RIL_PPP);
++    if (s_fdPPP < 0) {
++        LOGE("Failed to get socket '" SOCKET_NAME_RIL_PPP "' errno:%d", errno);
++        exit(-1);
++    }
++
++    for (;;) {
++        //Check pppd is alive or not
++        //Watch the ppp-down msg
++        //Raise a unsolict cmd to RILJ
++        LOGD("pppcheckLoop listen s_fdPPP");
++        ret = listen(s_fdPPP, 4);
++
++        if (ret < 0) {
++            LOGE("Failed to listen on ril ppp socket '%d': %s",
++             s_fdPPP, strerror(errno));
++            close(s_fdPPP);
++            return NULL;
++        }
++
++        LOGD("pppcheckLoop start accept s_fdPPP");
++        acceptFD = accept (s_fdPPP,  (struct sockaddr *) &peeraddr, &socklen);
++        if (acceptFD < 0) {
++            LOGE ("error accepting on ppp port: %d\n", errno);
++            close(acceptFD);
++            close(s_fdPPP);
++            return NULL;
++        }
++
++        LOGD("pppcheckLoop end accept s_fdPPP");
++        memset(buf, 0, MAX_PPPD_MSG_LEN);
++        if (recv(acceptFD, buf, MAX_PPPD_MSG_LEN, 0) <= 0) {
++            LOGE ("error reading on socket: ppp msg: \n");
++            close(acceptFD);
++            close(s_fdPPP);
++            return NULL;
++        }
++
++        //Big-endian/little-endian handling?
++        LOGD("ppp msg: %s",buf);
++        if(strcmp(buf,PPPD_MSG_PPP_DOWN) == 0) {
++            //Process ppp down here
++            //Since it will schedule the unsolicit handler
++            //Make a lock of s_commandmutex for different thread access for 
++            //unsolicit handler
++            pthread_mutex_lock(&s_commandmutex);
++            onDeactiveDataCallList();
++            pthread_mutex_unlock(&s_commandmutex);
++        }
++        LOGD("*****pppcheckLoop one process end*****");
++        close(acceptFD);
++    }
++	
++	//close the socket
++	close(s_fdPPP);
++	return NULL;
++}
++
+ 
+ static void *readerLoop(void *arg)
+ {
+@@ -642,6 +724,15 @@ int at_open(int fd, ATUnsolHandler h)
+         return -1;
+     }
+ 
++    pthread_attr_init (&attr);
++    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
++
++    ret = pthread_create(&s_tid_pppcheck, &attr, pppcheckLoop, &attr);
++
++    if (ret < 0) {
++        perror ("pthread_create");
++        return -1;
++    }
+ 
+     return 0;
+ }
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index b83b96f..b2a9a55 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -39,6 +39,7 @@
+ 
+ #include "ril.h"
+ #include "hardware/qemu_pipe.h"
++#include <linux/if.h>
+ 
+ #define LOG_TAG "RIL"
+ #include <utils/Log.h>
+@@ -430,6 +431,30 @@ static void requestDataCallList(void *data, size_t datalen, RIL_Token t)
+     requestOrSendDataCallList(&t);
+ }
+ 
++void onDeactiveDataCallList()
++{
++    RIL_Data_Call_Response *responses =
++        alloca(sizeof(RIL_Data_Call_Response));
++    LOGI("onDeactiveDataCallList");
++    //For n pdp context, or just one pdp context?
++    //Always cid =1 ?
++    //CDMADataConnectionTracker::onDataStateChanged()
++    //or GSMDataConnectionTracker::onPdpStateChanged(), will handle this result
++
++    responses->cid = 1;
++    //LINK_INACTIVE = 0
++    //LINK_DOWN = 1
++    //LINK_UP = 2;
++    responses->active = 0;
++    responses->type = "";
++    responses->apn = "";
++    responses->address = "";
++
++    RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED,
++                                  responses,
++                                  sizeof(RIL_Data_Call_Response));
++}
++
+ static void requestOrSendDataCallList(RIL_Token *t)
+ {
+     ATResponse *p_response;
+-- 
+1.8.0
+

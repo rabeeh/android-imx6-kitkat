@@ -1,0 +1,499 @@
+From a5e4855ee994a7e906499e4ab42f03d5c7e12b58 Mon Sep 17 00:00:00 2001
+From: b07211 <b07211@freescale.com>
+Date: Fri, 25 Jun 2010 14:14:00 -0400
+Subject: [PATCH 049/486] Add dual display feature support, by resizing the
+ fb0 framebuffer to fb1 Signed-off-by: b07211
+ <b07211@freescale.com>
+
+---
+ libgralloc/Android.mk      |  10 +-
+ libgralloc/framebuffer.cpp | 419 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 427 insertions(+), 2 deletions(-)
+
+diff --git a/libgralloc/Android.mk b/libgralloc/Android.mk
+index 2bbf4b4..6765821 100755
+--- a/libgralloc/Android.mk
++++ b/libgralloc/Android.mk
+@@ -20,8 +20,9 @@ LOCAL_PATH := $(call my-dir)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM
+-LOCAL_C_INCLUDES += kernel_imx/include
++LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libipu
++LOCAL_C_INCLUDES += kernel_imx/include \
++		    external/fsl_imx_lib/ipu \
+ 
+ LOCAL_SRC_FILES := 	\
+ 	allocator.cpp 	\
+@@ -32,9 +33,14 @@ LOCAL_SRC_FILES := 	\
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\"
+ 
++
+ ifeq ($(HAVE_FSL_EPDC_FB),true)
+ LOCAL_CFLAGS += -DFSL_EPDC_FB
+ endif
+ 
++ifeq ($(HAVE_FSL_IMX_IPU),true)
++LOCAL_CFLAGS += -DSECOND_DISPLAY_SUPPORT
++endif
++
+ include $(BUILD_SHARED_LIBRARY)
+ endif
+diff --git a/libgralloc/framebuffer.cpp b/libgralloc/framebuffer.cpp
+index 69cc734..c6fa655 100755
+--- a/libgralloc/framebuffer.cpp
++++ b/libgralloc/framebuffer.cpp
+@@ -37,6 +37,15 @@
+ #if HAVE_ANDROID_OS
+ #include <linux/fb.h>
+ #include <linux/mxcfb.h>
++#include <linux/videodev.h>
++#include <sys/mman.h>
++
++#ifdef SECOND_DISPLAY_SUPPORT
++extern "C" {
++#include "mxc_ipu_hl_lib.h" 
++} 
++#endif
++
+ #endif
+ #include <GLES/gl.h>
+ 
+@@ -64,8 +73,27 @@ struct fb_context_t {
+     int partial_width;
+     int partial_height;
+     #endif
++    #ifdef SECOND_DISPLAY_SUPPORT
++    bool sec_display_inited;
++    int sec_fp;
++    int sec_disp_w;
++    int sec_disp_h;
++    int sec_disp_base;
++    int sec_disp_phys;
++    int sec_frame_size;
++    int sec_disp_next_buf;
++    struct fb_var_screeninfo sec_info;
++    struct fb_fix_screeninfo sec_finfo;
++    #endif
+ };
+ 
++#ifdef SECOND_DISPLAY_SUPPORT
++#define MAX_SEC_DISP_WIDTH (1024)
++#define MAX_SEC_DISP_HEIGHT (1024)
++static int mapSecFrameBuffer(fb_context_t* ctx);
++static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx);
++#endif
++
+ #ifdef FSL_EPDC_FB
+ #define WAVEFORM_MODE_INIT                      0x0   // Screen goes to white (clears)
+ #define WAVEFORM_MODE_DU                        0x1   // Grey->white/grey->black
+@@ -164,6 +192,101 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
+         const size_t offset = hnd->base - m->framebuffer->base;
+         m->info.activate = FB_ACTIVATE_VBL;
+         m->info.yoffset = offset / m->finfo.line_length;
++
++        #ifdef SECOND_DISPLAY_SUPPORT
++        //Check the prop rw.SECOND_DISPLAY_CONNECTED
++        char value[PROPERTY_VALUE_MAX];
++     
++        property_get("rw.SECOND_DISPLAY_CONNECTED", value, "");
++        if (strcmp(value, "1") == 0) {
++            if(!ctx->sec_display_inited) {
++                //Init the second display
++                if(mapSecFrameBuffer(ctx)== 0)
++                {    
++                    ctx->sec_display_inited = true;
++                    //Set the prop rw.SECOND_DISPLAY_ENABLED to 1
++                    LOGI("sys.SECOND_DISPLAY_ENABLED Set to 1");
++                    property_set("sys.SECOND_DISPLAY_ENABLED", "1");
++                }
++            }
++
++            if(ctx->sec_display_inited) {
++                //Resize the primary display to the second display
++                resizeToSecFrameBuffer(hnd->base,
++                                       m->framebuffer->phys+offset,
++                                       ctx);
++                ctx->sec_info.activate = FB_ACTIVATE_VBL;
++                if(!ctx->sec_disp_next_buf) {
++                    ctx->sec_info.yoffset = 0; 
++                }
++                else{
++                    ctx->sec_info.yoffset = ctx->sec_disp_h;
++                }
++
++                ctx->sec_disp_next_buf = !ctx->sec_disp_next_buf;
++                ioctl(ctx->sec_fp, FBIOPAN_DISPLAY, &ctx->sec_info);
++            }
++        }
++        else{
++            if(ctx->sec_display_inited) {
++                //Set the prop rw.SECOND_DISPLAY_ENABLED to 0
++                LOGI("Switch back to display 0");
++                LOGI("sys.SECOND_DISPLAY_ENABLED Set to 0");
++                property_set("sys.SECOND_DISPLAY_ENABLED", "0");
++                //DeInit the second display
++                if(ctx->sec_fp) {
++                    int fp_property = open("/sys/class/graphics/fb1/fsl_disp_property",O_RDWR, 0); 
++                    if(fp_property >= 0) {
++                        char overlayStr[32];
++                        int blank;
++                        int fb2_fp;
++
++                        blank = 1;
++
++                        fb2_fp = open("/dev/graphics/fb2",O_RDWR, 0);
++                        if (fb2_fp < 0){
++                            LOGE("Error!Cannot open the /dev/graphics/fb2");
++                        }
++                        else{
++                            if(ioctl(fb2_fp, FBIOBLANK, blank) < 0) {
++                        		LOGI("Error!BLANK FB2 failed!\n");
++                        	}
++                            close(fb2_fp);
++                        }
++
++                    	if(ioctl(ctx->sec_fp, FBIOBLANK, blank) < 0) {
++                    		LOGI("Error!BLANK FB1 failed!\n");
++                    	}
++                    
++                        if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
++                    		LOGI("Error!BLANK FB0 failed!\n");
++                    	}
++
++                        memset(overlayStr, 0 ,32);
++                        strcpy(overlayStr, "1-layer-fb\n");
++                        LOGI("WRITE 1-layer-fb to fb0/fsl_disp_property");
++                        write(fp_property, overlayStr, strlen(overlayStr)+1);
++                        close(fp_property);
++
++                        blank = FB_BLANK_UNBLANK;
++                    	if(ioctl(ctx->sec_fp, FBIOBLANK, blank) < 0) {
++                    		LOGI("Error!BLANK FB1 failed!\n");
++                    	}
++                    	if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
++                    		LOGI("Error!UNBLANK FB0 failed!\n");
++                    	}
++
++                    }
++                    
++                    close(ctx->sec_fp);
++                    ctx->sec_fp = 0;
++                }
++                ctx->sec_display_inited = false;
++            }
++        }
++
++        #endif
++
+         if (ioctl(m->framebuffer->fd, FBIOPAN_DISPLAY, &m->info) == -1) {
+             LOGE("FBIOPAN_DISPLAY failed");
+             m->base.unlock(&m->base, buffer); 
+@@ -433,6 +556,302 @@ static int mapFrameBuffer(struct private_module_t* module)
+     return err;
+ }
+ 
++#ifdef SECOND_DISPLAY_SUPPORT
++static int mapSecFrameBuffer(fb_context_t* ctx)
++{
++    int retCode = 0;
++    int sec_fp = 0,fp_property = 0;
++    size_t fbSize = 0;
++    int blank;
++    void* vaddr = NULL;
++    //struct mxcfb_gbl_alpha gbl_alpha;
++    struct mxcfb_color_key key; 
++    char overlayStr[32];
++    int fb2_fp;
++    private_module_t* m = reinterpret_cast<private_module_t*>(
++            ctx->device.common.module);
++
++    sec_fp = open("/dev/graphics/fb1",O_RDWR, 0);
++    if (sec_fp < 0){
++        LOGE("Error!Cannot open the /dev/graphics/fb1 for second display");
++        goto disp_init_error;
++    }
++
++    //Switch overlay to second display after ipu deinit
++    //echo 1-layer-fb >  /sys/class/graphics/fb0/fsl_disp_property 
++    blank = 1;
++
++    fb2_fp = open("/dev/graphics/fb2",O_RDWR, 0);
++    if (fb2_fp < 0){
++        LOGE("Error!Cannot open the /dev/graphics/fb2");
++        goto disp_init_error;
++    }
++    if(ioctl(fb2_fp, FBIOBLANK, blank) < 0) {
++		LOGI("Error!BLANK FB0 failed!\n");
++        goto disp_init_error;
++	}
++    close(fb2_fp);
++
++	if(ioctl(sec_fp, FBIOBLANK, blank) < 0) {
++		LOGI("Error!BLANK FB1 failed!\n");
++        goto disp_init_error;
++	}
++
++    if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
++		LOGI("Error!BLANK FB0 failed!\n");
++        goto disp_init_error;
++	}
++    
++    LOGI("Open fb0/fsl_disp_property");
++    fp_property = open("/sys/class/graphics/fb0/fsl_disp_property",O_RDWR, 0); 
++    if(fp_property < 0) {
++         LOGI("Error!Cannot switch the overlay to second disp");
++         goto disp_init_error;
++    }
++    
++    memset(overlayStr, 0 ,32);
++    strcpy(overlayStr, "1-layer-fb\n");
++    LOGI("WRITE 1-layer-fb to fb0/fsl_disp_property");
++    write(fp_property, overlayStr, strlen(overlayStr)+1);
++    close(fp_property);
++
++    blank = FB_BLANK_UNBLANK;
++	if(ioctl(sec_fp, FBIOBLANK, blank) < 0) {
++		LOGI("Error!UNBLANK FB1 failed!\n");
++        goto disp_init_error;
++	}
++
++	if(ioctl(m->framebuffer->fd, FBIOBLANK, blank) < 0) {
++		LOGI("Error!UNBLANK FB0 failed!\n");
++        goto disp_init_error;
++	}
++
++    struct fb_fix_screeninfo finfo;
++    if (ioctl(sec_fp, FBIOGET_FSCREENINFO, &finfo) == -1)
++       goto disp_init_error;
++                
++    struct fb_var_screeninfo info;
++    if (ioctl(sec_fp, FBIOGET_VSCREENINFO, &info) == -1)
++        goto disp_init_error;
++                
++    LOGI("Second display: xres %d,yres %d, xres_virtual %d, yres_virtual %d",
++         info.xres,info.xres_virtual,info.yres,info.yres_virtual);
++
++    info.reserved[0] = 0;
++    info.reserved[1] = 0;
++    info.reserved[2] = 0;
++    info.xoffset = 0;
++    info.yoffset = 0;
++    info.activate = FB_ACTIVATE_NOW;
++                
++    /*
++    * Explicitly request 5/6/5
++    */
++    info.bits_per_pixel = 16;
++    info.nonstd = 0;
++    info.red.offset     = 11;
++    info.red.length     = 5;
++    info.green.offset   = 5;
++    info.green.length   = 6;
++    info.blue.offset    = 0;
++    info.blue.length    = 5;
++    info.transp.offset  = 0;
++    info.transp.length  = 0;
++    info.yres_virtual = info.yres * NUM_BUFFERS;
++	info.xres_virtual = info.xres;
++                        
++    if (ioctl(sec_fp, FBIOPUT_VSCREENINFO, &info) == -1) {
++        LOGE("Error!Second display FBIOPUT_VSCREENINFO");
++        goto disp_init_error;
++    }
++                    
++    if (ioctl(sec_fp, FBIOGET_VSCREENINFO, &info) == -1){
++        LOGE("Error!Second display FBIOGET_VSCREENINFO");
++        goto disp_init_error;
++    }
++                    
++    if (ioctl(sec_fp, FBIOGET_FSCREENINFO, &finfo) == -1){
++        LOGE("Error!Second display FBIOGET_FSCREENINFO");
++        goto disp_init_error;
++    }
++                    
++    if(finfo.smem_len <= 0)
++        goto disp_init_error;
++
++    fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);  
++                   
++    vaddr = mmap(0, fbSize, PROT_READ|PROT_WRITE, MAP_SHARED, sec_fp, 0);
++    if (vaddr == MAP_FAILED) {
++        LOGE("Error!mapping the framebuffer (%s)", strerror(errno));
++        goto disp_init_error;
++    }
++
++    key.enable = 1;
++    key.color_key = 0x00000000; // Black
++    LOGI("MXCFB_SET_CLR_KEY");
++    if( ioctl(sec_fp, MXCFB_SET_CLR_KEY, &key) < 0)
++    {
++        LOGE("Error!MXCFB_SET_CLR_KEY");
++        goto disp_init_error;
++    }
++                            
++    //gbl_alpha.alpha = 255;
++    //gbl_alpha.enable = 1;
++    //LOGI("MXCFB_SET_GBL_ALPHA");
++    //if(ioctl(sec_fp, MXCFB_SET_GBL_ALPHA, &key) <0)
++    //{
++    //    LOGI("Error!MXCFB_SET_GBL_ALPHA error");
++    //    goto disp_init_error;
++    //}
++
++    ctx->sec_disp_base = intptr_t(vaddr);
++    ctx->sec_disp_phys = intptr_t(finfo.smem_start);
++    memset(vaddr, 0, fbSize);
++    ctx->sec_fp = sec_fp;
++    ctx->sec_disp_w = info.xres;
++    ctx->sec_disp_h = info.yres;
++    ctx->sec_frame_size = fbSize/NUM_BUFFERS;
++    ctx->sec_disp_next_buf = 0;
++    ctx->sec_info = info;
++    ctx->sec_finfo = finfo;
++
++    struct fb_fix_screeninfo fb0_finfo;
++    if (ioctl(m->framebuffer->fd, FBIOGET_FSCREENINFO, &fb0_finfo) == -1)
++       goto disp_init_error;
++                
++    struct fb_var_screeninfo fb0_info;
++    if (ioctl(m->framebuffer->fd, FBIOGET_VSCREENINFO, &fb0_info) == -1)
++        goto disp_init_error;
++                
++    LOGI("fb0_info display: xres %d,yres %d, xres_virtual %d, yres_virtual %d",
++         fb0_info.xres,fb0_info.xres_virtual,
++         fb0_info.yres,fb0_info.yres_virtual);
++
++    fb0_info.reserved[0] = 0;
++    fb0_info.reserved[1] = 0;
++    fb0_info.reserved[2] = 0;
++    fb0_info.xoffset = 0;
++    fb0_info.yoffset = 0;
++    fb0_info.activate = FB_ACTIVATE_NOW;
++                
++    /*
++    * Explicitly request 5/6/5
++    */
++    fb0_info.bits_per_pixel = 16;
++    fb0_info.nonstd = 0;
++    fb0_info.red.offset     = 11;
++    fb0_info.red.length     = 5;
++    fb0_info.green.offset   = 5;
++    fb0_info.green.length   = 6;
++    fb0_info.blue.offset    = 0;
++    fb0_info.blue.length    = 5;
++    fb0_info.transp.offset  = 0;
++    fb0_info.transp.length  = 0;
++    fb0_info.yres_virtual = ALIGN_PIXEL_128(fb0_info.yres) * NUM_BUFFERS;
++	fb0_info.xres_virtual = fb0_info.xres;
++                        
++    if (ioctl(m->framebuffer->fd, FBIOPUT_VSCREENINFO, &fb0_info) == -1) {
++        LOGE("Error!Second display FBIOPUT_VSCREENINFO");
++        goto disp_init_error;
++    }
++
++    return 0;
++
++ disp_init_error:
++    if(sec_fp) {
++        close(sec_fp);
++        sec_fp = 0;
++        ctx->sec_fp = 0;
++    }
++    return -1;
++}
++
++static int resizeToSecFrameBuffer(int base,int phys,fb_context_t* ctx)
++{
++    ipu_lib_input_param_t sIPUInputParam;   
++    ipu_lib_output_param_t sIPUOutputParam; 
++    ipu_lib_handle_t            sIPUHandle;
++    int iIPURet = 0;
++    memset(&sIPUInputParam,0,sizeof(sIPUInputParam));
++    memset(&sIPUOutputParam,0,sizeof(sIPUOutputParam));
++    memset(&sIPUHandle,0,sizeof(sIPUHandle));
++
++    //Setting input format
++    sIPUInputParam.width = ctx->device.width;
++    sIPUInputParam.height = ctx->device.height;
++
++    sIPUInputParam.input_crop_win.pos.x = 0;
++    sIPUInputParam.input_crop_win.pos.y = 0;  
++    sIPUInputParam.input_crop_win.win_w = ctx->device.width;
++    sIPUInputParam.input_crop_win.win_h = ctx->device.height;
++    sIPUInputParam.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++    sIPUInputParam.user_def_paddr[0] = phys;
++        
++    //Setting output format
++    //Should align with v4l
++    sIPUOutputParam.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++    sIPUOutputParam.width = ctx->sec_disp_w;
++    sIPUOutputParam.height = ctx->sec_disp_h;   
++    sIPUOutputParam.show_to_fb = 0;
++    //Output param should be same as input, since no resize,crop
++    sIPUOutputParam.output_win.pos.x = 0;
++    sIPUOutputParam.output_win.pos.y = 0;
++    sIPUOutputParam.output_win.win_w = ctx->sec_disp_w;
++    sIPUOutputParam.output_win.win_h = ctx->sec_disp_h;
++
++    if((ctx->sec_disp_w > MAX_SEC_DISP_WIDTH)||
++       (ctx->sec_disp_h > MAX_SEC_DISP_HEIGHT)) {
++        sIPUOutputParam.output_win.win_w = MAX_SEC_DISP_WIDTH;
++        if(ctx->sec_disp_h > MAX_SEC_DISP_HEIGHT) {
++            sIPUOutputParam.output_win.win_h = ((ctx->sec_disp_h*MAX_SEC_DISP_WIDTH/ctx->sec_disp_w)>>3)<<3;
++        }
++        else{
++            sIPUOutputParam.output_win.win_h = ctx->sec_disp_h;
++        }
++        if(sIPUOutputParam.output_win.win_w < ctx->sec_disp_w) {
++            sIPUOutputParam.output_win.pos.x = (ctx->sec_disp_w - sIPUOutputParam.output_win.win_w)/2;
++        }
++    }
++
++    sIPUOutputParam.rot = 0;
++    sIPUOutputParam.user_def_paddr[0] = ctx->sec_disp_phys + ctx->sec_disp_next_buf*ctx->sec_frame_size;
++    //LOGI("Output param: width %d,height %d, pos.x %d, pos.y %d,win_w %d,win_h %d,rot %d",
++    //sIPUOutputParam.width,
++    //sIPUOutputParam.height,
++    //sIPUOutputParam.output_win.pos.x,
++    //sIPUOutputParam.output_win.pos.y,
++    //sIPUOutputParam.output_win.win_w,
++    //sIPUOutputParam.output_win.win_h,
++    //sIPUOutputParam.rot);
++                                         
++    //LOGI("Input param: width %d, height %d, fmt %d, crop_win pos x %d, crop_win pos y %d, crop_win win_w %d,crop_win win_h %d",
++    //sIPUInputParam.width,
++    //sIPUInputParam.height,
++    //sIPUInputParam.fmt,
++    //sIPUInputParam.input_crop_win.pos.x,
++    //sIPUInputParam.input_crop_win.pos.y,
++    //sIPUInputParam.input_crop_win.win_w,
++    //sIPUInputParam.input_crop_win.win_h);     
++        
++    iIPURet =  mxc_ipu_lib_task_init(&sIPUInputParam,NULL,&sIPUOutputParam,NULL,OP_NORMAL_MODE|TASK_VF_MODE,&sIPUHandle);
++    if (iIPURet < 0) {
++        LOGE("Error!mxc_ipu_lib_task_init failed mIPURet %d!",iIPURet);
++        return -1;
++    }  
++    //LOGI("mxc_ipu_lib_task_init success");
++    iIPURet = mxc_ipu_lib_task_buf_update(&sIPUHandle,phys,sIPUOutputParam.user_def_paddr[0],NULL,NULL,NULL);
++    if (iIPURet < 0) {
++        LOGE("Error!mxc_ipu_lib_task_buf_update failed mIPURet %d!",iIPURet);
++        mxc_ipu_lib_task_uninit(&sIPUHandle);
++        return -1;
++    }
++    //LOGI("mxc_ipu_lib_task_buf_update success");
++    mxc_ipu_lib_task_uninit(&sIPUHandle);
++
++    return 0;
++}
++#endif
++
+ /*****************************************************************************/
+ 
+ static int fb_close(struct hw_device_t *dev)
+-- 
+1.8.0
+

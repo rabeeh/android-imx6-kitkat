@@ -1,0 +1,600 @@
+From da99a799dd159361164c34cba50fe31211c481c9 Mon Sep 17 00:00:00 2001
+From: Lin Fuzhen <fuzhen.lin@freescale.com>
+Date: Mon, 17 Dec 2012 23:17:40 +0800
+Subject: [PATCH 388/486] ENGR000235628 mx6 powerHAL: fix screen turn on again
+ when sudpend issue
+
+this patch:
+--fix screen will turn on again after press the power key, and then wait
+timeout to go to sleep issue. the rootcause is system waiting for cpufreq
+governor switching completed when system entry in suspend or resume back.
+Introduce async write to fix this issue
+--add interfcaes and implement core functions for power profile customization
+
+Signed-off-by: Lin Fuzhen <fuzhen.lin@freescale.com>
+---
+ mx6/power/Android.mk        |   2 +-
+ mx6/power/messageQueue.cpp  | 111 +++++++++++++++++++++++++++++++
+ mx6/power/messageQueue.h    | 100 ++++++++++++++++++++++++++++
+ mx6/power/power.cpp         |  46 +++----------
+ mx6/power/switchprofile.cpp | 158 ++++++++++++++++++++++++++++++++++++++++++++
+ mx6/power/switchprofile.h   |  72 ++++++++++++++++++++
+ 6 files changed, 453 insertions(+), 36 deletions(-)
+ create mode 100644 mx6/power/messageQueue.cpp
+ create mode 100644 mx6/power/messageQueue.h
+ create mode 100644 mx6/power/switchprofile.cpp
+ create mode 100644 mx6/power/switchprofile.h
+
+diff --git a/mx6/power/Android.mk b/mx6/power/Android.mk
+index 22327e5..de2a2ac 100644
+--- a/mx6/power/Android.mk
++++ b/mx6/power/Android.mk
+@@ -22,7 +22,7 @@ include $(CLEAR_VARS)
+ 
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+ LOCAL_SHARED_LIBRARIES := liblog libcutils libutils
+-LOCAL_SRC_FILES := power.cpp watchdog.cpp
++LOCAL_SRC_FILES := power.cpp watchdog.cpp switchprofile.cpp messageQueue.cpp
+ LOCAL_MODULE := power.$(TARGET_BOARD_PLATFORM)
+ LOCAL_MODULE_TAGS := optional
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/mx6/power/messageQueue.cpp b/mx6/power/messageQueue.cpp
+new file mode 100644
+index 0000000..642eca5
+--- /dev/null
++++ b/mx6/power/messageQueue.cpp
+@@ -0,0 +1,111 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2009-2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/types.h>
++
++#include <utils/threads.h>
++#include <utils/Timers.h>
++#include <utils/Log.h>
++#include <binder/IPCThreadState.h>
++
++#include "messageQueue.h"
++
++namespace android {
++void CMessageList::insert(const sp<CMessage>& node)
++{
++    mList.push_back(node);
++}
++
++void CMessageList::remove(CMessageList::LIST::iterator pos)
++{
++    mList.erase(pos);
++}
++
++void CMessageList::clear()
++{
++    mList.clear();
++}
++
++CMessageQueue::CMessageQueue()
++{
++    Mutex::Autolock _l(mLock);
++
++    mMessages.clear();
++}
++
++CMessageQueue::~CMessageQueue()
++{
++    Mutex::Autolock _l(mLock);
++
++    mMessages.clear();
++}
++
++sp<CMessage>CMessageQueue::waitMessage(nsecs_t timeout)
++{
++    sp<CMessage>    result;
++    nsecs_t timeoutTime = systemTime() + timeout;
++    while (true) {
++        Mutex::Autolock _l(mLock);
++        nsecs_t now = systemTime();
++
++        LIST::iterator cur(mMessages.begin());
++        if (cur != mMessages.end()) {
++            result = *cur;
++        }
++
++        if (result != 0) {
++            mMessages.remove(cur);
++            break;
++        }
++
++        if (timeout >= 0) {
++            if (timeoutTime < now) {
++                result = 0;
++                break;
++            }
++            nsecs_t relTime = timeoutTime - systemTime();
++            mCondition.waitRelative(mLock, relTime);
++        } else {
++            mCondition.wait(mLock);
++        }
++    }
++
++    return result;
++}
++
++status_t CMessageQueue::postMessage(const sp<CMessage>& message,
++                                    int32_t             flags)
++{
++    return queueMessage(message, flags);
++}
++
++
++status_t CMessageQueue::queueMessage(const sp<CMessage>& message,
++                                     int32_t             flags)
++{
++    Mutex::Autolock _l(mLock);
++
++    mMessages.insert(message);
++    mCondition.signal();
++    return NO_ERROR;
++}
++
++};
++
+diff --git a/mx6/power/messageQueue.h b/mx6/power/messageQueue.h
+new file mode 100644
+index 0000000..191a39a
+--- /dev/null
++++ b/mx6/power/messageQueue.h
+@@ -0,0 +1,100 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2009-2012 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++#ifndef CAMERA_HAL_MESSAGE_QUEUE_H
++#define CAMERA_HAL_MESSAGE_QUEUE_H
++
++#include <stdint.h>
++#include <errno.h>
++#include <sys/types.h>
++#include <utils/threads.h>
++#include <utils/Timers.h>
++#include <utils/List.h>
++#include <semaphore.h>
++
++namespace android {
++class CMessage;
++
++class CMessageList {
++    List< sp<CMessage> > mList;
++    typedef List< sp<CMessage> > LIST;
++
++public:
++    inline LIST::iterator begin() {
++        return mList.begin();
++    }
++
++    inline LIST::const_iterator begin() const {
++        return mList.begin();
++    }
++
++    inline LIST::iterator end() {
++        return mList.end();
++    }
++
++    inline LIST::const_iterator end() const {
++        return mList.end();
++    }
++
++    inline bool isEmpty() const {
++        return mList.empty();
++    }
++
++    void insert(const sp<CMessage>& node);
++    void remove(LIST::iterator pos);
++    void clear();
++};
++
++class CMessage : public LightRefBase<CMessage>{
++public:
++    int32_t what;
++    int32_t arg0;
++
++    CMessage(int32_t what,
++             int32_t arg0 = 0)
++        : what(what), arg0(arg0) {}
++
++    virtual ~CMessage() {}
++
++private:
++    friend class LightRefBase<CMessage>;
++};
++
++
++class CMessageQueue {
++    typedef List< sp<CMessage> > LIST;
++
++public:
++    CMessageQueue();
++    ~CMessageQueue();
++
++    sp<CMessage> waitMessage(nsecs_t timeout = -1);
++    status_t     postMessage(const sp<CMessage>& message,
++                             int32_t             flags = 0);
++
++private:
++    status_t queueMessage(const sp<CMessage>& message,
++                          int32_t             flags);
++
++    Mutex mLock;
++    Condition mCondition;
++    CMessageList mMessages;
++};
++};
++
++#endif // ifndef CAMERA_HAL_MESSAGE_QUEUE_H
+diff --git a/mx6/power/power.cpp b/mx6/power/power.cpp
+index faabb0d..1885c1a 100644
+--- a/mx6/power/power.cpp
++++ b/mx6/power/power.cpp
+@@ -27,19 +27,16 @@
+ #include <hardware/power.h>
+ #include <utils/StrongPointer.h>
+ 
+-#include <cutils/properties.h>
+ #include "watchdog.h"
++#include "switchprofile.h"
+ 
+ #define BOOST_PATH      "/sys/devices/system/cpu/cpufreq/interactive/boost"
+ #define BOOSTPULSE_PATH "/sys/devices/system/cpu/cpufreq/interactive/boostpulse"
+-#define INPUTBOOST_PATH "/sys/devices/system/cpu/cpufreq/interactive/input_boost"
+-#define GOV_PATH "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+-#define PROP_CPUFREQGOVERNOR "sys.interactive"
+-#define PROP_VAL "active"
+-#define CONSERVATIVE "conservative"
++#define CONSER "conservative"
+ static int boost_fd = -1;
+ static int boost_warned;
+ static sp<WatchdogThread> wdThread;
++static sp<SwitchprofileThread> switchprofile;
+ 
+ static void getcpu_gov(char *s, int size)
+ {
+@@ -58,25 +55,6 @@ static void getcpu_gov(char *s, int size)
+     close(fd);
+ }
+ 
+-static int check_and_set_property(const char *propname, const char *propval)
+-{
+-    char prop_cpugov[PROPERTY_VALUE_MAX];
+-    char cpugov[64];
+-    int ret;
+-    memset(cpugov, 0, sizeof(cpugov));
+-    getcpu_gov(cpugov,sizeof(cpugov));
+-
+-    property_set(propname, propval);
+-    if( property_get(propname, prop_cpugov, NULL) &&
+-            (strcmp(prop_cpugov, propval) == 0) ){
+-	    ret = 0;
+-    }else{
+-	    ret = -1;
+-	    ALOGE("setprop: %s = %s fail\n", propname, propval);
+-    }
+-    return ret;
+-}
+-
+ static void sysfs_write(const char *path, const char *s)
+ {
+     int len;
+@@ -102,7 +80,9 @@ static void fsl_power_init(struct power_module *module)
+      * hispeed at cpufreq MAX freq in freq_table at load 40% 
+      * move the params initialization to init
+      */
+-    check_and_set_property(PROP_CPUFREQGOVERNOR, PROP_VAL);
++    //create power profile switch thread
++    switchprofile = new SwitchprofileThread();
++    switchprofile->do_setproperty(PROP_CPUFREQGOV, PROP_VAL);
+     // create and run the watchdog thread
+     wdThread = new WatchdogThread();
+ }
+@@ -112,14 +92,10 @@ static void fsl_power_set_interactive(struct power_module *module, int on)
+     /* swich to conservative when system in early_suspend or
+      * suspend mode.
+ 	 */
+-    if (on){
+-        sysfs_write(GOV_PATH, "interactive");
+-		check_and_set_property(PROP_CPUFREQGOVERNOR, PROP_VAL);
+-		sysfs_write(INPUTBOOST_PATH, "1");
+-	}else{
+-        sysfs_write(INPUTBOOST_PATH, "0");
+-		sysfs_write(GOV_PATH, "conservative");
+-	}
++    if (on)
++        switchprofile->set_cpugov(INTERACTIVE);
++	else
++        switchprofile->set_cpugov(CONSERVATIVE);
+ }
+ 
+ static void fsl_power_hint(struct power_module *module, power_hint_t hint,
+@@ -129,7 +105,7 @@ static void fsl_power_hint(struct power_module *module, power_hint_t hint,
+     int len;
+     memset(buf, 0, sizeof(buf));
+     getcpu_gov(buf,sizeof(buf));
+-    if(!strncmp(CONSERVATIVE, buf, strlen(CONSERVATIVE))){
++    if(!strncmp(CONSER, buf, strlen(CONSER))){
+ 	   ALOGE("Not in interactive mode, don't do powerhint\n");
+ 	    return;
+     }
+diff --git a/mx6/power/switchprofile.cpp b/mx6/power/switchprofile.cpp
+new file mode 100644
+index 0000000..abf2618
+--- /dev/null
++++ b/mx6/power/switchprofile.cpp
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "switchprofile.h"
++#define LOG_TAG "SWITCHPROFILE"
++#include <cutils/log.h>
++
++using namespace android;
++
++SwitchprofileThread::SwitchprofileThread()
++    : Thread(false)
++{
++}
++
++status_t SwitchprofileThread::readyToRun()
++{
++    mFd = open(getPath(), O_WRONLY);
++    if (mFd <= 0) {
++        ALOGE("Could not open the cpufreq scaling_governor:%s", getPath());
++	    return NO_INIT;
++    }
++    return NO_ERROR;
++}
++
++void SwitchprofileThread::onFirstRef()
++{
++    run("Switchprofilehread", PRIORITY_URGENT_DISPLAY);
++}
++
++bool SwitchprofileThread::handle_interactive()
++{
++    if(mThreadQueue.postMessage(new CMessage(SwitchprofileThread::GOV_INTERACTIVE)) == NO_ERROR)
++        return true;
++    else
++        return false;
++}
++
++bool SwitchprofileThread::handle_conservative()
++{
++    if( mThreadQueue.postMessage(new CMessage(SwitchprofileThread::GOV_CONSERVATIVE))== NO_ERROR)
++        return true;
++    else
++        return false;
++}
++
++bool SwitchprofileThread::handle_performance()
++{
++     return false;
++}
++int SwitchprofileThread::do_setproperty(const char *propname, const char *propval)
++{
++    char prop_cpugov[PROPERTY_VALUE_MAX];
++    int ret;
++
++    property_set(propname, propval);
++    if( property_get(propname, prop_cpugov, NULL) &&
++            (strcmp(prop_cpugov, propval) == 0) ){
++	    ret = 0;
++    }else{
++	    ret = -1;
++	    ALOGE("setprop: %s = %s fail\n", propname, propval);
++    }
++	    ALOGE("setprop: %s = %s ", propname, propval);
++    return ret;
++}
++
++void SwitchprofileThread::do_changecpugov(const char *gov)
++{
++    Mutex::Autolock lock(mLock);
++
++    if (strncmp("interactive", gov, strlen("interactive")) == 0)
++        mActive = true;
++    else {
++        mActive = false;
++        mFd1 = open(INPUTBOOST_PATH, O_WRONLY);
++        write(mFd1,"0",strlen("0"));
++        close(mFd1);
++    }
++    if (write(mFd, gov, strlen(gov)) < 0){
++        ALOGE("Error writing to %s: %s\n", GOV_PATH, strerror(errno));
++        return;
++    }
++    if (mActive){
++        do_setproperty(PROP_CPUFREQGOV, PROP_VAL);
++        mFd1 = open(INPUTBOOST_PATH, O_WRONLY);
++        write(mFd1,"1",strlen("1"));
++        close(mFd1);
++    }
++
++}
++
++void SwitchprofileThread::set_cpugov(int gov)
++{
++    if(gov >= UNKNOW) {
++        ALOGE(" set unsupport cpufreq governor");
++        return;
++    }
++    switch (gov) {
++        case INTERACTIVE:
++            handle_interactive();
++            break;
++        case CONSERVATIVE:
++            handle_conservative();
++            break;
++        case PERFORMANCE:
++            handle_performance();
++            break;
++        case USERSPACE:
++        default:
++            break;
++    }
++}
++
++bool SwitchprofileThread::threadLoop()
++{
++    sp<CMessage> msg = mThreadQueue.waitMessage();
++    if (msg == 0) {
++        ALOGE("swtichprofilehread: get invalid message");
++        return false;
++    }
++
++    switch (msg->what) {
++        case SwitchprofileThread::GOV_INTERACTIVE:
++            ALOGI("Switchprofile thread received GOV_INTERACTIVE from Power HAL");
++            do_changecpugov("interactive");
++
++            break;
++
++        case SwitchprofileThread::GOV_CONSERVATIVE:
++            ALOGI("Switchprofile thread received GOV_CONSERVATIVE from Power HAL");
++            do_changecpugov("conservative");
++
++            break;
++
++        case SwitchprofileThread::GOV_PERFORMANCE:
++            ALOGI("Switchprofile thread received GOV_PERFORMANCE from Power HAL");
++            break;
++
++        default:
++            ALOGE("Invalid Switch profile  Thread Command 0x%x.", msg->what);
++            break;
++    }
++
++    return true;
++}
+diff --git a/mx6/power/switchprofile.h b/mx6/power/switchprofile.h
+new file mode 100644
+index 0000000..58a967d
+--- /dev/null
++++ b/mx6/power/switchprofile.h
+@@ -0,0 +1,72 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#ifndef SWITCHGOV_H_
++#define SWITCHGOV_H_
++
++#include <errno.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++
++#include <utils/threads.h>
++#include <cutils/properties.h>
++#include "messageQueue.h"
++#define GOV_PATH "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
++#define INPUTBOOST_PATH "/sys/devices/system/cpu/cpufreq/interactive/input_boost"
++#define PROP_CPUFREQGOV "sys.interactive"
++#define PROP_VAL "active"
++enum Cpugov {
++    INTERACTIVE     =1,
++    CONSERVATIVE    =2,
++    PERFORMANCE,
++    USERSPACE,
++    UNKNOW
++};
++
++using namespace android;
++class SwitchprofileThread : public Thread
++{
++public:
++    SwitchprofileThread();
++
++    void set_cpugov(int gov);
++    int do_setproperty(const char *propname, const char *propval);
++
++    enum SwitchcpugovCommands {
++        GOV_INTERACTIVE,
++        GOV_CONSERVATIVE,
++        GOV_PERFORMANCE,
++        GOV_USERSPACE
++    };
++
++private:
++    virtual status_t readyToRun();
++    virtual void onFirstRef();
++    virtual bool threadLoop();
++
++    bool handle_interactive();
++    bool handle_conservative();
++    bool handle_performance();
++    void do_changecpugov(const char *gov);
++
++    CMessageQueue mThreadQueue;
++    mutable Mutex mLock;
++    int mFd;
++    int mFd1;
++    bool mActive;
++    static char const* getPath() { return GOV_PATH; }
++};
++#endif
+-- 
+1.8.0
+

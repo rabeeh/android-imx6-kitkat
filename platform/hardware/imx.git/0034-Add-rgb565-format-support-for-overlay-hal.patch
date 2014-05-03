@@ -1,0 +1,275 @@
+From db3fe6cb4ef34689d6b418ed25949cca1e1ea371 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Thu, 22 Apr 2010 16:46:40 +0800
+Subject: [PATCH 034/486] Add rgb565 format support for overlay hal
+ Signed-off-by: guoyin.chen
+ <guoyin.chen@freescale.com>
+
+---
+ liboverlay/overlay.cpp       |   3 +-
+ liboverlay/overlay_thread.h  |   8 ++-
+ liboverlay/overlays_test.cpp | 124 ++++++++++++++++++++++++++++++-------------
+ 3 files changed, 95 insertions(+), 40 deletions(-)
+
+diff --git a/liboverlay/overlay.cpp b/liboverlay/overlay.cpp
+index 4a7d76c..4cc87cc 100755
+--- a/liboverlay/overlay.cpp
++++ b/liboverlay/overlay.cpp
+@@ -917,11 +917,12 @@ static overlay_t* overlay_createOverlay(struct overlay_control_device_t *dev,
+     /* check the input params, reject if not supported or invalid */
+     switch (format) {
+         case PIXEL_FORMAT_RGB_888:
+-        case PIXEL_FORMAT_RGB_565:
+         case PIXEL_FORMAT_RGBA_8888:
+         case PIXEL_FORMAT_YCbCr_422_SP:
+             OVERLAY_LOG_ERR("Error!Not a valid format for overlay");
+             return NULL;
++        case PIXEL_FORMAT_RGB_565:
++            break;
+         case PIXEL_FORMAT_YCbCr_420_SP:
+             break;
+         case PIXEL_FORMAT_YCbCr_422_I:
+diff --git a/liboverlay/overlay_thread.h b/liboverlay/overlay_thread.h
+index f89fe32..8320d4a 100755
+--- a/liboverlay/overlay_thread.h
++++ b/liboverlay/overlay_thread.h
+@@ -311,7 +311,9 @@ class OverlayThread: public Thread {
+                 if(overlayObj0->mHandle.format == PIXEL_FORMAT_YCbCr_420_SP) {
+                     mIPUInputParam.fmt = v4l2_fourcc('I', '4', '2', '0');
+                 }
+-                else{
++                else if(overlayObj0->mHandle.format == PIXEL_FORMAT_RGB_565) {
++                    mIPUInputParam.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++                }else{
+                     OVERLAY_LOG_ERR("Error!Not supported input format %d",overlayObj0->mHandle.format);
+                     goto queue_buf_exit;
+                 }
+@@ -380,7 +382,9 @@ class OverlayThread: public Thread {
+                 if(overlayObj1->mHandle.format == PIXEL_FORMAT_YCbCr_420_SP) {
+                     mIPUInputParam.fmt = v4l2_fourcc('I', '4', '2', '0');
+                 }
+-                else{
++                else if(overlayObj0->mHandle.format == PIXEL_FORMAT_RGB_565) {
++                    mIPUInputParam.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++                }else{
+                     OVERLAY_LOG_ERR("Error!Obj1 Not supported input format %d",overlayObj1->mHandle.format);
+                     goto queue_buf_exit;
+                 }
+diff --git a/liboverlay/overlays_test.cpp b/liboverlay/overlays_test.cpp
+index 79cb925..2fc3582 100755
+--- a/liboverlay/overlays_test.cpp
++++ b/liboverlay/overlays_test.cpp
+@@ -39,6 +39,7 @@
+ 
+ #define LOG_TAG "overlay_test"
+ 
++using namespace android;
+ /*
+        Y = R *  .299 + G *  .587 + B *  .114;
+        U = R * -.169 + G * -.332 + B *  .500 + 128.;
+@@ -55,7 +56,28 @@
+ #define green_rgb565 (0b00000111111000000)
+ #define blue_rgb565 (0b00000000000011111)
+ 
+-void gen_fill_pattern(char * buf, int in_width, int in_height,int h_step, int w_step)
++void gen_fill_pattern_rgb(char * buf, int in_width, int in_height,int h_step, int w_step)
++{
++	int h, w;
++	static unsigned short rgb = 0;
++
++    unsigned short  *rgb565 = (unsigned short *)buf;
++	for (h = 0; h < in_height; h++) {
++		unsigned short rgb_temp = rgb;
++
++		for (w = 0; w < in_width; w++) {
++			if (w % w_step == 0) {
++                rgb_temp += 0x004;//inc r,g,b by one
++			}
++			buf[(h*in_width) + w] = rgb_temp;
++		}
++		if ((h > 0) && (h % h_step == 0)) {
++			rgb_temp += 0x20;
++		}
++	}
++
++}
++void gen_fill_pattern_yuv(char * buf, int in_width, int in_height,int h_step, int w_step)
+ {
+ 	int y_size = in_width * in_height;
+ 	//int h_step = in_height / 16;
+@@ -114,8 +136,16 @@ void gen_fill_pattern(char * buf, int in_width, int in_height,int h_step, int w_
+ 	}
+ }
+ 
++void gen_fill_pattern(char * buf, int in_width, int in_height,int h_step, int w_step,int32_t format)
++{
++    if(format == PIXEL_FORMAT_RGB_565) {
++        gen_fill_pattern_rgb(buf,in_width,in_height,h_step,w_step);
++    }
++    else if(format == PIXEL_FORMAT_YCbCr_420_SP) {
++        gen_fill_pattern_yuv(buf,in_width,in_height,h_step,w_step);
++    }
++}
+ 
+-using namespace android;
+ 
+ namespace android {
+ class Test {
+@@ -128,6 +158,7 @@ public:
+ typedef struct {
+     int w;
+     int h;
++    int32_t format;
+     int frame_num;
+     int crop_x;
+     int crop_y;
+@@ -161,20 +192,6 @@ int main(int argc, char** argv)
+     memset(&overlay_param0, 0 ,sizeof(OVERLAY_PARAM));
+     memset(&overlay_param1, 0 ,sizeof(OVERLAY_PARAM));
+  
+-    #if 0
+-    if ((fd_fb = open("/dev/graphics/fb1", O_RDWR, 0)) < 0) {
+-       LOGI("Error!Unable to open /dev/fb1\n");
+-       return 0;
+-    }
+-    if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
+-        LOGI("Error!Get FB var info failed!\n");
+-        close(fd_fb);
+-        return 0;
+-    }
+-    panel_x = fb_var.xres;
+-    panel_y = fb_var.yres;
+-    #endif
+-
+     DisplayInfo dinfo;
+     session = new SurfaceComposerClient();
+     status_t status = session->getDisplayInfo(0, &dinfo);
+@@ -202,6 +219,7 @@ int main(int argc, char** argv)
+ 
+     overlay_param0.w = 720;
+     overlay_param0.h = 576;
++    overlay_param0.format = PIXEL_FORMAT_YCbCr_420_SP;
+     overlay_param0.frame_num = 8;
+     overlay_param0.crop_x = 0;
+     overlay_param0.crop_y = 0;
+@@ -217,6 +235,7 @@ int main(int argc, char** argv)
+ 
+     overlay_param1.w = 320;
+     overlay_param1.h = 240;
++    overlay_param1.format = PIXEL_FORMAT_YCbCr_420_SP;
+     overlay_param1.frame_num = 6;
+     overlay_param1.crop_x = 0;
+     overlay_param1.crop_y = 0;
+@@ -482,27 +501,58 @@ int main(int argc, char** argv)
+             pthread_create(&thread1, NULL, overlay_instance_test, (void *)(&overlay_param1));
+             pthread_join(thread1, &ret);
+         }
++        else if(!strcmp(argv[1],"-6")){
++            LOGI("****Run one overlay instances 720/576 RGB test*****");
++            //pthread_attr_init(&attr0);
++            //pthread_attr_setdetachstate(&attr0, PTHREAD_CREATE_DETACHED);
++            overlay_param0.format = PIXEL_FORMAT_RGB_565;
++            if(argc==3) {
++                overlay_param0.show_num = atoi(argv[2]);
++            }
++
++            LOGI("Display info: panel_x %d panel_y %d",panel_x,panel_y);
++            LOGI("Overlay paramater: w %d,h %d, pos_x %d, pos_y %d, win_h %d win_w %d",
++                 overlay_param0.w,overlay_param0.h,
++                 overlay_param0.pos_x,overlay_param0.pos_y,
++                 overlay_param0.win_w,overlay_param0.win_h);
++
++            //draw the background to black
++            LOGI("Draw background to black");
++            background->lock(&sinfo_background);
++            memset(sinfo_background.bits, 0xff, sinfo_background.w*sinfo_background.h*2);
++            char *prgb565 = (char *)sinfo_background.bits+(overlay_param0.pos_y*sinfo_background.w+overlay_param0.pos_x)*2;
++            for(int height = overlay_param0.pos_y; height < (overlay_param0.pos_y+overlay_param0.win_h); height++) {
++                memset(prgb565, 0, overlay_param0.win_w*2);
++                prgb565 += (sinfo_background.w*2);
++            }
++        	background->unlockAndPost();
++            LOGI("Overlay running");
++            pthread_create(&thread0, NULL, overlay_instance_test, (void *)(&overlay_param0));
++            pthread_join(thread0, &ret);
++        }
+         else{
+             LOGE("Error!Not support parameters");
+-            LOGE("%s [-0] [-1] [-2] [-3] [-4] [-5] [frame num]",argv[0]);
+-            LOGE("  [-0] verlay instances 720/576 test");
+-            LOGE("  [-1] verlay instances 320/240 test");
+-            LOGE("  [-2] verlay instances 720/576&320/240 test");
+-            LOGE("  [-3] verlay instances 720/576&320/240 performance test");
+-            LOGE("  [-4] verlay instances 720/576 test");
+-            LOGE("  [-5] verlay instances 320/240 test");
++            LOGE("%s [-0] [-1] [-2] [-3] [-4] [-5] [-6] [frame num]",argv[0]);
++            LOGE("  [-0] verlay instances 720/576 YUV test");
++            LOGE("  [-1] verlay instances 320/240 YUV test");
++            LOGE("  [-2] verlay instances 720/576&320/240 YUV test");
++            LOGE("  [-3] verlay instances 720/576&320/240 YUV performance test");
++            LOGE("  [-4] verlay instances 720/576 YUV test");
++            LOGE("  [-5] verlay instances 320/240 YUV test");
++            LOGE("  [-6] verlay instances 720/576 RGB565 test");
+             LOGE("  [frame num] frame count number");
+         }
+     }
+     else{
+         LOGE("Error!Not support parameters");
+-        LOGE("%s [-0] [-1] [-2] [-3] [-4] [-5] [frame num]",argv[0]);
+-        LOGE("  [-0] verlay instances 720/576 test");
+-        LOGE("  [-1] verlay instances 320/240 test");
+-        LOGE("  [-2] verlay instances 720/576&320/240 test");
+-        LOGE("  [-3] verlay instances 720/576&320/240 performance test");
+-        LOGE("  [-4] verlay instances 720/576 test");
+-        LOGE("  [-5] verlay instances 320/240 test");
++        LOGE("%s [-0] [-1] [-2] [-3] [-4] [-5] [-6] [frame num]",argv[0]);
++        LOGE("  [-0] verlay instances 720/576 YUV test");
++        LOGE("  [-1] verlay instances 320/240 YUV test");
++        LOGE("  [-2] verlay instances 720/576&320/240 YUV test");
++        LOGE("  [-3] verlay instances 720/576&320/240 YUV performance test");
++        LOGE("  [-4] verlay instances 720/576 YUV test");
++        LOGE("  [-5] verlay instances 320/240 YUV test");
++        LOGE("  [-6] verlay instances 720/576 RGB565 test");
+         LOGE("  [frame num] frame count number");
+     }
+ 
+@@ -539,13 +589,11 @@ void *overlay_instance_test(void *arg)
+     // get to the isurface
+     sp<ISurface> isurface = Test::getISurface(surface);
+     LOGI("isurface = %p", isurface.get());
+-  
+-
+-
+-      
++    
+     // now request an overlay
+     LOGI("createOverlay()");
+-    sp<OverlayRef> ref = isurface->createOverlay(overlay_param->w, overlay_param->h, PIXEL_FORMAT_YCbCr_420_SP);
++    sp<OverlayRef> ref = isurface->createOverlay(overlay_param->w, overlay_param->h,
++                                                 overlay_param->format);
+     LOGI("createOverlay() AFTER");
+     LOGI("new Overlay(ref) start");
+     sp<Overlay> overlay = new Overlay(ref);
+@@ -587,7 +635,8 @@ void *overlay_instance_test(void *arg)
+             //Draw the data to the buffer address(YUV420 format as setting)
+             gen_fill_pattern((char *)address,overlay_param->w,overlay_param->h,
+                              overlay_param->w/overlay_param->step_line,
+-                             overlay_param->w/overlay_param->step_line);
++                             overlay_param->w/overlay_param->step_line,
++                             overlay_param->format);
+             overlay->queueBuffer(buffer);
+         }
+     }
+@@ -600,7 +649,8 @@ void *overlay_instance_test(void *arg)
+             void* address = overlay->getBufferAddress(buffer[i]);
+             gen_fill_pattern((char *)address,overlay_param->w,overlay_param->h,
+                              overlay_param->w/overlay_param->step_line,
+-                             overlay_param->w/overlay_param->step_line);
++                             overlay_param->w/overlay_param->step_line,
++                             overlay_param->format);
+         }
+         struct timeval startTime,lastTime;
+         int frameshow = 0;
+-- 
+1.8.0
+

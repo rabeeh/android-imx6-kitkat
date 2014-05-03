@@ -1,0 +1,221 @@
+From f7b08a7519b8f26a383db38e512b5bf27b520544 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Tue, 16 Mar 2010 14:54:00 +0800
+Subject: [PATCH 149/435] ENGR00121586 Change vpu unit test to due to f/w
+ upgrade to v1.3.6
+
+Change vpu unit test due to f/w upgrade to 1.3.6.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c | 50 +++++++++++++++++++++++++++++++++++----
+ test/mxc_vpu_test/enc.c | 62 ++++++++++++++++++++++++++++++++++++-------------
+ 2 files changed, 91 insertions(+), 21 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index a01c091..659964f 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -830,9 +830,8 @@ decoder_start(struct decode *dec)
+ 			/*
+ 			 * Suppose vpu is hang if one frame cannot be decoded in 5s,
+ 			 * then do vpu software reset.
+-			 * Please DON'T add the code if the application is in network
+-			 * case since vpu interrupt also cannot be received if no
+-			 * enough data.
++			 * Please take care of this for network case since vpu
++			 * interrupt also cannot be received if no enough data.
+ 			 */
+ 			if (loop_id == 10) {
+ 				err = vpu_SWReset(handle, 0);
+@@ -1411,7 +1410,7 @@ decoder_parse(struct decode *dec)
+ {
+ 	DecInitialInfo initinfo = {0};
+ 	DecHandle handle = dec->handle;
+-	int align;
++	int align, profile, level;
+ 	RetCode ret;
+ 
+ 	/*
+@@ -1501,8 +1500,49 @@ decoder_parse(struct decode *dec)
+ 			break;
+ 
+ 		case STD_MPEG4:
++			if (initinfo.level & 0x80) { /* VOS Header */
++				initinfo.level &= 0x7F;
++				if (initinfo.level == 8 && initinfo.profile == 0) {
++					level = 0; profile = 0;	 /* Simple, Level_L0 */
++				} else {
++					switch (initinfo.profile) {
++					case 0xB:
++						profile = 1; /* advanced coding efficiency object */
++						break;
++					case 0xF:
++						if (initinfo.level & 8 == 0)
++							profile = 2; /* advanced simple object */
++						else
++							profile = 5; /* reserved */
++						break;
++					case 0x0:
++						profile = 0;
++						break;    /* Simple Profile */
++					default:
++						profile = 5;
++						break;
++					}
++					level = initinfo.level;
++				}
++			} else { /* VOL Header only */
++				level = 7;  /* reserved */
++				switch (initinfo.profile) {
++				case 0x1:
++					profile = 0;  /* simple object */
++					break;
++				case 0xC:
++					profile = 1;  /* advanced coding efficiency object */
++					break;
++				case 0x11:
++					profile = 2;  /* advanced simple object */
++					break;
++				default:
++					profile = 5;  /* reserved */
++					break;
++				}
++			}
+ 			info_msg("Mpeg4 Profile: %d Level: %d Interlaced: %d\n",
+-				initinfo.profile, initinfo.level, initinfo.interlace);
++				profile, level, initinfo.interlace);
+ 			/*
+ 			 * Profile: 8'b00000000: SP, 8'b00010001: ASP
+ 			 * Level: 4'b0000: L0, 4'b0001: L1, 4'b0010: L2, 4'b0011: L3, ...
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 0551f64..faec402 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -30,6 +30,7 @@ extern struct capture_testbuffer cap_buffers[];
+ 
+ /* When app need to exit */
+ extern int quitflag;
++static int frameRateInfo = 0;
+ 
+ #define FN_ENC_QP_DATA "enc_qp.log"
+ #define FN_ENC_SLICE_BND_DATA "enc_slice_bnd.log"
+@@ -172,6 +173,7 @@ encoder_fill_headers(struct encode *enc)
+ 	EncHeaderParam enchdr_param = {0};
+ 	EncHandle handle = enc->handle;
+ 	RetCode ret;
++	int mbPicNum;
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+ 	u32 vbuf;
+@@ -181,27 +183,50 @@ encoder_fill_headers(struct encode *enc)
+ 
+ 	/* Must put encode header before encoding */
+ 	if (enc->cmdl->format == STD_MPEG4) {
+-		if (!cpu_is_mx5x()) {
+-			enchdr_param.headerType = VOS_HEADER;
+-			vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
++		enchdr_param.headerType = VOS_HEADER;
++		/*
++		 * Please set userProfileLevelEnable to 0 if you need to generate
++	         * user profile and level automaticaly by resolution, here is one
++		 * sample of how to work when userProfileLevelEnable is 1.
++		 */
++		enchdr_param.userProfileLevelEnable = 1;
++		mbPicNum = ((enc->picwidth + 15) / 16) *((enc->picheight + 15) / 16);
++		if (enc->picwidth <= 176 && enc->picheight <= 144 &&
++		    mbPicNum * frameRateInfo <= 1485)
++			enchdr_param.userProfileLevelIndication = 8; /* L1 */
++		/* Please set userProfileLevelIndication to 8 if L0 is needed */
++		else if (enc->picwidth <= 352 && enc->picheight <= 288 &&
++			 mbPicNum * frameRateInfo <= 5940)
++			enchdr_param.userProfileLevelIndication = 2; /* L2 */
++		else if (enc->picwidth <= 352 && enc->picheight <= 288 &&
++			 mbPicNum * frameRateInfo <= 11880)
++			enchdr_param.userProfileLevelIndication = 3; /* L3 */
++		else if (enc->picwidth <= 640 && enc->picheight <= 480 &&
++			 mbPicNum * frameRateInfo <= 36000)
++			enchdr_param.userProfileLevelIndication = 4; /* L4a */
++		else if (enc->picwidth <= 720 && enc->picheight <= 576 &&
++			 mbPicNum * frameRateInfo <= 40500)
++			enchdr_param.userProfileLevelIndication = 5; /* L5 */
++		else
++			enchdr_param.userProfileLevelIndication = 6; /* L6 */
++		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+-			vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-			ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-			if (ret < 0)
+-				return -1;
++		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
++		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
++		if (ret < 0)
++			return -1;
+ #endif
+ 
+-			enchdr_param.headerType = VIS_HEADER;
+-			vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
++		enchdr_param.headerType = VIS_HEADER;
++		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+-			vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-			ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-			if (ret < 0)
+-				return -1;
++		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
++		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
++		if (ret < 0)
++			return -1;
+ #endif
+-		}
+ 
+ 		enchdr_param.headerType = VOL_HEADER;
+ 		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+@@ -373,6 +398,7 @@ encoder_start(struct encode *enc)
+ 	enc_param.quantParam = 23;
+ 	enc_param.forceIPicture = 0;
+ 	enc_param.skipPicture = 0;
++	enc_param.enableAutoSkip = 1;
+ 
+ 	/* Set report info flag */
+ 	if (enc->mbInfo.enable) {
+@@ -468,6 +494,9 @@ encoder_start(struct encode *enc)
+ 			goto err2;
+ 		}
+ 
++		if (outinfo.skipEncoded)
++			info_msg("Skip encoding one Frame!\n");
++
+ 		if (outinfo.mbInfo.enable && outinfo.mbInfo.size && outinfo.mbInfo.addr) {
+ 			SaveEncMbInfo(outinfo.mbInfo.addr, outinfo.mbInfo.size,
+ 					 encop.picWidth/16, frame_id);
+@@ -680,7 +709,7 @@ encoder_open(struct encode *enc)
+ 	}
+ 
+ 	/*Note: Frame rate cannot be less than 15fps per H.263 spec */
+-	encop.frameRateInfo = 30;
++	encop.frameRateInfo = frameRateInfo = 30;
+ 	encop.bitRate = enc->cmdl->bitrate;
+ 	encop.gopSize = enc->cmdl->gop;
+ 	encop.slicemode.sliceMode = 0;	/* 0: 1 slice per picture; 1: Multiple slices per picture */
+@@ -689,13 +718,14 @@ encoder_open(struct encode *enc)
+ 
+ 	encop.initialDelay = 0;
+ 	encop.vbvBufferSize = 0;        /* 0 = ignore 8 */
+-	encop.enableAutoSkip = 1;
+ 	encop.intraRefresh = 0;
+ 	encop.sliceReport = 0;
+ 	encop.mbReport = 0;
+ 	encop.mbQpReport = 0;
+ 	encop.rcIntraQp = -1;
+ 	encop.userQpMax = 0;
++	encop.userQpMin = 0;
++
+ 	encop.userGamma = (Uint32)(0.75*32768);         /*  (0*32768 <= gamma <= 1*32768) */
+ 	encop.RcIntervalMode= 1;        /* 0:normal, 1:frame_level, 2:slice_level, 3: user defined Mb_level */
+ 	encop.MbInterval = 0;
+-- 
+1.8.0
+

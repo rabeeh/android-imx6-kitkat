@@ -1,0 +1,122 @@
+From fe7b21dd217415cc4506390110b128050a069f5e Mon Sep 17 00:00:00 2001
+From: YangYonggang <b31664@freescale.com>
+Date: Tue, 15 May 2012 10:00:28 +0800
+Subject: [PATCH 276/486] ENGR00209552 Sometimes some camera cts cases failed.
+
+The root cause was that error dealing was not good. Added some
+error dealing to fix the bug.
+
+Signed-off-by: YangYonggang <b31664@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp | 32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 937f8cf..342dad1 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -832,7 +832,7 @@ namespace android {
+             mWaitForTakingPicture = true;
+             sem_wait(&mTakingPicture);
+             mWaitForTakingPicture = false;
+-	}
++        }
+         Mutex::Autolock lock(mLock);
+         //isPreviewFinsh = 0;
+         mEnqueuedBufs = 0;
+@@ -1972,7 +1972,9 @@ Pic_out:
+                 //handle the error return.
+                 if(ret < 0) {
+                     CAMERA_HAL_ERR("%s: get invalide buffer", __FUNCTION__);
+-                    mCaptureThreadQueue.postQuitMessage();
++                    mCaptureRunning = false;
++                    mCaptureThreadQueue.clearMessage();
++                    sem_post(&mCaptureStoppedCondition);
+                     return NO_ERROR;
+                 }
+                 //handle the normal return.
+@@ -1996,9 +1998,12 @@ Pic_out:
+                 break;
+             case CMESSAGE_TYPE_QUITE:
+                 mExitCaptureThread = 1;
+-                mPreviewThreadQueue.postQuitMessage();
+-                mEncodeThreadQueue.postQuitMessage();
+-                mPostProcessThreadQueue.postQuitMessage();
++                if (mExitPreviewThread == 0)
++                    mPreviewThreadQueue.postQuitMessage();
++                if (mExitEncodeThread == 0)
++                    mEncodeThreadQueue.postQuitMessage();
++                if (mPPDeviceNeed && (mExitPostProcessThread == 0))
++                    mPostProcessThreadQueue.postQuitMessage();
+                 break;
+             default:
+                 CAMERA_HAL_ERR("%s: wrong msg type %d", __FUNCTION__, msg->what);
+@@ -2116,7 +2121,8 @@ Pic_out:
+             }
+             ret = previewshowFrameThread();
+             if(ret < 0) {
+-                CAMERA_HAL_ERR("%s: capture thread exit with exception", __FUNCTION__);
++                CAMERA_HAL_ERR("%s: preview thread exit with exception", __FUNCTION__);
++                mExitPreviewThread = 1;
+                 return ret;
+             }            
+         }
+@@ -2169,6 +2175,9 @@ Pic_out:
+                 display_index = msg->arg0;
+                 if(display_index < 0 || (unsigned int)display_index >= mCaptureBufNum) {
+                     CAMERA_HAL_ERR("%s: get invalide buffer index", __FUNCTION__);
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
+                     return BAD_VALUE;  
+                 }
+                 if(!mPPDeviceNeed) {
+@@ -2189,6 +2198,7 @@ Pic_out:
+                 if (mNativeWindow != 0) {
+                     if (mNativeWindow->enqueue_buffer(mNativeWindow, &((android_native_buffer_t * )pInBuf->native_buf)->handle) < 0){
+                         CAMERA_HAL_ERR("queueBuffer failed. May be bcos stream was not turned on yet.");
++                        mPreviewRunning = false;
+                         mPreviewThreadQueue.clearMessage();
+                         sem_post(&mPreviewStoppedCondition);
+                         return BAD_VALUE;
+@@ -2204,6 +2214,9 @@ Pic_out:
+                 err = mNativeWindow->dequeue_buffer(mNativeWindow, &buf_h, &stride);
+                 if((err != 0) || buf_h == NULL) {
+                     CAMERA_HAL_ERR("%s: dequeueBuffer failed.", __FUNCTION__);
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
+                     return INVALID_OPERATION;
+                 }
+                 buf = container_of(buf_h, ANativeWindowBuffer, handle);
+@@ -2213,6 +2226,9 @@ Pic_out:
+                 if(buf_index >= mCaptureBufNum || (buf_index < 0)) {
+                     mNativeWindow->cancel_buffer(mNativeWindow, &buf->handle);
+                     CAMERA_HAL_ERR("dequeue invalide buffer!!!!");
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
+                     return INVALID_OPERATION;
+                 }
+ 
+@@ -2248,6 +2264,7 @@ Pic_out:
+             ret = encodeframeThread();
+             if(ret < 0) {
+                 CAMERA_HAL_ERR("%s: encode thread exit with exception", __FUNCTION__);
++                mExitEncodeThread = 1;
+                 return ret;
+             }
+         }
+@@ -2271,6 +2288,9 @@ Pic_out:
+                 unsigned int i;
+                 if(enc_index < 0 || (unsigned int)enc_index >= mCaptureBufNum) {
+                     CAMERA_HAL_ERR("%s: get invalide buffer index", __FUNCTION__);
++                    mRecordRunning = false;
++                    mEncodeThreadQueue.clearMessage();
++                    sem_post(&mEncodeStoppedCondition);
+                     return BAD_VALUE;  
+                 }
+                 
+-- 
+1.8.0
+

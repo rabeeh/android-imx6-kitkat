@@ -1,0 +1,253 @@
+From c986c43f58ff7b0b128988d34a7630d1268c5a21 Mon Sep 17 00:00:00 2001
+From: ZhongWen <b47623@freescale.com>
+Date: Wed, 25 Dec 2013 16:05:33 +0800
+Subject: [PATCH 50/52] ENGR00290619 Add proxy setting and make some changes
+
+Add the proxy setting and make some changes.
+Solve one crash problem when set the static IP and DNS address null.
+
+Signed-off-by: ZhongWen <b47623@freescale.com>
+---
+ .../com/fsl/ethernet/EthernetConfigDialog.java     | 54 +++++++++++++----
+ Ethernet/res/layout/eth_configure.xml              | 69 ++++++++++++++++++++++
+ Ethernet/res/values/strings.xml                    |  6 ++
+ 3 files changed, 118 insertions(+), 11 deletions(-)
+
+diff --git a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+index 263c99c..73859e1 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
++++ b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+@@ -30,6 +30,11 @@ import android.widget.RadioButton;
+ import android.widget.Spinner;
+ import android.widget.TextView;
+ import com.fsl.ethernet.EthernetDevInfo;
++import android.widget.LinearLayout;
++import android.widget.CompoundButton;
++import android.widget.CheckBox;
++import android.widget.Toast;
++import android.widget.CompoundButton.OnCheckedChangeListener;
+ /**
+  * Created by B38613 on 13-8-5.
+  */
+@@ -46,6 +51,9 @@ public class EthernetConfigDialog extends AlertDialog implements
+     private RadioButton mConTypeManual;
+     private EditText mIpaddr;
+     private EditText mDns;
++    private CheckBox mProxy;
++    private LinearLayout ip_dns_setting;
++    private LinearLayout address_port_setting;
+     private static String Mode_dhcp = "dhcp";
+ 
+     public EthernetConfigDialog(Context context, EthernetEnabler Enabler) {
+@@ -61,18 +69,22 @@ public class EthernetConfigDialog extends AlertDialog implements
+         mDevList = (Spinner) mView.findViewById(R.id.eth_dev_spinner);
+         mConTypeDhcp = (RadioButton) mView.findViewById(R.id.dhcp_radio);
+         mConTypeManual = (RadioButton) mView.findViewById(R.id.manual_radio);
++        mProxy = (CheckBox) mView.findViewById(R.id.eth_proxy);
+         mIpaddr = (EditText)mView.findViewById(R.id.ipaddr_edit);
+         mDns = (EditText)mView.findViewById(R.id.eth_dns_edit);
++        ip_dns_setting = (LinearLayout)mView.findViewById(R.id.ip_dns_setting);
++        address_port_setting = (LinearLayout)mView.findViewById(R.id.address_port_setting);
++        address_port_setting.setVisibility(View.GONE);
+         if (mEthEnabler.getManager().isConfigured()) {
+             EthernetDevInfo info = mEthEnabler.getManager().getSavedConfig();
+             if (mEthEnabler.getManager().getSharedPreMode().equals(Mode_dhcp)) {
+                 mConTypeDhcp.setChecked(true);
+                 mConTypeManual.setChecked(false);
+-                mIpaddr.setEnabled(false);
+-                mDns.setEnabled(false);
++                ip_dns_setting.setVisibility(View.GONE);
+             } else {
+                 mConTypeDhcp.setChecked(false);
+                 mConTypeManual.setChecked(true);
++                ip_dns_setting.setVisibility(View.VISIBLE);
+                 mIpaddr.setEnabled(true);
+                 mDns.setEnabled(true);
+                 mIpaddr.setText(mEthEnabler.getManager().getSharedPreIpAddress(),TextView.BufferType.EDITABLE);
+@@ -84,21 +96,32 @@ public class EthernetConfigDialog extends AlertDialog implements
+             mEthEnabler.getManager().setMode(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
+             mConTypeDhcp.setChecked(true);
+             mConTypeManual.setChecked(false);
+-            mIpaddr.setEnabled(false);
+-            mDns.setEnabled(false);
++            ip_dns_setting.setVisibility(View.GONE);
+         }
+         mConTypeManual.setOnClickListener(new RadioButton.OnClickListener() {
+             public void onClick(View v) {
++                ip_dns_setting.setVisibility(View.VISIBLE);
+                 mIpaddr.setEnabled(true);
+                 mDns.setEnabled(true);
+             }
+         });
+         mConTypeDhcp.setOnClickListener(new RadioButton.OnClickListener() {
+             public void onClick(View v) {
++                ip_dns_setting.setVisibility(View.GONE);
+                 mIpaddr.setEnabled(false);
+                 mDns.setEnabled(false);
+             }
+         });
++        mProxy.setOnCheckedChangeListener(new OnCheckedChangeListener(){
++            public void onCheckedChanged(CompoundButton buttonView,boolean isChecked) {
++                if (!isChecked)
++                {
++                    address_port_setting.setVisibility(View.GONE);
++                }else{
++                    address_port_setting.setVisibility(View.VISIBLE);
++                }
++            }
++        });
+ 
+         this.setInverseBackgroundForced(true);
+         this.setButton(BUTTON_POSITIVE, context.getText(R.string.menu_save), this);
+@@ -122,15 +145,24 @@ public class EthernetConfigDialog extends AlertDialog implements
+             info.setIpAddress(null);
+             info.setDnsAddr(null);
+             mEthEnabler.getManager().sharedPreferencesStore(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP, null, null);
++            mEthEnabler.getManager().updateDevInfo(info);
++            mEthEnabler.setEthEnabled();
++
+         } else {
+-            info.setConnectMode(EthernetDevInfo.ETHERNET_CONN_MODE_MANUAL);
+-            info.setIpAddress(mIpaddr.getText().toString());
+-            info.setDnsAddr(mDns.getText().toString());
+-            mEthEnabler.getManager().sharedPreferencesStore(EthernetDevInfo.ETHERNET_CONN_MODE_MANUAL,
+-                mIpaddr.getText().toString(), mDns.getText().toString());
++            if ((mIpaddr.getText().toString().equals(""))||(mDns.getText().toString().equals("")))
++            {
++                Toast.makeText(this.getContext(), R.string.show_need_setting,Toast.LENGTH_SHORT).show();
++            }else{
++                info.setConnectMode(EthernetDevInfo.ETHERNET_CONN_MODE_MANUAL);
++                info.setIpAddress(mIpaddr.getText().toString());
++                info.setDnsAddr(mDns.getText().toString());
++                mEthEnabler.getManager().sharedPreferencesStore(EthernetDevInfo.ETHERNET_CONN_MODE_MANUAL,
++                    mIpaddr.getText().toString(), mDns.getText().toString());
++                mEthEnabler.getManager().updateDevInfo(info);
++                mEthEnabler.setEthEnabled();
++
++            }
+         }
+-        mEthEnabler.getManager().updateDevInfo(info);
+-        mEthEnabler.setEthEnabled();
+     }
+ 
+     public void onClick(DialogInterface dialog, int which) {
+diff --git a/Ethernet/res/layout/eth_configure.xml b/Ethernet/res/layout/eth_configure.xml
+index a3dc753..bc14bc6 100644
+--- a/Ethernet/res/layout/eth_configure.xml
++++ b/Ethernet/res/layout/eth_configure.xml
+@@ -42,6 +42,7 @@
+                   android:layout_marginEnd="16dip"
+                   android:orientation="vertical"
+                   android:gravity="start"
++                  android:textAppearance="?android:attr/textAppearanceMedium"
+                   android:text="@string/eth_con_type" />
+         <RadioGroup android:id="@+id/con_type"
+                     android:layout_width="match_parent"
+@@ -61,6 +62,25 @@
+                          android:text="@string/eth_con_type_manual">
+             </RadioButton>
+         </RadioGroup>
++        <TextView android:id="@+id/eth_proxy_text"
++                  android:layout_width="match_parent"
++                  android:layout_height="wrap_content"
++                  android:layout_marginTop="8dip"
++                  android:layout_marginStart="16dip"
++                  android:layout_marginEnd="16dip"
++                  android:orientation="vertical"
++                  android:gravity="start"
++                  android:textAppearance="?android:attr/textAppearanceMedium"
++                  android:text="@string/proxy_setting" />
++        
++        <CheckBox
++            android:id="@+id/eth_proxy"
++            android:layout_width="wrap_content"
++            android:layout_height="wrap_content"
++            android:textSize="14sp"
++            android:checked="false"
++            android:textAlignment="viewStart"            
++            android:text="@string/eth_proxy" />
+ 
+         <!-- IP address -->
+         <LinearLayout android:id="@+id/enterprise_wrapper"
+@@ -68,6 +88,12 @@
+                       android:layout_height="wrap_content"
+                       android:padding="0dip"
+                       android:orientation="vertical">
++            <LinearLayout
++                android:id="@+id/ip_dns_setting"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:orientation="vertical" >
++                
+             <TextView android:id="@+id/ipaddr_text"
+                       android:layout_width="match_parent"
+                       android:layout_height="wrap_content"
+@@ -99,7 +125,50 @@
+                       android:textSize="18sp"
+                       android:textAlignment="viewStart"
+                       android:singleLine="true"
++                      android:inputType="none" />
++            </LinearLayout>
++
++            <LinearLayout
++                android:id="@+id/address_port_setting"
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:orientation="vertical" >
++
++            <TextView android:id="@+id/eth_proxy_address"
++                      android:layout_width="match_parent"
++                      android:layout_height="wrap_content"
++                      android:layout_marginTop="8dip"
++                      android:layout_marginStart="16dip"
++                      android:layout_marginEnd="16dip"
++                      android:orientation="vertical"
++                      android:gravity="start"
++                      android:text="@string/proxy_address" />
++            <EditText android:id="@+id/proxy_address_edit"
++                      android:layout_width="match_parent"
++                      android:layout_height="wrap_content"
++                      android:textSize="18sp"
++                      android:textAlignment="viewStart"
++                      android:singleLine="true"
+                       android:inputType="phone" />
++           
++            <TextView android:id="@+id/eth_proxy_port"
++                      android:layout_width="match_parent"
++                      android:layout_height="wrap_content"
++                      android:layout_marginTop="8dip"
++                      android:layout_marginStart="16dip"
++                      android:layout_marginEnd="16dip"
++                      android:orientation="vertical"
++                      android:gravity="start"
++                      android:text="@string/proxy_port" />
++            <EditText android:id="@+id/proxy_port_edit"
++                      android:layout_width="match_parent"
++                      android:layout_height="wrap_content"
++                      android:textSize="18sp"
++                      android:textAlignment="viewStart"
++                      android:singleLine="true"
++                      android:inputType="number" />                
++            </LinearLayout>
++            
+         </LinearLayout>
+ 
+     </LinearLayout>
+diff --git a/Ethernet/res/values/strings.xml b/Ethernet/res/values/strings.xml
+index 1fdb046..8a0809f 100644
+--- a/Ethernet/res/values/strings.xml
++++ b/Ethernet/res/values/strings.xml
+@@ -23,4 +23,10 @@
+     <string name="eth_toggle_summary_on" translatable="false">Turn on Ethernet</string>
+     <string name="menu_save">confirm</string>
+     <string name="menu_cancel">cancel</string>
++    <string name="proxy_setting">Proxy setting</string>
++    <string name="eth_proxy">Proxy server</string>
++    <string name="proxy_address">Proxy address</string>
++    <string name="proxy_port">Proxy port</string> 
++    <string name="eth_proxy_address">Proxy address</string>
++    <string name="show_need_setting">You should setting the static IP and DNS address in this mode</string>
+ </resources>
+-- 
+1.8.0
+

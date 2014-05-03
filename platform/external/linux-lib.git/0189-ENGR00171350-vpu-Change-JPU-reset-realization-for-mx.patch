@@ -1,0 +1,146 @@
+From 1805c2c045d7991c870eba14f50dad15faf6fe6a Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 5 Jan 2012 13:17:15 +0800
+Subject: [PATCH 189/249] ENGR00171350 vpu: Change JPU reset realization for
+ mx6q
+
+Current processing in JPU reset isn't completed, this
+may cause bit processor PC doesn't run after reset.
+The patch will fix it.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c  | 31 ++++++-------------------------
+ vpu/vpu_util.c | 16 +++++++++++++++-
+ vpu/vpu_util.h |  3 ++-
+ 3 files changed, 23 insertions(+), 27 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index dcee81e..d191f46 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -146,10 +146,7 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 							VpuWriteReg(MJPEG_BBC_END_ADDR_REG,
+ 									wrPtr & 0xFFFFFE00);
+ 					} else if (rdPtr == bbcEnd && !(status & 0x3)) {
+-						VpuWriteReg(GDI_BUS_CTRL, 0x11);
+-						while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+-						VpuWriteReg(GDI_BUS_CTRL, 0x00);
+-						IOSysSWReset(); /* reset JPU */
++						vpu_mx6q_hwreset(); /* reset JPU */
+ 
+ 						VpuWriteReg(MJPEG_PIC_STATUS_REG,
+ 								1 << INT_JPU_BIT_BUF_EMPTY);
+@@ -169,10 +166,7 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 					else
+ 						ret = -1;
+ 				} else if (pDecInfo->streamEndflag && !status && (rdPtr >= bbcEnd)) {
+-					VpuWriteReg(GDI_BUS_CTRL, 0x11);
+-					while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+-					VpuWriteReg(GDI_BUS_CTRL, 0x00);
+-					IOSysSWReset(); /* reset JPU */
++					vpu_mx6q_hwreset(); /* reset JPU */
+ 
+ 					pDecInfo->jpgInfo.quitCodec = 1;
+ 					ret = 0;
+@@ -356,14 +350,7 @@ RetCode vpu_SWReset(DecHandle handle, int index)
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+ 	if (cpu_is_mx6q()) {
+-		VpuWriteReg(GDI_BUS_CTRL, 0x11);
+-		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+-		VpuWriteReg(GDI_BUS_CTRL, 0x00);
+-		IOSysSWReset();
+-
+-		VpuWriteReg(BIT_BUSY_FLAG, 1);
+-		VpuWriteReg(BIT_CODE_RUN, 1);
+-		while (vpu_IsBusy());
++		vpu_mx6q_hwreset();
+ 
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_SUCCESS;
+@@ -1768,10 +1755,7 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 
+ 		/* Workaround to reset JPU after each encoder: decoder may be blocked
+ 		 * after encoder randomly if not do reset. Fixme later */
+-		VpuWriteReg(GDI_BUS_CTRL, 0x11);
+-		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+-		VpuWriteReg(GDI_BUS_CTRL, 0x00);
+-		IOSysSWReset();
++		vpu_mx6q_hwreset();
+ 
+ 		UnlockVpu(vpu_semap);
+ 		return RETCODE_SUCCESS;
+@@ -3932,10 +3916,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 
+ 		/* Workaround to reset JPU after each decoder: encoder may be blocked
+ 		 * after decoder randomly if not do reset. Fixme later */
+-		VpuWriteReg(GDI_BUS_CTRL, 0x11);
+-		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+-		VpuWriteReg(GDI_BUS_CTRL, 0x00);
+-		IOSysSWReset();
++		vpu_mx6q_hwreset();
+ 
+ 		*ppendingInst = 0;
+ 		UnlockVpu(vpu_semap);
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 28205d3..c51feac 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media. All rights reserved.
+  */
+@@ -1231,6 +1231,20 @@ int vpu_mx6q_swreset(int forcedReset)
+ 	return RETCODE_SUCCESS;
+ }
+ 
++int vpu_mx6q_hwreset()
++{
++	VpuWriteReg(GDI_BUS_CTRL, 0x11);
++	while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
++	VpuWriteReg(GDI_BUS_CTRL, 0x00);
++	IOSysSWReset();
++
++	VpuWriteReg(BIT_BUSY_FLAG, 1);
++	VpuWriteReg(BIT_CODE_RUN, 1);
++	while (VpuReadReg(BIT_BUSY_FLAG));
++
++	return RETCODE_SUCCESS;
++}
++
+ int JpgEncGenHuffTab(EncInfo * pEncInfo, int tabNum)
+ {
+ 	int p, i, l, lastp, si, maxsymbol;
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index a2e71be..c00cf7b 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -533,6 +533,7 @@ static inline void UnlockVpuReg(semaphore_t *semap)
+ }
+ 
+ int vpu_mx6q_swreset(int forcedReset);
++int vpu_mx6q_hwreset();
+ int JpgEncLoadHuffTab(EncInfo *pEncInfo);
+ int JpgEncLoadQMatTab(EncInfo *pEncInfo);
+ int JpgEncEncodeHeader(EncHandle handle, EncParamSet *para);
+-- 
+1.8.0
+

@@ -1,0 +1,418 @@
+From 1296edf062d78e924773e52bdf325f98dcf62f72 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Fri, 28 Dec 2012 18:39:50 +0800
+Subject: [PATCH 226/249] ENGR00238447 JPEG decoder bug fixes
+
+VPU lib v5.4.11
+
+* JPEG decoder bug fixes
+* return RETCODE_NOT_SUPPORTED for not supported small resolution
+
+Bug 1&2: customer support for Cloud Times
+Reproduced using Jpglib test app (roll back mode)
+
+- Bug 1:
+vpu_WaitForInt success but VPU is still busy
+
+Root cause:
+Receiving interrupt but status was not buffer empty was
+treated as picture done. But in some case, VPU lib could handle and
+clear buffer empty status before interrupt was received due to delay
+(VPU blocking timeout). So after receiving the delayed buffer empty,
+WaitForInterrupt returned success. The risk is to reset VPU when it's
+busy.
+
+Solution:
+Return success only if picture done or error status was set.
+
+- Bug 2:
+Green lines were displayed in each MCU row, on top/bottom MCU border
+After that, MPEG-4 or other decoders were always blocked in decoding 1st
+picture.
+Couldn't recover even after power off/on VPU and re-run test app.
+
+Root cause:
+Improper reset flow: mask new bus request -> existing request done
+-> unmask request -> reset, new request may come before reset.
+This will lead to 1) bus hang 2) abnormal bus transactions unrecoverable
+unless board reset
+Jpglib ring buffer mode has roll back in each picture, so reset is
+called.
+Jpglib line buffer mode and VPU unit test don't trigger roll back.
+
+Solution:
+Mask new request -> existing request done -> reset -> unmask request
+
+- Bug 3:
+16KB sized picture decoding may always timeout then SWReset
+(ENGR00221985)
+Reproduced using VPU wrapper test app or Gstreamer (line buffer mode)
+
+Root cause:
+Has 512 byte stuffing after EOI, so BBC interrupt and picture done
+interrupt may come at the same time for such pictures. VPU lib clears
+BBC interrupt and wait for picture done interrupt which has already been
+issued.
+
+Solution:
+check all status when interrupt comes
+
+- Bug 4:
+JPEG decoding has no output (both modes) for a 188KB sized picture
+Reproduced using VPU unit test
+
+Found a RTL BUG:
+If picture size is a multiple of 256, BBC interrupt coincides with stream
+end process, if a GBU request is queued, BBC FSM will not back to IDLE
+state, so doesn't follow stream end process. BBHR isn't set to correct
+value, so DEC FSM will stall after GBU gets the last byte
+
+Solution:
+Disable BBC interrupt after stream end, so that stream end process
+won't coincide with BBC interrupt.
+Set MJPEG_BBC_END_ADDR_REG behind MJPEG_BBC_STRM_CTRL_REG
+(unreachable position).
+
+- Handling incomplete clip in line buffer mode
+
+RTL BUG:
+Although SW passes the clip end position to JPU, JPU will still be
+blocked because no more bs comes while picture is not done
+
+Solution in line buffer mode:
+Add margin of 3 256B buffers after end of clip position
+(modify MJPEG_BBC_STRM_CTRL_REG). For incomplete clip all 3
+buffers will be consumed. For correct clip at most 2 buffers
+can be consumed. We can compare the read pointer with end
+position to differentiate.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/Android.mk  |  3 ++-
+ vpu/Makefile    |  2 +-
+ vpu/vpu_debug.c | 35 +++++++++++++++++++++++++++++++++++
+ vpu/vpu_debug.h |  5 ++++-
+ vpu/vpu_lib.c   | 54 ++++++++++++++++++++++++++++++++++++++++--------------
+ vpu/vpu_lib.h   |  4 ++--
+ vpu/vpu_util.c  |  9 +++++----
+ 7 files changed, 89 insertions(+), 23 deletions(-)
+ create mode 100644 vpu/vpu_debug.c
+
+diff --git a/vpu/Android.mk b/vpu/Android.mk
+index b38136d..ce95e64 100755
+--- a/vpu/Android.mk
++++ b/vpu/Android.mk
+@@ -8,7 +8,8 @@ LOCAL_SRC_FILES := \
+ 	vpu_io.c \
+ 	vpu_util.c \
+ 	vpu_lib.c \
+-	vpu_gdi.c
++	vpu_gdi.c \
++	vpu_debug.c
+ ifeq ($(BOARD_SOC_CLASS),IMX6)
+ LOCAL_CFLAGS += -DBUILD_FOR_ANDROID -DIMX6Q
+ else
+diff --git a/vpu/Makefile b/vpu/Makefile
+index 4e460d2..b106631 100644
+--- a/vpu/Makefile
++++ b/vpu/Makefile
+@@ -4,7 +4,7 @@ AR=$(CROSS_COMPILE)ar
+ # list of platforms which want this test case
+ INCLUDE_LIST:= IMX27ADS IMX51 IMX53 IMX6Q
+ 
+-OBJ = vpu_io.o vpu_util.o vpu_lib.o vpu_gdi.o
++OBJ = vpu_io.o vpu_util.o vpu_lib.o vpu_gdi.o vpu_debug.o
+ 
+ LIBNAME = libvpu
+ SONAMEVERSION=4
+diff --git a/vpu/vpu_debug.c b/vpu/vpu_debug.c
+new file mode 100644
+index 0000000..9129668
+--- /dev/null
++++ b/vpu/vpu_debug.c
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ */
++
++/* The following programs are the sole property of Freescale Semiconductor Inc.,
++ * and contain its proprietary and confidential information. */
++
++/*!
++ * @file vpu_debug.c
++ *
++ * @brief This file implements VPU debug functions
++ *
++ * @ingroup VPU
++ */
++
++#include <stdio.h>
++#include "vpu_lib.h"
++#include "vpu_io.h"
++#include "vpu_debug.h"
++
++void dump_regs(Uint32 base, int cnt)
++{
++	int i;
++
++	if (vpu_lib_dbg_level >= 6) {
++		for (i=0; i<cnt; i++) {
++			if ((i%8)==0)
++				printf("\n 0x%08lx:   ", base+i*4);
++			printf("0x%lx, ", VpuReadReg(base+i*4));
++		}
++		printf("\n");
++	}
++}
++
+diff --git a/vpu/vpu_debug.h b/vpu/vpu_debug.h
+index 0465370..f46441d 100644
+--- a/vpu/vpu_debug.h
++++ b/vpu/vpu_debug.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2004-2013 Freescale Semiconductor, Inc.
+  *
+  */
+ 
+@@ -17,6 +17,8 @@
+ #ifndef __VPU_DEBUG_H
+ #define __VPU_DEBUG_H
+ 
++#include "vpu_lib.h"
++
+ #ifdef BUILD_FOR_ANDROID
+ #define LOG_TAG "vpu-lib"
+ #include <utils/Log.h>
+@@ -66,4 +68,5 @@ extern int vpu_lib_dbg_level;
+ #define ENTER_FUNC() dprintf(4, "enter %s()\n", __func__)
+ #define EXIT_FUNC() dprintf(4, "exit %s()\n", __func__)
+ 
++void dump_regs(Uint32 base, int cnt);
+ #endif
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 3fbb613..53f2945 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -1,7 +1,7 @@
+ /*
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  *
+- * Copyright (C) 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2004-2013 Freescale Semiconductor, Inc.
+  */
+ 
+ /* The following programs are the sole property of Freescale Semiconductor Inc.,
+@@ -130,6 +130,7 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 	ENTER_FUNC();
+ 
+ 	ret = IOWaitForInt(timeout_in_ms);
++	dprintf(4, "ret of IOWaitForInt %d\n", ret);
+ 
+ 	if (cpu_is_mx6x()) {
+ 		pCodecInst = *ppendingInst;
+@@ -139,16 +140,28 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 			IOClkGateSet(true);
+ 			status = VpuReadReg(MJPEG_PIC_STATUS_REG);
+ 			if (pDecInfo->jpgInfo.lineBufferMode) {
+-				/* Need to clear bit buffer empty interrupt since the interrupt
+-				 * has higher priority than PIC DONE */
+-				if (status & 1 << INT_JPU_BIT_BUF_EMPTY) {
+-					VpuWriteReg(MJPEG_PIC_STATUS_REG, 1 << INT_JPU_BIT_BUF_EMPTY);
++
++				rdPtr = VpuReadReg(MJPEG_BBC_RD_PTR_REG);
++				bbcEnd = VpuReadReg(MJPEG_BBC_END_ADDR_REG);
++
++				dprintf(4, "status 0x%lx, rdPtr 0x%lx, bbcEnd 0x%lx\n", status, rdPtr, bbcEnd);
++				if (status & 0x3) {
++					dprintf(4, "pic done\n");
++					ret = 0;
++				} else if (rdPtr > bbcEnd-256-256) {
++					warn_msg("pic was forced to be done\n");
++					vpu_mx6_hwreset(); /* reset JPU */
++					pDecInfo->jpgInfo.quitCodec = 1;
++					ret = 0;
++				} else {
++					dprintf(4, "pic not done, wait\n");
+ 					ret = -1;
+ 				}
+ 			} else {
+ 				rdPtr = VpuReadReg(MJPEG_BBC_RD_PTR_REG);
+ 				bbcEnd = VpuReadReg(MJPEG_BBC_END_ADDR_REG);
+ 
++				dprintf(4, "status 0x%lx, rdPtr 0x%lx, bbcEnd 0x%lx\n", status, rdPtr, bbcEnd);
+ 				if (status & 1 << INT_JPU_BIT_BUF_EMPTY) {
+ 					/* JPU_EMPTY interrupt is received */
+ 					if (rdPtr == pDecInfo->streamBufEndAddr) {
+@@ -156,11 +169,13 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 						VpuWriteReg(MJPEG_BBC_CUR_POS_REG, 0);
+ 						wrPtr = pDecInfo->streamWrPtr;
+ 						if (pDecInfo->streamEndflag)
+-							VpuWriteReg(MJPEG_BBC_END_ADDR_REG, wrPtr);
++							/* set to unreachable position to disable BBC interrupt */
++							VpuWriteReg(MJPEG_BBC_END_ADDR_REG, wrPtr+256);
+ 						else
+ 							VpuWriteReg(MJPEG_BBC_END_ADDR_REG,
+ 									wrPtr & 0xFFFFFE00);
+ 					} else if (rdPtr == bbcEnd && !(status & 0x3)) {
++						dprintf(4, "need bs, streamEndflag %d\n", pDecInfo->streamEndflag);
+ 						vpu_mx6_hwreset(); /* reset JPU */
+ 
+ 						VpuWriteReg(MJPEG_PIC_STATUS_REG,
+@@ -180,11 +195,18 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 						ret = 0;
+ 					else
+ 						ret = -1;
+-				} else if (pDecInfo->streamEndflag && !status && (rdPtr >= bbcEnd)) {
++				} else if (pDecInfo->streamEndflag && !status && (rdPtr >= bbcEnd-256)) {
++					warn_msg("forced to quit\n");
+ 					vpu_mx6_hwreset(); /* reset JPU */
+ 
+ 					pDecInfo->jpgInfo.quitCodec = 1;
+ 					ret = 0;
++				} else if (status & 0x3) {
++					ret = 0;
++					dprintf(4, "pic done\n");
++				} else {
++					ret = -1;
++					dprintf(4, "pic not done, wait\n");
+ 				}
+ 			}
+ 			IOClkGateSet(false);
+@@ -2952,13 +2974,13 @@ RetCode vpu_DecGetInitialInfo(DecHandle handle, DecInitialInfo * info)
+ 	if (pCodecInst->codecMode  == MJPG_DEC) {
+ 		if (info->picWidth < 16 || info->picHeight < 16) {
+ 			UnlockVpu(vpu_semap);
+-			return RETCODE_FAILURE;
++			return RETCODE_NOT_SUPPORTED;
+ 		}
+ 	}
+ 	else {
+ 		if (info->picWidth < 64 || info->picHeight < 64) {
+ 			UnlockVpu(vpu_semap);
+-			return RETCODE_FAILURE;
++			return RETCODE_NOT_SUPPORTED;
+ 		}
+ 	}
+ 
+@@ -3476,7 +3498,7 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 	Uint32 val = 0;
+ 
+ 	ENTER_FUNC();
+-	dprintf(4, "Update bitstream buffer size %d\n", size);
++	dprintf(4, "Update bitstream buffer size %ld\n", size);
+ 
+ 	ret = CheckDecInstanceValidity(handle);
+ 	if (ret != RETCODE_SUCCESS)
+@@ -3522,7 +3544,7 @@ RetCode vpu_DecUpdateBitstreamBuffer(DecHandle handle, Uint32 size)
+ 		if (wrOffset < pDecInfo->jpgInfo.frameOffset)
+ 			pDecInfo->jpgInfo.bbcEndAddr = pDecInfo->streamBufEndAddr;
+ 		else if (pDecInfo->streamEndflag)
+-			pDecInfo->jpgInfo.bbcEndAddr = wrPtr;
++			pDecInfo->jpgInfo.bbcEndAddr = wrPtr+256;
+ 		else
+ 			pDecInfo->jpgInfo.bbcEndAddr = wrPtr & 0xFFFFFE00;
+ 
+@@ -3688,11 +3710,14 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 			pDecInfo->streamBufStartAddr = param->phyJpgChunkBase;
+ 			VpuWriteReg(MJPEG_BBC_WR_PTR_REG, pDecInfo->streamBufStartAddr + param->chunkSize);
+ 			VpuWriteReg(MJPEG_BBC_BAS_ADDR_REG, pDecInfo->streamBufStartAddr);
+-			VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pDecInfo->streamBufStartAddr + param->chunkSize);
++			// never issue BBC interrupt in line buffer mode
++			VpuWriteReg(MJPEG_BBC_END_ADDR_REG, pDecInfo->streamBufStartAddr + param->chunkSize+256*3+256);
+ 
+-			val = (pDecInfo->streamBufStartAddr + param->chunkSize) / 256;
+-			if ((pDecInfo->streamBufStartAddr + param->chunkSize) % 256)
++			val = (param->chunkSize) / 256;
++			if ((param->chunkSize) % 256)
+ 				val = val + 1;
++			// reserve 256*3B margin for error clip stop condition
++			val += 3;
+ 			VpuWriteReg(MJPEG_BBC_STRM_CTRL_REG, (1 << 31 | val));
+ 		} else {
+ 			if (pDecInfo->jpgInfo.frameOffset < 0) {
+@@ -3814,6 +3839,7 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 
+ 		VpuWriteReg(GDI_CONTROL, 0);
+ 		VpuWriteReg(GDI_PIC_INIT_HOST, 1);
++		dump_regs(NPT_BASE, 256);
+ 		VpuWriteReg(MJPEG_PIC_START_REG, 1);
+ 
+ 		*ppendingInst = pCodecInst;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index d6781ac..89bad6b 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -1,7 +1,7 @@
+ /*
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  *
+- * Copyright (C) 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2004-2013 Freescale Semiconductor, Inc.
+  */
+ 
+ /* The following programs are the sole property of Freescale Semiconductor Inc.,
+@@ -661,7 +661,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 10)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 11)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index fbd58a9..7c05722 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1,7 +1,7 @@
+ /*
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  *
+- * Copyright (C) 2004-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2004-2013 Freescale Semiconductor, Inc.
+  */
+ 
+ /* The following programs are the sole property of Freescale Semiconductor Inc.,
+@@ -1258,7 +1258,6 @@ int vpu_mx6_swreset(int forcedReset)
+ 	if (forcedReset == 0) {
+ 		VpuWriteReg(GDI_BUS_CTRL, 0x11);
+ 		while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+-		VpuWriteReg(GDI_BUS_CTRL, 0x00);
+ 	}
+ 
+ 	cmd =  VPU_SW_RESET_BPU_CORE | VPU_SW_RESET_BPU_BUS;
+@@ -1269,6 +1268,8 @@ int vpu_mx6_swreset(int forcedReset)
+ 	while(VpuReadReg(BIT_SW_RESET_STATUS) != 0);
+ 
+ 	VpuWriteReg(BIT_SW_RESET, 0);
++	if (forcedReset == 0)
++		VpuWriteReg(GDI_BUS_CTRL, 0x00);
+ 	return RETCODE_SUCCESS;
+ }
+ 
+@@ -1276,9 +1277,9 @@ int vpu_mx6_hwreset()
+ {
+ 	VpuWriteReg(GDI_BUS_CTRL, 0x11);
+ 	while (VpuReadReg(GDI_BUS_STATUS) != 0x77);
+-	VpuWriteReg(GDI_BUS_CTRL, 0x00);
+ 	IOSysSWReset();
+ 
++	VpuWriteReg(GDI_BUS_CTRL, 0x00);
+ 	VpuWriteReg(BIT_BUSY_FLAG, 1);
+ 	VpuWriteReg(BIT_CODE_RUN, 1);
+ 	while (VpuReadReg(BIT_BUSY_FLAG));
+@@ -2990,7 +2991,7 @@ proc_wrap:
+ 				val += 1;
+ 			val = (1 << 31 | val);
+ 			pDecInfo->jpgInfo.bbcStreamCtl = val;
+-			pDecInfo->jpgInfo.bbcEndAddr = pDecInfo->streamWrPtr;
++			pDecInfo->jpgInfo.bbcEndAddr = pDecInfo->streamWrPtr+256;
+ 		}
+ 		else
+ 			pDecInfo->jpgInfo.bbcEndAddr = pDecInfo->streamWrPtr & 0xFFFFFE00;
+-- 
+1.8.0
+

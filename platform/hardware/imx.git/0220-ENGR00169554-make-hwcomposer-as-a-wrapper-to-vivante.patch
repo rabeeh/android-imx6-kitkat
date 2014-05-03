@@ -1,0 +1,103 @@
+From 7ecffaa34e69ebd31e2187a5f963925a6f51ad95 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Tue, 6 Dec 2011 17:46:09 +0800
+Subject: [PATCH 220/486] ENGR00169554 make hwcomposer as a wrapper to vivante
+ hwcomposer.
+
+make hwcomposer as a wrapper to vivante hwcomposer.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/hwcomposer/Android.mk     |  2 +-
+ mx6/hwcomposer/hwcomposer.cpp | 27 ++++++++++++++++++++++++++-
+ 2 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/mx6/hwcomposer/Android.mk b/mx6/hwcomposer/Android.mk
+index 70f0e25..c54650b 100755
+--- a/mx6/hwcomposer/Android.mk
++++ b/mx6/hwcomposer/Android.mk
+@@ -20,7 +20,7 @@ LOCAL_PATH := $(call my-dir)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libEGL libipu libcutils libutils libui
++LOCAL_SHARED_LIBRARIES := liblog libEGL libipu libcutils libutils libui libhardware
+ LOCAL_SRC_FILES := hwcomposer.cpp BG_device.cpp FG_device.cpp hwc_common.cpp blit_gpu.cpp blit_ipu.cpp output_device.cpp
+ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
+ LOCAL_C_INCLUDES += hardware/imx/mx6/libgralloc
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index 675bbdf..746c484 100755
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -44,6 +44,8 @@ struct hwc_context_t {
+     int display_mode;
+     char ui_refresh;
+     char vd_refresh;
++
++    hwc_composer_device_t* viv_hwc;
+ };
+ 
+ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+@@ -335,6 +337,8 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 
+     struct hwc_context_t *ctx = (struct hwc_context_t *)dev;
+     if(ctx) {
++        if(ctx->viv_hwc)
++            ctx->viv_hwc->prepare(ctx->viv_hwc, list);
+ 	hwc_check_property(ctx);
+     } 
+     if (list && dev) {
+@@ -466,6 +470,8 @@ static int hwc_set(hwc_composer_device_t *dev,
+     //when displayhardware do releas function, it will come here.
+     if(ctx && (dpy == NULL) && (sur == NULL) && (list == NULL)) {
+ 	//close the output device.
++        if(ctx->viv_hwc)
++            ctx->viv_hwc->set(ctx->viv_hwc, dpy, sur, list);
+ 	releaseAllOutput(ctx);
+ 	//ctx->display_mode_changed = 1;
+ 
+@@ -474,7 +480,11 @@ static int hwc_set(hwc_composer_device_t *dev,
+     ctx->ui_refresh = 1;
+     ctx->vd_refresh = 1;
+     if((ctx == NULL) || (ctx && ctx->ui_refresh)) {
+-        EGLBoolean sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
++        EGLBoolean sucess;
++        if(ctx->viv_hwc)
++            sucess = ctx->viv_hwc->set(ctx->viv_hwc, dpy, sur, list);
++        else
++            sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
+         if (!sucess) {
+             return HWC_EGL_ERROR;
+         }
+@@ -560,6 +570,9 @@ static int hwc_device_close(struct hw_device_t *dev)
+     		if(ctx->blit)
+     				blit_dev_close(ctx->blit);
+         releaseAllOutput(ctx);
++        if(ctx->viv_hwc)
++            hwc_close(ctx->viv_hwc);
++
+         free(ctx);
+     }
+     return 0;
+@@ -596,6 +609,18 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+         	  HWCOMPOSER_LOG_ERR("Error! blit_dev_open failed!");
+         	  goto err_exit;
+         }
++
++        const hw_module_t *hwc_module;
++        if(hw_get_module(HWC_VIV_HARDWARE_MODULE_ID,
++                        (const hw_module_t**)&hwc_module) < 0) {
++            HWCOMPOSER_LOG_ERR("Error! hw_get_module viv_hwc failed");
++            goto nor_exit;
++        }
++        if(hwc_open(hwc_module, &(dev->viv_hwc)) != 0) {
++            HWCOMPOSER_LOG_ERR("Error! viv_hwc open failed");
++            goto nor_exit;
++        }
++nor_exit:
+ 	HWCOMPOSER_LOG_RUNTIME("%s,%d", __FUNCTION__, __LINE__);
+         return 0;
+ err_exit:
+-- 
+1.8.0
+

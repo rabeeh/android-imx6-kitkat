@@ -1,0 +1,146 @@
+From c046933c36b20ca969aea94bf0b770a868449c4b Mon Sep 17 00:00:00 2001
+From: Xianzhong <b07117@freescale.com>
+Date: Wed, 6 Feb 2013 01:24:24 +0800
+Subject: [PATCH 05/23] ENGR00243337 Enable swap rectangle for surfaceflinger
+
+swap rectangle feature can reduce composing region to improve performance,
+also reduce power consumption during UI partial update, like mouse moving.
+
+Google enabled this feature in Android 3.0 and the older versions,
+but removed it now since some GPU devices have no this feature.
+
+Add this feature back because i.mx6 GPU support swap rectangle.
+
+Signed-off-by: Xianzhong <b07117@freescale.com>
+---
+ opengl/include/EGL/eglext.h               | 12 +++++++++++
+ opengl/libs/EGL/eglApi.cpp                | 35 +++++++++++++++++++++++++++++++
+ services/surfaceflinger/DisplayDevice.cpp | 15 +++++++++++++
+ 3 files changed, 62 insertions(+)
+
+diff --git a/opengl/include/EGL/eglext.h b/opengl/include/EGL/eglext.h
+index 3b2984a..603856d 100644
+--- a/opengl/include/EGL/eglext.h
++++ b/opengl/include/EGL/eglext.h
+@@ -28,6 +28,8 @@ extern "C" {
+ ** MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
+ */
+ 
++/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
++
+ #include <EGL/eglplatform.h>
+ 
+ /*************************************************************/
+@@ -576,6 +578,16 @@ typedef EGLBoolean (EGLAPIENTRYP PFNEGLPRESENTATIONTIMEANDROID) (EGLDisplay dpy,
+ #endif
+ #endif
+ 
++/* EGL_ANDROID_swap_rectangle
++ */
++#ifndef EGL_ANDROID_swap_rectangle
++#define EGL_ANDROID_swap_rectangle 1
++#ifdef EGL_EGLEXT_PROTOTYPES
++EGLAPI EGLBoolean EGLAPIENTRY eglSetSwapRectangleANDROID (EGLDisplay dpy, EGLSurface draw, EGLint left, EGLint top, EGLint width, EGLint height);
++#endif /* EGL_EGLEXT_PROTOTYPES */
++typedef EGLBoolean (EGLAPIENTRYP PFNEGLSETSWAPRECTANGLEANDROIDPROC) (EGLDisplay dpy, EGLSurface draw, EGLint left, EGLint top, EGLint width, EGLint height);
++#endif
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/opengl/libs/EGL/eglApi.cpp b/opengl/libs/EGL/eglApi.cpp
+index 0cc5265..40b0843 100644
+--- a/opengl/libs/EGL/eglApi.cpp
++++ b/opengl/libs/EGL/eglApi.cpp
+@@ -14,6 +14,8 @@
+  ** limitations under the License.
+  */
+ 
++/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
++
+ #define ATRACE_TAG ATRACE_TAG_GRAPHICS
+ 
+ #include <dlfcn.h>
+@@ -162,6 +164,7 @@ static const extention_map_t sExtensionMap[] = {
+         (!strcmp((procname), "eglSetBlobCacheFuncsANDROID") ||    \
+          !strcmp((procname), "eglHibernateProcessIMG")      ||    \
+          !strcmp((procname), "eglAwakenProcessIMG")         ||    \
++         !strcmp((procname), "eglSetSwapRectangleANDROID")  ||    \
+          !strcmp((procname), "eglDupNativeFenceFDANDROID"))
+ 
+ 
+@@ -1548,6 +1551,38 @@ EGLBoolean eglPresentationTimeANDROID(EGLDisplay dpy, EGLSurface surface,
+     return EGL_TRUE;
+ }
+ 
++EGLBoolean eglSetSwapRectangleANDROID(EGLDisplay dpy, EGLSurface draw,
++        EGLint left, EGLint top, EGLint width, EGLint height)
++{
++    clearError();
++
++    //The empty swap region should not be set since all layers are not drawn by surfaceflinger
++    if(!width || !height) {
++        return setError(EGL_BAD_PARAMETER, NULL);
++    }
++
++    const egl_display_ptr dp = validate_display(dpy);
++    if (!dp) return EGL_FALSE;
++
++    //Because "EGL_ANDROID_swap_rectangle" extension cannot be exposed to applications,
++    //The extension should be checked when eglSetSwapRectangleANDROID is called by surfaceflinger
++    const char* exts = dp->disp.queryString.extensions;
++    if(!exts || !strstr(exts, "EGL_ANDROID_swap_rectangle")) {
++        return EGL_FALSE;
++    }
++
++    SurfaceRef _s(dp.get(), draw);
++    if (!_s.get())
++        return setError(EGL_BAD_SURFACE, EGL_FALSE);
++
++    egl_surface_t const * const s = get_surface(draw);
++    if (s->cnx->egl.eglSetSwapRectangleANDROID) {
++        return s->cnx->egl.eglSetSwapRectangleANDROID(
++                dp->disp.dpy, s->surface, left, top, width, height);
++    }
++    return setError(EGL_BAD_DISPLAY, NULL);
++}
++
+ // ----------------------------------------------------------------------------
+ // NVIDIA extensions
+ // ----------------------------------------------------------------------------
+diff --git a/services/surfaceflinger/DisplayDevice.cpp b/services/surfaceflinger/DisplayDevice.cpp
+index 800137b..a7ca85e 100644
+--- a/services/surfaceflinger/DisplayDevice.cpp
++++ b/services/surfaceflinger/DisplayDevice.cpp
+@@ -14,6 +14,8 @@
+  * limitations under the License.
+  */
+ 
++/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
++
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+@@ -126,6 +128,19 @@ DisplayDevice::DisplayDevice(
+ 
+     // initialize the display orientation transform.
+     setProjection(DisplayState::eOrientationDefault, mViewport, mFrame);
++
++#ifdef EGL_ANDROID_swap_rectangle
++    if (eglSetSwapRectangleANDROID(display, surface,
++            0, 0, mDisplayWidth, mDisplayHeight) == EGL_TRUE) {
++        // This could fail if this extension is not supported by this
++        // specific surface (of config)
++        mFlags |= SWAP_RECTANGLE;
++    }
++    // when we have the choice between PARTIAL_UPDATES and SWAP_RECTANGLE
++    // choose PARTIAL_UPDATES, which should be more efficient
++    if (mFlags & PARTIAL_UPDATES)
++        mFlags &= ~SWAP_RECTANGLE;
++#endif
+ }
+ 
+ DisplayDevice::~DisplayDevice() {
+-- 
+1.8.0
+

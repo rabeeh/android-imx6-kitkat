@@ -1,0 +1,341 @@
+From 7efb047de658b9c2416aa05a7b6e97cb9657f5ba Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Fri, 8 Mar 2013 15:47:03 +0800
+Subject: [PATCH 427/486] ENGR00214328 fix single hdmi display plug in/out
+ problem.
+
+when single hdmi display is not ready, hwcomposer uses software
+fake vsync to trigger framework drawing.
+when it is plug in, then switch to hardware vsync.
+
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/hwcomposer/hwc_context.h   |  3 ++-
+ mx6/hwcomposer/hwc_display.cpp | 43 +++++++++++++++------------------
+ mx6/hwcomposer/hwc_display.h   |  1 +
+ mx6/hwcomposer/hwc_uevent.cpp  | 30 +++++++++++++++++++----
+ mx6/hwcomposer/hwc_uevent.h    |  2 +-
+ mx6/hwcomposer/hwc_vsync.cpp   | 54 ++++++++++++++++++++++++++++++++++++++----
+ mx6/hwcomposer/hwc_vsync.h     | 12 ++++++++--
+ 7 files changed, 108 insertions(+), 37 deletions(-)
+
+diff --git a/mx6/hwcomposer/hwc_context.h b/mx6/hwcomposer/hwc_context.h
+index 986b536..6c6975c 100644
+--- a/mx6/hwcomposer/hwc_context.h
++++ b/mx6/hwcomposer/hwc_context.h
+@@ -52,7 +52,8 @@ class UeventThread;
+ enum {
+     HWC_DISPLAY_LDB = 1,
+     HWC_DISPLAY_HDMI = 2,
+-    HWC_DISPLAY_DVI = 3
++    HWC_DISPLAY_DVI = 3,
++    HWC_DISPLAY_HDMI_ON_BOARD = 4
+ };
+ 
+ typedef struct {
+diff --git a/mx6/hwcomposer/hwc_display.cpp b/mx6/hwcomposer/hwc_display.cpp
+index 58c17b7..95c8949 100644
+--- a/mx6/hwcomposer/hwc_display.cpp
++++ b/mx6/hwcomposer/hwc_display.cpp
+@@ -140,6 +140,11 @@ static int hwc_judge_display_state(struct hwc_context_t* ctx)
+             }
+         }
+ 
++        //allow primary display plug-out then plug-in.
++        if (dispid == 0 && pInfo->connected == false) {
++            pInfo->connected = true;
++            ctx->m_vsync_thread->setFakeVSync(true);
++        }
+         dispid ++;
+     }
+ 
+@@ -195,30 +200,7 @@ int hwc_get_framebuffer_info(displayInfo *pInfo)
+ 
+     return NO_ERROR;
+ }
+-#if 0
+-static int hwc_get_framebuffer_info(struct hwc_context_t* ctx)
+-{
+-    struct fb_var_screeninfo info;
+-    if (ioctl(ctx->m_mainfb_fd, FBIOGET_VSCREENINFO, &info) == -1) {
+-        ALOGE("<%s,%d> FBIOGET_VSCREENINFO failed", __FUNCTION__, __LINE__);
+-        return -errno;
+-    }
+ 
+-    int refreshRate = 1000000000000000LLU / (uint64_t(info.upper_margin +
+-                                                      info.lower_margin +
+-                                                      info.yres +
+-                                                      info.vsync_len) *
+-                                             (info.left_margin  +
+-                                              info.right_margin +
+-                                              info.xres +
+-                                              info.hsync_len) * info.pixclock);
+-    if (refreshRate == 0)
+-        refreshRate = 60 * 1000;  // 60 Hz
+-
+-    ctx->m_mainfb_fps = refreshRate / 1000.0f;
+-    return 0;
+-}
+-#endif
+ int hwc_get_display_info(struct hwc_context_t* ctx)
+ {
+     int err = 0;
+@@ -235,7 +217,6 @@ int hwc_get_display_info(struct hwc_context_t* ctx)
+     return err;
+ }
+ 
+-
+ int hwc_get_display_fbid(struct hwc_context_t* ctx, int disp_type)
+ {
+     int fbid = -1;
+@@ -250,3 +231,17 @@ int hwc_get_display_fbid(struct hwc_context_t* ctx, int disp_type)
+ 
+     return fbid;
+ }
++
++int hwc_get_display_dispid(struct hwc_context_t* ctx, int disp_type)
++{
++    int dispid = 0;
++    for(dispid=0; dispid<HWC_NUM_DISPLAY_TYPES; dispid++) {
++        displayInfo *pInfo = &ctx->mDispInfo[dispid];
++        if(pInfo->type == disp_type) {
++            return dispid;
++        }
++    }
++
++    return dispid;
++}
++
+diff --git a/mx6/hwcomposer/hwc_display.h b/mx6/hwcomposer/hwc_display.h
+index 82662f8..199d543 100644
+--- a/mx6/hwcomposer/hwc_display.h
++++ b/mx6/hwcomposer/hwc_display.h
+@@ -20,5 +20,6 @@
+ int hwc_get_display_fbid(struct hwc_context_t* ctx, int disp_type);
+ int hwc_get_framebuffer_info(displayInfo *pInfo);
+ int hwc_get_display_info(struct hwc_context_t* ctx);
++int hwc_get_display_dispid(struct hwc_context_t* ctx, int disp_type);
+ 
+ #endif
+diff --git a/mx6/hwcomposer/hwc_uevent.cpp b/mx6/hwcomposer/hwc_uevent.cpp
+index 22f371f..418288a 100644
+--- a/mx6/hwcomposer/hwc_uevent.cpp
++++ b/mx6/hwcomposer/hwc_uevent.cpp
+@@ -19,6 +19,7 @@
+ #include "hwc_display.h"
+ 
+ #define HDMI_PLUG_EVENT "change@/devices/platform/mxc_hdmi"
++#define HDMI_SII902_PLUG_EVENT "change@/devices/platform/sii902x.0"
+ 
+ using namespace android;
+ 
+@@ -33,7 +34,7 @@ status_t UeventThread::readyToRun() {
+     return NO_ERROR;
+ }
+ 
+-void UeventThread::handleHdmiUevent(const char *buff, int len) {
++void UeventThread::handleHdmiUevent(const char *buff, int len, int dispid) {
+     struct private_module_t *priv_m = NULL;
+     int fbid = -1;
+     const char *s = buff;
+@@ -45,6 +46,11 @@ void UeventThread::handleHdmiUevent(const char *buff, int len) {
+ 
+     while (*s) {
+         if (!strncmp(s, "EVENT=plugin", strlen("EVENT=plugin"))) {
++            if (dispid == HWC_DISPLAY_PRIMARY) {
++                mCtx->m_vsync_thread->setFakeVSync(false);
++                return;
++            }
++
+             mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = true;
+             fbid = hwc_get_display_fbid(mCtx, HWC_DISPLAY_HDMI);
+             if (fbid < 0) {
+@@ -56,6 +62,11 @@ void UeventThread::handleHdmiUevent(const char *buff, int len) {
+                 }
+             }
+         } else if (!strncmp(s, "EVENT=plugout", strlen("EVENT=plugout"))) {
++            if (dispid == HWC_DISPLAY_PRIMARY) {
++                mCtx->m_vsync_thread->setFakeVSync(true);
++                return;
++            }
++
+             mCtx->mDispInfo[HWC_DISPLAY_EXTERNAL].connected = false;
+             ALOGI("HDMI Plugout detected");
+         }
+@@ -85,13 +96,24 @@ void UeventThread::handleHdmiUevent(const char *buff, int len) {
+ bool UeventThread::threadLoop() {
+     char uevent_desc[4096];
+     const char *pHdmiEvent = HDMI_PLUG_EVENT;
++    const char *pSii902 = HDMI_SII902_PLUG_EVENT;
+ 
+     memset(uevent_desc, 0, sizeof(uevent_desc));
+     int len = uevent_next_event(uevent_desc, sizeof(uevent_desc) - 2);
+-    bool hdmi = !strncmp(uevent_desc, pHdmiEvent, strlen(pHdmiEvent));
++    int type = -1;
++    if (!strncmp(uevent_desc, pHdmiEvent, strlen(pHdmiEvent))) {
++        type = HWC_DISPLAY_HDMI;
++    }
++    else if (!strncmp(uevent_desc, pSii902, strlen(pSii902))) {
++        type = HWC_DISPLAY_HDMI_ON_BOARD;
++    }
++    else {
++        ALOGV("%s invalid uevent %s", __FUNCTION__, uevent_desc);
++        return true;
++    }
+ 
+-    if (hdmi && mCtx->mDispInfo[HWC_DISPLAY_PRIMARY].type != HWC_DISPLAY_HDMI)
+-        handleHdmiUevent(uevent_desc, len);
++    int dispid = hwc_get_display_dispid(mCtx, type);
++    handleHdmiUevent(uevent_desc, len, dispid);
+ 
+     return true;
+ }
+diff --git a/mx6/hwcomposer/hwc_uevent.h b/mx6/hwcomposer/hwc_uevent.h
+index cae2be9..e51cceb 100644
+--- a/mx6/hwcomposer/hwc_uevent.h
++++ b/mx6/hwcomposer/hwc_uevent.h
+@@ -31,7 +31,7 @@ private:
+     virtual void onFirstRef();
+     virtual status_t readyToRun();
+     virtual bool threadLoop();
+-    void handleHdmiUevent(const char *buff, int len);
++    void handleHdmiUevent(const char *buff, int len, int dispid);
+ 
+     hwc_context_t *mCtx;
+ };
+diff --git a/mx6/hwcomposer/hwc_vsync.cpp b/mx6/hwcomposer/hwc_vsync.cpp
+index 6e0c37e..fc6b9bf 100644
+--- a/mx6/hwcomposer/hwc_vsync.cpp
++++ b/mx6/hwcomposer/hwc_vsync.cpp
+@@ -24,8 +24,10 @@
+ using namespace android;
+ 
+ VSyncThread::VSyncThread(hwc_context_t *ctx)
+-    : Thread(false), mCtx(ctx), mEnabled(false)
++    : Thread(false), mCtx(ctx), mEnabled(false),
++      mFakeVSync(false), mNextFakeVSync(0)
+ {
++    mRefreshPeriod = 0;
+ }
+ 
+ void VSyncThread::onFirstRef()
+@@ -44,6 +46,11 @@ void VSyncThread::setEnabled(bool enabled) {
+     mCondition.signal();
+ }
+ 
++void VSyncThread::setFakeVSync(bool enable)
++{
++    mFakeVSync = enable;
++}
++
+ bool VSyncThread::threadLoop()
+ {
+     { // scope for lock
+@@ -53,6 +60,46 @@ bool VSyncThread::threadLoop()
+         }
+     }
+ 
++    if (mFakeVSync) {
++        performFakeVSync();
++    }
++    else {
++        performVSync();
++    }
++
++    return true;
++}
++
++void VSyncThread::performFakeVSync()
++{
++    mRefreshPeriod = mCtx->mDispInfo[HWC_DISPLAY_PRIMARY].vsync_period;
++    const nsecs_t period = mRefreshPeriod;
++    const nsecs_t now = systemTime(CLOCK_MONOTONIC);
++    nsecs_t next_vsync = mNextFakeVSync;
++    nsecs_t sleep = next_vsync - now;
++    if (sleep < 0) {
++        // we missed, find where the next vsync should be
++        sleep = (period - ((now - next_vsync) % period));
++        next_vsync = now + sleep;
++    }
++    mNextFakeVSync = next_vsync + period;
++
++    struct timespec spec;
++    spec.tv_sec  = next_vsync / 1000000000;
++    spec.tv_nsec = next_vsync % 1000000000;
++
++    int err;
++    do {
++        err = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &spec, NULL);
++    } while (err<0 && errno == EINTR);
++
++    if (err == 0) {
++        mCtx->m_callback->vsync(mCtx->m_callback, 0, next_vsync);
++    }
++}
++
++void VSyncThread::performVSync()
++{
+     uint64_t timestamp = 0;
+     uint32_t crt = (uint32_t)&timestamp;
+ 
+@@ -60,7 +107,7 @@ bool VSyncThread::threadLoop()
+                     MXCFB_WAIT_FOR_VSYNC, crt);
+     if ( err < 0 ) {
+         ALOGE("FBIO_WAITFORVSYNC error: %s\n", strerror(errno));
+-        return true;
++        return;
+     }
+ 
+ #ifdef DEBUG_HWC_VSYNC_TIMING
+@@ -86,8 +133,5 @@ bool VSyncThread::threadLoop()
+         - (systemTime(SYSTEM_TIME_MONOTONIC) + wake_up );
+     ts.tv_sec = 0;
+     nanosleep( &ts, &tm);
+-
+-    return true;
+ }
+ 
+-
+diff --git a/mx6/hwcomposer/hwc_vsync.h b/mx6/hwcomposer/hwc_vsync.h
+index 2b78867..1b066dc 100644
+--- a/mx6/hwcomposer/hwc_vsync.h
++++ b/mx6/hwcomposer/hwc_vsync.h
+@@ -40,6 +40,9 @@
+ 
+ using namespace android;
+ 
++extern "C" int clock_nanosleep(clockid_t clock_id, int flags,
++                           const struct timespec *request,
++                           struct timespec *remain);
+ struct hwc_context_t;
+ 
+ class VSyncThread : public Thread
+@@ -47,18 +50,23 @@ class VSyncThread : public Thread
+ public:
+     explicit VSyncThread(hwc_context_t *ctx);
+     void setEnabled(bool enabled);
++    void setFakeVSync(bool enable);
+ 
+ private:
+     virtual void onFirstRef();
+     virtual status_t readyToRun();
+     virtual bool threadLoop();
+-    void handleVsyncUevent(const char *buff, int len);
+-    void handleHdmiUevent(const char *buff, int len);
++    void performFakeVSync();
++    void performVSync();
+ 
+     hwc_context_t *mCtx;
+     mutable Mutex mLock;
+     Condition mCondition;
+     bool mEnabled;
++
++    bool mFakeVSync;
++    mutable nsecs_t mNextFakeVSync;
++    nsecs_t mRefreshPeriod;
+ };
+ 
+ #endif
+-- 
+1.8.0
+

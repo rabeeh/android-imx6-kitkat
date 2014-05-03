@@ -1,0 +1,158 @@
+From f80bd5e144f91b33d6c767707bada0a9330dce0c Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Thu, 21 Nov 2013 10:32:58 +0800
+Subject: [PATCH 45/50] ENGR00288965 after recored many times, can't recorder
+ video in the clip
+
+The frame consuming order isn't always same as producting order,
+so need find a free heap slot
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ .../api1/client2/StreamingProcessor.cpp            | 56 +++++++++++++++++++++-
+ .../api1/client2/StreamingProcessor.h              |  7 ++-
+ 2 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp b/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp
+index bf569ba..f1597fc 100644
+--- a/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp
++++ b/services/camera/libcameraservice/api1/client2/StreamingProcessor.cpp
+@@ -14,6 +14,10 @@
+  * limitations under the License.
+  */
+ 
++ /*
++  * Copyright (C) 2013 Freescale Semiconductor, Inc.
++  */
++
+ #define LOG_TAG "Camera2-StreamingProcessor"
+ #define ATRACE_TAG ATRACE_TAG_CAMERA
+ //#define LOG_NDEBUG 0
+@@ -50,13 +54,19 @@ StreamingProcessor::StreamingProcessor(sp<Camera2Client> client):
+         mRecordingStreamId(NO_STREAM),
+         mRecordingFrameAvailable(false),
+         mRecordingHeapCount(kDefaultRecordingHeapCount),
+-        mRecordingHeapFree(kDefaultRecordingHeapCount)
++        mRecordingHeapFree(kDefaultRecordingHeapCount),
++        mpHeapStatus(NULL)
+ {
+ }
+ 
+ StreamingProcessor::~StreamingProcessor() {
+     deletePreviewStream();
+     deleteRecordingStream();
++
++    if (mpHeapStatus) {
++       free(mpHeapStatus);
++       mpHeapStatus = NULL;
++    }
+ }
+ 
+ status_t StreamingProcessor::setPreviewWindow(sp<ANativeWindow> window) {
+@@ -255,6 +265,11 @@ status_t StreamingProcessor::setRecordingBufferCount(size_t count) {
+         mRecordingHeapCount = count;
+         mRecordingHeapFree = count;
+ 
++        if(mpHeapStatus) {
++            free(mpHeapStatus);
++            mpHeapStatus = NULL;
++        }
++
+         mRecordingConsumer.clear();
+     }
+ 
+@@ -690,6 +705,17 @@ status_t StreamingProcessor::processRecordingFrame() {
+             mRecordingHeapFree = mRecordingHeapCount;
+         }
+ 
++		if(mpHeapStatus == NULL) {
++		    mpHeapStatus = (int32_t *)malloc(mRecordingHeapCount * sizeof(int32_t));
++            if(mpHeapStatus == NULL) {
++                ALOGE("%s: Camera %d: malloc %d heap status item failed",
++                            __FUNCTION__, mId, mRecordingHeapCount);
++                return NO_MEMORY;
++            }
++            memset(mpHeapStatus, 0, mRecordingHeapCount * sizeof(int32_t));
++		}
++
++
+         if ( mRecordingHeapFree == 0) {
+             ALOGV("%s: Camera %d: No free recording buffers, dropping frame",
+                     __FUNCTION__, mId);
+@@ -701,6 +727,25 @@ status_t StreamingProcessor::processRecordingFrame() {
+         mRecordingHeapHead = (mRecordingHeapHead + 1) % mRecordingHeapCount;
+         mRecordingHeapFree--;
+ 
++        //since the consuming order not assure same as producting order,
++        //so we need find a free slot
++		size_t nFreeIdx;
++        for(nFreeIdx = 0; nFreeIdx < mRecordingHeapCount; nFreeIdx++)
++        {
++            if(mpHeapStatus[nFreeIdx] == 0)
++                break;
++        }
++
++        //should not happed, add for protection
++        if(nFreeIdx >= mRecordingHeapCount)
++        {
++            ALOGE("%s: Camera %d: No free heap idx, dropping frame", __FUNCTION__, mId);
++            return NO_MEMORY;
++        }
++
++        heapIdx = nFreeIdx;
++        mpHeapStatus[nFreeIdx] = 1;
++
+         ALOGVV("%s: Camera %d: Timestamp %lld",
+                 __FUNCTION__, mId, timestamp);
+ 
+@@ -791,6 +836,15 @@ void StreamingProcessor::releaseRecordingFrame(const sp<IMemory>& mem) {
+     mRecordingBuffers.replaceAt(itemIndex);
+ 
+     mRecordingHeapFree++;
++
++    if ((itemIndex < mRecordingHeapCount) && mpHeapStatus) {
++        mpHeapStatus[itemIndex] = 0;
++    }
++    else { //shoud never happed
++        ALOGE("%s: Camera %d: status err, itemIndex %d, mpHeapStatus %p",
++                __FUNCTION__, mId, itemIndex, mpHeapStatus);
++    }
++
+     ALOGV_IF(mRecordingHeapFree == mRecordingHeapCount,
+             "%s: Camera %d: All %d recording buffers returned",
+             __FUNCTION__, mId, mRecordingHeapCount);
+diff --git a/services/camera/libcameraservice/api1/client2/StreamingProcessor.h b/services/camera/libcameraservice/api1/client2/StreamingProcessor.h
+index 833bb8f..d43605e 100644
+--- a/services/camera/libcameraservice/api1/client2/StreamingProcessor.h
++++ b/services/camera/libcameraservice/api1/client2/StreamingProcessor.h
+@@ -14,6 +14,10 @@
+  * limitations under the License.
+  */
+ 
++/*
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ */
++
+ #ifndef ANDROID_SERVERS_CAMERA_CAMERA2_STREAMINGPROCESSOR_H
+ #define ANDROID_SERVERS_CAMERA_CAMERA2_STREAMINGPROCESSOR_H
+ 
+@@ -114,7 +118,7 @@ class StreamingProcessor:
+     sp<BufferItemConsumer> mRecordingConsumer;
+     sp<ANativeWindow>  mRecordingWindow;
+     CameraMetadata mRecordingRequest;
+-    sp<camera2::Camera2Heap> mRecordingHeap;
++    sp<camera2::Camera2Heap> mRecordingHeap;	
+ 
+     bool mRecordingFrameAvailable;
+     Condition mRecordingFrameAvailableSignal;
+@@ -123,6 +127,7 @@ class StreamingProcessor:
+     size_t mRecordingHeapCount;
+     Vector<BufferItemConsumer::BufferItem> mRecordingBuffers;
+     size_t mRecordingHeapHead, mRecordingHeapFree;
++	int32_t *mpHeapStatus;
+ 
+     virtual bool threadLoop();
+ 
+-- 
+1.8.0
+

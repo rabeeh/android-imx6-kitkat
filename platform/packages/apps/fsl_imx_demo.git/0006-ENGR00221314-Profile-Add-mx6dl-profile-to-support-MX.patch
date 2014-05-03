@@ -1,0 +1,310 @@
+From f27d119899231e2deff1ef0c342b9049d787ff77 Mon Sep 17 00:00:00 2001
+From: Lin Fuzhen <fuzhen.lin@freescale.com>
+Date: Fri, 24 Aug 2012 12:40:17 +0800
+Subject: [PATCH 06/52] ENGR00221314 Profile: Add mx6dl profile to support
+ MX6DL
+
+Add mx6dl power profile for FSLProfileService
+Remove some debug message
+
+Signed-off-by: Lin Fuzhen <fuzhen.lin@freescale.com>
+---
+ .../fsl/power/service/FSLPowerOptionService.java   | 206 ++++++++++++++++-----
+ .../src/fsl/power/service/FSLPpowerProvider.java   |   4 +-
+ 2 files changed, 164 insertions(+), 46 deletions(-)
+
+diff --git a/FSLProfileService/src/fsl/power/service/FSLPowerOptionService.java b/FSLProfileService/src/fsl/power/service/FSLPowerOptionService.java
+index cee91a0..a3c3121 100755
+--- a/FSLProfileService/src/fsl/power/service/FSLPowerOptionService.java
++++ b/FSLProfileService/src/fsl/power/service/FSLPowerOptionService.java
+@@ -74,6 +74,8 @@ public class FSLPowerOptionService extends Service{
+    private boolean gNothermal = false;
+    static private int gTempKeeper = 50;
+    static private int gMaxcpus = 1;
++   static private int gSocType = 0;
++   static private int gSocRev = 0;
+    static private long gProfileId = 3;
+    public class cpufreq_table {
+ 	   static final int F198 = 198*1000;
+@@ -89,6 +91,17 @@ public class FSLPowerOptionService extends Service{
+    private int POWERSAVING =2;
+    private int DEFAULT =3;
+ 
++   public class soc_type {
++	   static final int MX6Q  = 63;
++	   static final int MX6DL = 61;
++   }
++   public class soc_rev {
++	   static final int TO1_0 = 10;
++	   static final int TO1_1 = 11;
++	   static final int TO1_2 = 12;
++	   static final int TO1_3 = 13;
++   }
++
+ 
+    public void testProvider() {
+ 	   if(DEBUG) Log.i(TAG,"testProvider");
+@@ -117,15 +130,37 @@ public class FSLPowerOptionService extends Service{
+ 	timer = new Timer(true);
+ 	//showNotification();
+ 	//testProvider();
++	String sys_rev = get_system_rev();
++	byte rev[] = null;
++	if(!sys_rev.isEmpty()){
++		//rev = sys_rev.getBytes(US-ASCII);
++			gSocType = (int) Long.parseLong(sys_rev.substring(1, 3));
++			Log.i(TAG, "get soc type " + gSocType +"string:"+sys_rev.substring(1,3));
++	}
++	else
++		Log.e(TAG, "could not get SOC type");
++
++	if(!sys_rev.isEmpty()){
++		//rev = sys_rev.getBytes(US-ASCII);
++		gSocRev = (int) Long.parseLong(sys_rev.substring(4));
++		if(DEBUG) Log.i(TAG, "get soc revision " + gSocRev +"string:"+sys_rev.substring(4));
++	}
++	else
++		Log.e(TAG, "could not get SOC revision");
++
++	if (gSocType <=0 || gSocRev <=0)
++		Log.e(TAG,"get the Soc type or Soc rev fail!");
++
++
+ 	ContentResolver cr = getContentResolver();
+ 	Cursor cur = cr.query(PowerServiceDB.Profiles.CONTENT_URI, null, null, null, null);
+ 	int i  = cur.getCount();
+ 	if (i  == 0)
+-		initPowerProfile();
++		initPowerProfile(gSocType, gSocRev);
+ 	cur.close();
+ 	cur = null;
+ 	gMaxcpus = getCurCPUNm();
+-	Log.i(TAG,"boot with core0-"+gMaxcpus);
++	if(DEBUG) Log.i(TAG,"boot with core0-"+gMaxcpus);
+ 	}
+ 
+ 	@Override
+@@ -137,6 +172,16 @@ public class FSLPowerOptionService extends Service{
+ 		//if(DEBUG) Log.i(TAG,"set temp to 50,40 ");
+ 		//Toast.makeText(this, "service start", Toast.LENGTH_SHORT).show();
+ 
++		if (gSocType <=0 || gSocRev <=0){
++			Toast.makeText(this, "profile stop", Toast.LENGTH_SHORT).show();
++			return;
++		}
++		// MX6DL TO1.0 thermal is not be calibrated, so don't start profile service
++		if (gSocType == soc_type.MX6DL && gSocRev < soc_rev.TO1_1){
++			Toast.makeText(this, "mx6dl TO1.0 profile stop", Toast.LENGTH_SHORT).show();
++			return;
++		}
++
+ 		TimerTask moniteProfile = new TimerTask() {
+ 			public void run() {
+ 				getCurrentTime();
+@@ -221,6 +266,36 @@ public class FSLPowerOptionService extends Service{
+ 
+ 		}
+ 
++		static String get_system_rev() {
++			String  revision = null;
++			String version = null;
++			String tmp[] = null;
++			try {
++				BufferedReader reader = new BufferedReader(
++						     new InputStreamReader(
++						 new FileInputStream( "/proc/cpuinfo") ), 1000 );
++				version = reader.readLine();
++				while (version != null){
++					Log.i(TAG,"get line: " +version);
++					version = reader.readLine();
++					if (version.startsWith("Revision")){
++						tmp = version.split(":");
++						//revision = (int)(Long.parseLong(tmp[1]));
++						revision = tmp[1];
++						break;
++					}
++				}
++				reader.close();
++			}catch( IOException ex ) {
++				ex.printStackTrace();
++			}
++			tmp = null;
++			if (DEBUG) Log.i(TAG, "get system revison " + revision);
++			return revision;
++
++		}
++
++
+ 		static void setCPUFreq(int maxf, int minf){
+ 			FileOutputStream scaling_max = null;
+ 			File scaling_max1 = null;
+@@ -426,7 +501,6 @@ public class FSLPowerOptionService extends Service{
+ 			int cpu_freq = getCPUCurrentFreq();
+ 			int soc_temp = getCPUTemp();
+ 			int cpu_nm = getCurCPUNm();
+-			int cpu_id =0;
+ 			if(DEBUG) Log.i(TAG,"cpu frequency= "+cpu_freq+ " profileId ="
+ 					+ gProfileId+ " soc temp="+soc_temp+ "  CPU nM "+cpu_nm);
+ 
+@@ -521,51 +595,95 @@ public class FSLPowerOptionService extends Service{
+ 	    return temp;
+ 		}
+ 
+-		public void initPowerProfile(){
++		public void initPowerProfile(int soctype, int socrev){
+ 
+ 			   ContentResolver cr = getContentResolver();
++			   ContentValues values = new ContentValues();
+ 			   //Uri uri = ContentUris.withAppendedId(PowerServiceDB.Profiles.CONTENT_URI, 1);
+ 			   //Cursor cur = cr.query(PowerServiceDB.Profiles.CONTENT_URI, null, null, null, null);
+-
+-			   ContentValues values = new ContentValues();
+-			   values.clear();
+-			   values.put(Profiles.ProfileName, "Performance Mode");
+-			   values.put(Profiles.ProfileID, PERFORMANCE);
+-			   values.put(Profiles.TempActive, "60");
+-			   values.put(Profiles.TempHot, "80");
+-			   values.put(Profiles.MaxFreq, "996");
+-			   values.put(Profiles.MinFreq, "996");
+-			   values.put(Profiles.CPUNM, "3");
+-			   values.put(Profiles.CPUHotPlug, "0");
+-			   values.put(Profiles.CurCPUGov, "performance");
+-			   values.put(Profiles.PfofileStatus, "0");
+-			   cr.insert(Profiles.CONTENT_URI, values);
+-
+-			   values.clear();
+-			   values.put(Profiles.ProfileName, "PowerSaving Mode");
+-			   values.put(Profiles.ProfileID, POWERSAVING);
+-			   values.put(Profiles.TempActive, "60");
+-			   values.put(Profiles.TempHot, "80");
+-			   values.put(Profiles.MaxFreq, "792");
+-			   values.put(Profiles.MinFreq, "396");
+-			   values.put(Profiles.CPUNM, "0");
+-			   values.put(Profiles.CPUHotPlug, "1");
+-			   values.put(Profiles.CurCPUGov, "ondemand");
+-			   values.put(Profiles.PfofileStatus, "0");
+-			   cr.insert(Profiles.CONTENT_URI, values);
+-
+-			   values.clear();
+-			   values.put(Profiles.ProfileName, "Normal Mode");
+-			   values.put(Profiles.ProfileID, DEFAULT);
+-			   values.put(Profiles.TempActive, "50");
+-			   values.put(Profiles.TempHot, "70");
+-			   values.put(Profiles.MaxFreq, "996");
+-			   values.put(Profiles.MinFreq, "396");
+-			   values.put(Profiles.CPUNM, "1");
+-			   values.put(Profiles.CPUHotPlug, "1");
+-			   values.put(Profiles.CurCPUGov, "interactive");
+-			   values.put(Profiles.PfofileStatus, "1");
+-			   cr.insert(Profiles.CONTENT_URI, values);
++			   if (soctype == soc_type.MX6Q){
++
++				   values.clear();
++				   values.put(Profiles.ProfileName, "Performance Mode");
++				   values.put(Profiles.ProfileID, PERFORMANCE);
++				   values.put(Profiles.TempActive, "60");
++				   values.put(Profiles.TempHot, "80");
++				   values.put(Profiles.MaxFreq, "996");
++				   values.put(Profiles.MinFreq, "996");
++				   values.put(Profiles.CPUNM, "3");
++				   values.put(Profiles.CPUHotPlug, "0");
++				   values.put(Profiles.CurCPUGov, "performance");
++				   values.put(Profiles.PfofileStatus, "0");
++				   cr.insert(Profiles.CONTENT_URI, values);
++
++				   values.clear();
++				   values.put(Profiles.ProfileName, "PowerSaving Mode");
++				   values.put(Profiles.ProfileID, POWERSAVING);
++				   values.put(Profiles.TempActive, "60");
++				   values.put(Profiles.TempHot, "80");
++				   values.put(Profiles.MaxFreq, "792");
++				   values.put(Profiles.MinFreq, "396");
++				   values.put(Profiles.CPUNM, "0");
++				   values.put(Profiles.CPUHotPlug, "1");
++				   values.put(Profiles.CurCPUGov, "ondemand");
++				   values.put(Profiles.PfofileStatus, "0");
++				   cr.insert(Profiles.CONTENT_URI, values);
++
++				   values.clear();
++				   values.put(Profiles.ProfileName, "Normal Mode");
++				   values.put(Profiles.ProfileID, DEFAULT);
++				   values.put(Profiles.TempActive, "50");
++				   values.put(Profiles.TempHot, "70");
++				   values.put(Profiles.MaxFreq, "996");
++				   values.put(Profiles.MinFreq, "396");
++				   values.put(Profiles.CPUNM, "1");
++				   values.put(Profiles.CPUHotPlug, "1");
++				   values.put(Profiles.CurCPUGov, "interactive");
++				   values.put(Profiles.PfofileStatus, "1");
++				   cr.insert(Profiles.CONTENT_URI, values);
++			   }
++
++			   if (soctype == soc_type.MX6DL){
++
++				   values.clear();
++				   values.put(Profiles.ProfileName, "Performance Mode");
++				   values.put(Profiles.ProfileID, PERFORMANCE);
++				   values.put(Profiles.TempActive, "60");
++				   values.put(Profiles.TempHot, "80");
++				   values.put(Profiles.MaxFreq, "996");
++				   values.put(Profiles.MinFreq, "996");
++				   values.put(Profiles.CPUNM, "1");
++				   values.put(Profiles.CPUHotPlug, "0");
++				   values.put(Profiles.CurCPUGov, "performance");
++				   values.put(Profiles.PfofileStatus, "0");
++				   cr.insert(Profiles.CONTENT_URI, values);
++
++				   values.clear();
++				   values.put(Profiles.ProfileName, "PowerSaving Mode");
++				   values.put(Profiles.ProfileID, POWERSAVING);
++				   values.put(Profiles.TempActive, "60");
++				   values.put(Profiles.TempHot, "80");
++				   values.put(Profiles.MaxFreq, "792");
++				   values.put(Profiles.MinFreq, "396");
++				   values.put(Profiles.CPUNM, "0");
++				   values.put(Profiles.CPUHotPlug, "0");
++				   values.put(Profiles.CurCPUGov, "ondemand");
++				   values.put(Profiles.PfofileStatus, "0");
++				   cr.insert(Profiles.CONTENT_URI, values);
++
++				   values.clear();
++				   values.put(Profiles.ProfileName, "Normal Mode");
++				   values.put(Profiles.ProfileID, DEFAULT);
++				   values.put(Profiles.TempActive, "50");
++				   values.put(Profiles.TempHot, "70");
++				   values.put(Profiles.MaxFreq, "996");
++				   values.put(Profiles.MinFreq, "396");
++				   values.put(Profiles.CPUNM, "1");
++				   values.put(Profiles.CPUHotPlug, "1");
++				   values.put(Profiles.CurCPUGov, "interactive");
++				   values.put(Profiles.PfofileStatus, "1");
++				   cr.insert(Profiles.CONTENT_URI, values);
++			   }
+ 
+ 		}
+ 
+diff --git a/FSLProfileService/src/fsl/power/service/FSLPpowerProvider.java b/FSLProfileService/src/fsl/power/service/FSLPpowerProvider.java
+index 8146e7b..3ebfa1d 100755
+--- a/FSLProfileService/src/fsl/power/service/FSLPpowerProvider.java
++++ b/FSLProfileService/src/fsl/power/service/FSLPpowerProvider.java
+@@ -282,7 +282,7 @@ public class FSLPpowerProvider extends ContentProvider{
+ 	    qb.setTables(PROFILE_TABLE_NAME);
+ 	    qb.setProjectionMap(sProfilesProjectionMap);
+ 	    defaultOrder=PowerServiceDB.Profiles.DEFAULT_SORT_ORDER;
+-	    Log.i(TAG,"=========>query profile table");
++	    if(DEBUG) Log.i(TAG,"=========>query profile table");
+ 	    break;
+ 	case PROFILES_ID:
+ 	    qb.setTables(PROFILE_TABLE_NAME);
+@@ -290,7 +290,7 @@ public class FSLPpowerProvider extends ContentProvider{
+ 	    qb.appendWhere(Profiles._ID + "=" + uri.getPathSegments().get(1));
+ 	    //qb.appendWhere(Profiles.ProfileID + "=" + uri.getPathSegments().get(1));
+ 	    defaultOrder=PowerServiceDB.Profiles.DEFAULT_SORT_ORDER;
+-	    Log.i(TAG,"=========>query profile table item");
++	    if(DEBUG) Log.i(TAG,"=========>query profile table item");
+ 	    break;
+ 	default:
+ 	    throw new IllegalArgumentException("Unknown URI " + uri);
+-- 
+1.8.0
+

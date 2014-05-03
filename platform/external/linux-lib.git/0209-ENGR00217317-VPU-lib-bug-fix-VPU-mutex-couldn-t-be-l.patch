@@ -1,0 +1,77 @@
+From ba142baf53278967b50a6b5fbdde2afde97b34b8 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Mon, 16 Jul 2012 19:32:23 +0800
+Subject: [PATCH 209/249] ENGR00217317 VPU lib bug fix: VPU mutex couldn't be
+ locked if VPU_IOC_PHYMEM_CHECK has wrong return
+ value in kernel
+
+Bug: If VPU_IOC_PHYMEM_CHECK is not implemented in kernel (invalid
+ioctl), kernel driver returns 0 (it's a bug ENGR00217258), thus register
+frame buffer failed, but VPU mutex couldn't be locked after that.
+
+Fix: UnlockVpu before quiting vpu_DecRegisterFrameBuffer if IOPhyMemCheck
+failed
+
+Additionally,
+- Don't check tiled format
+- Don't check bufCr in NV12 format
+- Don't check bufMvCol, because it's not likely to be allocated
+  from IPU/GPU, and its usage varies across standards.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index ab38999..d5ca4db 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -2433,6 +2433,9 @@ RetCode vpu_DecOpen(DecHandle * pHandle, DecOpenParam * pop)
+ 		return ret;
+ 	}
+ 
++	info_msg("bitstreamMode %d, chromaInterleave %d, mapType %d, tiled2LinearEnable %d\n",
++			pop->bitstreamMode, pop->chromaInterleave, pop->mapType, pop->tiled2LinearEnable);
++
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
+@@ -3213,12 +3216,19 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 	} else {
+ 		/* none mx27 platform case need to swap word */
+ 		for (i = 0; i < num; i += 2) {
+-			if (!IOPhyMemCheck(bufArray[i].bufY, "bufY"))
+-				return RETCODE_INVALID_FRAME_BUFFER;
+-			if (!IOPhyMemCheck(bufArray[i].bufCb, "bufCb"))
+-				return RETCODE_INVALID_FRAME_BUFFER;
+-			if (!IOPhyMemCheck(bufArray[i].bufCr, "bufCr"))
+-				return RETCODE_INVALID_FRAME_BUFFER;
++			if (pDecInfo->mapType == LINEAR_FRAME_MAP) {
++				if (!(IOPhyMemCheck(bufArray[i].bufY, "bufY")
++				   && IOPhyMemCheck(bufArray[i].bufCb, "bufCb"))) {
++					UnlockVpu(vpu_semap);
++					return RETCODE_INVALID_FRAME_BUFFER;
++				}
++				if (pDecInfo->openParam.chromaInterleave == 0) {
++					if (!IOPhyMemCheck(bufArray[i].bufCr, "bufCr")) {
++						UnlockVpu(vpu_semap);
++						return RETCODE_INVALID_FRAME_BUFFER;
++					}
++				}
++			}
+ 			virt_paraBuf[i * 3] = bufArray[i].bufCb;
+ 			virt_paraBuf[i * 3 + 1] = bufArray[i].bufY;
+ 			virt_paraBuf[i * 3 + 3] = bufArray[i].bufCr;
+@@ -3232,8 +3242,6 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 				    STD_AVC)
+ 					virt_paraBuf[96 + i] =
+ 					    bufArray[i + 1].bufMvCol;
+-				if (!IOPhyMemCheck(bufArray[i + 1].bufMvCol, "bufMvCol"))
+-					return RETCODE_INVALID_FRAME_BUFFER;
+ 			}
+ 		}
+ 		if (pDecInfo->openParam.bitstreamFormat == STD_VC1 ||
+-- 
+1.8.0
+

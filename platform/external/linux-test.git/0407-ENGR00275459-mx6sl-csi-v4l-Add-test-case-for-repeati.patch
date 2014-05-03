@@ -1,0 +1,127 @@
+From db9be2ed57179873218fdc734984e6da1d554ed3 Mon Sep 17 00:00:00 2001
+From: Robby Cai <R63905@freescale.com>
+Date: Thu, 15 Aug 2013 21:01:03 +0800
+Subject: [PATCH 407/435] ENGR00275459 mx6sl: csi/v4l: Add test case for
+ repeating streamon/off in pair
+
+Add the test case for repeating streamon/off in pair without close the v4l2
+capture device. For MEMORY_MMAP mode, each time STREAMOFF ioctl is called,
+REQBUFS ioctl need to be re-called, thus the patch changes the position for it.
+
+Passed the test for MEMORY_MMAP mode and MEMORY_USERPTR mode.
+
+Signed-off-by: Robby Cai <R63905@freescale.com>
+---
+ test/mxc_v4l2_test/csi_v4l2_capture.c | 47 +++++++++++++++++++++--------------
+ 1 file changed, 29 insertions(+), 18 deletions(-)
+
+diff --git a/test/mxc_v4l2_test/csi_v4l2_capture.c b/test/mxc_v4l2_test/csi_v4l2_capture.c
+index c586ae7..94bbcc8 100644
+--- a/test/mxc_v4l2_test/csi_v4l2_capture.c
++++ b/test/mxc_v4l2_test/csi_v4l2_capture.c
+@@ -79,6 +79,7 @@ int g_camera_framerate = 30;	/* 30 fps */
+ int g_hflip = 0;
+ int g_vflip = 0;
+ int g_rotation = 0;
++int g_loop = 0;
+ int g_mem_type = V4L2_MEMORY_MMAP;
+ int g_frame_size;
+ 
+@@ -87,6 +88,18 @@ int start_capturing(int fd_v4l)
+         unsigned int i;
+         struct v4l2_buffer buf;
+         enum v4l2_buf_type type;
++        struct v4l2_requestbuffers req;
++
++        memset(&req, 0, sizeof (req));
++        req.count = TEST_BUFFER_NUM;
++        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        req.memory = g_mem_type;
++
++        if (ioctl(fd_v4l, VIDIOC_REQBUFS, &req) < 0)
++        {
++                printf("VIDIOC_REQBUFS failed\n");
++                return -1;
++        }
+ 
+ 	for (i = 0; i < TEST_BUFFER_NUM; i++) {
+ 		memset(&buf, 0, sizeof (buf));
+@@ -329,18 +342,6 @@ int v4l_capture_setup(void)
+ 		return -1;
+ 	}
+ 
+-        struct v4l2_requestbuffers req;
+-        memset(&req, 0, sizeof (req));
+-        req.count = TEST_BUFFER_NUM;
+-        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        req.memory = g_mem_type;
+-
+-        if (ioctl(fd_v4l, VIDIOC_REQBUFS, &req) < 0)
+-        {
+-                printf("v4l_capture_setup: VIDIOC_REQBUFS failed\n");
+-                return 0;
+-        }
+-
+         return fd_v4l;
+ }
+ 
+@@ -390,12 +391,6 @@ int v4l_capture_test(int fd_v4l)
+ 		goto FAIL;
+ 	}
+ 
+-        if (start_capturing(fd_v4l) < 0)
+-        {
+-                printf("start_capturing failed\n");
+-		goto FAIL;
+-        }
+-
+ 	 /* Map the device to memory*/
+ 	fb0_size = var.xres * var.yres_virtual * var.bits_per_pixel / 8;
+ 	fb0 = (unsigned char *)mmap(0, fb0_size,
+@@ -406,6 +401,13 @@ int v4l_capture_test(int fd_v4l)
+ 		goto FAIL;
+ 	}
+ 
++loop:
++        if (start_capturing(fd_v4l) < 0)
++        {
++		printf("start_capturing failed\n");
++		goto FAIL;
++        }
++
+ 	gettimeofday(&tv1, NULL);
+ 	do {
+                 memset(&buf, 0, sizeof (buf));
+@@ -467,6 +469,12 @@ int v4l_capture_test(int fd_v4l)
+                 printf("stop_capturing failed\n");
+         }
+ 
++	if (g_loop > 0 && !quitflag) {
++		printf("loop %d done!\n", g_loop);
++		g_loop--;
++		goto loop;
++	}
++
+ 	munmap((void *)fd_fb, fb0_size);
+ 	close(fd_fb);
+         close(fd_v4l);
+@@ -489,6 +497,7 @@ void print_help(void)
+ 	       " -m <capture mode, 0-640x480, 1-320x240, etc>\n" \
+ 	       " -r <rotation 0, 90, 180, 270>\n"
+ 	       " -t <time> -fr <framerate>\n"
++	       " -loop <times>\n"
+ #ifdef	GET_CONTI_PHY_MEM_VIA_PXP_LIB
+ 	       " [-u if defined, means use userp, otherwise mmap]\n"
+ #endif
+@@ -518,6 +527,8 @@ int process_cmdline(int argc, char **argv)
+ 			g_vflip = 1;
+ 		} else if (strcmp(argv[i], "-r") == 0) {
+ 			g_rotation = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-loop") == 0) {
++			g_loop = atoi(argv[++i]);
+ 		} else if (strcmp(argv[i], "-help") == 0) {
+ 			print_help();
+ 			return -1;
+-- 
+1.8.0
+

@@ -1,0 +1,69 @@
+From db4a68d4727e41a359866d4e1d89c2da68cc1046 Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Fri, 30 Nov 2012 09:31:27 +0800
+Subject: [PATCH 376/486] ENGR00215174 fix long time 1080p recording problem.
+
+dequeue buffer and queue buffer share the same variable.
+and then work in different thread.
+it may cause race condition to access the variable.
+now, use local vairable to do that to avoid race condition.
+
+Change-Id: Ided7887c1de5f445ad1689b75ea8c00b44b57f74
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera/DeviceAdapter.cpp | 24 ++++++++++++++----------
+ 1 file changed, 14 insertions(+), 10 deletions(-)
+
+diff --git a/mx6/libcamera/DeviceAdapter.cpp b/mx6/libcamera/DeviceAdapter.cpp
+index d89ccb3..deb4f42 100644
+--- a/mx6/libcamera/DeviceAdapter.cpp
++++ b/mx6/libcamera/DeviceAdapter.cpp
+@@ -275,12 +275,14 @@ status_t DeviceAdapter::fillCameraFrame(CameraFrame *frame)
+         return BAD_VALUE;
+     }
+ 
+-    mVideoInfo->buf.index    = i;
+-    mVideoInfo->buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    mVideoInfo->buf.memory   = V4L2_MEMORY_USERPTR;
+-    mVideoInfo->buf.m.offset = frame->mPhyAddr;
+-
+-    ret = ioctl(mCameraHandle, VIDIOC_QBUF, &mVideoInfo->buf);
++    struct v4l2_buffer cfilledbuffer;
++    memset(&cfilledbuffer, 0, sizeof (struct v4l2_buffer));
++    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    cfilledbuffer.memory = V4L2_MEMORY_USERPTR;
++    cfilledbuffer.index    = i;
++    cfilledbuffer.m.offset = frame->mPhyAddr;
++
++    ret = ioctl(mCameraHandle, VIDIOC_QBUF, &cfilledbuffer);
+     if (ret < 0) {
+         FLOGE("fillCameraFrame: VIDIOC_QBUF Failed");
+         return BAD_VALUE;
+@@ -431,18 +433,20 @@ CameraFrame * DeviceAdapter::acquireCameraFrame()
+ {
+     int ret;
+ 
+-    mVideoInfo->buf.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    mVideoInfo->buf.memory = V4L2_MEMORY_USERPTR;
++    struct v4l2_buffer cfilledbuffer;
++    memset(&cfilledbuffer, 0, sizeof (cfilledbuffer));
++    cfilledbuffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    cfilledbuffer.memory = V4L2_MEMORY_USERPTR;
+ 
+     /* DQ */
+-    ret = ioctl(mCameraHandle, VIDIOC_DQBUF, &mVideoInfo->buf);
++    ret = ioctl(mCameraHandle, VIDIOC_DQBUF, &cfilledbuffer);
+     if (ret < 0) {
+         FLOGE("GetFrame: VIDIOC_DQBUF Failed");
+         return NULL;
+     }
+     mDequeued++;
+ 
+-    int index = mVideoInfo->buf.index;
++    int index = cfilledbuffer.index;
+     FSL_ASSERT(!mPreviewBufs.isEmpty(), "mPreviewBufs is empty");
+     return (CameraFrame *)mPreviewBufs.keyAt(index);
+ }
+-- 
+1.8.0
+

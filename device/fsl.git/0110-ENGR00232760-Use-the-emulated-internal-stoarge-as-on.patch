@@ -1,0 +1,328 @@
+From 0a84656625fd90cda4745f17a88db7268964e0ba Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Mon, 3 Dec 2012 15:45:45 +0800
+Subject: [PATCH 110/281] ENGR00232760 Use the emulated internal stoarge as on
+ Android 4.2
+
+Add sdcard service to mount the FUSE fs from
+/data/media to /storage/sdcard0 to emulate the
+VFAT internal storage.
+
+Update the sdcard partition host tool to remove the
+VFAT mmcblk0p4 partition, and move /data partition
+to mmcblk0p4. Now we only have system, cache, device, misc
+partitions in the extension partition.
+
+Update recovery fstab for emulated internal storage
+
+Change-Id: I02e98743ef89f8209f1236e41a247a079f8579fd
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ arm2_6dq/recovery.fstab                            |  4 ++--
+ arm2_6sl/recovery.fstab                            |  4 ++--
+ common/tools/fsl-sdcard-partition.sh               | 26 +++++-----------------
+ evk_6sl/recovery.fstab                             |  4 ++--
+ .../base/core/res/res/xml/storage_list.xml         |  3 ++-
+ imx6/arm2/vold.fstab                               |  2 +-
+ imx6/etc/fstab.freescale                           |  4 ++--
+ imx6/etc/init.rc                                   | 19 +++++++++++++---
+ imx6/imx6.mk                                       |  3 +++
+ .../base/core/res/res/xml/storage_list.xml         |  3 ++-
+ imx6/sabresd/vold.fstab                            |  2 +-
+ sabreauto_6q/recovery.fstab                        |  4 ++--
+ sabresd_6dq/recovery.fstab                         |  4 ++--
+ 13 files changed, 43 insertions(+), 39 deletions(-)
+
+diff --git a/arm2_6dq/recovery.fstab b/arm2_6dq/recovery.fstab
+index d075111..9c557b8 100644
+--- a/arm2_6dq/recovery.fstab
++++ b/arm2_6dq/recovery.fstab
+@@ -2,8 +2,8 @@
+ /recovery emmc /dev/block/mmcblk0p2
+ /system ext4 /dev/block/mmcblk0p5
+ /cache ext4 /dev/block/mmcblk0p6
+-/data ext4 /dev/block/mmcblk0p7
+-/misc  emmc /dev/block/mmcblk0p9
++/data ext4 /dev/block/mmcblk0p4
++/misc  emmc /dev/block/mmcblk0p8
+ 
+ # UBI support is under below:
+ #/system ubifs /dev/ubi1_0
+diff --git a/arm2_6sl/recovery.fstab b/arm2_6sl/recovery.fstab
+index 484dfbb..97371f6 100644
+--- a/arm2_6sl/recovery.fstab
++++ b/arm2_6sl/recovery.fstab
+@@ -2,8 +2,8 @@
+ /recovery emmc /dev/block/mmcblk0p2
+ /system ext4 /dev/block/mmcblk0p5
+ /cache ext4 /dev/block/mmcblk0p6
+-/data ext4 /dev/block/mmcblk0p7
+-/misc  emmc  /dev/block/mmcblk0p9
++/data ext4 /dev/block/mmcblk0p4
++/misc  emmc  /dev/block/mmcblk0p8
+ 
+ # UBI support is under below:
+ #/system ubifs /dev/ubi1_0
+diff --git a/common/tools/fsl-sdcard-partition.sh b/common/tools/fsl-sdcard-partition.sh
+index c599f78..df19bf5 100755
+--- a/common/tools/fsl-sdcard-partition.sh
++++ b/common/tools/fsl-sdcard-partition.sh
+@@ -4,7 +4,6 @@
+ BOOTLOAD_RESERVE=8
+ BOOT_ROM_SIZE=8
+ SYSTEM_ROM_SIZE=512
+-DATA_SIZE=1024
+ CACHE_SIZE=256
+ RECOVERY_ROM_SIZE=8
+ VENDER_SIZE=8
+@@ -64,19 +63,9 @@ fi
+ seprate=40
+ total_size=`sfdisk -s ${node}`
+ total_size=`expr ${total_size} / 1024`
+-rom_size=`expr ${BOOT_ROM_SIZE} + ${SYSTEM_ROM_SIZE} + ${DATA_SIZE}`
+-rom_size=`expr ${rom_size} + ${CACHE_SIZE} + ${RECOVERY_ROM_SIZE} + ${MISC_SIZE} + ${VENDER_SIZE} + ${seprate}`
+-boot_start=`expr ${BOOTLOAD_RESERVE}`
+ boot_rom_sizeb=`expr ${BOOT_ROM_SIZE} + ${BOOTLOAD_RESERVE}`
+-recovery_start=`expr ${boot_start} + ${BOOT_ROM_SIZE} + 1`
+-extend_start=`expr ${recovery_start} + 1`
+-extend_size=`expr ${SYSTEM_ROM_SIZE} + ${DATA_SIZE} + ${CACHE_SIZE} + ${VENDER_SIZE} + ${MISC_SIZE} + ${seprate}`
+-system_start=`expr ${extend_start} + 1`
+-cache_start=`expr ${extend_start} + ${SYSTEM_ROM_SIZE} + 1`
+-data_start=`expr ${cache_start} + ${CACHE_SIZE} + 1`
+-misc_start=`expr ${data_start} + ${DATA_SIZE}`
+-vfat_start=`expr ${extend_start} + ${extend_size}`
+-vfat_size=`expr ${total_size} - ${rom_size}`
++extend_size=`expr ${SYSTEM_ROM_SIZE} + ${CACHE_SIZE} + ${VENDER_SIZE} + ${MISC_SIZE} + ${seprate}`
++data_size=`expr ${total_size} - ${boot_rom_sizeb} - ${RECOVERY_ROM_SIZE} - ${extend_size} + ${seprate}`
+ 
+ # create partitions
+ if [ "${cal_only}" -eq "1" ]; then
+@@ -85,9 +74,8 @@ BOOT   : ${boot_rom_sizeb}MB
+ RECOVERY: ${RECOVERY_ROM_SIZE}MB
+ SYSTEM : ${SYSTEM_ROM_SIZE}MB
+ CACHE  : ${CACHE_SIZE}MB
+-DATA   : ${DATA_SIZE}MB
++DATA   : ${data_size}MB
+ MISC   : ${MISC_SIZE}MB
+-VFAT   : ${vfat_size}MB
+ EOF
+ exit
+ fi
+@@ -95,11 +83,10 @@ fi
+ function format_android
+ {
+     echo "formating android images"
+-    mkfs.vfat ${node}4
++    mkfs.ext4 ${node}4 -Ldata
+     mkfs.ext4 ${node}5 -Lsystem
+     mkfs.ext4 ${node}6 -Lcache
+-    mkfs.ext4 ${node}7 -Ldata
+-    mkfs.ext4 ${node}8 -Lvender
++    mkfs.ext4 ${node}7 -Lvender
+ }
+ 
+ function flash_android
+@@ -127,10 +114,9 @@ sfdisk --force -uM ${node} << EOF
+ ,${boot_rom_sizeb},83
+ ,${RECOVERY_ROM_SIZE},83
+ ,${extend_size},5
+-,${vfat_size},b
++,${data_size},83
+ ,${SYSTEM_ROM_SIZE},83
+ ,${CACHE_SIZE},83
+-,${DATA_SIZE},83
+ ,${VENDER_SIZE},83
+ ,${MISC_SIZE},83
+ EOF
+diff --git a/evk_6sl/recovery.fstab b/evk_6sl/recovery.fstab
+index 484dfbb..97371f6 100644
+--- a/evk_6sl/recovery.fstab
++++ b/evk_6sl/recovery.fstab
+@@ -2,8 +2,8 @@
+ /recovery emmc /dev/block/mmcblk0p2
+ /system ext4 /dev/block/mmcblk0p5
+ /cache ext4 /dev/block/mmcblk0p6
+-/data ext4 /dev/block/mmcblk0p7
+-/misc  emmc  /dev/block/mmcblk0p9
++/data ext4 /dev/block/mmcblk0p4
++/misc  emmc  /dev/block/mmcblk0p8
+ 
+ # UBI support is under below:
+ #/system ubifs /dev/ubi1_0
+diff --git a/imx6/arm2/overlay/frameworks/base/core/res/res/xml/storage_list.xml b/imx6/arm2/overlay/frameworks/base/core/res/res/xml/storage_list.xml
+index b03eff6..4d84b02 100644
+--- a/imx6/arm2/overlay/frameworks/base/core/res/res/xml/storage_list.xml
++++ b/imx6/arm2/overlay/frameworks/base/core/res/res/xml/storage_list.xml
+@@ -33,9 +33,10 @@
+ -->
+ 
+ <StorageList xmlns:android="http://schemas.android.com/apk/res/android">
+-    <storage android:mountPoint="/mnt/sdcard"
++    <storage android:mountPoint="/storage/sdcard0"
+              android:storageDescription="@string/storage_internal"
+              android:primary="true"
++             android:emulated="true"
+              android:mtpReserve="100" />
+     <storage android:mountPoint="/mnt/extsd"
+              android:storageDescription="@string/storage_sd_card"
+diff --git a/imx6/arm2/vold.fstab b/imx6/arm2/vold.fstab
+index 87472fa..c353442 100644
+--- a/imx6/arm2/vold.fstab
++++ b/imx6/arm2/vold.fstab
+@@ -17,7 +17,7 @@
+ #for internal emmc as primary storage
+ #dev_mount sdcard /mnt/sdcard auto /devices/platform/mxsdhci.2/mmc_host/mmc0
+ #for external sdcard as primary storage
+-dev_mount sdcard /mnt/sdcard 4 /devices/platform/sdhci-esdhc-imx.0/mmc_host/mmc0/
++#dev_mount sdcard /mnt/sdcard 4 /devices/platform/sdhci-esdhc-imx.0/mmc_host/mmc0/
+ dev_mount extsd  /mnt/extsd auto /devices/platform/sdhci-esdhc-imx.2/mmc_host/mmc2/ /devices/platform/sdhci-esdhc-imx.2/mmc_host/mmc1/
+ #dev_mount extsd /mnt/sdcard/extsd auto /devices/platform/mxsdhci.0/mmc_host/mmc1
+ #used for usb host
+diff --git a/imx6/etc/fstab.freescale b/imx6/etc/fstab.freescale
+index 6b70843..685b4ea 100644
+--- a/imx6/etc/fstab.freescale
++++ b/imx6/etc/fstab.freescale
+@@ -5,7 +5,7 @@
+ 
+ 
+ /dev/block/mmcblk0p5    /system  ext4    ro                                                                               wait
++/dev/block/mmcblk0p4    /data    ext4    nosuid,nodev,nodiratime,noatime,nomblk_io_submit,noauto_da_alloc,errors=panic    wait
+ /dev/block/mmcblk0p6    /cache   ext4    nosuid,nodev,nomblk_io_submit				                          wait
+-/dev/block/mmcblk0p7    /data    ext4    nosuid,nodev,nodiratime,noatime,nomblk_io_submit,noauto_da_alloc,errors=panic    wait
+-/dev/block/mmcblk0p8    /device  ext4    ro,nosuid,nodev				                                  wait
++/dev/block/mmcblk0p7    /device  ext4    ro,nosuid,nodev				                                  wait
+ 
+diff --git a/imx6/etc/init.rc b/imx6/etc/init.rc
+index 7e992b8..75e1763 100755
+--- a/imx6/etc/init.rc
++++ b/imx6/etc/init.rc
+@@ -34,7 +34,7 @@ loglevel 3
+     export LOOP_MOUNTPOINT /mnt/obb
+     export BOOTCLASSPATH /system/framework/core.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/android.policy.jar:/system/framework/services.jar:/system/framework/apache-xml.jar
+     export SHM_MOUNTPOINT /mnt/shm
+-    export EXTERNAL_STORAGE /mnt/sdcard
++    export EXTERNAL_STORAGE /storage/sdcard0
+     export SECONDARY_STORAGE /mnt/extsd:/mnt/udisk
+     export LIGHTSENSOR_PATH /sys/class/i2c-adapter/i2c-1/1-0044
+     export VPU_FW_PATH /system/lib/firmware/vpu
+@@ -57,8 +57,6 @@ loglevel 3
+     mount cgroup none /acct cpuacct
+     mkdir /acct/uid
+ 
+-    mkdir /mnt/sdcard 0000 system system
+-    symlink /mnt/sdcard /sdcard
+     mkdir /mnt/extsd 0000 system system
+     symlink /mnt/extsd /extsd
+     mkdir /mnt/udisk 0000 system system
+@@ -70,6 +68,14 @@ loglevel 3
+ 
+     mkdir /device 0771 system system
+ 
++    # See storage config details at http://source.android.com/tech/storage/
++    mkdir /storage 0050 root sdcard_r
++    mkdir /storage/sdcard0 0700 shell shell
++    # Support legacy paths
++    symlink /storage/sdcard0 /sdcard
++    symlink /storage/sdcard0 /mnt/sdcard
++
++
+     # Directory for putting things only root should see.
+     mkdir /mnt/secure 0700 root root
+ 
+@@ -163,6 +169,8 @@ on post-fs-data
+     chown system system /data
+     chmod 0771 /data
+ 
++    mkdir /data/media 0770 media_rw media_rw
++
+     # Create dump dir and collect dumps.
+     # Do this before we mount cache so eventually we can use cache for
+     # storing dumps on platforms which do not have a dedicated dump partition.
+@@ -595,6 +603,11 @@ service pppd_gprs /etc/ppp/init.gprs-pppd
+     group radio cache inet misc
+     disabled
+     oneshot
++
+ service wifi_mac /system/bin/sh /system/etc/check_wifi_mac.sh
+     class late_start
+     oneshot
++
++# virtual sdcard daemon running as media_rw (1023)
++service sdcard /system/bin/sdcard /data/media 1023 1023
++    class late_start
+diff --git a/imx6/imx6.mk b/imx6/imx6.mk
+index bc7215f..2e6c67f 100644
+--- a/imx6/imx6.mk
++++ b/imx6/imx6.mk
+@@ -241,6 +241,9 @@ PRODUCT_PACKAGES += $(omx_libs) $(omx_excluded_libs)
+ 
+ PRODUCT_PACKAGES += libubi ubinize ubiformat ubiattach ubidetach ubiupdatevol ubimkvol ubinfo mkfs.ubifs
+ 
++# FUSE based emulated sdcard daemon
++PRODUCT_PACKAGES += sdcard
++
+ # e2fsprogs libs
+ PRODUCT_PACKAGES += \
+ 	mke2fs		\
+diff --git a/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml b/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml
+index f486f92..51ba794 100644
+--- a/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml
++++ b/imx6/sabresd/overlay/frameworks/base/core/res/res/xml/storage_list.xml
+@@ -33,9 +33,10 @@
+ -->
+ 
+ <StorageList xmlns:android="http://schemas.android.com/apk/res/android">
+-    <storage android:mountPoint="/mnt/sdcard"
++    <storage android:mountPoint="/storage/sdcard0"
+              android:storageDescription="@string/storage_internal"
+              android:primary="true"
++             android:emulated="true"
+              android:mtpReserve="100" />
+     <storage android:mountPoint="/mnt/extsd"
+              android:storageDescription="@string/storage_sd_card"
+diff --git a/imx6/sabresd/vold.fstab b/imx6/sabresd/vold.fstab
+index 8a2546b..2bd145c 100644
+--- a/imx6/sabresd/vold.fstab
++++ b/imx6/sabresd/vold.fstab
+@@ -26,7 +26,7 @@ dev_mount udisk /mnt/udisk auto /devices/platform/fsl-ehci.0/usb1
+ #mount SDHC4 SD card /mnt/sdcard as primary storage forMX6Q SABER_LITE RevC
+ dev_mount extsd /mnt/extsd auto /devices/platform/sdhci-esdhc-imx.2/mmc_host/mmc1
+ #mount SDHC3 TF card to /mnt/extsd as external storage forMX6Q SABER_LITE RevC
+-dev_mount sdcard /mnt/sdcard 4 /devices/platform/sdhci-esdhc-imx.3/mmc_host/mmc0
++#dev_mount sdcard /mnt/sdcard 4 /devices/platform/sdhci-esdhc-imx.3/mmc_host/mmc0
+ 
+ ## Example of a dual card setup
+ # dev_mount left_sdcard  /sdcard1  auto /devices/platform/goldfish_mmc.0 /devices/platform/msm_sdcc.2/mmc_host/mmc1
+diff --git a/sabreauto_6q/recovery.fstab b/sabreauto_6q/recovery.fstab
+index d075111..9c557b8 100644
+--- a/sabreauto_6q/recovery.fstab
++++ b/sabreauto_6q/recovery.fstab
+@@ -2,8 +2,8 @@
+ /recovery emmc /dev/block/mmcblk0p2
+ /system ext4 /dev/block/mmcblk0p5
+ /cache ext4 /dev/block/mmcblk0p6
+-/data ext4 /dev/block/mmcblk0p7
+-/misc  emmc /dev/block/mmcblk0p9
++/data ext4 /dev/block/mmcblk0p4
++/misc  emmc /dev/block/mmcblk0p8
+ 
+ # UBI support is under below:
+ #/system ubifs /dev/ubi1_0
+diff --git a/sabresd_6dq/recovery.fstab b/sabresd_6dq/recovery.fstab
+index cbff3ce..6c86648 100644
+--- a/sabresd_6dq/recovery.fstab
++++ b/sabresd_6dq/recovery.fstab
+@@ -2,8 +2,8 @@
+ /recovery emmc /dev/block/mmcblk0p2
+ /system ext4 /dev/block/mmcblk0p5
+ /cache ext4 /dev/block/mmcblk0p6
+-/data ext4 /dev/block/mmcblk0p7
+-/misc  emmc  /dev/block/mmcblk0p9
++/data ext4 /dev/block/mmcblk0p4
++/misc  emmc  /dev/block/mmcblk0p8
+ /sdcard vfat /dev/block/mmcblk1p1
+ 
+ # Use below lines if you use NAND:
+-- 
+1.8.0
+

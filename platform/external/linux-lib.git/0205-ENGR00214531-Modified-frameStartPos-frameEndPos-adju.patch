@@ -1,0 +1,105 @@
+From 90638e5db8d9a7a6ccb7c6dc5eefc6fadfdad8f5 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Tue, 26 Jun 2012 16:06:11 +0800
+Subject: [PATCH 205/249] ENGR00214531 Modified frameStartPos/frameEndPos,
+ adjusted "size" of vpu_DecGetBitstreamBuffer,
+ removed warning of vpu_lib.h
+
+1. Modified frameStartPos/frameEndPos calculation to match FW change to
+report exact read pointer
+   VC1/AVS/MPEG-4 has different calculation from other decoders
+   (FSLARIK-235 [Decode/General] Request to report accurate frame
+size (in bytes) for all decoders)
+
+2. Adjusted return value of "size" argument of
+vpu_DecGetBitstreamBuffer to match FW change to report exact
+read pointer
+   FW reports exact read pointer instead of 512 byte aligned
+read pointer, but next time bs loading will still read from
+512 byte boundary, so "size" must be decreased.
+   (FSLARIK-237 [Decode/General] SW change for reporting
+exact read pointer)
+
+3. Removed warning of vpu_lib.h
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c  | 13 +++++++++----
+ vpu/vpu_lib.h  |  6 +++---
+ vpu/vpu_util.h |  1 +
+ 3 files changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 1440856..e3998cd 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -3295,10 +3295,10 @@ RetCode vpu_DecGetBitstreamBuffer(DecHandle handle,
+ 	UnlockVpuReg(vpu_semap);
+ 
+ 	if (wrPtr < rdPtr) {
+-		room = rdPtr - wrPtr - 1;
++		room = rdPtr - wrPtr - VPU_GBU_SIZE*2 - 1;
+ 	} else {
+ 		room = (pDecInfo->streamBufEndAddr - wrPtr) +
+-		    (rdPtr - pDecInfo->streamBufStartAddr) - 1;
++		    (rdPtr - pDecInfo->streamBufStartAddr) - VPU_GBU_SIZE*2 - 1;
+ 	}
+ 
+ 	*paRdPtr = rdPtr;
+@@ -3991,8 +3991,13 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 	info->decPicWidth = (val >> 16) & 0xFFFF;
+ 
+ 	if (cpu_is_mx6x()) {
+-		info->frameStartPos = VpuReadReg(BIT_BYTE_POS_FRAME_START);
+-		info->frameEndPos = VpuReadReg(BIT_BYTE_POS_FRAME_END);
++        if(pCodecInst->codecMode == VC1_DEC || pCodecInst->codecMode == AVS_DEC || pCodecInst->codecMode == MP4_DEC) {
++            info->frameStartPos = VpuReadReg(BIT_BYTE_POS_FRAME_START);
++            info->frameEndPos = VpuReadReg(BIT_BYTE_POS_FRAME_END);
++        } else {
++            info->frameStartPos = pCodecInst->ctxRegs[CTX_BIT_RD_PTR];
++            info->frameEndPos = VpuReadReg(BIT_RD_PTR);
++        }
+         if (info->frameEndPos < info->frameStartPos) {
+ 			info->consumedByte =
+ 				    pDecInfo->streamBufEndAddr - info->frameStartPos;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 0eb9f8e..c558123 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -667,7 +667,7 @@ typedef struct vpu_versioninfo {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 2)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 3)
+ 
+ extern unsigned int system_rev;
+ 
+@@ -676,10 +676,10 @@ extern unsigned int system_rev;
+ #define CHIP_REV_2_1            	0x21
+ 
+ #define mxc_cpu()               (system_rev >> 12)
+-#define mxc_is_cpu(part)        ((mxc_cpu() == part) ? 1 : 0)
++#define mxc_is_cpu(part)        ((mxc_cpu() == (unsigned int)part) ? 1 : 0)
+ #define mxc_cpu_rev()           (system_rev & 0xFF)
+ #define mxc_cpu_is_rev(rev)     \
+-        ((mxc_cpu_rev() == rev) ? 1 : ((mxc_cpu_rev() < rev) ? -1 : 2))
++        ((mxc_cpu_rev() == (unsigned int)rev) ? 1 : ((mxc_cpu_rev() < (unsigned int)rev) ? -1 : 2))
+ #define MXC_REV(type)                           \
+ static inline int type## _rev (int rev)         \
+ {                                               \
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 108a5ce..bcbed2e 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -57,6 +57,7 @@ typedef enum {
+ #define SIZE_FRAME_BUF_STAT             0x100
+ #define SIZE_SLICE_INFO                 0x4000
+ #define USER_DATA_INFO_OFFSET           8*17
++#define VPU_GBU_SIZE			1024
+ #define JPU_GBU_SIZE			512
+ 
+ #define ADDR_PIC_PARA_BASE_OFFSET       0
+-- 
+1.8.0
+

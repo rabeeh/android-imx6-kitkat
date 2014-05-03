@@ -1,0 +1,132 @@
+From 03d6f7cb2f435327e2168f033d18db2735c40b94 Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Thu, 9 Dec 2010 15:01:39 +0800
+Subject: [PATCH 07/38] ENGR00136152 add infineon 3G modem special ril code.
+
+add a vendor type AMAZON, since this modem called Amazon.
+
+Fix for issue where connection does not start and the APN
+is not displayed. During startup, RILD calls the function
+requestRadioPower(off) as a means to reset the modem. It
+also uses this function to enter airplane mode. The current
+implementation sends the AT+CFUN=0 command, which causes
+the Amazon module to shutdown the USB interface.
+A temporary fix for this problem is to issue AT+CFUN=4
+instead. This powers down the radio, but does not disable
+the USB interface.
+
+A permanent fix should use GPIO lines to reset the modem and
+manage the modem power states more carefully.
+
+The HuaWei module integration uses the radio interface layer
+daemon (RILD) to establish a data connection by sending AT
+commands over /dev/ttyUSB3. Once the connection is established,
+it uses a shell script to start the PPP daemon on /dev/ttyUSB0.
+This process fails with the Amazon module, because it times out
+(1 sec) waiting for the PPP connection.
+The result is PPPD exiting with error 17, EXIT_LOOPBACK.
+
+The fix for this problem is to have the PPPD dial the connection.
+RILD continues to manage all setup and configuration of the modem,
+but no longer issues the dial command
+
+ref: http://wiki.freescale.net/display/MADCPOIMX/Infineon+3G+Mobile
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ reference-ril/Android.mk      |  4 ++++
+ reference-ril/reference-ril.c | 22 ++++++++++++++++------
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/reference-ril/Android.mk b/reference-ril/Android.mk
+index 8f324ce..170cd9e 100644
+--- a/reference-ril/Android.mk
++++ b/reference-ril/Android.mk
+@@ -29,6 +29,10 @@ ifeq ($(BOARD_MODEM_VENDOR),HUAWEI)
+   LOCAL_CFLAGS += -DHUAWEI_MODEM
+ endif
+ 
++ifeq ($(BOARD_MODEM_VENDOR),AMAZON)
++  LOCAL_CFLAGS += -DUSE_AMAZONE_MODEM -DHUAWEI_MODEM
++endif
++
+ ifeq ($(TARGET_DEVICE),sooner)
+   LOCAL_CFLAGS += -DOMAP_CSMI_POWER_CONTROL -DUSE_TI_COMMANDS
+ endif
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 7a0e8e7..c871778 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -212,10 +212,8 @@ static const char * s_data_device_path = NULL;
+ #endif
+ static int          s_device_socket = 0;
+ 
+-#ifdef HUAWEI_MODEM
+ // flag for pppd status. 1: started; 0: stoped 
+ static int pppd = 0;
+-#endif
+ 
+ /* trigger change to this with s_state_cond */
+ static int s_closed = 0;
+@@ -388,7 +386,11 @@ static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
+     onOff = ((int *)data)[0];
+ 
+     if (onOff == 0 && sState != RADIO_STATE_OFF) {
+-        err = at_send_command("AT+CFUN=0", &p_response);
++#ifdef USE_AMAZONE_MODEM
++        err = at_send_command("AT+CFUN=4", &p_response);
++#else
++	err = at_send_command("AT+CFUN=0", &p_response);
++#endif
+        if (err < 0 || p_response->success == 0) goto error;
+         setRadioState(RADIO_STATE_OFF);
+     } else if (onOff > 0 && sState == RADIO_STATE_OFF) {
+@@ -1807,6 +1809,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
+     // packet-domain event reporting
+     err = at_send_command("AT+CGEREP=1,0", NULL);
+ 
++#ifndef USE_AMAZONE_MODEM
+     // Hangup anything that's happening there now
+     err = at_send_command("AT+CGACT=0,1", NULL);
+ 
+@@ -1816,7 +1819,12 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
+     if (err < 0 || p_response->success == 0) {
+         goto error;
+     }
+-
++#else
++    #
++    if (err < 0) {
++	    goto error;
++    }
++#endif
+     // Setup PPP connection after PDP Context activated successfully
+     // The ppp service name is specified in /init.rc
+     property_set(PROPERTY_PPPD_EXIT_CODE, "");
+@@ -1830,7 +1838,11 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
+     LOGD("PPPd started");
+ 
+     // Wait for PPP interface ready
++#ifdef USE_AMAZONE_MODEM
++    sleep(2);
++#else
+     sleep(1);
++#endif
+     do {
+ 	// Check whether PPPD exit abnormally
+ 	property_get(PROPERTY_PPPD_EXIT_CODE, exit_code, "");
+@@ -3395,11 +3407,9 @@ mainLoop(void *param)
+ #ifdef HAVE_DATA_DEVICE
+     struct stat dummy;
+ #endif
+-#ifdef HUAWEI_MODEM
+     struct termios new_termios, old_termios;
+     char delay_init[PROPERTY_VALUE_MAX];
+     int delay;
+-#endif
+ 
+     AT_DUMP("== ", "entering mainLoop()", -1 );
+     at_set_on_reader_closed(onATReaderClosed);
+-- 
+1.8.0
+

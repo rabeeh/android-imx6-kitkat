@@ -1,0 +1,126 @@
+From a470d19bbc682030c12e07d1faf57bd1f5b6b41e Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Mon, 21 Nov 2011 23:00:05 +0800
+Subject: [PATCH 245/435] ENGR00163252 vpu: Add MJPG decoder test with
+ streaming mode for mx6q
+
+MJPG decoder test with streaming for mx6q is added with the patch.
+The test flow is mainly compatiable with mx5x, but there are some
+main difference here:
+1) Bitstream filling cannot be done in JPU is in decoding;
+2) Need to handle RETCODE_JPEG_EOS and RETCODE_JPEG_BIT_EMPTY
+   return value in DecStartOneFrame() func;
+3) Need to set oparam.pBitStream in vpu_DecOpen() func.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c | 67 ++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 53 insertions(+), 14 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index abd238f..5257413 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -897,12 +897,44 @@ decoder_start(struct decode *dec)
+ 			}
+ 		}
+ 
++		/*
++		 * FIXME for mx6q MJPG decoding with streaming mode
++		 * Currently bitstream buffer filling cannot be done when JPU is in decoding,
++		 * there are three places can do this:
++		 * 1. before vpu_DecStartOneFrame;
++		 * 2. in the case of RETCODE_JPEG_BIT_EMPTY returned in DecStartOneFrame() func;
++		 * 3. after vpu_DecGetOutputInfo.
++		 */
++		if (cpu_is_mx6q() && (dec->cmdl->format == STD_MJPG)) {
++			err = dec_fill_bsbuffer(handle, dec->cmdl,
++				    dec->virt_bsbuf_addr,
++				    (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
++				    dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
++				    &eos, &fill_end_bs);
++			if (err < 0) {
++				err_msg("dec_fill_bsbuffer failed\n");
++				return -1;
++			}
++		}
++
+ 		gettimeofday(&tdec_begin, NULL);
+ 		ret = vpu_DecStartOneFrame(handle, &decparam);
+ 		if (ret == RETCODE_JPEG_EOS) {
+-			warn_msg(" JPEG bitstream is end\n");
+-			return -1;
++			info_msg(" JPEG bitstream is end\n");
++			break;
++		} else if (ret == RETCODE_JPEG_BIT_EMPTY) {
++			err = dec_fill_bsbuffer(handle, dec->cmdl,
++				    dec->virt_bsbuf_addr,
++				    (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
++				    dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
++				    &eos, &fill_end_bs);
++			if (err < 0) {
++				err_msg("dec_fill_bsbuffer failed\n");
++				return -1;
++			}
++			continue;
+ 		}
++
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("DecStartOneFrame failed, ret=%d\n", ret);
+ 			return -1;
+@@ -911,16 +943,17 @@ decoder_start(struct decode *dec)
+ 		is_waited_int = 0;
+ 		loop_id = 0;
+ 		while (vpu_IsBusy()) {
+-			err = dec_fill_bsbuffer(handle, dec->cmdl,
+-				      dec->virt_bsbuf_addr,
+-				      (dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
+-				      dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
+-				      &eos, &fill_end_bs);
+-			if (err < 0) {
+-				err_msg("dec_fill_bsbuffer failed\n");
+-				return -1;
++			if (!(cpu_is_mx6q() && (dec->cmdl->format == STD_MJPG))) {
++				err = dec_fill_bsbuffer(handle, dec->cmdl,
++					dec->virt_bsbuf_addr,
++					(dec->virt_bsbuf_addr + STREAM_BUF_SIZE),
++					dec->phy_bsbuf_addr, STREAM_FILL_SIZE,
++					&eos, &fill_end_bs);
++				if (err < 0) {
++					err_msg("dec_fill_bsbuffer failed\n");
++					return -1;
++				}
+ 			}
+-
+ 			/*
+ 			 * Suppose vpu is hang if one frame cannot be decoded in 5s,
+ 			 * then do vpu software reset.
+@@ -1208,9 +1241,14 @@ decoder_start(struct decode *dec)
+ 		}
+ 
+ 		if (outinfo.numOfErrMBs) {
+-			totalNumofErrMbs += outinfo.numOfErrMBs;
+-			info_msg("Num of Error Mbs : %d, in Frame : %d \n",
+-					outinfo.numOfErrMBs, (int)frame_id);
++			if (cpu_is_mx6q() && dec->cmdl->format == STD_MJPG)
++				info_msg("Error Mb info:0x%x, in Frame : %d\n",
++					    outinfo.numOfErrMBs, (int)frame_id);
++			else {
++				totalNumofErrMbs += outinfo.numOfErrMBs;
++				info_msg("Num of Error Mbs : %d, in Frame : %d \n",
++					    outinfo.numOfErrMBs, (int)frame_id);
++			}
+ 		}
+ 
+ 		frame_id++;
+@@ -1896,6 +1934,7 @@ decoder_open(struct decode *dec)
+ 	oparam.bitstreamFormat = dec->cmdl->format;
+ 	oparam.bitstreamBuffer = dec->phy_bsbuf_addr;
+ 	oparam.bitstreamBufferSize = STREAM_BUF_SIZE;
++	oparam.pBitStream = dec->virt_bsbuf_addr;
+ 	oparam.reorderEnable = dec->reorderEnable;
+ 	oparam.mp4DeblkEnable = dec->cmdl->deblock_en;
+ 	oparam.chromaInterleave = dec->cmdl->chromaInterleave;
+-- 
+1.8.0
+

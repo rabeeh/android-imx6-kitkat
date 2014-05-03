@@ -1,0 +1,668 @@
+From 42e1312993edbe0730e9d87d043088513fa372f6 Mon Sep 17 00:00:00 2001
+From: Eric Sun <jian.sun@freescale.com>
+Date: Wed, 1 Aug 2012 10:56:50 +0800
+Subject: [PATCH 341/435] ENGR00218972 MX6, SECURE BOOT, Change to Dynamic HAB
+ Data Allocation
+
+The original secure boot implementation make a consumption that
+u-boot.bin will not exceed 0x2F000. With this consumption, the hab data
+is hard coded in linker script file to relative address 0x2F000 without
+causing any problem.
+
+But when this consumption don't hold, the hard coded way will cause
+memory region overlap and break build. So we need to change to a dynamic
+way of allocating hab_data. The new implementation put hab data at the
+next 0x1000 alignment after u-boot data and text section, instead of
+hard coded to 0x2F000.
+
+Similar changes is made to uImage authentication implementation. The new
+secure image layout are as the following
+
+U-Boot
+    +-------------------+      DDR_START
+    |                   |
+    |    U-Boot Image   |
+    |                   |
+    +-------------------+      DDR_START + UBOOT_SIZE
+    |    PADDING        |
+    +-------------------+      align to 0x1000
+    |    CSF Data       | \
+    +-------------------+  +-- CSF + Pad,  Size : 0x2000
+    |    PADDING        | /
+    +-------------------+
+
+uImage
+
+    +-------------------+      DDR_START
+    |                   |
+    |     uImage        |
+    |                   |
+    +-------------------+      DDR_START + UIMAGE_SIZE
+    |     PADDING       |
+    +-------------------+      align to 0x1000
+    |     IVT           | ---- Size : 0x20
+    +-------------------+
+    |     CSF Data      | \
+    +-------------------+  +-- CSF + Pad,  Size : 0x2000
+    |     PADDING       | /
+    +-------------------+
+
+The change will cause a lot of code signing script and configuration
+file changes. For easy-to-use, they are covered by a all-in-one script.
+For U-boot, the script is "mk_secure_uboot", for uImage, the script is
+"mk_secure_uImage". They both use a 2-phase mechanism, first the CST
+scripts and configuration files are generated using a file template,
+second the generated script is excecuted to generated the final signed
+image. The intermediate files are all deleted at the end. Please see
+README for details.
+
+Signed-off-by: Eric Sun <jian.sun@freescale.com>
+---
+ test/mxc_secureboot/README                         | 72 +++++++++++++++++-----
+ test/mxc_secureboot/habUimageGen                   | 19 ------
+ test/mxc_secureboot/habimagegen                    | 15 -----
+ test/mxc_secureboot/mx6q_mx6dl/genIVT              | 13 ----
+ test/mxc_secureboot/mx6q_mx6dl/u-boot.csf          | 31 ----------
+ test/mxc_secureboot/mx6q_mx6dl/uImage.csf          | 31 ----------
+ test/mxc_secureboot/mx6sl/genIVT                   | 13 ----
+ test/mxc_secureboot/mx6sl/u-boot.csf               | 31 ----------
+ test/mxc_secureboot/mx6sl/uImage.csf               | 31 ----------
+ test/mxc_secureboot/templates/genivt_template      | 13 ++++
+ test/mxc_secureboot/templates/habimagegen_template | 15 +++++
+ .../mxc_secureboot/templates/habuimagegen_template | 19 ++++++
+ test/mxc_secureboot/templates/ubootcsf_template    | 31 ++++++++++
+ test/mxc_secureboot/templates/uimagecsf_template   | 31 ++++++++++
+ test/mxc_secureboot/u-boot/mk_secure_uboot         | 50 +++++++++++++++
+ test/mxc_secureboot/uImage/mk_secure_uimage        | 56 +++++++++++++++++
+ 16 files changed, 272 insertions(+), 199 deletions(-)
+ delete mode 100755 test/mxc_secureboot/habUimageGen
+ delete mode 100755 test/mxc_secureboot/habimagegen
+ delete mode 100755 test/mxc_secureboot/mx6q_mx6dl/genIVT
+ delete mode 100644 test/mxc_secureboot/mx6q_mx6dl/u-boot.csf
+ delete mode 100644 test/mxc_secureboot/mx6q_mx6dl/uImage.csf
+ delete mode 100755 test/mxc_secureboot/mx6sl/genIVT
+ delete mode 100644 test/mxc_secureboot/mx6sl/u-boot.csf
+ delete mode 100644 test/mxc_secureboot/mx6sl/uImage.csf
+ create mode 100644 test/mxc_secureboot/templates/genivt_template
+ create mode 100644 test/mxc_secureboot/templates/habimagegen_template
+ create mode 100644 test/mxc_secureboot/templates/habuimagegen_template
+ create mode 100644 test/mxc_secureboot/templates/ubootcsf_template
+ create mode 100644 test/mxc_secureboot/templates/uimagecsf_template
+ create mode 100755 test/mxc_secureboot/u-boot/mk_secure_uboot
+ create mode 100755 test/mxc_secureboot/uImage/mk_secure_uimage
+
+diff --git a/test/mxc_secureboot/README b/test/mxc_secureboot/README
+index fe350e4..e89719c 100644
+--- a/test/mxc_secureboot/README
++++ b/test/mxc_secureboot/README
+@@ -8,21 +8,63 @@ File Description
+ 	The footprint value is also dumped out, they should be written to
+ 	SRK fuse later
+ 
+-"habimagegen"
+-"<chip>/u-boot.csf" :
+-	These 2 files should be copied to "BLN_CST_MAIN_01.00.00/u-boot"
+-	the first one is the signing script, the second one is the
+-	signing configuration. Note that u-boot.csf is different for
+-	MX6Q/MX6DL and MX6SoloLite
+-
+-"habUimagegen"
+-"<chip>/genIVT"
+-"<chip>/uImage.csf
+-	These 3 files should be copied to "BLN_CST_MAIN_01.00.00/uImage"
+-	the first one is the signing script, the second one is used to
+-	generate the "IVT" for uImage. the third one is the signing
+-	configuration. Note that genIVT and uImage.csf is different for
+-	MX6Q/MX6DL and MX6SoloLite
++"u-boot/mk_secure_uboot"
++"uImage/mk_secure_uimage"
++"templates/"
++	Automatic secure uboot and uImage generation scripts. These files
++	are used for dynamic authentication. It is more convinient and
++	adaptive comparing to the original static way.
++
++	Copy "u-boot/mk_secure_uboot" to "BLN_CST_MAIN_01.00.00/u-boot"
++	Copy "uImage/mk_secure_uimage" to "BLN_CST_MAIN_01.00.00/uImage"
++	Copy "templates/" to "BLN_CST_MAIN_01.00.00"
++
++	For generating secure uboot
++	    . copy "u-boot.bin" to "BLN_CST_MAIN_01.00.00/u-boot"
++	    . "./mk_secure_uboot 0x87800000"
++	        - where 0x87800000 is the DDR location where u-boot is
++		  copied to by ROM code, different from platform to platform
++	    . u-boot-signed.bin will be generated. It is the u-boot image
++	      with signature
++
++	For generating secure uImage
++	    . copy "uImage" to "BLN_CST_MAIN_01.00.00/uImage"
++	    . "./mk_secure_uimage 0x80800000"
++	        - where 0x80800000 is the DDR location where uImage is
++		  copied to by UBoot, different from platform to platform
++	    . uimage-signed.bin will be generated. It is the uImage
++	      with signature
++
++Image Layout
++------------------------------------
++U-Boot
++    +-------------------+      DDR_START
++    |                   |
++    |    U-Boot Image   |
++    |                   |
++    +-------------------+      DDR_START + UBOOT_SIZE
++    |    PADDING        |
++    +-------------------+      align to 0x1000
++    |    CSF Data       | \
++    +-------------------+  +-- CSF + Pad,  Size : 0x2000
++    |    PADDING        | /
++    +-------------------+
++
++uImage
++
++    +-------------------+      DDR_START
++    |                   |
++    |     uImage        |
++    |                   |
++    +-------------------+      DDR_START + UIMAGE_SIZE
++    |     PADDING       |
++    +-------------------+      align to 0x1000
++    |     IVT           | ---- Size : 0x20
++    +-------------------+
++    |     CSF Data      | \
++    +-------------------+  +-- CSF + Pad,  Size : 0x2000
++    |     PADDING       | /
++    +-------------------+
+ 
+ Please refer to "MX6 Linux High Assurance Boot (HAB) User Guide" for
+ detailed test steps.
+diff --git a/test/mxc_secureboot/habUimageGen b/test/mxc_secureboot/habUimageGen
+deleted file mode 100755
+index d3b60bd..0000000
+--- a/test/mxc_secureboot/habUimageGen
++++ /dev/null
+@@ -1,19 +0,0 @@
+-#! /bin/bash
+-
+-echo "extend uImage to 0x3FDFE0..."
+-objcopy -I binary -O binary --pad-to 0x3fdfe0 --gap-fill=0x5a uImage uImage-pad.bin
+-
+-echo "generate IVT"
+-./genIVT
+-
+-echo "attach IVT..."
+-cat uImage-pad.bin ivt.bin > uImage-pad-ivt.bin
+-
+-echo "generate csf data..."
+-../linux/cst --o uImage_csf.bin < uImage.csf
+-
+-echo "merge image and csf data..."
+-cat uImage-pad-ivt.bin uImage_csf.bin > uImage-signed.bin
+-
+-echo "extend final image to 0x400000..."
+-objcopy -I binary -O binary --pad-to 0x400000 --gap-fill=0x5a uImage-signed.bin uImage-signed-pad.bin
+diff --git a/test/mxc_secureboot/habimagegen b/test/mxc_secureboot/habimagegen
+deleted file mode 100755
+index ab92c5c..0000000
+--- a/test/mxc_secureboot/habimagegen
++++ /dev/null
+@@ -1,15 +0,0 @@
+-#! /bin/bash
+-
+-echo "extend u-boot to 0x2F000..."
+-objcopy -I binary -O binary --pad-to 0x2f000 --gap-fill=0x5a u-boot.bin u-boot-pad.bin
+-
+-echo "generate csf data..."
+-../linux/cst --o u-boot_csf.bin < u-boot.csf
+-
+-echo "merge image and csf data..."
+-cat u-boot-pad.bin u-boot_csf.bin > u-boot-signed.bin
+-
+-echo "extend final image to 0x31000..."
+-objcopy -I binary -O binary --pad-to 0x31000 --gap-fill=0x5a u-boot-signed.bin u-boot-signed-pad.bin
+-
+-echo "u-boot-signed-pad.bin is ready"
+diff --git a/test/mxc_secureboot/mx6q_mx6dl/genIVT b/test/mxc_secureboot/mx6q_mx6dl/genIVT
+deleted file mode 100755
+index 1d1b5b3..0000000
+--- a/test/mxc_secureboot/mx6q_mx6dl/genIVT
++++ /dev/null
+@@ -1,13 +0,0 @@
+-#! /usr/bin/perl -w
+-use strict;
+-
+-open(my $out, '>:raw', 'ivt.bin') or die "Unable to open: $!";
+-print $out pack("V", 0x402000D1);	# Signature
+-print $out pack("V", 0x10801000);	# Jump Location
+-print $out pack("V", 0x0);		# Reserved
+-print $out pack("V", 0x0);		# DCD pointer
+-print $out pack("V", 0x0);		# Boot Data
+-print $out pack("V", 0x10BFDFE0);	# Self Pointer
+-print $out pack("V", 0x10BFE000);	# CSF Pointer
+-print $out pack("V", 0x0);		# Reserved
+-close($out);
+diff --git a/test/mxc_secureboot/mx6q_mx6dl/u-boot.csf b/test/mxc_secureboot/mx6q_mx6dl/u-boot.csf
+deleted file mode 100644
+index 00442f1..0000000
+--- a/test/mxc_secureboot/mx6q_mx6dl/u-boot.csf
++++ /dev/null
+@@ -1,31 +0,0 @@
+-[Header]
+-    Version = 4.0
+-    Security Configuration = Open
+-    Hash Algorithm = sha256
+-    Engine Configuration = 0
+-    Certificate Format = X509
+-    Signature Format = CMS
+-
+-[Install SRK]
+-    File = "../crts/SRK_1_2_3_4_table.bin"
+-    Source index = 0
+-
+-[Install CSFK]
+-    File = "../crts/CSF1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-[Authenticate CSF]
+-
+-[Install Key]
+-    Verification index = 0
+-    Target index = 2
+-    File = "../crts/IMG1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-# Sign padded u-boot starting at the IVT through to the end with
+-# length = 0x2F000 (padded u-boot length) - 0x400 (IVT offset) = 0x2EC00
+-# This covers the essential parts: IVT, boot data and DCD.
+-# Blocks have the following definition:
+-#    Image block start address on i.MX, Offset from start of image file,
+-#    Length of block in bytes, image data file
+-[Authenticate Data]
+-    Verification index = 2
+-    Blocks = 0x27800400 0x400 0x2EC00 "u-boot-pad.bin"
+diff --git a/test/mxc_secureboot/mx6q_mx6dl/uImage.csf b/test/mxc_secureboot/mx6q_mx6dl/uImage.csf
+deleted file mode 100644
+index 1bf51c4..0000000
+--- a/test/mxc_secureboot/mx6q_mx6dl/uImage.csf
++++ /dev/null
+@@ -1,31 +0,0 @@
+-[Header]
+-    Version = 4.0
+-    Security Configuration = Open
+-    Hash Algorithm = sha256
+-    Engine Configuration = 0
+-    Certificate Format = X509
+-    Signature Format = CMS
+-
+-[Install SRK]
+-    File = "../crts/SRK_1_2_3_4_table.bin"
+-    Source index = 0
+-
+-[Install CSFK]
+-    File = "../crts/CSF1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-[Authenticate CSF]
+-
+-[Install Key]
+-    Verification index = 0
+-    Target index = 2
+-    File = "../crts/IMG1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-# Sign padded uImage start at address 0x10800000
+-# length = 0x3FE0000
+-# This covers the essential parts: original uImage and the attached IVT
+-# Blocks have the following definition:
+-#    Image block start address on i.MX, Offset from start of image file,
+-#    Length of block in bytes, image data file
+-[Authenticate Data]
+-    Verification index = 2
+-    Blocks = 0x10800000 0x0 0x003FE000 "uImage-pad-ivt.bin"
+diff --git a/test/mxc_secureboot/mx6sl/genIVT b/test/mxc_secureboot/mx6sl/genIVT
+deleted file mode 100755
+index 04e9c99..0000000
+--- a/test/mxc_secureboot/mx6sl/genIVT
++++ /dev/null
+@@ -1,13 +0,0 @@
+-#! /usr/bin/perl -w
+-use strict;
+-
+-open(my $out, '>:raw', 'ivt.bin') or die "Unable to open: $!";
+-print $out pack("V", 0x402000D1);	# Signature
+-print $out pack("V", 0x80801000);	# Jump Location
+-print $out pack("V", 0x0);		# Reserved
+-print $out pack("V", 0x0);		# DCD pointer
+-print $out pack("V", 0x0);		# Boot Data
+-print $out pack("V", 0x80BFDFE0);	# Self Pointer
+-print $out pack("V", 0x80BFE000);	# CSF Pointer
+-print $out pack("V", 0x0);		# Reserved
+-close($out);
+diff --git a/test/mxc_secureboot/mx6sl/u-boot.csf b/test/mxc_secureboot/mx6sl/u-boot.csf
+deleted file mode 100644
+index 3d19814..0000000
+--- a/test/mxc_secureboot/mx6sl/u-boot.csf
++++ /dev/null
+@@ -1,31 +0,0 @@
+-[Header]
+-    Version = 4.0
+-    Security Configuration = Open
+-    Hash Algorithm = sha256
+-    Engine Configuration = 0
+-    Certificate Format = X509
+-    Signature Format = CMS
+-
+-[Install SRK]
+-    File = "../crts/SRK_1_2_3_4_table.bin"
+-    Source index = 0
+-
+-[Install CSFK]
+-    File = "../crts/CSF1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-[Authenticate CSF]
+-
+-[Install Key]
+-    Verification index = 0
+-    Target index = 2
+-    File = "../crts/IMG1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-# Sign padded u-boot starting at the IVT through to the end with
+-# length = 0x2F000 (padded u-boot length) - 0x400 (IVT offset) = 0x2EC00
+-# This covers the essential parts: IVT, boot data and DCD.
+-# Blocks have the following definition:
+-#    Image block start address on i.MX, Offset from start of image file,
+-#    Length of block in bytes, image data file
+-[Authenticate Data]
+-    Verification index = 2
+-    Blocks = 0x87800400 0x400 0x2EC00 "u-boot-pad.bin"
+diff --git a/test/mxc_secureboot/mx6sl/uImage.csf b/test/mxc_secureboot/mx6sl/uImage.csf
+deleted file mode 100644
+index b08fb03..0000000
+--- a/test/mxc_secureboot/mx6sl/uImage.csf
++++ /dev/null
+@@ -1,31 +0,0 @@
+-[Header]
+-    Version = 4.0
+-    Security Configuration = Open
+-    Hash Algorithm = sha256
+-    Engine Configuration = 0
+-    Certificate Format = X509
+-    Signature Format = CMS
+-
+-[Install SRK]
+-    File = "../crts/SRK_1_2_3_4_table.bin"
+-    Source index = 0
+-
+-[Install CSFK]
+-    File = "../crts/CSF1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-[Authenticate CSF]
+-
+-[Install Key]
+-    Verification index = 0
+-    Target index = 2
+-    File = "../crts/IMG1_1_sha256_2048_65537_v3_usr_crt.pem"
+-
+-# Sign padded uImage start at address 0x80800000
+-# length = 0x3FE0000
+-# This covers the essential parts: original uImage and the attached IVT
+-# Blocks have the following definition:
+-#    Image block start address on i.MX, Offset from start of image file,
+-#    Length of block in bytes, image data file
+-[Authenticate Data]
+-    Verification index = 2
+-    Blocks = 0x80800000 0x0 0x003FE000 "uImage-pad-ivt.bin"
+diff --git a/test/mxc_secureboot/templates/genivt_template b/test/mxc_secureboot/templates/genivt_template
+new file mode 100644
+index 0000000..9d06107
+--- /dev/null
++++ b/test/mxc_secureboot/templates/genivt_template
+@@ -0,0 +1,13 @@
++#! /usr/bin/perl -w
++use strict;
++
++open(my $out, '>:raw', 'ivt.bin') or die "Unable to open: $!";
++print $out pack("V", 0x402000D1);	# Signature
++print $out pack("V", %jump_addr%);	# Jump Location
++print $out pack("V", 0x0);		# Reserved
++print $out pack("V", 0x0);		# DCD pointer
++print $out pack("V", 0x0);		# Boot Data
++print $out pack("V", %self_ptr%);	# Self Pointer
++print $out pack("V", %csf_ptr%);	# CSF Pointer
++print $out pack("V", 0x0);		# Reserved
++close($out);
+diff --git a/test/mxc_secureboot/templates/habimagegen_template b/test/mxc_secureboot/templates/habimagegen_template
+new file mode 100644
+index 0000000..a325e96
+--- /dev/null
++++ b/test/mxc_secureboot/templates/habimagegen_template
+@@ -0,0 +1,15 @@
++#! /bin/bash
++
++echo "extend u-boot to %pad_len%..."
++objcopy -I binary -O binary --pad-to %pad_len% --gap-fill=0x5A u-boot.bin u-boot-pad.bin
++
++echo "generate csf data..."
++../linux/cst --o u-boot_csf.bin < u-boot.csf
++
++echo "merge image and csf data..."
++cat u-boot-pad.bin u-boot_csf.bin > u-boot-signed.bin
++
++echo "extend final image to %sig_len%..."
++objcopy -I binary -O binary --pad-to %sig_len% --gap-fill=0x5A u-boot-signed.bin u-boot-signed-pad.bin
++
++echo "u-boot-signed-pad.bin is ready"
+diff --git a/test/mxc_secureboot/templates/habuimagegen_template b/test/mxc_secureboot/templates/habuimagegen_template
+new file mode 100644
+index 0000000..a1f54c6
+--- /dev/null
++++ b/test/mxc_secureboot/templates/habuimagegen_template
+@@ -0,0 +1,19 @@
++#! /bin/bash
++
++echo "extend uImage to %pad_len%..."
++objcopy -I binary -O binary --pad-to %pad_len% --gap-fill=0x5A uImage uImage-pad.bin
++
++echo "generate IVT"
++./genIVT
++
++echo "attach IVT..."
++cat uImage-pad.bin ivt.bin > uImage-pad-ivt.bin
++
++echo "generate csf data..."
++../linux/cst --o uImage_csf.bin < uImage.csf
++
++echo "merge image and csf data..."
++cat uImage-pad-ivt.bin uImage_csf.bin > uImage-signed.bin
++
++echo "extend final image to %sig_len%..."
++objcopy -I binary -O binary --pad-to %sig_len% --gap-fill=0x5A uImage-signed.bin uImage-signed-pad.bin
+diff --git a/test/mxc_secureboot/templates/ubootcsf_template b/test/mxc_secureboot/templates/ubootcsf_template
+new file mode 100644
+index 0000000..56f7e28
+--- /dev/null
++++ b/test/mxc_secureboot/templates/ubootcsf_template
+@@ -0,0 +1,31 @@
++[Header]
++    Version = 4.0
++    Security Configuration = Open
++    Hash Algorithm = sha256
++    Engine Configuration = 0
++    Certificate Format = X509
++    Signature Format = CMS
++
++[Install SRK]
++    File = "../crts/SRK_1_2_3_4_table.bin"
++    Source index = 0
++
++[Install CSFK]
++    File = "../crts/CSF1_1_sha256_2048_65537_v3_usr_crt.pem"
++
++[Authenticate CSF]
++
++[Install Key]
++    Verification index = 0
++    Target index = 2
++    File = "../crts/IMG1_1_sha256_2048_65537_v3_usr_crt.pem"
++
++# Sign padded u-boot starting at the IVT through to the end with
++# length = %auth_len%
++# This covers the essential parts: IVT, boot data and DCD.
++# Blocks have the following definition:
++#    Image block start address on i.MX, Offset from start of image file,
++#    Length of block in bytes, image data file
++[Authenticate Data]
++    Verification index = 2
++    Blocks = %ram_start% %image_offset% %auth_len% "u-boot-pad.bin"
+diff --git a/test/mxc_secureboot/templates/uimagecsf_template b/test/mxc_secureboot/templates/uimagecsf_template
+new file mode 100644
+index 0000000..a927ef1
+--- /dev/null
++++ b/test/mxc_secureboot/templates/uimagecsf_template
+@@ -0,0 +1,31 @@
++[Header]
++    Version = 4.0
++    Security Configuration = Open
++    Hash Algorithm = sha256
++    Engine Configuration = 0
++    Certificate Format = X509
++    Signature Format = CMS
++
++[Install SRK]
++    File = "../crts/SRK_1_2_3_4_table.bin"
++    Source index = 0
++
++[Install CSFK]
++    File = "../crts/CSF1_1_sha256_2048_65537_v3_usr_crt.pem"
++
++[Authenticate CSF]
++
++[Install Key]
++    Verification index = 0
++    Target index = 2
++    File = "../crts/IMG1_1_sha256_2048_65537_v3_usr_crt.pem"
++
++# Sign padded uImage start at address %ddr_addr%
++# length = %auth_len%
++# This covers the essential parts: original uImage and the attached IVT
++# Blocks have the following definition:
++#    Image block start address on i.MX, Offset from start of image file,
++#    Length of block in bytes, image data file
++[Authenticate Data]
++    Verification index = 2
++    Blocks = %ddr_addr% 0x0 %auth_len% "uImage-pad-ivt.bin"
+diff --git a/test/mxc_secureboot/u-boot/mk_secure_uboot b/test/mxc_secureboot/u-boot/mk_secure_uboot
+new file mode 100755
+index 0000000..a1e5955
+--- /dev/null
++++ b/test/mxc_secureboot/u-boot/mk_secure_uboot
+@@ -0,0 +1,50 @@
++#! /bin/bash
++
++if [ $# != 1 ]
++then
++	printf "	Command Syntax:\n"
++	printf "	    mk_secure_uboot <DDR_ADDR>\n"
++	printf "	        DDR_ADDR : ddr address where u-boot is copied to RAM by ROM code\n"
++	printf "	Please try again\n"
++	exit
++fi
++
++let ddr_addr=$1
++
++if [ ! -f u-boot.bin ]
++then
++	printf "File \"u-boot.bin\" does not exist. Copy it from u-boot directory and try again\n"
++	exit 1
++fi
++printf "Make Sure Your \"u-boot.bin\" is up to date...\n"
++
++# Calculate the size
++let uboot_size=$(ls -lct u-boot.bin | awk '{print $5}')
++let pad_len=$((uboot_size - uboot_size % 0x1000 + 0x1000)) # align to 0x1000
++let sig_len=$((pad_len + 0x2000))
++let ivt_offset=0x400
++let auth_len=$((pad_len - ivt_offset))
++let ivt_start=$((ddr_addr + ivt_offset))
++
++# change value to hex string
++pad_len=`printf "0x%X" ${pad_len}`
++sig_len=`printf "0x%X" ${sig_len}`
++auth_len=`printf "0x%X" ${auth_len}`
++ivt_offset=`printf "0x%X" ${ivt_offset}`
++ivt_start=`printf "0x%X" ${ivt_start}`
++
++# Create habimagegen
++sed -e s/%pad_len%/${pad_len}/g -e s/%sig_len%/${sig_len}/g ../templates/habimagegen_template > habimagegen
++chmod +x habimagegen
++
++# Create u-boot.csf
++sed -e s/%ram_start%/${ivt_start}/g -e s/%image_offset%/${ivt_offset}/g -e s/%auth_len%/${auth_len}/g ../templates/ubootcsf_template > u-boot.csf
++
++# Generate secure boot
++./habimagegen
++
++# Remove temperory files
++rm -f habimagegen u-boot.csf u-boot_csf.bin u-boot-pad.bin u-boot-signed.bin
++
++# OK
++printf "U-Boot image with Signature \"u-boot-signed-pad.bin\" is ready to use\n"
+diff --git a/test/mxc_secureboot/uImage/mk_secure_uimage b/test/mxc_secureboot/uImage/mk_secure_uimage
+new file mode 100755
+index 0000000..2f0857f
+--- /dev/null
++++ b/test/mxc_secureboot/uImage/mk_secure_uimage
+@@ -0,0 +1,56 @@
++#! /bin/bash
++if [ $# != 1 ]
++then
++	printf "	Command Syntax:\n"
++	printf "	    mk_secure_uimage <DDR_ADDR>\n"
++	printf "	        DDR_ADDR : ddr address where uImage is copied to RAM by U-Boot\n"
++	printf "	Please try again\n"
++	exit
++fi
++
++let ddr_addr=$1
++
++if [ ! -f uImage ]
++then
++	printf "File \"uImage\" does not exist. Copy it from u-boot directory and try again\n"
++	exit 1
++fi
++printf "Make Sure Your \"uImage\" is up to date...\n"
++
++# Calculate the size
++let uimage_size=$(ls -lct uImage | awk '{print $5}')
++let pad_len=$((uimage_size - uimage_size % 0x1000 + 0x1000)) # align to 0x1000
++let auth_len=$((pad_len + 0x20)) # +0x20 "IVT"
++let sig_len=$((auth_len + 0x2000))
++let self_ptr=$((ddr_addr + pad_len))
++let csf_ptr=$((ddr_addr + auth_len))
++let jump_addr=$((ddr_addr + 0x1000))
++
++# change value to hex string
++pad_len=`printf "0x%X" ${pad_len}`
++auth_len=`printf "0x%X" ${auth_len}`
++sig_len=`printf "0x%X" ${sig_len}`
++ddr_addr=`printf "0x%X" ${ddr_addr}`
++self_ptr=`printf "0x%X" ${self_ptr}`
++csf_ptr=`printf "0x%X" ${csf_ptr}`
++jump_addr=`printf "0x%X" ${jump_addr}`
++
++# Create habUimagegen
++sed -e s/%pad_len%/${pad_len}/g -e s/%sig_len%/${sig_len}/g ../templates/habuimagegen_template > habUImageGen
++chmod +x habUImageGen
++
++# Create u-boot.csf
++sed -e s/%ddr_addr%/${ddr_addr}/g -e s/%auth_len%/${auth_len}/g ../templates/uimagecsf_template > uImage.csf
++
++# Create genIVT
++sed -e s/%jump_addr%/${jump_addr}/g -e s/%self_ptr%/${self_ptr}/g -e s/%csf_ptr%/${csf_ptr}/g ../templates/genivt_template > genIVT
++chmod +x genIVT
++
++# Generate secure boot
++./habUImageGen
++
++# Remove temperory files
++rm -f genIVT habUImageGen uImage.csf uImage-pad.bin ivt.bin uImage-pad-ivt.bin uImage_csf.bin uImage-signed.bin
++
++# OK
++printf "uImage with Signature \"uImage-signed-pad.bin\" is ready to use\n"
+-- 
+1.8.0
+

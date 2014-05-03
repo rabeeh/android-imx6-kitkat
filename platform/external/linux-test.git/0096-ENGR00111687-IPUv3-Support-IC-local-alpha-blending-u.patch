@@ -1,0 +1,337 @@
+From 73ee2df051d253c8444c78df52f5319cc1c3b6ee Mon Sep 17 00:00:00 2001
+From: Liu Ying <b17645@freescale.com>
+Date: Wed, 20 May 2009 17:14:11 +0800
+Subject: [PATCH 096/435] ENGR00111687 IPUv3:Support IC local alpha blending
+ unit test
+
+Support IC local alpha blending unit test.
+
+Signed-off-by: Liu Ying <b17645@freescale.com>
+---
+ test/mxc_ipudev_test/mxc_ipudev_test.c |  11 ++-
+ test/mxc_ipudev_test/mxc_ipudev_test.h |   6 ++
+ test/mxc_ipudev_test/test_pattern.c    | 171 +++++++++++++++++++++++++++------
+ 3 files changed, 155 insertions(+), 33 deletions(-)
+
+diff --git a/test/mxc_ipudev_test/mxc_ipudev_test.c b/test/mxc_ipudev_test/mxc_ipudev_test.c
+index 32b6fc0..caa4e3a 100644
+--- a/test/mxc_ipudev_test/mxc_ipudev_test.c
++++ b/test/mxc_ipudev_test/mxc_ipudev_test.c
+@@ -122,10 +122,11 @@ int main(int argc, char *argv[])
+ 			"2: video pattern with user define dma buffer queue, with two output\n" \
+ 			"3: hopping block screen save\n" \
+ 			"4: color bar + hopping block\n" \
+-			"5: color bar overlay\n" \
+-			"6: ipu dma copy test\n" \
+-			"7: 2 screen layer test\n" \
+-			"8: 3 screen layer test\n\n");
++			"5: color bar global alpha overlay\n" \
++			"6: color bar local alpha overlay\n" \
++			"7: ipu dma copy test\n" \
++			"8: 2 screen layer test\n" \
++			"9: 3 screen layer test\n\n");
+ 		return -1;
+ 	}
+ 
+@@ -184,7 +185,7 @@ int main(int argc, char *argv[])
+ 			first_time = 0;
+ 			done_cnt++;
+ 		}
+-		next_update_idx = mxc_ipu_lib_task_buf_update(test_handle.ipu_handle, 0, 0, output_to_file_cb, &test_handle);
++		next_update_idx = mxc_ipu_lib_task_buf_update(test_handle.ipu_handle, 0, 0, 0, output_to_file_cb, &test_handle);
+ 		if (next_update_idx < 0)
+ 			break;
+ 		done_cnt++;
+diff --git a/test/mxc_ipudev_test/mxc_ipudev_test.h b/test/mxc_ipudev_test/mxc_ipudev_test.h
+index 32bbebd..d4fc9be 100644
+--- a/test/mxc_ipudev_test/mxc_ipudev_test.h
++++ b/test/mxc_ipudev_test/mxc_ipudev_test.h
+@@ -42,6 +42,12 @@ typedef struct {
+ 	ipu_lib_output_param_t output1;
+ } ipu_test_handle_t;
+ 
++enum {
++	NO_OV = 0x00,
++	GLB_ALP_OV = 0x01,
++	LOC_ALP_OV = 0x02,
++};
++
+ extern int parse_config_file(char *file_name, ipu_test_handle_t *test_handle);
+ int run_test_pattern(int pattern, ipu_test_handle_t * test_handle);
+ 
+diff --git a/test/mxc_ipudev_test/test_pattern.c b/test/mxc_ipudev_test/test_pattern.c
+index 16622f0..9724ec2 100644
+--- a/test/mxc_ipudev_test/test_pattern.c
++++ b/test/mxc_ipudev_test/test_pattern.c
+@@ -299,7 +299,7 @@ int copy_test(ipu_test_handle_t * test_handle)
+ 		if ((j % 3) == 2)
+ 			memset(fake_fb[0], 0xff, screen_size);
+ 		j++;
+-		if (mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, 0, NULL, NULL) < 0)
++		if (mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, 0, 0, NULL, NULL) < 0)
+ 			break;
+ 		done_cnt++;
+ 		sleep(1);
+@@ -315,14 +315,16 @@ done:
+ 
+ int color_bar(int two_output, int overlay, ipu_test_handle_t * test_handle)
+ {
+-	int ret = 0, fd_fb = 0, size = 0, i, done_cnt = 0;
+-	void * buf[BUF_CNT] = {0}, * ov_fake_fb = 0, * fb[2];
+-	int paddr[BUF_CNT] = {0}, ov_fake_fb_paddr = 0;
++	int ret = 0, fd_fb = 0, size = 0, i, k = 0, done_cnt = 0, fcount = 0;
++	void * buf[BUF_CNT] = {0}, * fb[2];
++	void * ov_fake_fb = 0, * ov_alpha_fake_fb = 0;
++	int ov_fake_fb_paddr = 0, ov_alpha_fake_fb_paddr = 0;
++	int paddr[BUF_CNT] = {0};
+ 	struct fb_var_screeninfo fb_var;
+ 	struct fb_fix_screeninfo fb_fix;
+ 	unsigned int system_rev = 0, ipu_version;
+ 	ipu_lib_overlay_param_t ov;
+-	int screen_size, ov_fake_fb_size = 0;
++	int screen_size, ov_fake_fb_size = 0, ov_alpha_fake_fb_size = 0;
+ 
+ 	get_system_rev(&system_rev);
+ 	if (((system_rev & 0xff000) == 0x37000) ||
+@@ -378,7 +380,7 @@ int color_bar(int two_output, int overlay, ipu_test_handle_t * test_handle)
+ 
+ 	/* use I420 input format as fix*/
+ 	test_handle->mode = OP_STREAM_MODE;
+-	test_handle->fcount = 255;
++	test_handle->fcount = fcount = 511;
+ 	test_handle->input.width = 320;
+ 	test_handle->input.height = 240;
+ 	test_handle->input.fmt = v4l2_fourcc('I', '4', '2', '0');
+@@ -421,11 +423,19 @@ int color_bar(int two_output, int overlay, ipu_test_handle_t * test_handle)
+ 		ov.ov_crop_win.pos.y = fb_var.yres/4;
+ 		ov.ov_crop_win.win_w = fb_var.xres/2;
+ 		ov.ov_crop_win.win_h = fb_var.yres/2;
+-		ov.alpha_en = 1;
++		if (overlay == LOC_ALP_OV) {
++			ov.local_alpha_en = 1;
++			ov.global_alpha_en = 0;
++		} else {
++			ov.global_alpha_en = 1;
++			ov.local_alpha_en = 0;
++		}
+ 		ov.key_color_en = 0;
+ 		ov.alpha = 0;
+ 		ov.key_color = 0x808080;
+ 		ov_fake_fb_size = screen_size;
++		if (overlay == LOC_ALP_OV)
++			ov_alpha_fake_fb_size = ov.width * ov.height;
+ 		test_handle->output0.width = fb_var.xres/2;
+ 		test_handle->output0.height = fb_var.yres/2;
+ 		test_handle->output0.fb_disp.pos.x = fb_var.xres/4;
+@@ -460,6 +470,28 @@ int color_bar(int two_output, int overlay, ipu_test_handle_t * test_handle)
+ 		}
+ 		ov.user_def_paddr[0] = ov_fake_fb_paddr;
+ 		ov.user_def_paddr[1] = ov.user_def_paddr[0];
++
++		if (overlay == LOC_ALP_OV) {
++			ov_alpha_fake_fb_paddr = ov_alpha_fake_fb_size;
++			if (ioctl(fd_fb, FBIO_ALLOC,
++				  &(ov_alpha_fake_fb_paddr)) < 0) {
++				printf("Unable alloc mem from /dev/fb0\n");
++				ret = -1;
++				goto done;
++			}
++			ov_alpha_fake_fb = mmap(NULL, ov_alpha_fake_fb_size,
++						PROT_READ | PROT_WRITE,
++						MAP_SHARED,
++						fd_fb,
++						ov_alpha_fake_fb_paddr);
++			if (ov_alpha_fake_fb == MAP_FAILED) {
++				printf("mmap failed!\n");
++				ret = -1;
++				goto done;
++			}
++			ov.user_def_alpha_paddr[0] = ov_alpha_fake_fb_paddr;
++			ov.user_def_alpha_paddr[1] = ov_alpha_fake_fb_paddr;
++		}
+ 	}
+ 
+ 	/* we are using stream mode and we set dma addr by ourselves*/
+@@ -487,20 +519,99 @@ int color_bar(int two_output, int overlay, ipu_test_handle_t * test_handle)
+ 
+ 	while((done_cnt < test_handle->fcount) && (ctrl_c_rev == 0)) {
+ 		if (overlay) {
+-			if (done_cnt % 50 == 0) {
+-				static int j = 0;
+-				if ((j % 3) == 0)
+-					memset(ov_fake_fb, 0, ov_fake_fb_size);
+-				if ((j % 3) == 1)
+-					memset(ov_fake_fb, 0x80, ov_fake_fb_size);
+-				if ((j % 3) == 2)
+-					memset(ov_fake_fb, 0xff, ov_fake_fb_size);
+-				j++;
++			if (overlay == GLB_ALP_OV) {
++				if (done_cnt % 50 == 0) {
++					static int j = 0;
++					if ((j % 3) == 0)
++						memset(ov_fake_fb, 0,
++						       ov_fake_fb_size);
++					if ((j % 3) == 1)
++						memset(ov_fake_fb, 0x80,
++						       ov_fake_fb_size);
++					if ((j % 3) == 2)
++						memset(ov_fake_fb, 0xff,
++						       ov_fake_fb_size);
++					j++;
++				}
++				memcpy(fb[(done_cnt+1)%2], ov_fake_fb,
++				       ov_fake_fb_size);
++				if (mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, paddr[i], ov_fake_fb_paddr, 0, NULL, NULL) < 0)
++					break;
++			} else if (overlay == LOC_ALP_OV) {
++				if (done_cnt == 1) {
++					/* RGB565 red */
++					for (k = 0; k < ov_fake_fb_size; k++) {
++						if (k % 2 == 1)
++							memset(ov_fake_fb + k,
++							       0xF8, 1);
++						else
++							memset(ov_fake_fb + k,
++							       0x00, 1);
++					}
++					/* 2 planes */
++					memset(ov_alpha_fake_fb, 0x80,
++				      	       ov_alpha_fake_fb_size);
++				} else if (done_cnt == 1*fcount/9) {
++					/* video plane */
++					memset(ov_alpha_fake_fb, 0x00,
++				      	       ov_alpha_fake_fb_size);
++				} else if (done_cnt == 2*fcount/9) {
++					/* graphic plane */
++					memset(ov_alpha_fake_fb, 0xFF,
++				      	       ov_alpha_fake_fb_size);
++				} else if (done_cnt == fcount/3) {
++					/* RGB565 green */
++					for (k = 0; k < ov_fake_fb_size; k++) {
++						if (k % 2 == 1)
++							memset(ov_fake_fb + k,
++							       0x07, 1);
++						else
++							memset(ov_fake_fb + k,
++							       0xE0, 1);
++					}
++					/* 2 planes */
++					memset(ov_alpha_fake_fb, 0x80,
++					       ov_alpha_fake_fb_size);
++				} else if (done_cnt == 4*fcount/9) {
++					/* video plane */
++					memset(ov_alpha_fake_fb, 0x00,
++				      	       ov_alpha_fake_fb_size);
++				} else if (done_cnt == 5*fcount/9) {
++					/* graphic plane */
++					memset(ov_alpha_fake_fb, 0xFF,
++				      	       ov_alpha_fake_fb_size);
++				} else if (done_cnt == 2*fcount/3) {
++					/* RGB565 blue */
++					for (k = 0; k < ov_fake_fb_size; k++) {
++						if (k % 2 == 0)
++							memset(ov_fake_fb + k,
++							       0x1F, 1);
++						else
++							memset(ov_fake_fb + k,
++							       0x00, 1);
++					}
++					/* 2 planes */
++					memset(ov_alpha_fake_fb, 0x80,
++					       ov_alpha_fake_fb_size);
++				} else if (done_cnt == 7*fcount/9) {
++					/* video plane */
++					memset(ov_alpha_fake_fb, 0x00,
++				      	       ov_alpha_fake_fb_size);
++				} else if (done_cnt == 8*fcount/9) {
++					/* graphic plane */
++					memset(ov_alpha_fake_fb, 0xFF,
++				      	       ov_alpha_fake_fb_size);
++				}
++				memcpy(fb[(done_cnt+1)%2], ov_fake_fb,
++				       ov_fake_fb_size);
++				if (mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, paddr[i], ov_fake_fb_paddr, ov_alpha_fake_fb_paddr, NULL, NULL) < 0)
++					break;
+ 			}
+-			memcpy(fb[(done_cnt+1)%2], ov_fake_fb, ov_fake_fb_size);
++		} else {
++			if (mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, paddr[i], 0, 0, NULL, NULL) < 0)
++				break;
+ 		}
+-		if (mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, paddr[i], 0, NULL, NULL) < 0)
+-			break;
++
+ 		i++;
+ 		if (i == BUF_CNT)
+ 			i = 0;
+@@ -721,7 +832,7 @@ int hop_block(ipu_test_handle_t * test_handle)
+ 	printf("Start angle is %d\n", start_angle);
+ 
+ 	/* start first frame */
+-	if((next_update_idx = mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, 0, hop_block_output_cb, &fd_fb)) < 0)
++	if((next_update_idx = mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, 0, 0, hop_block_output_cb, &fd_fb)) < 0)
+ 		goto err;
+ 
+ 	while(ctrl_c_rev == 0) {
+@@ -731,7 +842,7 @@ int hop_block(ipu_test_handle_t * test_handle)
+ 			random_color = (char)(rand()%255);
+ 			memset(test_handle->ipu_handle->inbuf_start[next_update_idx], random_color,
+ 					test_handle->ipu_handle->ifr_size);
+-			if((next_update_idx = mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, 0, hop_block_output_cb, &fd_fb)) < 0)
++			if((next_update_idx = mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, 0, 0, hop_block_output_cb, &fd_fb)) < 0)
+ 				break;
+ 		}
+ 	}
+@@ -766,7 +877,7 @@ void * thread_func_color_bar(void *arg)
+ 	memset(&test_handle, 0, sizeof(ipu_test_handle_t));
+ 
+ 	test_handle.ipu_handle = &ipu_handle;
+-	ret = color_bar(0, 0, &test_handle);
++	color_bar(0, NO_OV, &test_handle);
+ 
+ 	pthread_exit((void*)ret);
+ }
+@@ -1071,11 +1182,11 @@ int run_test_pattern(int pattern, ipu_test_handle_t * test_handle)
+ {
+ 	if (pattern == 1) {
+ 		printf("Color bar test with full-screen:\n");
+-		return color_bar(0, 0, test_handle);
++		return color_bar(0, NO_OV, test_handle);
+ 	}
+ 	if (pattern == 2) {
+ 		printf("Color bar test 1 input with 2 output:\n");
+-		return color_bar(1, 0, test_handle);
++		return color_bar(1, NO_OV, test_handle);
+ 	}
+ 	if (pattern == 3) {
+ 		printf("Hopping block test:\n");
+@@ -1104,18 +1215,22 @@ int run_test_pattern(int pattern, ipu_test_handle_t * test_handle)
+ 		return ret;
+ 	}
+ 	if (pattern == 5) {
+-		printf("Color bar overlay test:\n");
+-		return color_bar(0, 1, test_handle);
++		printf("Color bar global alpha overlay test:\n");
++		return color_bar(0, GLB_ALP_OV, test_handle);
+ 	}
+ 	if (pattern == 6) {
++		printf("Color bar local alpha overlay test:\n");
++		return color_bar(0, LOC_ALP_OV, test_handle);
++	}
++	if (pattern == 7) {
+ 		printf("Copy test:\n");
+ 		return copy_test(test_handle);
+ 	}
+-	if (pattern == 7) {
++	if (pattern == 8) {
+ 		printf("Screen layer with 2 layers test:\n");
+ 		return screenlayer_test(0);
+ 	}
+-	if (pattern == 8) {
++	if (pattern == 9) {
+ 		printf("Screen layer with 3 layers test:\n");
+ 		return screenlayer_test(1);
+ 	}
+-- 
+1.8.0
+

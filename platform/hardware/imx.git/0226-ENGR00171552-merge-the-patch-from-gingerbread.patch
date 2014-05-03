@@ -1,0 +1,700 @@
+From 08f100f177196cc23626dbaba22d309ebf0199c6 Mon Sep 17 00:00:00 2001
+From: b02247 <b02247@freescale.com>
+Date: Mon, 9 Jan 2012 13:50:22 +0800
+Subject: [PATCH 226/486] ENGR00171552 merge the patch from gingerbread
+
+1.support wm89958
+2.support hdmi audio in ics
+
+Signed-off-by: b02247 <b02247@freescale.com>
+---
+ alsa/alsa_imx.cpp | 519 +++++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 398 insertions(+), 121 deletions(-)
+
+diff --git a/alsa/alsa_imx.cpp b/alsa/alsa_imx.cpp
+index 552fb31..0e8df46 100755
+--- a/alsa/alsa_imx.cpp
++++ b/alsa/alsa_imx.cpp
+@@ -13,7 +13,7 @@
+  ** limitations under the License.
+  */
+ 
+-/* Copyright 2010-2011 Freescale Semiconductor Inc. */
++/* Copyright 2010-2012 Freescale Semiconductor, Inc. */
+ 
+ #define LOG_TAG "iMXALSA"
+ #include <utils/Log.h>
+@@ -68,7 +68,10 @@ static status_t s_route(alsa_handle_t *, uint32_t, int);
+ char hdmicardname[32];
+ char spdifcardname[32];
+ char sgtlcardname[32];
+-int  selecteddevice ;    
++char wm8958cardname_0[32];
++char wm8958cardname_1[32];
++char wm8958cardname_2[32];
++int  selecteddevice ;
+     
+ static hw_module_methods_t s_module_methods = {
+     open            : s_device_open
+@@ -126,7 +129,7 @@ static void setDefaultControls(uint32_t devices, int mode, const char *cardname)
+ 
+ typedef void (*AlsaControlSet)(uint32_t devices, int mode, const char *cardname);
+ 
+-#define IMX_OUT_DEFAULT   (\
++#define IMX_OUT_CODEC_DEFAULT   (\
+         AudioSystem::DEVICE_OUT_EARPIECE | \
+         AudioSystem::DEVICE_OUT_SPEAKER | \
+         AudioSystem::DEVICE_OUT_WIRED_HEADSET | \
+@@ -134,22 +137,29 @@ typedef void (*AlsaControlSet)(uint32_t devices, int mode, const char *cardname)
+         AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP | \
+         AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES | \
+         AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER | \
++        AudioSystem::DEVICE_OUT_AUX_DIGITAL | \
+         AudioSystem::DEVICE_OUT_DEFAULT \
+-	)
++    )
++
++#define IMX_BT_DEFAULT   (\
++        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP | \
++        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_HEADPHONES | \
++        AudioSystem::DEVICE_OUT_BLUETOOTH_A2DP_SPEAKER \
++    )
+ 
+-#define IMX_OUT_SPDIF    (\
+-        AudioSystem::DEVICE_OUT_AUX_DIGITAL \
++#define IMX_OUT_SPDIF_DEFAULT   (\
++        AudioSystem::DEVICE_OUT_AUX_DIGITAL  \
+     )
+ 
+-#define IMX_IN_DEFAULT    (\
++#define IMX_IN_CODEC_DEFAULT    (\
+         AudioSystem::DEVICE_IN_ALL &\
+-	~AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET \
+-	)
++    ~AudioSystem::DEVICE_IN_BLUETOOTH_SCO_HEADSET \
++    )
+ 
+ static alsa_handle_t _defaults[] = {
+     {
+         module      : 0,
+-        devices     : IMX_OUT_DEFAULT,
++        devices     : IMX_OUT_CODEC_DEFAULT,
+         curDev      : 0,
+         curMode     : 0,
+         handle      : 0,
+@@ -159,35 +169,63 @@ static alsa_handle_t _defaults[] = {
+         latency     : 200000, // Desired Delay in usec
+         bufferSize  : 2048, // Desired Number of samples
+         modPrivate  : (void *)&setDefaultControls,
++        mmap        : 0,
++        devName     : 0,
++        handle_1    : 0,
++        handle_2    : 0,
+     },
+     {
+         module      : 0,
+-        devices     : IMX_OUT_SPDIF,
++        devices     : IMX_IN_CODEC_DEFAULT,
+         curDev      : 0,
+         curMode     : 0,
+         handle      : 0,
+         format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
+         channels    : 2,
+         sampleRate  : DEFAULT_SAMPLE_RATE,
+-        latency     : 200000, // Desired Delay in usec
++        latency     : 250000, // Desired Delay in usec
+         bufferSize  : 6144, // Desired Number of samples
+         modPrivate  : (void *)&setDefaultControls,
++        mmap        : 0,
++        devName     : 0,
++        handle_1    : 0,
++        handle_2    : 0,
+     },
+-    {
++};
++
++static alsa_handle_t modem_handle = {
+         module      : 0,
+-        devices     : IMX_IN_DEFAULT,
++        devices     : IMX_OUT_CODEC_DEFAULT,
+         curDev      : 0,
+         curMode     : 0,
+         handle      : 0,
+         format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
+-        channels    : 2,
+-        sampleRate  : DEFAULT_SAMPLE_RATE,
+-        latency     : 250000, // Desired Delay in usec
+-        bufferSize  : 6144, // Desired Number of samples
+-        modPrivate  : (void *)&setDefaultControls,
+-    },
++        channels    : 1,
++        sampleRate  : 8000,
++        latency     : 200000,
++        bufferSize  : 2048,
++        modPrivate  : 0,
++        mmap        : 0,
++        devName     : AUDIOCARD_DEVICE_WM8958_VOICE,
++};
++
++static alsa_handle_t bt_handle = {
++        module      : 0,
++        devices     : IMX_BT_DEFAULT,
++        curDev      : 0,
++        curMode     : 0,
++        handle      : 0,
++        format      : SND_PCM_FORMAT_S16_LE, // AudioSystem::PCM_16_BIT
++        channels    : 1,
++        sampleRate  : 8000,
++        latency     : 200000,
++        bufferSize  : 2048,
++        modPrivate  : 0,
++        mmap        : 0,
++        devName     : AUDIOCARD_DEVICE_WM8958_BT,
+ };
+ 
++
+ // ----------------------------------------------------------------------------
+ 
+ snd_pcm_stream_t direction(alsa_handle_t *handle)
+@@ -200,103 +238,130 @@ snd_pcm_stream_t direction(alsa_handle_t *handle)
+ const char *deviceName(alsa_handle_t *alsa_handle, uint32_t device, int mode, int card_device)
+ {
+ 
+-	snd_ctl_t *handle;
+-	int card, err, dev, idx;
+-	snd_ctl_card_info_t *info;
+-	snd_pcm_info_t *pcminfo;
+-	snd_ctl_card_info_alloca(&info);
+-	snd_pcm_info_alloca(&pcminfo);
++    snd_ctl_t *handle;
++    int card, err, dev, idx;
++    snd_ctl_card_info_t *info;
++    snd_pcm_info_t *pcminfo;
++    snd_ctl_card_info_alloca(&info);
++    snd_pcm_info_alloca(&pcminfo);
+     int  cardnum = 0;
+     char value[PROPERTY_VALUE_MAX];
+     snd_pcm_stream_t stream = direction(alsa_handle);
+     bool havespdifdevice = false;
+     bool havesgtldevice = false;
+     bool havehdmidevice = false;
++    bool havewm8958device =false;
+ 
+-	card = -1;
+-	if (snd_card_next(&card) < 0 || card < 0) {
+-		LOGD("no soundcards found...");
+-		return "default";
+-	}
+-	LOGD("**** List of %s Hardware Devices ****\n",
+-	       snd_pcm_stream_name(stream));
+-	while (card >= 0) {
+-		char name[32];
+-		sprintf(name, "hw:%d", card);
+-		if ((err = snd_ctl_open(&handle, name, 0)) < 0) {
+-			LOGD("control open (%i): %s", card, snd_strerror(err));
+-			goto next_card;
+-		}
+-		if ((err = snd_ctl_card_info(handle, info)) < 0) {
+-			LOGD("control hardware info (%i): %s", card, snd_strerror(err));
+-			snd_ctl_close(handle);
+-			goto next_card;
+-		}
+-		dev = -1;
+-		while (1) {
+-			unsigned int count;
+-			if (snd_ctl_pcm_next_device(handle, &dev)<0)
+-				LOGD("snd_ctl_pcm_next_device");
+-			if (dev < 0)
+-				break;
+-			snd_pcm_info_set_device(pcminfo, dev);
+-			snd_pcm_info_set_subdevice(pcminfo, 0);
+-			snd_pcm_info_set_stream(pcminfo, stream);
+-			if ((err = snd_ctl_pcm_info(handle, pcminfo)) < 0) {
+-				if (err != -ENOENT)
+-					LOGD("control digital audio info (%i): %s", card, snd_strerror(err));
+-				continue;
+-			}
+-			
+-			LOGD("card %i: %s [%s], device %i: %s [%s]\n",
+-				card, snd_ctl_card_info_get_id(info), snd_ctl_card_info_get_name(info),
+-				dev,
+-				snd_pcm_info_get_id(pcminfo),
+-				snd_pcm_info_get_name(pcminfo));
+-                			
+-			if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_SPDIF)==0) {
+-			     if(card_device==0)  sprintf(spdifcardname, "hw:0%d", card);
+-			     else         		 sprintf(spdifcardname, "hw:%d,%d", card, dev);
+-			     havespdifdevice =  true;
+-			}
+-            
+-			if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_HDMI)==0) {
+-			     if(card_device==0)  sprintf(hdmicardname, "hw:0%d", card);
+-			     else         		 sprintf(hdmicardname, "hw:%d,%d", card, dev);
+-			     havehdmidevice =  true;
+-			}
++    card = -1;
++    if (snd_card_next(&card) < 0 || card < 0) {
++        LOGD("no soundcards found...");
++        return "default";
++    }
++    LOGD("**** List of %s Hardware Devices ****\n",
++           snd_pcm_stream_name(stream));
++    while (card >= 0) {
++        char name[32];
++        sprintf(name, "hw:%d", card);
++        if ((err = snd_ctl_open(&handle, name, 0)) < 0) {
++            LOGD("control open (%i): %s", card, snd_strerror(err));
++            goto next_card;
++        }
++        if ((err = snd_ctl_card_info(handle, info)) < 0) {
++            LOGD("control hardware info (%i): %s", card, snd_strerror(err));
++            snd_ctl_close(handle);
++            goto next_card;
++        }
++        dev = -1;
++        while (1) {
++            unsigned int count;
++            if (snd_ctl_pcm_next_device(handle, &dev)<0)
++                LOGD("snd_ctl_pcm_next_device");
++            if (dev < 0)
++                break;
++            snd_pcm_info_set_device(pcminfo, dev);
++            snd_pcm_info_set_subdevice(pcminfo, 0);
++            snd_pcm_info_set_stream(pcminfo, stream);
++            if ((err = snd_ctl_pcm_info(handle, pcminfo)) < 0) {
++                if (err != -ENOENT)
++                    LOGD("control digital audio info (%i): %s", card, snd_strerror(err));
++                continue;
++            }
+             
+-			if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_SGTL5000_HIFI)==0) {
+-			     if(card_device==0) sprintf(sgtlcardname, "hw:0%d", card);
+-			     else               sprintf(sgtlcardname, "hw:%d,%d", card, dev);
+-			     havesgtldevice =  true;                
+-			}
+-			cardnum++;
+-		}
+-		snd_ctl_close(handle);
+-	next_card:
+-
+-		if (snd_card_next(&card) < 0) {
+-			LOGD("snd_card_next");
+-			break;
+-		}
+-	}
+-        
++            LOGD("card %i: %s [%s], device %i: %s [%s]\n",
++                card, snd_ctl_card_info_get_id(info), snd_ctl_card_info_get_name(info),
++                dev,
++                snd_pcm_info_get_id(pcminfo),
++                snd_pcm_info_get_name(pcminfo));
++            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_SPDIF)==0) {
++                 if(card_device==0)  sprintf(spdifcardname, "hw:0%d", card);
++                 else                sprintf(spdifcardname, "hw:%d,%d", card, dev);
++                 havespdifdevice =  true;
++            }
++            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_HDMI)==0) {
++                 if(card_device==0)  sprintf(hdmicardname, "hw:0%d", card);
++                 else                sprintf(hdmicardname, "hw:%d,%d", card, dev);
++                 havehdmidevice =  true;
++            }
++            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_SGTL5000_HIFI)==0) {
++                 if(card_device==0) sprintf(sgtlcardname, "hw:0%d", card);
++                 else               sprintf(sgtlcardname, "hw:%d,%d", card, dev);
++                 havesgtldevice =  true;
++            }
++            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8958_HIFI)==0) {
++                 if(card_device==0) sprintf(wm8958cardname_0, "hw:0%d", card);
++                 else               sprintf(wm8958cardname_0, "hw:%d,%d", card, dev);
++                 havewm8958device =  true;
++            }
++            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8958_VOICE)==0) {
++                 if(card_device==0) sprintf(wm8958cardname_1, "hw:0%d", card);
++                 else               sprintf(wm8958cardname_1, "hw:%d,%d", card, dev);
++                 havewm8958device =  true;
++            }
++            if(strcmp(snd_pcm_info_get_id(pcminfo),AUDIOCARD_DEVICE_WM8958_BT)==0) {
++                 if(card_device==0) sprintf(wm8958cardname_2, "hw:0%d", card);
++                 else               sprintf(wm8958cardname_2, "hw:%d,%d", card, dev);
++                 havewm8958device =  true;
++            }
++            cardnum++;
++        }
++        snd_ctl_close(handle);
++    next_card:
++
++        if (snd_card_next(&card) < 0) {
++            LOGD("snd_card_next");
++            break;
++        }
++    }
++
+     property_get("ro.HDMI_AUDIO_OUTPUT", value, "");
+     if((device & AudioSystem::DEVICE_OUT_AUX_DIGITAL) && havehdmidevice && (strcmp(value, "1") == 0))
+     {
+         selecteddevice = DEVICE_HDMI;
++        alsa_handle->devName = AUDIOCARD_DEVICE_HDMI;
+         return hdmicardname;
+ 
+     }else if((device & AudioSystem::DEVICE_OUT_AUX_DIGITAL) && havespdifdevice && (strcmp(value, "1") == 0))
+     {
+         selecteddevice = DEVICE_SPDIF;
++        alsa_handle->devName = AUDIOCARD_DEVICE_SPDIF;
+         return spdifcardname;
+ 
+     }else if(havesgtldevice)
+     {
+         selecteddevice = DEVICE_SGTL5000;
++        alsa_handle->devName = AUDIOCARD_DEVICE_SGTL5000_HIFI;
+         return sgtlcardname;
++    }else if(havewm8958device)
++    {
++        selecteddevice = DEVICE_WM8958;
++        if(alsa_handle->devName && strcmp(alsa_handle->devName,AUDIOCARD_DEVICE_WM8958_VOICE)==0)
++            return wm8958cardname_1;
++        else if(alsa_handle->devName && strcmp(alsa_handle->devName,AUDIOCARD_DEVICE_WM8958_BT)==0)
++            return wm8958cardname_2;
++        else {
++            alsa_handle->devName = AUDIOCARD_DEVICE_WM8958_HIFI;
++            return wm8958cardname_0;
++        }
+     }
+     selecteddevice = DEVICE_DEFAULT; 
+     return "default";
+@@ -373,7 +438,7 @@ status_t setHardwareParams(alsa_handle_t *handle)
+         goto done;
+     }
+ 
+-    LOGV("Set %s PCM format to %s (%s)", streamName(), formatName, formatDesc);
++    LOGV("Set %s PCM format to %s (%s)", streamName(handle), formatName, formatDesc);
+ 
+     err = snd_pcm_hw_params_set_channels(handle->handle, hardwareParams,
+             handle->channels);
+@@ -399,7 +464,7 @@ status_t setHardwareParams(alsa_handle_t *handle)
+         LOGW("Requested rate (%u HZ) does not match actual rate (%u HZ)",
+                 handle->sampleRate, requestedRate);
+     else
+-        LOGV("Set sample rate to %u HZ", requestedRate);
++        LOGW("Set sample rate to %u HZ", requestedRate);
+ 
+     // get the max buffer size we can set
+     /* pass cts, don't use the max buffer size,which will add big latency
+@@ -562,32 +627,199 @@ void setDefaultControls(uint32_t devices, int mode, const char *cardname)
+ {
+ 
+     ALSAControl *ctl = new ALSAControl(cardname);
+-    LOGD (" setDefaultControls set card :%s",cardname);
+-    if(devices & IMX_OUT_DEFAULT)
++    LOGD ("setDefaultControls set card: %s",cardname);
++
++    if(devices & IMX_OUT_CODEC_DEFAULT)
+     {
+         if(selecteddevice == DEVICE_SGTL5000)
+         {
+             if (devices & AudioSystem::DEVICE_OUT_SPEAKER ||
+-               devices & AudioSystem::DEVICE_OUT_EARPIECE) {
+-               ctl->set("Speaker Function", "on"); // on
+-             } else {
+-               ctl->set("Speaker Function", "off"); // off
+-             }
++                devices & AudioSystem::DEVICE_OUT_EARPIECE) {
++                ctl->set("Speaker Function", "on"); // on
++            } else {
++                ctl->set("Speaker Function", "off"); // off
++            }
+         }
+-     }
++    }
+ 
+-#if 0
+-    if (devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
+-        devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE) {
+-        control.set("Speader Function", 0); // on
+-    } else {
+-        control.set("Speader Function", 1); // on
++    if(devices & IMX_IN_CODEC_DEFAULT)
++    {
++        if(selecteddevice == DEVICE_SGTL5000)
++        {
++            if(devices & AudioSystem::DEVICE_IN_BUILTIN_MIC){
++                ctl->set("MIC GAIN","20dB");
++            }
++        }
++    }
++
++    if(devices & IMX_OUT_CODEC_DEFAULT)
++    {
++        if(selecteddevice == DEVICE_WM8958)
++        {
++            ctl->set("AIF1DAC Mux", 0, 0); /* 0: AIF1DACDAT, 1: AIF3DACDAT */
++            ctl->set("AIF2DAC Mux", 0, 0); /* 0: AIF2DACDAT, 1: AIF3DACDAT */
++            if (mode == AudioSystem::MODE_IN_CALL)
++            {
++                ctl->set("DAC1L Mixer AIF1.1 Switch", 0, 0);
++                ctl->set("DAC1L Mixer AIF1.2 Switch", 0, 0);
++                ctl->set("DAC1L Mixer AIF2 Switch", 1, 0);
++                ctl->set("DAC1L Mixer Left Sidetone Switch", 0, 0);
++                ctl->set("DAC1L Mixer Right Sidetone Switch", 0, 0);
++
++                ctl->set("DAC1R Mixer AIF1.1 Switch", 0, 0);
++                ctl->set("DAC1R Mixer AIF1.2 Switch", 0, 0);
++                ctl->set("DAC1R Mixer AIF2 Switch", 1, 0);
++                ctl->set("DAC1R Mixer Left Sidetone Switch", 0, 0);
++                ctl->set("DAC1R Mixer Right Sidetone Switch", 0, 0);
++
++                if(devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
++                    devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE ){
++                    ctl->set("Speaker Switch", 0, -1);   /*0 : mute  1: unmute */
++                    ctl->set("Earpiece Switch", 0, 0);   /*0 : mute  1: unmute */
++                    ctl->set("Left Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
++                    ctl->set("Right Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
++                    ctl->set("DAC1 Switch", 1, -1);
++                    ctl->set("Headphone Switch", 1, -1); /*0 : mute  1: unmute */
++                    ctl->set("Headphone Volume", 57, -1); /* 0 ~ 63 */
++
++                }else {
++                    ctl->set("Earpiece Switch", 0, 0); /*0 : mute  1: unmute */
++                    ctl->set("Headphone Switch", 0, -1); /*0 : mute  1: unmute */
++                    ctl->set("SPKL DAC1 Switch", 1, 0);
++                    ctl->set("SPKL DAC1 Volume", 1, 0);
++                    ctl->set("SPKR DAC1 Switch", 1, 0);
++                    ctl->set("SPKR DAC1 Volume", 1, 0);
++                    ctl->set("SPKL Boost SPKL Switch", 1, 0);
++                    ctl->set("SPKR Boost SPKR Switch", 1, 0);
++                    ctl->set("Speaker Mixer Volume", 3, -1);
++                    ctl->set("DAC1 Switch", 1, -1);
++                    ctl->set("Speaker Switch", 1, -1);   /*0 : mute  1: unmute */
++                    ctl->set("Speaker Volume", 60, -1); /* 0 ~ 63 */
++                }
++
++
++                if (devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ){
++                    ctl->set("IN1R Switch", 0, 0);
++                    ctl->set("IN1L Switch", 1, 0);
++                    ctl->set("IN1L Volume", 27, 0);
++                    ctl->set("MIXINL IN1L Switch", 1, 0);
++                    ctl->set("MIXINL IN1L Volume", 1, 0);
++                    ctl->set("IN1L PGA IN1LN Switch", 1, 0);
++                    ctl->set("IN1L PGA IN1LP Switch", 1, 0);
++                    ctl->set("ADCL Mux", 0, 0);   /* 0: ADC  1: DMIC */
++                    ctl->set("DAC2 Left Sidetone Volume", 12, 0);
++                    ctl->set("DAC2 Switch", 1, -1);
++                    ctl->set("AIF2ADC Mux", 0, 0); /*AIF2ADCDAT AIF3DACDAT */
++                    ctl->set("AIF2DAC2L Mixer Left Sidetone Switch", 1, 0);
++
++                }else {
++                    ctl->set("IN1L Switch", 0, 0);
++                    ctl->set("IN1R Switch", 1, 0);
++                    ctl->set("IN1R Volume", 27, 0);
++                    ctl->set("MIXINR IN1R Switch", 1, 0);
++                    ctl->set("MIXINR IN1R Volume", 1, 0);
++                    ctl->set("IN1R PGA IN1RN Switch", 1, 0);
++                    ctl->set("IN1R PGA IN1RP Switch", 1, 0);
++                    ctl->set("ADCR Mux", 0, 0);   /* 0: ADC  1: DMIC */
++                    ctl->set("DAC2 Right Sidetone Volume", 12, 0);
++                    ctl->set("DAC2 Switch", 1, -1);
++                    ctl->set("AIF2ADC Mux", 0, 0); /*AIF2ADCDAT AIF3DACDAT */
++                    ctl->set("AIF2DAC2R Mixer Right Sidetone Switch", 1, 0);
++
++                }
++            }
++            else
++            {
++
++                ctl->set("DAC1L Mixer AIF1.1 Switch", 1, 0);
++                ctl->set("DAC1L Mixer AIF1.2 Switch", 0, 0);
++                ctl->set("DAC1L Mixer AIF2 Switch", 0, 0);
++                ctl->set("DAC1L Mixer Left Sidetone Switch", 0, 0);
++                ctl->set("DAC1L Mixer Right Sidetone Switch", 0, 0);
++
++                ctl->set("DAC1R Mixer AIF1.1 Switch", 1, 0);
++                ctl->set("DAC1R Mixer AIF1.2 Switch", 0, 0);
++                ctl->set("DAC1R Mixer AIF2 Switch", 0, 0);
++                ctl->set("DAC1R Mixer Left Sidetone Switch", 0, 0);
++                ctl->set("DAC1R Mixer Right Sidetone Switch", 0, 0);
++
++
++                if (devices & AudioSystem::DEVICE_OUT_SPEAKER || devices & AudioSystem::DEVICE_OUT_EARPIECE)
++                {
++                    ctl->set("Earpiece Switch", 0, 0); /*0 : mute  1: unmute */
++                    ctl->set("Headphone Switch", 0, -1); /*0 : mute  1: unmute */
++                    ctl->set("SPKL DAC1 Switch", 1, 0);
++                    ctl->set("SPKL DAC1 Volume", 1, 0);
++                    ctl->set("SPKR DAC1 Switch", 1, 0);
++                    ctl->set("SPKR DAC1 Volume", 1, 0);
++                    ctl->set("SPKL Boost SPKL Switch", 1, 0);
++                    ctl->set("SPKR Boost SPKR Switch", 1, 0);
++                    ctl->set("Speaker Mixer Volume", 3, -1);
++                    ctl->set("DAC1 Switch", 1, -1);
++                    ctl->set("Speaker Switch", 1, -1);   /*0 : mute  1: unmute */
++                    ctl->set("Speaker Volume", 60, -1); /* 0 ~ 63 */
++
++                }else if(devices & AudioSystem::DEVICE_OUT_WIRED_HEADSET ||
++                    devices & AudioSystem::DEVICE_OUT_WIRED_HEADPHONE ){
++                    ctl->set("Speaker Switch", 0, -1);   /*0 : mute  1: unmute */
++                    ctl->set("Earpiece Switch", 0, 0);   /*0 : mute  1: unmute */
++                    ctl->set("Left Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
++                    ctl->set("Right Headphone Mux", 1, 0); /* 0: Mixer, 1: DAC */
++                    ctl->set("DAC1 Switch", 1, -1);
++                    ctl->set("Headphone Switch", 1, -1); /*0 : mute  1: unmute */
++                    ctl->set("Headphone Volume", 57, -1); /* 0 ~ 63 */
++                }
++            }
++        }
++    }
++
++    if(devices & IMX_IN_CODEC_DEFAULT)
++    {
++        if(selecteddevice == DEVICE_WM8958)
++        {
++            ctl->set("AIF1DAC Mux", 0, 0); /* 0: AIF1DACDAT, 1: AIF3DACDAT */
++            ctl->set("AIF2DAC Mux", 0, 0); /* 0: AIF2DACDAT, 1: AIF3DACDAT */
++
++            if (devices & AudioSystem::DEVICE_IN_WIRED_HEADSET ){
++                ctl->set("IN1R Switch", 0, 0);
++                ctl->set("IN1L Switch", 1, 0);
++                ctl->set("IN1L Volume", 27, 0);
++                ctl->set("MIXINL IN1L Switch", 1, 0);
++                ctl->set("MIXINL IN1L Volume", 1, 0);
++                ctl->set("IN1L PGA IN1LN Switch", 1, 0);
++                ctl->set("ADCL Mux", 0, 0);   /* 0: ADC  1: DMIC */
++                if (mode == AudioSystem::MODE_IN_CALL)
++                {
++                    ctl->set("AIF2DAC2L Mixer Left Sidetone Switch", 1, 0);
++                    ctl->set("Left Sidetone",0, 0);/*0: ADC/DMIC1, 1:DMIC2 */
++                }
++                else
++                    ctl->set("AIF1ADC1L Mixer ADC/DMIC Switch", 1, 0);
++
++            }else if(devices & AudioSystem::DEVICE_IN_BUILTIN_MIC ){
++                ctl->set("IN1L Switch", 0, 0);
++                ctl->set("IN1R Switch", 1, 0);
++                ctl->set("IN1R Volume", 27, 0);
++                ctl->set("MIXINR IN1R Switch", 1, 0);
++                ctl->set("MIXINR IN1R Volume", 1, 0);
++                ctl->set("IN1R PGA IN1RN Switch", 1, 0);
++                ctl->set("IN1R PGA IN1RP Switch", 1, 0);
++                ctl->set("ADCR Mux", 0, 0);   /* 0: ADC  1: DMIC */
++                if (mode == AudioSystem::MODE_IN_CALL)
++                {
++                    ctl->set("AIF2DAC2R Mixer Right Sidetone Switch", 1, 0);
++                    ctl->set("Right Sidetone", 0, 0);/*0: ADC/DMIC1, 1:DMIC2 */
++                }
++                else
++                    ctl->set("AIF1ADC1R Mixer ADC/DMIC Switch", 1, 0);
++            }
++        }
+     }
+-#endif
+ }
+ 
+ void setAlsaControls(alsa_handle_t *handle, uint32_t devices, int mode)
+ {
++    if(!handle->modPrivate) return;
+     AlsaControlSet set = (AlsaControlSet) handle->modPrivate;
+     const char *card = deviceName(handle, devices, mode, 0);
+     set(devices, mode, card);
+@@ -597,13 +829,17 @@ void setAlsaControls(alsa_handle_t *handle, uint32_t devices, int mode)
+ 
+ static status_t s_init(alsa_device_t *module, ALSAHandleList &list)
+ {
+-    LOGD("Initializing devices for IMX ALSA module");
++    LOGD("Initializing devices for IMX51 ALSA module");
+ 
+     list.clear();
+ 
+     for (size_t i = 0; i < ARRAY_SIZE(_defaults); i++) {
+ 
+-        _defaults[i].module = module;
++        _defaults[i].module   = module;
++#ifdef BOARD_IS_PCBA
++        _defaults[i].handle_1 = &modem_handle;
++        _defaults[i].handle_2 = &bt_handle;
++#endif
+         list.push_back(_defaults[i]);
+     }
+ 
+@@ -634,13 +870,19 @@ static status_t s_open(alsa_handle_t *handle, uint32_t devices, int mode)
+         return NO_INIT;
+     }
+ 
++    if(strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI)==0)
++        handle->bufferSize = 6144;
++    else
++        handle->bufferSize = 2048;
++
+     err = setHardwareParams(handle);
+ 
+     if (err == NO_ERROR) err = setSoftwareParams(handle);
+ 
+-    setAlsaControls(handle, devices, mode);
+     LOGI("Initialized ALSA %s device %s", stream, devName);
+ 
++    setAlsaControls(handle, devices, mode);
++
+     handle->curDev = devices;
+     handle->curMode = mode;
+ 
+@@ -668,17 +910,52 @@ static status_t s_route(alsa_handle_t *handle, uint32_t devices, int mode)
+     status_t status = NO_ERROR;
+ 
+     LOGD("route called for devices %08x in mode %d...", devices, mode);
+-    // below Always noting to do, so we open device every time.
++
+     if (handle->handle && handle->curDev == devices && handle->curMode == mode)
+         ; // Nothing to do
+-    else if (handle->handle && (handle->devices & devices))
+-    {
+-        setAlsaControls(handle, devices, mode);
+-        handle->curDev  = devices;
+-        handle->curMode = mode;
++    else if (handle->handle && (handle->devices & devices)) {
++            LOGD("Call setAlsaControls, devices %08x in mode %d...", devices, mode);
++
++            if(mode == AudioSystem::MODE_IN_CALL && (handle->handle_1) && (!handle->handle_1->handle)){
++                status = s_open(handle->handle_1, devices, mode);
++            }
++            else if(mode != AudioSystem::MODE_IN_CALL && (handle->handle_1) && handle->handle_1->handle){
++                status = s_close(handle->handle_1);
++            }
++
++            if((devices & IMX_BT_DEFAULT) && (handle->handle_2) && (!handle->handle_2->handle)){
++                status = s_open(handle->handle_2, devices, mode);
++            }
++            else if((devices & ~IMX_BT_DEFAULT) && (handle->handle_2) && handle->handle_2->handle){
++                status = s_close(handle->handle_2);
++            }
++            if(mode != AudioSystem::MODE_IN_CALL)
++            {
++                if(devices == AudioSystem::DEVICE_OUT_AUX_DIGITAL &&  (!(strcmp(handle->devName,AUDIOCARD_DEVICE_SPDIF)==0 
++                                                    || strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI)==0 ))){
++                    status = s_open(handle, devices, mode);
++                }else if(devices != AudioSystem::DEVICE_OUT_AUX_DIGITAL && (strcmp(handle->devName,AUDIOCARD_DEVICE_SPDIF) == 0
++                                                    || strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI) == 0)){
++                    status = s_open(handle, devices, mode);
++                }
++                else{
++                    setAlsaControls(handle, devices, mode);
++                    handle->curDev  = devices;
++                    handle->curMode = mode;
++                }
++            }else {
++                if(strcmp(handle->devName,AUDIOCARD_DEVICE_SPDIF) == 0 || strcmp(handle->devName,AUDIOCARD_DEVICE_HDMI) == 0)
++                {
++                    status = s_open(handle, AudioSystem::DEVICE_OUT_SPEAKER , mode);
++                }else {
++                    setAlsaControls(handle, devices, mode);
++                    handle->curDev  = devices;
++                    handle->curMode = mode;
++                }
++            }
+     }
+     else {
+-        //LOGE("Why are we routing to a device that isn't supported by this object?!?!?!?!");
++        LOGW("Maybe the route is wrong!!");
+         status = s_open(handle, devices, mode);
+     }
+     return status;
+-- 
+1.8.0
+

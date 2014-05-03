@@ -1,0 +1,408 @@
+From 760cc8b7b11ca3bafa9af79d82bce80b80a25b7c Mon Sep 17 00:00:00 2001
+From: Huang Shijie <b32955@freescale.com>
+Date: Mon, 6 Aug 2012 15:26:57 +0800
+Subject: [PATCH 342/435] ENGR00219494 UART: add RTSCTS test cases
+
+add the RTSCTS test case.
+When we enable the DMA support, we should pass the RTSCTS cases firstly.
+But these cases should be tested by hand. We can not test them automatically.
+
+add the uart_test.c, this file is used in test the uart.
+
+Signed-off-by: Huang Shijie <b32955@freescale.com>
+---
+ test/mxc_uart_test/RTSCTS/uart_rtscts.txt | 119 ++++++++++++++
+ test/mxc_uart_test/RTSCTS/uart_test.c     | 255 ++++++++++++++++++++++++++++++
+ 2 files changed, 374 insertions(+)
+ create mode 100644 test/mxc_uart_test/RTSCTS/uart_rtscts.txt
+ create mode 100644 test/mxc_uart_test/RTSCTS/uart_test.c
+
+diff --git a/test/mxc_uart_test/RTSCTS/uart_rtscts.txt b/test/mxc_uart_test/RTSCTS/uart_rtscts.txt
+new file mode 100644
+index 0000000..65b805a
+--- /dev/null
++++ b/test/mxc_uart_test/RTSCTS/uart_rtscts.txt
+@@ -0,0 +1,119 @@
++1. Theory of the RTS/CTS
++=====================
++
++Many perple confuse on the RTS/CTS.
++Please read the email for Russull King:
++http://marc.info/?l=linux-arm-kernel&m=133554080524774&w=2
++
++"
++Well, theres a lot of confusion over RTS.  Most implementations of it
++are as per this paragraph on the above page:
++
++ A non-standard symmetric alternative, commonly called "RTS/CTS handshaking=,"
++ was developed by various equipment manufacturers. In this scheme, CTS is no
++ longer a response to RTS; instead, CTS indicates permission from the DCE
++ for the DTE to send data to the DCE, and RTS indicates permission from
++ the DTE for the DCE to send data to the DTE. RTS and CTS are controlled
++ by the DTE and DCE respectively, each independent of the other. This was
++ eventually codified in version RS-232-E (actually TIA-232-E by that time)
++ by defining a new signal, "RTR (Ready to Receive)," which is CCITT V.24
++ circuit 133. TIA-232-E and the corresponding international standards were
++ updated to show that circuit 133, when implemented, shares the same pin
++ as RTS (Request to Send), and that when 133 is in use, RTS is assumed by
++ the DCE to be ON at all times
++
++This is what is actually used by all NULL modem cables, serial consoles,
++and many modems can be (sensibly) configured to support it.  Many
++modems can be configured via AT commands to respond as per the above
++paragraph too.
++
++And this is the hardware flow control scheme implemented by the Linux
++Kernel for CRTSCTS, plus the hardware assisted hardware flow control
++provided by industry standard UARTs such as the 1675x and later UARTs.
++"
++
++But the IC guy gave me a simple rule about the RTS/CTS signals:
++  "The RX side controls the Output signal. The TX side just follows the
++  signal of the RX."
++
++2. Connection of the DTE/CTE
++=========================
++
++If we connect a mx28-evk with a mx23-evk, the connection should
++like this:
++
++	+-------------+                   +-------------+
++	|             | 2 -----\/------ 2 |             |
++	|             | 3 -----/\------ 3 |             |
++	|  MX28(DTE)  |                   |  MX23(DTE)  |
++	|             | 7 -----\/------ 7 |             |
++	|             | 8 -----/\------ 8 |             |
++	+-------------+                   +-------------+
++
++
++If we connect a mx28-evk with a mx53-evk(with an AUTOMOTIVE PORT CARD).
++The connection should like this:
++
++	+-------------+                   +-------------+
++	|             | 2 ------------- 2 |             |
++	|             | 3 ------------- 3 |             |
++	|  MX28(DTE)  |                   |  MX53(DCE)  |
++	|             | 7 ------------- 7 |             |
++	|             | 8 ------------- 8 |             |
++	+-------------+                   +-------------+
++
++3. Test cases
++===================
++
++We test the UART with the uart_test application. The uart_test is an internal tool.
++We can only tranfer just one byte.
++
++Just take the mx53 as example to show how to test the RTSCTS feature of
++the driver. (I am testing the mx53 now.)
++
++ ------------------------- test cases begin here ----------------------
++  [1] Use the mx53 as the TX end (use mx28 as RX end).
++	< Case 1 > Start the mx28 first: "uart_test /dev/ttySP1 115200 F R 1 1"
++
++	  In the mx53 side, the uart_startup() will call the ->get_mctrl() to
++	  get the _CURRENT_ state of modem control inputs. The ->get_mctrl()
++	  will return the TIOCM_CTS in this case, since the RTS is asserted
++	  by the mx28. So the uart_startup() will set ->hw_stopped to 0.
++	  When we start the mx53 to send the data, it will send out the
++	  data immediatly without any wait.
++
++	< Case 2 > Start the mx53 first: "uart_test /dev/ttymxc1 115200 F W 1 1"
++
++	  In the mx53 side, the ->get_mctrl() return 0, and the ->hw_stopped
++	  will be set to 1. So the mx53 do not send out the data right now,
++	  it has to wait until the RTS pin is asserted. See the __uart_start()
++	  for the detail.
++
++	  At this time, we can start the mx28 now. It will asserted the mx53's
++	  RTS pin. There is an RTSD interrupt arised in the mx53, the interrupt
++	  hander will detect the change of RTS pin, and it will call the
++	  uart_handle_cts_change() in the end which will send out the data out.
++
++  [2] Use the mx53 as the RX end (use mx28 as TX end).
++	< Case 3 > Start the mx53 first: "uart_test /dev/ttymxc1 115200 F R 1 1"
++
++	  The mx53 will assert the mx28's CTS pin, so the mx28 will send out the
++	  data immediatly.
++
++	< Case 4 > Start the mx28 first: "uart_test /dev/ttySP1 115200 F W 1 1"
++
++	  The mx28 will wait until its CTS pin is asserted.
++	  What about the mx53? When should it asserts the mx28's CTS pin?
++	  The CTSC(UCR2) controls the operation of the CTS output pin.
++	  When the mx53 is ready, it can set the CTSC bit which will assert
++	  the mx28's CTS pin.
++ ------------------------- test cases end here -----------------------
++
++The driver should passes all the four test cases!
++
++4. Enable the DMA for uart
++==========================
++
++If the uart driver supports the DMA tranfer, it should also passed the
++four test cases above. Also you should try to tranfer more bytes,
++not just only  byte.
+diff --git a/test/mxc_uart_test/RTSCTS/uart_test.c b/test/mxc_uart_test/RTSCTS/uart_test.c
+new file mode 100644
+index 0000000..00f30f7
+--- /dev/null
++++ b/test/mxc_uart_test/RTSCTS/uart_test.c
+@@ -0,0 +1,255 @@
++/*
++ * Copyright (C) 2012 Freescale Semiconductor, Inc. All rights reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++#include <stdio.h>
++#include <unistd.h>
++#include <termios.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++
++static int uart_speed(int s)
++{
++	switch (s) {
++	case 9600:
++		return B9600;
++	case 19200:
++		return B19200;
++	case 38400:
++		return B38400;
++	case 57600:
++		return B57600;
++	case 115200:
++		return B115200;
++	case 230400:
++		return B230400;
++	case 460800:
++		return B460800;
++	case 500000:
++		return B500000;
++	case 576000:
++		return B576000;
++	case 921600:
++		return B921600;
++	case 1000000:
++		return B1000000;
++	case 1152000:
++		return B1152000;
++	case 1500000:
++		return B1500000;
++	case 2000000:
++		return B2000000;
++	case 2500000:
++		return B2500000;
++	case 3000000:
++		return B3000000;
++	case 3500000:
++		return B3500000;
++	case 4000000:
++		return B4000000;
++	default:
++		return B0;
++	}
++}
++
++int set_speed(int fd, struct termios *ti, int speed)
++{
++	cfsetospeed(ti, uart_speed(speed));
++	cfsetispeed(ti, uart_speed(speed));
++	if (tcsetattr(fd, TCSANOW, ti) < 0) {
++		perror("Can't set speed");
++		return -1;
++	}
++	printf("Speed set to %d\n", speed);
++	return 0;
++}
++
++int set_flow_control(int fd, struct termios *ti, int flow_control)
++{
++	if (flow_control)
++		ti->c_cflag |= CRTSCTS;
++	else
++		ti->c_cflag &= ~CRTSCTS;
++
++	if (tcsetattr(fd, TCSANOW, ti) < 0) {
++		perror("Can't set flow control");
++		return -1;
++	}
++	printf("%sUsing flow control\n", (flow_control? "" : "NOT "));
++	return 0;
++}
++
++int init_uart(char *dev, struct termios *ti)
++{
++	int fd, i;
++	unsigned long flags = 0;
++
++	fd = open(dev, O_RDWR |  O_NOCTTY);
++	if (fd < 0) {
++		perror("Can't open serial port");
++		return -1;
++	}
++
++	tcflush(fd, TCIOFLUSH);
++
++	if (tcgetattr(fd, ti) < 0) {
++		perror("Can't get port settings");
++		return -1;
++	}
++
++	cfmakeraw(ti);
++	printf("Serial port %s opened\n", dev);
++	return fd;
++}
++#define STR(X) #X
++#define XSTR(X) STR(X)
++
++
++int CHUNK_SIZE = 1024;
++int CHUNKS = 100;
++
++#define RECORDS	20
++static int record[RECORDS];
++
++void real_op(int fd, char op)
++{
++	int nfds;
++	char tmp[1024];
++	int i = 0, j = -1, k = 0, r;
++	size_t count, total = 0, max = 0, min = 0;
++	char *opstr = (op == 'R' ? "reading" : "writing");
++	fd_set rfds;
++	struct timeval tv;
++
++	nfds = fd;
++	tv.tv_sec = 15;
++	tv.tv_usec = 0;
++
++	printf("Hit enter to start %s\n", opstr);
++	read(STDIN_FILENO, tmp, 3);
++
++	/* init buffer */
++	if (op == 'W') {
++		for (i = 0; i < CHUNK_SIZE; i++)
++			tmp[i] = (i + 1) % 0x100;
++		i = 0;
++	}
++
++	while (total < (CHUNK_SIZE * CHUNKS) && k < 10)
++	{
++		i++;
++		if (op == 'R') {
++			/*
++			FD_ZERO(&rfds);
++			FD_SET(fd, &rfds);
++			r = select(nfds + 1, &rfds, NULL, NULL, &tv);
++			*/
++			r = 1;
++			/* clear it first */
++			memset(tmp, 0, sizeof(tmp));
++			if (r > 0)
++				count = read(fd, tmp, CHUNK_SIZE);
++			else {
++				printf("timeout\n");
++				count = 0;
++			}
++		} else
++			count = write(fd, tmp, CHUNK_SIZE);
++
++#ifdef ANDROID
++		if (count > SSIZE_MAX)
++#else
++		if (count < 0)
++#endif
++		{
++			printf("\nError while %s: %d attempt %d\n",
++				opstr, (int)count, i);
++			k++;
++		} else {
++			total += count;
++
++			if (op == 'R') {
++				int v;
++				static int sum = 0;
++				int bad = 0;
++
++				for (v = 0; v < CHUNK_SIZE && v < count; v++, sum++) {
++					if (tmp[v] == (((sum % CHUNK_SIZE) + 1) % 0x100)) {
++						continue;
++					} else {
++						bad = 1;
++						printf("%d (should be %x): but %x\n",
++							v, ((sum % CHUNK_SIZE) + 1) % 0x100, tmp[v]);
++					}
++				}
++
++				if (count > 0)
++					printf(":)[ %d ] READ is %s, count : %d\n",
++						i, bad ? "bad!!!" : "good.", count);
++				else if (count == 0)
++					printf("We read 0 byte\n");
++			}
++			if (count == 0)
++				k++;
++		}
++	}
++	close(fd);
++	printf("\ndone : total : %d\n", total);
++
++	if (k > 0)
++		printf("too many errors or empty %ss\n", opstr);
++
++	if (i == CHUNKS)
++		printf("\t %s : %d calls issued, %d bytes per call\n",
++			opstr, CHUNKS, CHUNK_SIZE);
++	else
++		printf("\t%d %s calls isued\n"
++			"\t total : %d\n",
++			i, opstr, total);
++}
++
++int main(int argc, char* argv[])
++{
++	if (argc < 6)
++		printf("Usage:\n\t%s <PORT> <BAUDRATE> <FLOWCONTROL> <READ/WRITE> X Y\n"
++			"X : the group number\n"
++			"Y : the group size\n\n"
++			"For example:\n"
++			"in mx23, send one byte:\n"
++			"         ./uart2 /dev/ttySP1 115200 F W 1 1\n\n"
++			"in mx28, receive one byte:\n"
++			"         ./uart2 /dev/ttySP0 115200 F R 1 1\n\n"
++			"in mx53-evk(with the extension card), receive one byte:\n"
++			"         ./uart2 /dev/ttymxc1 115200 F R 1 1\n\n"
++			,
++			argv[0]);
++	else {
++		struct termios ti;
++		int fd = init_uart(argv[1], &ti);
++
++		CHUNKS = atoi(argv[5]);
++		if (CHUNKS < 0) {
++			printf("error chunks, %d\n", CHUNKS);
++			return 1;
++		}
++
++		CHUNK_SIZE  = atoi(argv[6]);
++
++		if (fd >= 0 && !set_speed(fd, &ti, atoi(argv[2]))
++			&& !set_flow_control(fd, &ti, ((argv[3][0] & (~0x20))=='F')))
++		{
++			char op = argv[4][0] & (~0x20);
++			real_op(fd, op);
++		}
++	}
++	return 0;
++}
+-- 
+1.8.0
+

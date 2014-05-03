@@ -1,0 +1,185 @@
+From 7f802676c899daef49347dd22aeab0f6fde32c6b Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Wed, 2 Nov 2011 12:01:36 +0800
+Subject: [PATCH 199/486] ENGR00161214 Add rotation buffer allocation in hwc
+
+reduce the dma allocation in ipu lib
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx5x/hwcomposer/blit_ipu.cpp | 104 ++++++++++++++++++++++++++++++++++++++++++-
+ mx5x/hwcomposer/blit_ipu.h   |   7 ++-
+ 2 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/mx5x/hwcomposer/blit_ipu.cpp b/mx5x/hwcomposer/blit_ipu.cpp
+index 803b3b6..973a079 100755
+--- a/mx5x/hwcomposer/blit_ipu.cpp
++++ b/mx5x/hwcomposer/blit_ipu.cpp
+@@ -19,12 +19,17 @@
+ 
+ #include <fcntl.h>
+ #include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
+ 
+ #include <cutils/log.h>
+ #include <cutils/atomic.h>
+ 
+ #include <hardware/hwcomposer.h>
+ 
++#include <linux/android_pmem.h>
++
+ #include <EGL/egl.h>
+ #include "gralloc_priv.h"
+ #include "hwc_common.h"
+@@ -32,6 +37,9 @@
+ extern "C" {
+ #include "mxc_ipu_hl_lib.h"
+ }
++
++#define PMEMDEV    "/dev/pmem_adsp"
++
+ /*****************************************************************************/
+ using namespace android;
+ 
+@@ -65,8 +73,15 @@ int blit_ipu::init()//, hwc_layer_t *layer, struct output_device *output
+ int blit_ipu::uninit()
+ {
+ 	  //int status = -EINVAL;
++    //Free the phy rotation buffer 
++    if(mRotPhyBuffer != 0){
++       returnPmemBuffer(mRotVirBuffer, mRotSize);
++       mRotSize = 0;
++       mRotVirBuffer = NULL;
++       mRotPhyBuffer = 0;
++    }
+ 
+-	  return 0;
++    return 0;
+ }
+ 
+ static void fill_buffer(char *pbuf, int len)
+@@ -213,6 +228,40 @@ HWCOMPOSER_LOG_RUNTIME("^^^^^^^^handle->format= RGBP");
+     mIPUOutputParam.rot = layer->transform;
+     if(out_buf->usage & GRALLOC_USAGE_HWC_OVERLAY_DISP1) mIPUOutputParam.rot = 0;
+ 
++    //If there is a rotation need, we need allocate a rotation buffer for ipu usage
++    //IPU lib support internal allocation for this buffer
++    //to avoid the usage of dma buffer, we allocate externally
++    if(mIPUOutputParam.rot != 0){
++        int rotPhySize = mIPUOutputParam.width*mIPUOutputParam.height*fmt_to_bpp(mIPUOutputParam.fmt)/8;
++        rotPhySize = (rotPhySize + getpagesize()-1) & ~(getpagesize()-1);
++        if(rotPhySize != mRotSize){
++            //Free the phy buffer firstly
++            if(mRotPhyBuffer != 0){
++                returnPmemBuffer(mRotVirBuffer, mRotSize);
++                mRotSize = 0;
++                mRotVirBuffer = NULL;
++                mRotPhyBuffer = 0;
++
++            }
++
++            if(getPmemBuffer(rotPhySize, &mRotVirBuffer, &mRotPhyBuffer) >= 0){
++                HWCOMPOSER_LOG_INFO("getPmemBuffer: 0x%p, 0x%x", mRotVirBuffer, mRotPhyBuffer);
++                mRotSize = rotPhySize;
++            }
++            else{
++                mRotSize = 0;
++                mRotVirBuffer = NULL;
++                mRotPhyBuffer = 0;
++            }
++        }
++
++        //set the buffer to ipu handle
++        if((mRotSize != 0)&&(mRotPhyBuffer != 0)){
++           mIPUHandle.rotbuf_phy_start[0] = (void *)mRotPhyBuffer; 
++           mIPUHandle.rotfr_size = mRotSize;
++        }
++    }
++
+     mIPUOutputParam.user_def_paddr[0] = out_buf->phy_addr;
+ HWCOMPOSER_LOG_RUNTIME("------mxc_ipu_lib_task_init-----in blit_ipu::blit()------\n");
+     if(out_buf->usage & GRALLOC_USAGE_DISPLAY_MASK)
+@@ -235,3 +284,56 @@ HWCOMPOSER_LOG_RUNTIME("------mxc_ipu_lib_task_uninit-----in blit_ipu::blit()---
+         HWCOMPOSER_LOG_RUNTIME("^^^^^^^^^^^^^^^blit_ipu::blit()^^end^^^^^^^^^^^^^^^^^^^^");
+ 	  return status;
+ }
++
++int blit_ipu::getPmemBuffer(int size, void **ppVirBuffer, unsigned int *phyBuffer)
++{
++    int ret;
++    int fd_pmem = 0;
++    struct pmem_region region;
++
++    fd_pmem = open(PMEMDEV, O_RDWR, 0);
++    if(fd_pmem < 0) {
++        HWCOMPOSER_LOG_ERR("Error!Cannot open pmem fd for getPmemBuffer");
++        return -1;
++    }
++    
++    ret = ioctl(fd_pmem, PMEM_GET_TOTAL_SIZE, &region);
++    if (ret < 0) {
++        HWCOMPOSER_LOG_ERR("Cannot get PMEM total size!");
++        close(fd_pmem);
++        return -1;
++    }
++
++    if (region.len <= 0) {
++        HWCOMPOSER_LOG_ERR("PMEM total size smaller than zero!");
++        close(fd_pmem);
++        return -1;
++    }
++
++    *ppVirBuffer = mmap(0, size,
++            PROT_READ|PROT_WRITE, MAP_SHARED, fd_pmem, 0);
++
++    if (*ppVirBuffer == MAP_FAILED) {
++        HWCOMPOSER_LOG_ERR("Error!cannot map the pmem buffer");
++        close(fd_pmem);
++        return -1;
++    }
++
++    memset(&region, 0, sizeof(region));
++    if (ioctl(fd_pmem, PMEM_GET_PHYS, &region) == -1) {
++        munmap(*ppVirBuffer, size);
++        HWCOMPOSER_LOG_ERR("Error!cannot map the pmem buffer"); 
++        close(fd_pmem);
++        return -1;
++    }
++    *phyBuffer = (unsigned long)region.offset;
++    close(fd_pmem); 
++    return 0;
++}
++
++int blit_ipu::returnPmemBuffer(void *pVirBuffer, unsigned int size)
++{
++    munmap(pVirBuffer, size); 
++    return 0;
++}
++
+diff --git a/mx5x/hwcomposer/blit_ipu.h b/mx5x/hwcomposer/blit_ipu.h
+index 15d163e..e870d7b 100755
+--- a/mx5x/hwcomposer/blit_ipu.h
++++ b/mx5x/hwcomposer/blit_ipu.h
+@@ -49,11 +49,16 @@ private:
+ 		ipu_lib_input_param_t  mIPUInputParam;
+     ipu_lib_output_param_t mIPUOutputParam;
+     ipu_lib_handle_t       mIPUHandle;
++    unsigned int mRotSize;
++    unsigned int mRotPhyBuffer;
++    void *mRotVirBuffer;
++
+ //    int                    mIPURet;
+ private:
+ 		int init();
+     int uninit();
+-
++    int getPmemBuffer(int size, void **ppVirBuffer, unsigned int *phyBuffer);
++    int returnPmemBuffer(void *pVirBuffer, unsigned int size); 
+ 		blit_ipu& operator = (blit_ipu& out);
+ 		blit_ipu(const blit_ipu& out);
+ };
+-- 
+1.8.0
+

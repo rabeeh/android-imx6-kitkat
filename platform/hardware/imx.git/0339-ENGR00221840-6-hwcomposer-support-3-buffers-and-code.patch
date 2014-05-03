@@ -1,0 +1,114 @@
+From 80ea96a26725e633518b4cb0c72a3f0e4df1b9ba Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Wed, 8 Aug 2012 10:27:45 +0800
+Subject: [PATCH 339/486] ENGR00221840-6 hwcomposer: support 3 buffers and
+ code refine.
+
+check the function before call it.
+add support for 3 buffers to avoid flicker.
+
+Change-Id: If25a2e771c8e6e30e8d4c1b94da6b5fb9a258be0
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ mx6/hwcomposer/blit_ipu.cpp            |  3 ++-
+ mx6/hwcomposer/hwcomposer.cpp          | 12 ++++++++----
+ mx6/libgralloc_wrapper/framebuffer.cpp |  1 +
+ 3 files changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/mx6/hwcomposer/blit_ipu.cpp b/mx6/hwcomposer/blit_ipu.cpp
+index 1ff2da9..24423ed 100755
+--- a/mx6/hwcomposer/blit_ipu.cpp
++++ b/mx6/hwcomposer/blit_ipu.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <fcntl.h>
+ #include <errno.h>
++#include <string.h>
+ 
+ #include <cutils/log.h>
+ #include <cutils/atomic.h>
+@@ -60,7 +61,7 @@ int blit_ipu::init()//, hwc_layer_t *layer, struct output_device *output
+ 	int status = -EINVAL;
+     mIpuFd = open("/dev/mxc_ipu", O_RDWR, 0);
+     if(mIpuFd < 0) {
+-        HWCOMPOSER_LOG_ERR("%s:%d,open ipu dev failed", __FUNCTION__, __LINE__);
++        HWCOMPOSER_LOG_ERR("%s:%d,open ipu dev failed:%s", __FUNCTION__, __LINE__, strerror(errno));
+         return status;
+     }
+ 
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index 51ac062..29a37ae 100755
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -30,6 +30,8 @@
+ #include "gralloc_priv.h"
+ #include "hwc_common.h"
+ /*****************************************************************************/
++
++
+ using namespace android;
+ 
+ struct hwc_context_t {
+@@ -64,7 +66,7 @@ hwc_module_t HAL_MODULE_INFO_SYM = {
+         version_major: 1,
+         version_minor: 0,
+         id: HWC_HARDWARE_MODULE_ID,
+-        name: "Sample hwcomposer module",
++        name: "Freescale i.MX hwcomposer module",
+         author: "The Android Open Source Project",
+         methods: &hwc_module_methods,
+     }
+@@ -434,7 +436,7 @@ static int hwc_prepare(hwc_composer_device_t *dev, hwc_layer_list_t* list) {
+ 
+     struct hwc_context_t *ctx = (struct hwc_context_t *)dev;
+     if(ctx) {
+-        if(ctx->viv_hwc)
++        if(ctx->viv_hwc && ctx->viv_hwc->prepare)
+             ctx->viv_hwc->prepare(ctx->viv_hwc, list);
+ 	//hwc_check_property(ctx);
+     }
+@@ -570,18 +572,19 @@ static int hwc_set(hwc_composer_device_t *dev,
+     //when displayhardware do releas function, it will come here.
+     if(ctx && (dpy == NULL) && (sur == NULL) && (list == NULL)) {
+ 	//close the output device.
+-        if(ctx->viv_hwc)
++        if(ctx->viv_hwc && ctx->viv_hwc->set)
+             ctx->viv_hwc->set(ctx->viv_hwc, dpy, sur, list);
+ 	releaseAllOutput(ctx);
+ 	//ctx->display_mode_changed = 1;
+ 
+ 	return 0;
+     }
++
+     ctx->ui_refresh = 1;
+     ctx->vd_refresh = 1;
+     if((ctx == NULL) || (ctx && ctx->ui_refresh)) {
+         EGLBoolean sucess;
+-        if(ctx->viv_hwc)
++        if(ctx->viv_hwc && ctx->viv_hwc->set)
+             sucess = !ctx->viv_hwc->set(ctx->viv_hwc, dpy, sur, list);
+         else
+             sucess = eglSwapBuffers((EGLDisplay)dpy, (EGLSurface)sur);
+@@ -589,6 +592,7 @@ static int hwc_set(hwc_composer_device_t *dev,
+             return HWC_EGL_ERROR;
+         }
+     }
++
+     if(list == NULL || dev == NULL || !ctx->vd_refresh) {
+     	return 0;
+     }
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 0fc4859..b7b947e 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -695,6 +695,7 @@ static void fb_device_init(private_module_t* m, fb_context_t *dev)
+     const_cast<float&>(dev->device.fps) = m->fps;
+     const_cast<int&>(dev->device.minSwapInterval) = 1;
+     const_cast<int&>(dev->device.maxSwapInterval) = 1;
++    const_cast<int &>(dev->device.bufferCount) = NUM_BUFFERS;
+ 
+ }
+ 
+-- 
+1.8.0
+

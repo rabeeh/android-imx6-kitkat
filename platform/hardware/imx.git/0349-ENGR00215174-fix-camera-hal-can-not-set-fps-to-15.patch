@@ -1,0 +1,97 @@
+From 1aad3c744718cf9497c1cc253f3e056af427ddcb Mon Sep 17 00:00:00 2001
+From: Xiaowen Liu <b37945@freescale.com>
+Date: Mon, 8 Oct 2012 16:55:37 +0800
+Subject: [PATCH 349/486] ENGR00215174 fix camera hal can not set fps to 15.
+
+reason: legacy function setPreviewFrameRate still used in framework
+        code to set sensor fps. The recommend function getPreviewFpsRange
+        only use in CTS code. So, set fps only depend on getPreviewFpsRange
+        can not work effectively.
+
+solution: add getPreviewFrameRate code to get frame rate and check if the
+          frame rate value is changed compared to local value.
+          If the value changed, then setPreviewFpsRange to the right fps
+          range value. Because the setPreviewFrameRate and setPreviewFpsRange
+          will not be used at the same to set fps.
+
+Change-Id: I71e7bca9637c3a1372dc9bcc1df4a123391578cb
+Signed-off-by: Xiaowen Liu <b37945@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp | 31 +++++++++++++++++++++++--------
+ mx6/libcamera/CameraHal.h   |  2 +-
+ 2 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 018c674..f114071 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -610,11 +610,11 @@ namespace android {
+         return setParameters(parameters);
+     }
+ 
+-    status_t  CameraHal:: setParameters(const CameraParameters& params)
++    status_t  CameraHal:: setParameters(CameraParameters& params)
+     {
+         CAMERA_LOG_FUNC;
+         int w, h;
+-        int framerate;
++        int framerate, local_framerate;
+         int max_zoom,zoom, max_fps, min_fps;
+         char tmp[128];
+         Mutex::Autolock lock(mLock);
+@@ -653,18 +653,33 @@ namespace android {
+             return BAD_VALUE;
+         }
+ 
++        params.getPreviewFpsRange(&min_fps, &max_fps);
++        CAMERA_LOG_INFO("FPS range: %d - %d",min_fps, max_fps);
++        if (max_fps < 1000 || min_fps < 1000 || max_fps > 33000 || min_fps > 33000){
++            CAMERA_LOG_ERR("The fps range from %d to %d is error", min_fps, max_fps);
++            return BAD_VALUE;
++        }
++
++        local_framerate = mParameters.getPreviewFrameRate();
++        CAMERA_LOG_INFO("get local frame rate:%d FPS", local_framerate);
++        if ((local_framerate > 30) || (local_framerate < 0) ){
++            CAMERA_LOG_ERR("The framerate is not corrected");
++            local_framerate = 15;
++        }
++
+         framerate = params.getPreviewFrameRate();
+         CAMERA_LOG_INFO("Set frame rate:%d FPS", framerate);
+         if ((framerate > 30) || (framerate < 0) ){
+             CAMERA_LOG_ERR("The framerate is not corrected");
+             return BAD_VALUE;
+         }
+-
+-        params.getPreviewFpsRange(&min_fps, &max_fps);
+-        CAMERA_LOG_INFO("FPS range: %d - %d",min_fps, max_fps);
+-        if (max_fps < 1000 || min_fps < 1000 || max_fps > 33000 || min_fps > 33000){
+-            CAMERA_LOG_ERR("The fps range from %d to %d is error", min_fps, max_fps);
+-            return BAD_VALUE;
++        else if(local_framerate != framerate) {
++            if(framerate == 15) {
++                params.set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "12000,17000");
++            }
++            else if (framerate == 30) {
++                params.set(CameraParameters::KEY_PREVIEW_FPS_RANGE, "25000,33000");
++            }
+         }
+ 
+         const char *pFlashStr;
+diff --git a/mx6/libcamera/CameraHal.h b/mx6/libcamera/CameraHal.h
+index 22f8e23..69a00b0 100755
+--- a/mx6/libcamera/CameraHal.h
++++ b/mx6/libcamera/CameraHal.h
+@@ -131,7 +131,7 @@ namespace android {
+         virtual status_t    takePicture();
+         virtual status_t    cancelPicture();
+         virtual status_t    dump(int fd) const;
+-        virtual status_t    setParameters(const CameraParameters& params);
++        virtual status_t    setParameters(CameraParameters& params);
+         virtual status_t    setParameters(const char* params);
+         virtual char*  getParameters() const;
+         void putParameters(char *);
+-- 
+1.8.0
+

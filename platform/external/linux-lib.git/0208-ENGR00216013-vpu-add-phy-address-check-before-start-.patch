@@ -1,0 +1,137 @@
+From b8f5aa2fe58974458a1beb3f06cffa8053ef98a9 Mon Sep 17 00:00:00 2001
+From: Zhang Jiejing <jiejing.zhang@freescale.com>
+Date: Fri, 6 Jul 2012 18:11:29 +0800
+Subject: [PATCH 208/249] ENGR00216013 vpu: add phy address check before start
+ use.
+
+this patch is adding a protection for vpu, the address of framebuffer
+was passed by other driver, like GPU in android, VPU will use
+this address to decode to do direction render to archive perfomance.
+
+But this address maybe not a valid phy address, if this happens,
+VPU will access this address, and system will hang.
+
+This patch is adding a protection for this, since VPU only
+can access phy address, add this check before start using it.
+
+the check is in two phase,
+1. if memory address allocated by vmalloc, (kernel vmalloc,
+  or user space memory).
+2. if the memory in the DDR's address, if it's access beyond
+  DDR size, the check will stop.
+
+With this protection, we can replace the hang with a error reported.
+so we know the memory given by other(GPU) is wrong,
+rather than Hang without any information.
+
+Signed-off-by: Zhang Jiejing <jiejing.zhang@freescale.com>
+---
+ vpu/vpu_io.c  | 37 +++++++++++++++++++++++++++++++++++++
+ vpu/vpu_io.h  |  4 +++-
+ vpu/vpu_lib.c |  8 ++++++++
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index 7fe4abd..c65ceeb 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -541,6 +541,43 @@ int IOFreePhyMem(vpu_mem_desc * buff)
+ }
+ 
+ /*!
++ * @brief check phy memory prepare to pass to vpu is valid or not, we
++ * already address some issue that if pass a wrong address to vpu
++ * (like virtual address), system will hang.
++ *
++ * @return true return is a valid phy memory address, false return not.
++ */
++int IOPhyMemCheck(unsigned long phyaddr, const char *name)
++{
++	unsigned long va_addr;
++	vpu_mem_desc buff;
++	int result;
++
++	memset(&buff, 0, sizeof(buff));
++	buff.phy_addr = phyaddr;
++	if (ioctl(vpu_fd, VPU_IOC_PHYMEM_CHECK, &buff)) {
++#ifdef BUILD_FOR_ANDROID
++		LOGE("phy memory check failed!:%s\n", strerror(errno));
++#endif
++		err_msg("phy memory check failed!:%s\n", strerror(errno));
++		/* if driver don't support this feature, just ignore
++		 * it by return turn to bypass the check. */
++		return true;
++	}
++	/* borrow .size to pass back result. */
++	result = buff.size;
++	dprintf(3, "memory phy: %s: %p va:%p %s phy memory",
++	     name, buff.phy_addr, buff.virt_uaddr, result ? "is" : "isn't");
++#ifdef BUILD_FOR_ANDROID
++	if (result == false)
++		LOGE("memory phy: %s: %p va:%p %s phy memory",
++		     name, buff.phy_addr, buff.virt_uaddr, result ? "is" : "isn't");
++#endif
++
++	return result;
++}
++
++/*!
+  * @brief Map physical memory to user space.
+  *
+  * @param	buff	the structure containing memory information to be mapped.
+diff --git a/vpu/vpu_io.h b/vpu/vpu_io.h
+index d6c3fe6..e04507d 100644
+--- a/vpu/vpu_io.h
++++ b/vpu/vpu_io.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -61,6 +61,7 @@ typedef struct iram_t {
+ #define VPU_IOC_GET_SHARE_MEM   _IO(VPU_IOC_MAGIC, 12)
+ #define VPU_IOC_QUERY_BITWORK_MEM  _IO(VPU_IOC_MAGIC, 13)
+ #define VPU_IOC_SET_BITWORK_MEM    _IO(VPU_IOC_MAGIC, 14)
++#define VPU_IOC_PHYMEM_CHECK	_IO(VPU_IOC_MAGIC, 15)
+ 
+ typedef void (*vpu_callback) (int status);
+ 
+@@ -72,6 +73,7 @@ int IOGetVirtMem(vpu_mem_desc * buff);
+ int IOFreeVirtMem(vpu_mem_desc * buff);
+ int IOGetVShareMem(int size);
+ int IOWaitForInt(int timeout_in_ms);
++int IOPhyMemCheck(unsigned long phyaddr, const char *name);
+ int IOGetIramBase(iram_t * iram);
+ int IOClkGateSet(int on);
+ int IOGetPhyShareMem(vpu_mem_desc * buff);
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index dd039e7..ab38999 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -3213,6 +3213,12 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 	} else {
+ 		/* none mx27 platform case need to swap word */
+ 		for (i = 0; i < num; i += 2) {
++			if (!IOPhyMemCheck(bufArray[i].bufY, "bufY"))
++				return RETCODE_INVALID_FRAME_BUFFER;
++			if (!IOPhyMemCheck(bufArray[i].bufCb, "bufCb"))
++				return RETCODE_INVALID_FRAME_BUFFER;
++			if (!IOPhyMemCheck(bufArray[i].bufCr, "bufCr"))
++				return RETCODE_INVALID_FRAME_BUFFER;
+ 			virt_paraBuf[i * 3] = bufArray[i].bufCb;
+ 			virt_paraBuf[i * 3 + 1] = bufArray[i].bufY;
+ 			virt_paraBuf[i * 3 + 3] = bufArray[i].bufCr;
+@@ -3226,6 +3232,8 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 				    STD_AVC)
+ 					virt_paraBuf[96 + i] =
+ 					    bufArray[i + 1].bufMvCol;
++				if (!IOPhyMemCheck(bufArray[i + 1].bufMvCol, "bufMvCol"))
++					return RETCODE_INVALID_FRAME_BUFFER;
+ 			}
+ 		}
+ 		if (pDecInfo->openParam.bitstreamFormat == STD_VC1 ||
+-- 
+1.8.0
+

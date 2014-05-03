@@ -1,0 +1,131 @@
+From 21724a1d3ab916bddf10657a897b24c68f9bdcff Mon Sep 17 00:00:00 2001
+From: Shi Wenjun <b42754@freescale.com>
+Date: Thu, 8 Nov 2012 09:18:57 +0800
+Subject: [PATCH 097/281] ENGR00232938 Integrate ZTE 3G modem.
+
+1, Remove libreference path in init.rc. Set the path in rild.
+2, Start pppd according to "gsm.version.ril-impl" property.
+
+Change-Id: I3e2950f256ef918ef18e8312b9e0ebf742faa4e9
+Signed-off-by: Shi Wenjun <b42754@freescale.com>
+---
+ imx6/etc/init.rc            |  2 +-
+ imx6/etc/ppp/init.gprs-pppd | 65 ++++++++++++++++++++++++++++++++++++++-------
+ imx6/imx6.mk                |  5 ++++
+ 3 files changed, 62 insertions(+), 10 deletions(-)
+
+diff --git a/imx6/etc/init.rc b/imx6/etc/init.rc
+index 9bf386e..ecd5017 100755
+--- a/imx6/etc/init.rc
++++ b/imx6/etc/init.rc
+@@ -576,7 +576,7 @@ service hostapd /system/bin/hostapd /data/misc/wifi/hostapd.conf
+     oneshot
+     disabled
+ 
+-service ril-daemon /system/bin/rild -l /system/lib/libreference-ril.so
++service ril-daemon /system/bin/rild
+     class main
+     socket rild stream 660 root radio
+     socket rild-debug stream 660 radio system
+diff --git a/imx6/etc/ppp/init.gprs-pppd b/imx6/etc/ppp/init.gprs-pppd
+index 7ee5e77..790f65c 100755
+--- a/imx6/etc/ppp/init.gprs-pppd
++++ b/imx6/etc/ppp/init.gprs-pppd
+@@ -10,17 +10,65 @@
+ PPPD_PID=
+ 
+ /system/bin/setprop "net.gprs.ppp-exit" ""
++ril_impl=`/system/bin/getprop gsm.version.ril-impl`
+ 
+-/system/bin/log -t pppd "Starting pppd"
++case "$ril_impl" in
++"ZTE_RIL_W_GENERAL_V02B01")
++		private_username=`/system/bin/getprop ril.private.username`
+ 
+-#/system/xbin/pppd $*
+-# pppd was put into /system/bin instead of /system/xbin after SDK1.6
+-if ls /dev/ttyUSB0 > /dev/null 2>&1; then
+-    /system/bin/pppd  /dev/ttyUSB0 115200 mru 1280 mtu 1280 nodetach debug dump defaultroute usepeerdns novj novjccomp noipdefault ipcp-accept-local ipcp-accept-remote connect-delay 5000 linkname ppp0
+-else
+-   /system/bin/pppd ttyACM0 921600 nodetach noauth noipdefault defaultroute usepeerdns linkname ppp0 connect "chat -v '' AT OK ATD*99***1# CONNECT" debug
+-fi
++		private_password=`/system/bin/getprop ril.private.password`
+ 
++		private_auth_type=`/system/bin/getprop ril.private.authtype`
++
++		dev_path=`/system/bin/getprop ril.data.device.path`
++
++		cmdline=$dev_path" /dev/ttyUSB2 115200 mru 1280 mtu 1280 nodetach debug dump defaultroute usepeerdns novj novjccomp noipdefault ipcp-accept-local ipcp-accept-remote ipcp-max-configure 30 ipcp-max-failure 30 connect-delay 5000 lcp-restart 1 lcp-max-terminate 1 linkname ppp0 "
++
++		case "$private_username" in
++		"")
++
++		;;
++		*)
++		cmdline=$cmdline" name "$private_username
++		;;
++		esac
++
++		case "$private_password" in
++		"")
++
++		;;
++		*)
++
++		cmdline=$cmdline" password "$private_password
++		;;
++		esac
++
++		echo "here starts pppd..."
++		echo $cmdline
++		/system/bin/log -t pppd $cmdline
++		#/system/xbin/pppd $*
++		# pppd was put into /system/bin instead of /system/xbin after SDK1.6
++
++
++		#below is config for ZTE CDMA modem
++		#/system/bin/pppd  /dev/ttyUSB0 115200 mru 1280 mtu 1280 nodetach debug dump defaultroute usepeerdns novj novjccomp noipdefault ipcp-accept-local ipcp-accept-remote connect-delay 5000 linkname ppp0 name "card" password "card"
++
++		#below is config for general network
++		/system/bin/pppd $cmdline
++		;;
++
++"AMAZON reference-ril 1.0")
++		/system/bin/pppd ttyACM0 921600 nodetach noauth noipdefault defaultroute usepeerdns linkname ppp0 connect "chat -v '' AT OK ATD*99***1# CONNECT" debug
++		;;
++
++"HUAWEI reference-ril 1.0")
++		/system/bin/pppd  /dev/ttyUSB0 115200 mru 1280 mtu 1280 nodetach debug dump defaultroute usepeerdns novj novjccomp noipdefault ipcp-accept-local ipcp-accept-remote connect-delay 5000 linkname ppp0
++		;;
++
++		*)
++		echo ""net.gprs.ppp-exit" not set yet"
++		;;
++esac
+ 
+ PPPD_EXIT=$?
+ PPPD_PID=$!
+@@ -28,4 +76,3 @@ PPPD_PID=$!
+ /system/bin/log -t pppd "pppd exited with $PPPD_EXIT"
+ 
+ /system/bin/setprop "net.gprs.ppp-exit" "$PPPD_EXIT"
+-
+diff --git a/imx6/imx6.mk b/imx6/imx6.mk
+index 941f88c..fc53834 100644
+--- a/imx6/imx6.mk
++++ b/imx6/imx6.mk
+@@ -259,6 +259,11 @@ PRODUCT_PACKAGES += \
+ 
+ PRODUCT_AAPT_CONFIG := normal mdpi
+ 
++# ril related libs
++PRODUCT_PACKAGES += \
++	libreference-ril-zte.so \
++	libruntime-ril-port
++
+ PRODUCT_COPY_FILES +=	\
+ 	device/fsl/common/input/Dell_Dell_USB_Keyboard.kl:system/usr/keylayout/Dell_Dell_USB_Keyboard.kl \
+ 	device/fsl/common/input/Dell_Dell_USB_Keyboard.idc:system/usr/idc/Dell_Dell_USB_Keyboard.idc \
+-- 
+1.8.0
+

@@ -1,0 +1,2374 @@
+From f123d4cfa803bb7d6d19343641739e68858874ae Mon Sep 17 00:00:00 2001
+From: Quinn Jensen <quinn.jensen@freescale.com>
+Date: Wed, 19 Nov 2008 17:10:47 -0700
+Subject: [PATCH 062/435] ENGR00102262 Add MC34704 PMIC test program
+
+Add a test program for MC34704 PMIC used on MX25 3STACK.
+
+Signed-off-by: Ross Wille <wille@freescale.com>
+---
+ test/mxc_pmic_test/Makefile                        |   4 +-
+ test/mxc_pmic_test/autorun-mc34704.sh              |  19 ++
+ test/mxc_pmic_test/protocol_tests/Makefile         |  11 +-
+ test/mxc_pmic_test/protocol_tests/mc34704_main.c   | 377 +++++++++++++++++++++
+ test/mxc_pmic_test/protocol_tests/mc34704_test.c   | 152 +++++++++
+ test/mxc_pmic_test/protocol_tests/mc34704_test.h   |  60 ++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_CA.c | 162 +++++++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_CA.h |  61 ++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_IP.c | 225 ++++++++++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_IP.h |  61 ++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_OC.c | 140 ++++++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_OC.h |  61 ++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_RA.c | 177 ++++++++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_RA.h |  61 ++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_SU.c | 168 +++++++++
+ .../mxc_pmic_test/protocol_tests/mc34704_test_SU.h |  61 ++++
+ .../protocol_tests/mc34704_test_common.c           | 292 ++++++++++++++++
+ .../protocol_tests/mc34704_test_common.h           | 107 ++++++
+ 18 files changed, 2195 insertions(+), 4 deletions(-)
+ create mode 100644 test/mxc_pmic_test/autorun-mc34704.sh
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_main.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test.h
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_CA.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_CA.h
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_IP.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_IP.h
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_OC.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_OC.h
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_RA.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_RA.h
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_SU.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_SU.h
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_common.c
+ create mode 100644 test/mxc_pmic_test/protocol_tests/mc34704_test_common.h
+
+diff --git a/test/mxc_pmic_test/Makefile b/test/mxc_pmic_test/Makefile
+index 62cd95e..3fb8dd8 100644
+--- a/test/mxc_pmic_test/Makefile
++++ b/test/mxc_pmic_test/Makefile
+@@ -1,11 +1,11 @@
+ # list of platforms which did not want this test case
+-EXCLUDE_LIST:="IMX37_3STACK IMX35_3STACK IMX51_3STACK IMX25_3STACK"
++EXCLUDE_LIST:="IMX37_3STACK IMX35_3STACK IMX51_3STACK"
+ 
+ LTP_DIR = ../
+ LOADLIBES+= -L$(LTP_DIR)lib -lltp -lpthread -lm
+ 
+ ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
+-OBJS = libltp.a $(OBJDIR)/autorun-pmic.sh
++OBJS = libltp.a $(OBJDIR)/autorun-pmic.sh $(OBJDIR)/autorun-mc34704.sh
+ else
+ OBJS =
+ endif
+diff --git a/test/mxc_pmic_test/autorun-mc34704.sh b/test/mxc_pmic_test/autorun-mc34704.sh
+new file mode 100644
+index 0000000..74a6487
+--- /dev/null
++++ b/test/mxc_pmic_test/autorun-mc34704.sh
+@@ -0,0 +1,19 @@
++#!/bin/sh
++
++source /unit_tests/test-utils.sh
++
++#
++# Exit status is 0 for PASS, nonzero for FAIL
++#
++STATUS=0
++
++# devnode test
++check_devnode "/dev/pmic"
++
++# protocol test cases
++for CASE in SU OC CA; do
++	run_testcase "./mc34704_testapp.out -T $CASE"
++done
++
++print_status
++exit $STATUS
+diff --git a/test/mxc_pmic_test/protocol_tests/Makefile b/test/mxc_pmic_test/protocol_tests/Makefile
+index 9c126aa..6fd9834 100644
+--- a/test/mxc_pmic_test/protocol_tests/Makefile
++++ b/test/mxc_pmic_test/protocol_tests/Makefile
+@@ -1,14 +1,21 @@
+ #
+ # Here are a list of OBJS needed
+ #
++ifeq ("$(PLATFORM)", "IMX25_3STACK")
++TARGET=mc34704_testapp.out
++SRCS=$(wildcard *mc34704*.c)
++CFLAGS+= -DCONFIG_MXC_PMIC_MC34704 -UCONFIG_MXC_PMIC_MC13783
++else
+ TARGET=pmic_testapp.out
+-SRCS=$(wildcard *.c)
++SRCS=$(wildcard *mc13783*.c)
++endif
++
+ OBJS2=$(patsubst %.c,%.o,$(SRCS))
+ 
+ all : $(TARGET)
+ 	mkdir -p $(OBJDIR)
+ 	cp -f $(TARGET) $(OBJDIR)
+-        
++
+ $(TARGET): $(OBJS2)
+ 	$(CC) $(OBJS2) $(LOADLIBES) -o $@
+ 
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_main.c b/test/mxc_pmic_test/protocol_tests/mc34704_main.c
+new file mode 100644
+index 0000000..90465ac
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_main.c
+@@ -0,0 +1,377 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_main.c
++ * @brief  MC34704 Protocol driver testing.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <pthread.h>
++
++/* Harness Specific Include Files. */
++#include "../include/usctest.h"
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test_common.h"
++#include "mc34704_test.h"
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++/* Extern Global Variables */
++	extern int Tst_count;	/* counter for tst_xxx routines.         */
++	extern char *TESTDIR;	/* temporary dir created by tst_tmpdir() */
++
++/* Global Variables */
++	char *TCID = "mc34704_testapp";	/* test program identifier.          */
++	int TST_TOTAL = 8;	/* total number of tests in this file.   */
++
++	int threads_num = 1;
++	int *thr_result;
++	pthread_t *thread;
++
++	int verbose_flag;
++	pthread_mutex_t mutex;
++/*==============================================================================
++                                   GLOBAL FUNCTION PROTOTYPES
++==============================================================================*/
++	void cleanup(void);
++	void setup(void);
++	int main(int argc, char **argv);
++	void help(void);
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== cleanup =====*/
++/**
++@brief  Performs all one time clean up for this test on successful
++                completion,  premature exit or  failure. Closes all temporary
++                files, removes all temporary directories exits the test with
++                appropriate return code by calling tst_exit() function.cleanup
++
++@param  Input :      None.
++        Output:      None.
++
++@return Nothing
++*/
++/*============================================================================*/
++	void cleanup(void) {
++		/* VTE : Actions needed to get a stable target environment */
++		int VT_rv = TFAIL;
++
++		 free(thr_result);
++		 free(thread);
++
++		 VT_rv = VT_mc34704_cleanup();
++		if (VT_rv != TPASS) {
++			tst_resm(TWARN,
++				 "VT_cleanup() Failed : error code = %d\n",
++				 VT_rv);
++		}
++
++		tst_exit();
++	}
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== setup =====*/
++/**
++@brief  Performs all one time setup for this test. This function is
++        typically used to capture signals, create temporary directories
++        and temporary files that may be used in the course of this test.
++
++@param  Input :      None.
++        Output:      None.
++
++@return On failure - Exits by calling cleanup().
++        On success - returns 0.
++*/
++/*============================================================================*/
++	void setup(void) {
++		int VT_rv = TFAIL;
++
++		/* VTE : Actions needed to prepare the test running */
++		if ((thr_result =
++		     malloc(sizeof(opt_params) * threads_num)) == NULL) {
++			tst_brkm(TBROK, cleanup,
++				 "VT_setup() Failed : error code = " "%d\n",
++				 VT_rv);
++		}
++		if ((thread = malloc(sizeof(pthread_t) * threads_num)) == NULL) {
++			tst_brkm(TBROK, cleanup,
++				 "VT_setup() Failed : error code = " "%d\n",
++				 VT_rv);
++
++		}
++		VT_rv = VT_mc34704_setup();
++		if (VT_rv != TPASS) {
++			tst_brkm(TBROK, cleanup,
++				 "VT_setup() Failed : error code = " "%d\n",
++				 VT_rv);
++		}
++		/* VTE */
++
++	}
++
++/*============================================================================*/
++/*===== main =====*/
++/**
++@brief  Entry point to this test-case. It parses all the command line
++        inputs, calls the global setup and executes the test. It logs
++        the test status and results appropriately using the LTP API's
++        On successful completion or premature failure, cleanup() func
++        is called and test exits with an appropriate return code.
++
++@param  Input :    argc - number of command line parameters.
++        Output:    **argv - pointer to the array of the command line parameters.
++        Describe input arguments to this test-case
++         -v - Print verbose output
++         -c - Number of concurrent threads
++         -R reg_number - Read from register reg_number
++         -W reg_number - Write to register reg_number
++         -S event_number - Subscribe event event_number
++         -U event_number - Unsubscribe event event_number
++         -T  test_case - exec test case by prefix
++             test cases prefixes:
++             RW - Read/write test
++             SU - Subscribe/Unsubscribe test
++             S_IT_U - Subscribe/interrupt/Unsubscribe test
++             D - Register dependencies test
++             OC - Open/close test
++             CA - Concurrent access test
++             RA - Random access test
++             IP - Access with incorrect parameters test
++
++@return On failure - Exits by calling cleanup().
++        On success - exits with 0 exit value.
++*/
++/*============================================================================*/
++	int main(int argc, char **argv) {
++		int VT_rv = TPASS;
++
++		/* parse options. */
++		/* binary flags: opt or not */
++		int rflag = 0, wflag = 0, vflag = 0, sflag = 0, uflag =
++		    0, tflag = 0;
++		/* option arguments */
++		char *ch_reg_num, *ch_reg_value, *ch_event_num, *ch_test_case;
++		/* option arguments */
++		unsigned int reg_num = 0, reg_value = 0, event_num = 0;
++		char *msg;
++		opt_params optparams;
++		void *params;
++		void *(*func) (void *) = NULL;
++
++		option_t options[] = {
++			{"R:", &rflag, &ch_reg_num},	/* Read register opt */
++			{"W:", &wflag, &ch_reg_num},	/* Write register opt */
++			{"V:", &vflag, &ch_reg_value},	/* Value to write */
++			{"S:", &sflag, &ch_event_num},	/* Subscribe event opt */
++			{"U:", &uflag, &ch_event_num},	/* Unsubscribe event opt */
++			{"T:", &tflag, &ch_test_case},	/* Execute test case */
++			{"v", &verbose_flag, NULL},	/* Verbose flag */
++			{NULL, NULL, NULL}	/* NULL required to
++						   end array */
++		};
++
++		if ((msg = parse_opts(argc, argv, options, &help)) != NULL) {
++			tst_resm(TFAIL, "%s\n", msg);
++			tst_resm(TFAIL,
++				 "%s test case did NOT work as expected\n",
++				 TCID);
++			return VT_rv;
++		}
++
++		threads_num = STD_COPIES;
++
++		if (rflag || wflag) {
++			reg_num = atoi(ch_reg_num);
++		}
++		if (sflag || uflag) {
++			event_num = atoi(ch_event_num);
++		}
++		if (vflag) {
++			sscanf((char *)ch_reg_value, "%x", &reg_value);
++		}
++
++		/* perform global test setup, call setup() function. */
++		setup();
++
++		/* Test Case Body. */
++
++		if (tflag) {
++			/* Print test Assertion using tst_resm() function
++			   with argument TINFO. */
++			func = &VT_mc34704_exec_test_case;
++			params = (void *)ch_test_case;
++#ifdef __CVS_TEST
++			VT_rv = (int)VT_mc34704_exec_test_case(params);
++#endif
++		} else {
++			if (rflag) {
++				optparams.operation = CMD_READ;
++				optparams.val1 = reg_num;
++				optparams.val2 = &reg_value;
++				ch_test_case = "R";
++			} else if (wflag) {
++				optparams.operation = CMD_WRITE;
++				optparams.val1 = reg_num;
++				optparams.val2 = &reg_value;
++				ch_test_case = "W";
++			} else if (sflag) {
++				optparams.operation = CMD_SUB;
++				optparams.val1 = event_num;
++				optparams.val2 = NULL;
++				ch_test_case = "S";
++			} else if (uflag) {
++				optparams.operation = CMD_UNSUB;
++				optparams.val1 = event_num;
++				optparams.val2 = NULL;
++				ch_test_case = "U";
++			}
++			func = &VT_mc34704_exec_opt;
++			params = (void *)(&optparams);
++#ifdef __CVS_TEST
++			VT_rv = (int)VT_mc34704_exec_opt(&optparams);
++#endif
++		}
++
++#ifndef __CVS_TEST
++		int i;
++		for (i = 0; i < threads_num; i++) {
++			thr_result[i] = pthread_create(&(thread[i]), NULL,
++						       func, params);
++			if (thr_result[i] != 0) {
++				if (verbose_flag) {
++					tst_resm(TFAIL,
++						 "Thread %d starting failed\n",
++						 i);
++				}
++				VT_rv = TFAIL;
++			} else if (verbose_flag) {
++				tst_resm(TINFO, "Thread %d started\n", i);
++			}
++		}
++
++		for (i = 0; i < threads_num; i++) {
++			if (thr_result[i] == 0) {
++				pthread_join(thread[i],
++					     (void *)&(thr_result[i]));
++				if (thr_result[i] == 0) {
++					if (verbose_flag) {
++						tst_resm(TINFO,
++							 "Thread %d finished: "
++							 "OK\n", i);
++					}
++				} else {
++					if (verbose_flag) {
++						tst_resm(TFAIL,
++							 "Thread %d finished: "
++							 "FAILED\n", i);
++					}
++				}
++			}
++		}
++
++		for (i = 0; i < threads_num; i++)
++			if (thr_result[i] != 0) {
++				VT_rv = TFAIL;
++			}
++#endif
++		/* Print test Assertion using tst_resm() */
++		if (VT_rv == TPASS) {
++			tst_resm(TPASS, "%s test worked as expected\n", TCID);
++		} else {
++			tst_resm(TFAIL, "%s test did NOT work as expected\n",
++				 TCID);
++		}
++
++		cleanup();
++		return VT_rv;
++	}
++
++	void help(void) {
++		printf("MC34704 core driver option\n");
++		printf("  -R <Reg>  Read a register\n");
++		printf("  -W <Reg>  write a register\n");
++		printf("  -V <hexa value> used for write option\n");
++		printf("  -S <event_number> Subscribe event notification\n");
++		printf("  -U <event_number> Unsubscribe event notification\n");
++		printf("  -v display information\n");
++		printf("\tWith event_number value is:\n");
++		printf(" 0 : Regulator 1 Fault\t\t\t");
++		printf(" 1 : Regulator 2 Fault\n");
++		printf(" 2 : Regulator 3 Fault\t\t\t");
++		printf(" 3 : Regulator 4 Fault\n");
++		printf(" 4 : Regulator 5 Fault\t\t\t");
++		printf(" 5 : Regulator 6 Fault\n");
++		printf(" 6 : Regulator 7 Fault\t\t\t");
++		printf(" 7 : Regulator 8 Fault\n");
++#ifdef __CVS_TEST
++		printf("  -T test case 'RW', 'SU'\n");
++#else
++		printf
++		    ("  -T test case 'RW', 'SU', 'OC', 'CA', 'RA',"
++		     " 'IP'\n");
++#endif
++		printf("Example :\n");
++		printf("\tmc34704_testapp -W 18 -V 05F4DA\n");
++		printf("\tmc34704_testapp -v -R 18\n");
++		printf("\tmc34704_testapp -S 20\n");
++		printf("\tmc34704_testapp -U 20\n");
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test.c b/test/mxc_pmic_test/protocol_tests/mc34704_test.c
+new file mode 100644
+index 0000000..38d9151
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test.c
+@@ -0,0 +1,152 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test.c
++ * @brief  Test scenario C source MC34704.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++
++/* Harness Specific Include Files. */
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test.h"
++#include "mc34704_test_common.h"
++#include "mc34704_test_SU.h"
++#include "mc34704_test_OC.h"
++#include "mc34704_test_CA.h"
++#include "mc34704_test_RA.h"
++#include "mc34704_test_IP.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_mc34704_exec_opt =====*/
++/**
++@brief  open MC34704, perform operation on it and then close it.
++
++@param  Input :		params - pointer to opt_params structure,
++                        operation - performing operation
++                        	(CMD_READ, CMD_WRITE, CMD_SUB, CMD_UNSUB)
++                        val1 - reg number if operation is CMD_READ or CMD_WRITE,
++                                reg number if operation is CMD_READ
++                                or CMD_WRITE,
++                        *val2 - writing reg value in case of CMD_WRITE operation
++        Output:         *val2 - return reg value in case of CMD_READ operation
++
++@return On success - return TPASS
++        On failure - return TFAIL
++
++*/
++/*============================================================================*/
++
++	void *VT_mc34704_exec_opt(void *params) {
++		int fd, rv;
++
++		 fd = open(MC34704_DEVICE, O_RDWR);
++		if (fd < 0) {
++			tst_resm(TFAIL, "Unable to open %s\n", MC34704_DEVICE);
++			return (void *)TFAIL;
++		}
++
++		opt_params optparams = *((opt_params *) params);
++
++		rv = VT_mc34704_opt(fd, optparams.operation, optparams.val1,
++				    optparams.val2);
++		if (rv != 0) {
++			close(fd);
++			return (void *)TFAIL;
++		}
++
++		rv = close(fd);
++		if (rv < 0) {
++			tst_resm(TFAIL, "Unable to close file descriptor %d\n",
++				 fd);
++			return (void *)TFAIL;
++		}
++
++		return (void *)TPASS;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_exec_test_case =====*/
++/**
++@brief  exec MC34704 test scenario
++
++@param  Input :                *test_case - Test case prefix
++        Output:                None.
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	void *VT_mc34704_exec_test_case(void *test_case) {
++		int VT_rv = TFAIL;
++
++		if (!strcmp((char *)test_case, TEST_CASE_RA)) {
++			VT_rv = VT_mc34704_test_RA();
++		} else if (!strcmp((char *)test_case, TEST_CASE_SU)) {
++			VT_rv = VT_mc34704_test_SU();
++		} else if (!strcmp((char *)test_case, TEST_CASE_OC)) {
++			VT_rv = VT_mc34704_test_OC();
++		} else if (!strcmp((char *)test_case, TEST_CASE_CA)) {
++			VT_rv = VT_mc34704_test_CA();
++		} else if (!strcmp((char *)test_case, TEST_CASE_IP)) {
++			VT_rv = VT_mc34704_test_IP();
++		}
++
++		return (void *)VT_rv;
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test.h b/test/mxc_pmic_test/protocol_tests/mc34704_test.h
+new file mode 100644
+index 0000000..43d5d84
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test.h
+@@ -0,0 +1,60 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test.h
++ * @brief  Test scenario C header MC34704.
++ */
++
++#ifndef MC34704_TEST_H
++#define MC34704_TEST_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++/*==============================================================================
++                                           CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++/*==============================================================================
++                                             ENUMS
++==============================================================================*/
++
++/*==============================================================================
++                                 STRUCTURES AND OTHER TYPEDEFS
++==============================================================================*/
++
++/*==============================================================================
++                                 GLOBAL VARIABLE DECLARATIONS
++==============================================================================*/
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++
++	void *VT_mc34704_exec_opt(void *params);
++	void *VT_mc34704_exec_test_case(void *test_case);
++
++#ifdef __cplusplus
++}
++#endif
++#endif				// MC34704_TEST_H //
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_CA.c b/test/mxc_pmic_test/protocol_tests/mc34704_test_CA.c
+new file mode 100644
+index 0000000..a250b64
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_CA.c
+@@ -0,0 +1,162 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_CA.c
++ * @brief  Test scenario C source PMIC.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <errno.h>
++
++/* Harness Specific Include Files. */
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test_common.h"
++#include "mc34704_test_CA.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++#define nb_value 8
++
++	unsigned int TEST_TMP;
++	unsigned int TEST_VALUE_CA[nb_value][3] = {
++		{CMD_READ, REG_MC34704_GENERAL1, &TEST_TMP},
++		{CMD_SUB, 2, 0},
++		{CMD_READ, REG_MC34704_GENERAL2, &TEST_TMP},
++		{CMD_SUB, 0, 0},
++		{CMD_READ, REG_MC34704_FAULTS, &TEST_TMP},
++		{CMD_UNSUB, 0, 0},
++		{CMD_UNSUB, 2, 0}
++	};
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_mc34704_setup =====*/
++/**
++@brief  assumes the initial condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_CA_setup(void) {
++		int rv = TFAIL;
++
++		rv = TPASS;
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_cleanup =====*/
++/**
++@brief  assumes the post-condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_CA_cleanup(void) {
++		int rv = TFAIL;
++
++		rv = TPASS;
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_test_CA =====*/
++/**
++@brief  MC34704 test scenario Concurrent Access
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_test_CA(void) {
++		int rv = TPASS, fd, i = 0;
++
++		fd = open(MC34704_DEVICE, O_RDWR);
++		if (fd < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to open %s", MC34704_DEVICE);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		for (i = 0; i < nb_value; i++) {
++			if (VT_mc34704_opt
++			    (fd, TEST_VALUE_CA[i][0], TEST_VALUE_CA[i][1],
++			     &(TEST_VALUE_CA[i][2])) != TPASS) {
++				rv = TFAIL;
++			}
++		}
++
++		if (close(fd) < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to close file descriptor %d",
++				 fd);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		return rv;
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_CA.h b/test/mxc_pmic_test/protocol_tests/mc34704_test_CA.h
+new file mode 100644
+index 0000000..41fb61b
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_CA.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_CA.h
++ * @brief  Test scenario C header PMIC.
++ */
++
++#ifndef MC34704_TEST_CA_H
++#define MC34704_TEST_CA_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++/*==============================================================================
++                                           CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++/*==============================================================================
++                                             ENUMS
++==============================================================================*/
++
++/*==============================================================================
++                                 STRUCTURES AND OTHER TYPEDEFS
++==============================================================================*/
++
++/*==============================================================================
++                                 GLOBAL VARIABLE DECLARATIONS
++==============================================================================*/
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++	int VT_mc34704_CA_setup();
++	int VT_mc34704_CA_cleanup();
++
++	int VT_mc34704_test_CA(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif				// MC34704_TEST_CA_H //
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_IP.c b/test/mxc_pmic_test/protocol_tests/mc34704_test_IP.c
+new file mode 100644
+index 0000000..cc0c285
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_IP.c
+@@ -0,0 +1,225 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_IP.c
++ * @brief  Test scenario C source PMIC.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <errno.h>
++
++/* Harness Specific Include Files. */
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test_common.h"
++#include "mc34704_test_IP.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++#define nb_REG_RO 4
++	unsigned int TEST_REG_RO[nb_REG_RO] = { REG_MC34704_GENERAL3,
++		REG_MC34704_FAULTS,
++		REG_MC34704_REG4SET2,
++		REG_MC34704_VGSET2,
++	};
++
++#define nb_REG_NA 3
++	unsigned int TEST_REG_NA[nb_REG_NA] = { 0x00,
++		0x20,
++		0x60,
++	};
++
++#define nb_EVNT_NE 1
++	unsigned int TEST_EVNT_NA[nb_EVNT_NE] = { EVENT_NB };
++
++	int TEST_VALUE = 0xFFF000;
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_mc34704_setup =====*/
++/**
++@brief  assumes the initial condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_IP_setup(void) {
++		int rv = TFAIL;
++
++		rv = TPASS;
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_cleanup =====*/
++/**
++@brief  assumes the post-condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_IP_cleanup(void) {
++		int rv = TFAIL;
++
++		rv = TPASS;
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_test_IP =====*/
++/**
++@brief  MC34704 test scenario Access with incorrect parameters
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_test_IP(void) {
++		int rv = TPASS, fd, i = 0;
++
++		fd = open(MC34704_DEVICE, O_RDWR);
++		if (fd < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to open %s", MC34704_DEVICE);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++		// writing into Read Only register
++		for (i = 0; i < nb_REG_RO; i++) {
++			if (VT_mc34704_opt
++			    (fd, CMD_WRITE, TEST_REG_RO[i],
++			     &TEST_VALUE) == TPASS) {
++				pthread_mutex_lock(&mutex);
++				printf
++				    ("Driver have wrote to Read Only reg %d\n",
++				     TEST_REG_RO[i]);
++				pthread_mutex_unlock(&mutex);
++				rv = TFAIL;
++			}
++
++		}
++
++		// writing into non avaible register
++		for (i = 0; i < nb_REG_NA; i++) {
++			if (VT_mc34704_opt
++			    (fd, CMD_WRITE, TEST_REG_NA[i],
++			     &TEST_VALUE) == TPASS) {
++				pthread_mutex_lock(&mutex);
++				printf
++				    ("Driver have wrote to non avaible reg %d\n",
++				     TEST_REG_NA[i]);
++				pthread_mutex_unlock(&mutex);
++				rv = TFAIL;
++			}
++		}
++
++		// reading from non avaible register
++		for (i = 0; i < nb_REG_NA; i++) {
++			if (VT_mc34704_opt
++			    (fd, CMD_READ, TEST_REG_NA[i],
++			     &TEST_VALUE) == TPASS) {
++				pthread_mutex_lock(&mutex);
++				printf
++				    ("Driver have read from non avaible reg %d\n",
++				     TEST_REG_NA[i]);
++				pthread_mutex_unlock(&mutex);
++				rv = TFAIL;
++			}
++		}
++
++		// subscribing non existing event
++		for (i = 0; i < nb_EVNT_NE; i++) {
++			if (VT_mc34704_opt
++			    (fd, CMD_SUB, TEST_EVNT_NA[i],
++			     &TEST_VALUE) == TPASS) {
++				pthread_mutex_lock(&mutex);
++				printf
++				    ("Driver have subscribed non existing event %d\n",
++				     TEST_EVNT_NA[i]);
++				pthread_mutex_unlock(&mutex);
++				rv = TFAIL;
++			}
++		}
++
++		// un-subscribing not subscribed event
++		if (VT_mc34704_opt(fd, CMD_UNSUB, 2, &TEST_VALUE) == TPASS) {
++			pthread_mutex_lock(&mutex);
++			printf
++			    ("Driver have unsubscribed not subscribed event %d\n",
++			     TEST_EVNT_NA[i]);
++			pthread_mutex_unlock(&mutex);
++			rv = TFAIL;
++		}
++
++		if (close(fd) < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to close file descriptor %d",
++				 fd);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		return rv;
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_IP.h b/test/mxc_pmic_test/protocol_tests/mc34704_test_IP.h
+new file mode 100644
+index 0000000..012ed1f
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_IP.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_IP.h
++ * @brief  Test scenario C header PMIC.
++ */
++
++#ifndef MC34704_TEST_IP_H
++#define MC34704_TEST_IP_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++/*==============================================================================
++                                           CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++/*==============================================================================
++                                             ENUMS
++==============================================================================*/
++
++/*==============================================================================
++                                 STRUCTURES AND OTHER TYPEDEFS
++==============================================================================*/
++
++/*==============================================================================
++                                 GLOBAL VARIABLE DECLARATIONS
++==============================================================================*/
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++	int VT_mc34704_IP_setup();
++	int VT_mc34704_IP_cleanup();
++
++	int VT_mc34704_test_IP(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif				// MC34704_TEST_IP_H //
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_OC.c b/test/mxc_pmic_test/protocol_tests/mc34704_test_OC.c
+new file mode 100644
+index 0000000..7492f06
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_OC.c
+@@ -0,0 +1,140 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_OC.c
++ * @brief  Test scenario C source PMIC.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <errno.h>
++
++/* Harness Specific Include Files. */
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test_common.h"
++#include "mc34704_test_OC.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_mc34704_setup =====*/
++/**
++@brief  assumes the initial condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_OC_setup(void) {
++		int rv = TFAIL;
++
++		 rv = TPASS;
++
++		 return rv;
++	}
++/*============================================================================*/
++/*===== VT_cleanup =====*/
++/**
++@brief  assumes the post-condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_OC_cleanup(void) {
++		int rv = TFAIL;
++
++		rv = TPASS;
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_test_OC =====*/
++/**
++@brief  MC34704 test scenario Open/Close function
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_test_OC(void) {
++		int fd;
++
++		fd = open(MC34704_DEVICE, O_RDWR);
++		if (fd < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to open %s", MC34704_DEVICE);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		if (close(fd) < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to close file descriptor %d",
++				 fd);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		return TPASS;
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_OC.h b/test/mxc_pmic_test/protocol_tests/mc34704_test_OC.h
+new file mode 100644
+index 0000000..5ea2994
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_OC.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_OC.h
++ * @brief  Test scenario C header PMIC.
++ */
++
++#ifndef MC34704_TEST_OC_H
++#define MC34704_TEST_OC_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++/*==============================================================================
++                                           CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++/*==============================================================================
++                                             ENUMS
++==============================================================================*/
++
++/*==============================================================================
++                                 STRUCTURES AND OTHER TYPEDEFS
++==============================================================================*/
++
++/*==============================================================================
++                                 GLOBAL VARIABLE DECLARATIONS
++==============================================================================*/
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++	int VT_mc34704_OC_setup();
++	int VT_mc34704_OC_cleanup();
++
++	int VT_mc34704_test_OC(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif				// MC34704_TEST_OC_H //
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_RA.c b/test/mxc_pmic_test/protocol_tests/mc34704_test_RA.c
+new file mode 100644
+index 0000000..c892c91
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_RA.c
+@@ -0,0 +1,177 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_RA.c
++ * @brief  Test scenario C source PMIC.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <errno.h>
++#include <time.h>
++
++/* Harness Specific Include Files. */
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test_common.h"
++#include "mc34704_test_RA.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++#define nb_value 8
++	unsigned int TEST_VALUE_RA[2 * nb_value][3];
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_mc34704_setup =====*/
++/**
++@brief  assumes the initial condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_RA_setup(void) {
++		int rv = TFAIL;
++
++		 rv = TPASS;
++
++		 return rv;
++	}
++/*============================================================================*/
++/*===== VT_cleanup =====*/
++/**
++@brief  assumes the post-condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_RA_cleanup(void) {
++		int rv = TFAIL;
++
++		rv = TPASS;
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_test_RA =====*/
++/**
++@brief  MC34704 test scenario Random Access
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_test_RA(void) {
++		int rv = TPASS, fd, i = 0, val;
++		srand((unsigned)time(NULL));
++
++		fd = open(MC34704_DEVICE, O_RDWR);
++		if (fd < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to open %s", MC34704_DEVICE);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		for (i = 0; i < nb_value; i++) {
++			val = rand() % 2;
++			switch (val) {
++			case 0:
++				TEST_VALUE_RA[i][0] = CMD_WRITE;
++				TEST_VALUE_RA[i][1] = rand() % REG_NB;
++				TEST_VALUE_RA[i][2] = rand() % 0xFFFFFF;
++				TEST_VALUE_RA[nb_value + i][0] = CMD_READ;
++				TEST_VALUE_RA[nb_value + i][1] =
++				    rand() % REG_NB;
++				TEST_VALUE_RA[nb_value + i][2] =
++				    rand() % 0xFFFFFF;
++				break;
++			case 1:
++				TEST_VALUE_RA[i][0] = CMD_SUB;
++				TEST_VALUE_RA[i][1] = rand() % EVENT_NB;
++				TEST_VALUE_RA[i][2] = 0;
++				TEST_VALUE_RA[nb_value + i][0] = CMD_UNSUB;
++				TEST_VALUE_RA[nb_value + i][1] =
++				    rand() % EVENT_NB;
++				TEST_VALUE_RA[nb_value + i][2] = 0;
++				break;
++			}
++		}
++
++		for (i = 0; i < 2 * nb_value; i++) {
++			if (VT_mc34704_opt
++			    (fd, TEST_VALUE_RA[i][0], TEST_VALUE_RA[i][1],
++			     &(TEST_VALUE_RA[i][2])) != TPASS) {
++				rv = TFAIL;
++			}
++		}
++
++		if (close(fd) < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to close file descriptor %d",
++				 fd);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		return rv;
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_RA.h b/test/mxc_pmic_test/protocol_tests/mc34704_test_RA.h
+new file mode 100644
+index 0000000..75a6525
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_RA.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_RA.h
++ * @brief  Test scenario C header PMIC.
++ */
++
++#ifndef MC34704_TEST_RA_H
++#define MC34704_TEST_RA_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++/*==============================================================================
++                                           CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++/*==============================================================================
++                                             ENUMS
++==============================================================================*/
++
++/*==============================================================================
++                                 STRUCTURES AND OTHER TYPEDEFS
++==============================================================================*/
++
++/*==============================================================================
++                                 GLOBAL VARIABLE DECLARATIONS
++==============================================================================*/
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++	int VT_mc34704_RA_setup();
++	int VT_mc34704_RA_cleanup();
++
++	int VT_mc34704_test_RA(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif				// MC34704_TEST_RA_H //
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_SU.c b/test/mxc_pmic_test/protocol_tests/mc34704_test_SU.c
+new file mode 100644
+index 0000000..e3c1a41
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_SU.c
+@@ -0,0 +1,168 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_SU.c
++ * @brief  Test scenario C source PMIC.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <errno.h>
++
++/* Harness Specific Include Files. */
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test_common.h"
++#include "mc34704_test_SU.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_mc34704_SU_setup =====*/
++/**
++@brief  assumes the initial condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_SU_setup(void) {
++		int rv = TFAIL;
++
++		 rv = TPASS;
++
++		 return rv;
++	}
++/*============================================================================*/
++/*===== VT_mc34704_SU_cleanup =====*/
++/**
++@brief  assumes the post-condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_SU_cleanup(void) {
++		int rv = TFAIL;
++
++		rv = TPASS;
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_test_SU =====*/
++/**
++@brief  MC34704 test scenario SU function
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_test_SU(void) {
++		int rv = TPASS, fd;
++		int event = EVENT_FLT5;
++
++		fd = open(MC34704_DEVICE, O_RDWR);
++		if (fd < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to open %s", MC34704_DEVICE);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		pthread_mutex_lock(&mutex);
++		/* printf("Test subscribe/un-subscribe event = %d\n", event); */
++		pthread_mutex_unlock(&mutex);
++
++		if (VT_mc34704_subscribe(fd, event) != TPASS) {
++			rv = TFAIL;
++		}
++		if (VT_mc34704_unsubscribe(fd, event) != TPASS) {
++			rv = TFAIL;
++		}
++
++		pthread_mutex_lock(&mutex);
++		/* printf("Test subscribe/un-subscribe 2 event = %d\n", event); */
++		pthread_mutex_unlock(&mutex);
++		if (VT_mc34704_subscribe(fd, event) != TPASS) {
++			rv = TFAIL;
++		}
++		if (VT_mc34704_subscribe(fd, event) != TPASS) {
++			rv = TFAIL;
++		}
++		if (VT_mc34704_unsubscribe(fd, event) != TPASS) {
++			rv = TFAIL;
++		}
++		if (VT_mc34704_unsubscribe(fd, event) != TPASS) {
++			rv = TFAIL;
++		}
++
++		if (close(fd) < 0) {
++			pthread_mutex_lock(&mutex);
++			tst_resm(TFAIL, "Unable to close file descriptor %d",
++				 fd);
++			pthread_mutex_unlock(&mutex);
++			return TFAIL;
++		}
++
++		return rv;
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_SU.h b/test/mxc_pmic_test/protocol_tests/mc34704_test_SU.h
+new file mode 100644
+index 0000000..5844d5d
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_SU.h
+@@ -0,0 +1,61 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_SU.h
++ * @brief  Test scenario C header PMIC.
++ */
++
++#ifndef MC34704_TEST_SU_H
++#define MC34704_TEST_SU_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++/*==============================================================================
++                                           CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++/*==============================================================================
++                                             ENUMS
++==============================================================================*/
++
++/*==============================================================================
++                                 STRUCTURES AND OTHER TYPEDEFS
++==============================================================================*/
++
++/*==============================================================================
++                                 GLOBAL VARIABLE DECLARATIONS
++==============================================================================*/
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++	int VT_mc34704_SU_setup();
++	int VT_mc34704_SU_cleanup();
++
++	int VT_mc34704_test_SU(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif				// MC34704_TEST_SU_H //
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_common.c b/test/mxc_pmic_test/protocol_tests/mc34704_test_common.c
+new file mode 100644
+index 0000000..423085c
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_common.c
+@@ -0,0 +1,292 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_common.c
++ * @brief  Test scenario C source PMIC.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                        INCLUDE FILES
++==============================================================================*/
++/* Standard Include Files */
++#include <errno.h>
++
++/* Harness Specific Include Files. */
++#include "../include/test.h"
++
++/* Verification Test Environment Include Files */
++#include "mc34704_test_common.h"
++
++/*==============================================================================
++                                        LOCAL MACROS
++==============================================================================*/
++
++/*==============================================================================
++                          LOCAL TYPEDEFS (STRUCTURES, UNIONS, ENUMS)
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       GLOBAL VARIABLES
++==============================================================================*/
++
++/*==============================================================================
++                                   LOCAL FUNCTION PROTOTYPES
++==============================================================================*/
++
++/*==============================================================================
++                                       LOCAL FUNCTIONS
++==============================================================================*/
++
++/*============================================================================*/
++/*===== VT_mc34704_setup =====*/
++/**
++@brief  assumes the initial condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_setup(void) {
++		int rv = TFAIL;
++		 rv = pthread_mutex_init(&mutex, NULL);
++
++		 return rv;
++	}
++/*============================================================================*/
++/*===== VT_cleanup =====*/
++/**
++@brief  assumes the post-condition of the test case execution
++
++@param  None
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++	int VT_mc34704_cleanup(void) {
++		int rv = TFAIL;
++
++		rv = pthread_mutex_destroy(&mutex);
++
++		return rv;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_read =====*/
++/**
++@brief  read register
++
++@param  Input :                fd - file descriptor assigned to the mc34704
++                               reg - reg number
++                               *val - return read value
++
++@return On success - return TPASS
++        On failure - return the error code
++*/
++/*============================================================================*/
++
++	int VT_mc34704_read(int fd, int reg, unsigned int *val) {
++		register_info reg_info;
++		reg_info.reg = reg;
++		reg_info.reg_value = 0;
++
++		int rv = ioctl(fd, PMIC_READ_REG, &reg_info);
++		*val = reg_info.reg_value;
++
++		if (rv != 0) {
++			if (verbose_flag) {
++
++				pthread_mutex_lock(&mutex);
++				printf("Read value from reg %d: FAILED\n", reg);
++				pthread_mutex_unlock(&mutex);
++			}
++			return TFAIL;
++		}
++		if (verbose_flag) {
++			pthread_mutex_lock(&mutex);
++			printf("Read value from reg %d: 0x%X\n", reg, *val);
++			pthread_mutex_unlock(&mutex);
++		}
++		return TPASS;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_write =====*/
++/**
++@brief  writes register
++
++@param  Input :                fd - file descriptor assigned to the mc34704
++                               reg - reg number
++                               *val - writing value
++
++@return On success - return TPASS
++        On failure - return TFAIL
++
++*/
++/*============================================================================*/
++
++	int VT_mc34704_write(int fd, int reg, unsigned int val) {
++		register_info reg_info;
++		reg_info.reg = reg;
++		reg_info.reg_value = val;
++
++		int rv = ioctl(fd, PMIC_WRITE_REG, &reg_info);
++
++		if (rv != 0) {
++			if (verbose_flag) {
++				pthread_mutex_lock(&mutex);
++				printf("Write value 0x%X in reg %d: FAILED\n",
++				       val, reg);
++				pthread_mutex_unlock(&mutex);
++			}
++			return TFAIL;
++		}
++		if (verbose_flag) {
++			pthread_mutex_lock(&mutex);
++			printf("Write value 0x%X in reg %d: OK\n", val, reg);
++			pthread_mutex_unlock(&mutex);
++		}
++		return TPASS;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_subscribe =====*/
++/**
++@brief  Subscribe event
++
++@param  Input :                fd - file descriptor assigned to the mc34704
++                               event - event number
++
++@return On success - return TPASS
++        On failure - return TFAIL
++
++*/
++/*============================================================================*/
++
++	int VT_mc34704_subscribe(int fd, unsigned int event) {
++
++		int rv = ioctl(fd, PMIC_SUBSCRIBE, &event);
++		if (rv != 0) {
++			if (verbose_flag) {
++				pthread_mutex_lock(&mutex);
++				printf("Subscribe event %d: FAILED\n", event);
++				pthread_mutex_unlock(&mutex);
++			}
++			return TFAIL;
++		}
++		if (verbose_flag) {
++			pthread_mutex_lock(&mutex);
++			printf("Subscribe event %d: OK\n", event);
++			pthread_mutex_unlock(&mutex);
++		}
++		return TPASS;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_unsubscribe =====*/
++/**
++@brief  Unsubscribe event
++
++@param  Input :                fd - file descriptor assigned to the mc34704
++                               event - event number
++
++@return On success - return TPASS
++        On failure - return TFAIL
++*/
++/*============================================================================*/
++
++	int VT_mc34704_unsubscribe(int fd, unsigned int event) {
++
++		int rv = ioctl(fd, PMIC_UNSUBSCRIBE, &event);
++		if (rv != 0) {
++			if (verbose_flag) {
++				pthread_mutex_lock(&mutex);
++				printf("Unsubscribe event %d: FAILED\n", event);
++				pthread_mutex_unlock(&mutex);
++			}
++			return TFAIL;
++		}
++		if (verbose_flag) {
++			pthread_mutex_lock(&mutex);
++			printf("Unsubscribe event %d: OK\n", event);
++			pthread_mutex_unlock(&mutex);
++		}
++		return TPASS;
++	}
++
++/*============================================================================*/
++/*===== VT_mc34704_opt =====*/
++/**
++@brief  perform operations (read reg, write reg, subscribe event, Unsubscribe
++        event) on already opened MC34704 file
++
++@param  Input : fd - file descriptor assigned to the mc34704
++                operation - performing operation (CMD_READ, CMD_WRITE, CMD_SUB,
++        	 	    CMD_UNSUB)
++                val1 - reg number if operation is CMD_READ or CMD_WRITE,
++                       event number in case of CMD_SUB or CMD_UNSUB operations
++                *val2 - writing reg value in case of CMD_WRITE operation
++        Output: *val2 - return reg value in case of CMD_READ operation
++
++@return On success - return TPASS
++        On failure - return TFAIL
++
++*/
++/*============================================================================*/
++
++	int VT_mc34704_opt(int fd, int operation, int val1, unsigned int *val2) {
++		int rv;
++		switch (operation) {
++		case CMD_READ:
++			rv = VT_mc34704_read(fd, val1, val2);
++			break;
++		case CMD_WRITE:
++			rv = VT_mc34704_write(fd, val1, *val2);
++			break;
++		case CMD_SUB:
++			rv = VT_mc34704_subscribe(fd, val1);
++			break;
++		case CMD_UNSUB:
++			rv = VT_mc34704_unsubscribe(fd, val1);
++			break;
++
++		default:
++			tst_resm(TFAIL, "Unsupported operation");
++			rv = TFAIL;
++			break;
++		}
++		return rv;
++	}
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/test/mxc_pmic_test/protocol_tests/mc34704_test_common.h b/test/mxc_pmic_test/protocol_tests/mc34704_test_common.h
+new file mode 100644
+index 0000000..a3ba856
+--- /dev/null
++++ b/test/mxc_pmic_test/protocol_tests/mc34704_test_common.h
+@@ -0,0 +1,107 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/*!
++ * @file   mc34704_test_common.h
++ * @brief  Test scenario C header PMIC.
++ */
++
++#ifndef MC34704_TEST_COMMON_H
++#define MC34704_TEST_COMMON_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*==============================================================================
++                                         INCLUDE FILES
++==============================================================================*/
++
++#include <sys/types.h>		/* open() */
++#include <sys/stat.h>		/* open() */
++#include <fcntl.h>		/* open() */
++#include <sys/ioctl.h>		/* ioctl() */
++#include <unistd.h>		/* close() */
++#include <stdio.h>		/* sscanf() & perror() */
++#include <stdlib.h>		/* atoi() */
++#include <pthread.h>
++
++#include <asm/arch/pmic_external.h>
++
++/*==============================================================================
++                                           CONSTANTS
++==============================================================================*/
++
++/*==============================================================================
++                                       DEFINES AND MACROS
++==============================================================================*/
++
++#define    TEST_CASE_RW                "RW"
++#define    TEST_CASE_SU                "SU"
++#define    TEST_CASE_S_IT_U            "S_IT_U"
++#define    TEST_CASE_D                 "D"
++#define    TEST_CASE_OC                "OC"
++#define    TEST_CASE_CA                "CA"
++#define    TEST_CASE_RA                "RA"
++#define    TEST_CASE_IP                "IP"
++
++#define    CMD_READ         0
++#define    CMD_WRITE        1
++#define    CMD_SUB          2
++#define    CMD_UNSUB        3
++
++#if !defined(TRUE) && !defined(FALSE)
++#define TRUE         1
++#define FALSE        0
++#endif
++
++#define MC34704_DEVICE           "/dev/pmic"
++#define MAX_REG                50
++
++	typedef struct {
++		// operation - performing operation (CMD_READ, CMD_WRITE, CMD_SUB,
++		//             CMD_UNSUB)
++		int operation;
++		// val1 - reg number if operation is CMD_READ or CMD_WRITE,
++		// event number if operation is CMD_SUB or CMD_UNSUB,
++		int val1;
++		// *val2 - writing reg value in case of CMD_WRITE operation
++		// *val2 - return reg value in case of CMD_READ operation
++		// not used in CMD_SUB or CMD_UNSUB operations
++		unsigned int *val2;
++	} opt_params;
++
++/*==============================================================================
++                                 GLOBAL VARIABLE DECLARATIONS
++==============================================================================*/
++
++extern	int verbose_flag;
++extern	pthread_mutex_t mutex;
++
++/*==============================================================================
++                                     FUNCTION PROTOTYPES
++==============================================================================*/
++	int VT_mc34704_setup();
++	int VT_mc34704_cleanup();
++
++	int VT_mc34704_read(int device, int reg, unsigned int *val);
++	int VT_mc34704_write(int device, int reg, unsigned int val);
++	int VT_mc34704_subscribe(int device, unsigned int event);
++	int VT_mc34704_unsubscribe(int device, unsigned int event);
++
++	int VT_mc34704_opt(int fd, int operation, int val1, unsigned int *val2);
++
++#ifdef __cplusplus
++}
++#endif
++#endif				// MC34704_TEST_H //
+-- 
+1.8.0
+

@@ -1,0 +1,606 @@
+From 87a56a4374deee4f34c1a292039aa9ee4d8e13d4 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Mon, 1 Sep 2008 11:36:17 +0800
+Subject: [PATCH 049/435] ENGR000069674 MX51: VPU encoder support
+
+Integrate CodaHx14 VPU encoder feature to MX51,firmware version is F.0.1
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/configs/config_enc    |   6 +-
+ test/mxc_vpu_test/configs/config_encdec |  18 ++-
+ test/mxc_vpu_test/enc.c                 | 205 ++++++++++++++++++++++++++++----
+ test/mxc_vpu_test/loopback.c            |   2 +-
+ test/mxc_vpu_test/vpu_jpegtable.h       | 142 ++++++++++++++++++++++
+ test/mxc_vpu_test/vpu_test.h            |   2 +
+ 6 files changed, 343 insertions(+), 32 deletions(-)
+ create mode 100644 test/mxc_vpu_test/vpu_jpegtable.h
+
+diff --git a/test/mxc_vpu_test/configs/config_enc b/test/mxc_vpu_test/configs/config_enc
+index db2f8e8..f924cbf 100644
+--- a/test/mxc_vpu_test/configs/config_enc
++++ b/test/mxc_vpu_test/configs/config_enc
+@@ -10,7 +10,7 @@ input=
+ # write output to file. For decode, if not specified, then default is LCD
+ output=test.264
+ 
+-# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1
++# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 7 - MJPG
+ format=2
+ 
+ # rotation angle (0, 90, 180, 270). Do not specify anything if not needed.
+@@ -28,10 +28,10 @@ dering=
+ # mirroring (0, 1, 2 , 3)
+ mirror=
+ 
+-# width for encoding. This will be the capture/yuv image width
++# width, display width for decoding or capture/yuv image width for encoding
+ width=240
+ 
+-# height for encoding. This will be the capture/yuv image height
++# height, display height for decoding or capture/yuv image width for encoding
+ height=320
+ 
+ # bitrate. default is auto
+diff --git a/test/mxc_vpu_test/configs/config_encdec b/test/mxc_vpu_test/configs/config_encdec
+index eb65a95..4681c6b 100644
+--- a/test/mxc_vpu_test/configs/config_encdec
++++ b/test/mxc_vpu_test/configs/config_encdec
+@@ -10,12 +10,18 @@ input=/usr/vectors/h264/Corvette.264
+ # write output to file. For decode, if not specified, then default is LCD
+ output=
+ 
+-# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1
++# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, 4 - MPEG2, 5 - DIV3
++# 6 - RV, 7 - MJPG
+ format=2
+ 
+ # rotation angle (0, 90, 180, 270). Do not specify anything if not needed.
++# Default is VPU rotation.
+ rotation=
+ 
++# ipu_rot, 1 - Enable IPU rotation and disable VPU rotation when output
++# to LCD for display
++ipu_rot=
++
+ # count, number of frames to encode or decode
+ count=
+ 
+@@ -25,10 +31,10 @@ deblock=
+ # mirroring (0, 1, 2 , 3)
+ mirror=
+ 
+-# width for encoding. This will be the capture/yuv image width
++# width, display width for decoding or capture/yuv image width for encoding
+ width=
+ 
+-# height for encoding. This will be the capture/yuv image height
++# height, display height for decoding or capture/yuv image width for encoding
+ height=
+ 
+ # bitrate. default is auto
+@@ -52,7 +58,7 @@ input=
+ # write output to file. For decode, if not specified, then default is LCD
+ output=test.264
+ 
+-# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1
++# format; 0 - MPEG4, 1 - H.263, 2 - H.264, 7 - MJPG
+ format=2
+ 
+ # rotation angle (0, 90, 180, 270). Do not specify anything if not needed.
+@@ -67,10 +73,10 @@ deblock=
+ # mirroring (0, 1, 2 , 3)
+ mirror=
+ 
+-# width for encoding. This will be the capture/yuv image width
++# width, display width for decoding or capture/yuv image width for encoding
+ width=240
+ 
+-# height for encoding. This will be the capture/yuv image height
++# height, display height for decoding or capture/yuv image width for encoding
+ height=320
+ 
+ # bitrate. default is auto
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 8c45d29..fd8f87a 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -22,6 +22,7 @@
+ #include <string.h>
+ #include <stdlib.h>
+ #include "vpu_test.h"
++#include "vpu_jpegtable.h"
+ 
+ 
+ /* V4L2 capture buffers are obtained from here */
+@@ -97,29 +98,31 @@ encoder_fill_headers(struct encode *enc)
+ 
+ 	/* Must put encode header before encoding */
+ 	if (enc->cmdl->format == STD_MPEG4) {
+-		enchdr_param.headerType = VOS_HEADER;
+-		lock(enc->cmdl);
+-		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+-		unlock(enc->cmdl);
++		if (!cpu_is_mx51()) {
++			enchdr_param.headerType = VOS_HEADER;
++			lock(enc->cmdl);
++			vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
++			unlock(enc->cmdl);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-		if (ret < 0)
+-			return -1;
++			vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
++			ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
++			if (ret < 0)
++				return -1;
+ #endif
+ 
+-		enchdr_param.headerType = VIS_HEADER;
+-		lock(enc->cmdl);
+-		vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
+-		unlock(enc->cmdl);
++			enchdr_param.headerType = VIS_HEADER;
++			lock(enc->cmdl);
++			vpu_EncGiveCommand(handle, ENC_PUT_MP4_HEADER, &enchdr_param);
++			unlock(enc->cmdl);
+ 
+ #if STREAM_ENC_PIC_RESET == 1
+-		vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
+-		ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
+-		if (ret < 0)
+-			return -1;
++			vbuf = (virt_bsbuf + enchdr_param.buf - phy_bsbuf);
++			ret = vpu_write(enc->cmdl, (void *)vbuf, enchdr_param.size);
++			if (ret < 0)
++				return -1;
+ #endif
++		}
+ 
+ 		enchdr_param.headerType = VOL_HEADER;
+ 		lock(enc->cmdl);
+@@ -155,6 +158,11 @@ encoder_fill_headers(struct encode *enc)
+ 		if (ret < 0)
+ 			return -1;
+ #endif
++	} else if (enc->cmdl->format == STD_MJPG) {
++		if (enc->huffTable)
++			free(enc->huffTable);
++		if (enc->qMatTable)
++			free(enc->qMatTable);
+ 	}
+ 
+ 	return 0;
+@@ -267,6 +275,9 @@ encoder_start(struct encode *enc)
+ 	int src_fd = enc->cmdl->src_fd;
+ 	int src_scheme = enc->cmdl->src_scheme;
+ 	int count = enc->cmdl->count;
++	struct timeval tenc_begin,tenc_end, total_start, total_end;
++	int sec, usec;
++	float tenc_time = 0, total_time=0;
+ 
+ #if STREAM_ENC_PIC_RESET == 0
+ 	PhysicalAddress phy_bsbuf_start = enc->phy_bsbuf_addr;
+@@ -284,7 +295,7 @@ encoder_start(struct encode *enc)
+ 	}
+ 
+ 	enc_param.sourceFrame = &enc->fb[src_fbid];
+-	enc_param.quantParam = 30;
++	enc_param.quantParam = 23;
+ 	enc_param.forceIPicture = 0;
+ 	enc_param.skipPicture = 0;
+ 
+@@ -299,6 +310,8 @@ encoder_start(struct encode *enc)
+ 		img_size = enc->picwidth * enc->picheight * 3 / 2;
+ 	}
+ 
++	gettimeofday(&total_start, NULL);
++
+ 	/* The main encoding loop */
+ 	while (1) {
+ 		if (src_scheme == PATH_V4L2) {
+@@ -329,6 +342,8 @@ encoder_start(struct encode *enc)
+ 		}
+ 
+ 		lock(enc->cmdl);
++
++		gettimeofday(&tenc_begin, NULL);
+ 		ret = vpu_EncStartOneFrame(handle, &enc_param);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("vpu_EncStartOneFrame failed Err code:%d\n",
+@@ -350,6 +365,17 @@ encoder_start(struct encode *enc)
+ 			vpu_WaitForInt(200);
+ 		}
+ 
++		gettimeofday(&tenc_end, NULL);
++		sec = tenc_end.tv_sec - tenc_begin.tv_sec;
++		usec = tenc_end.tv_usec - tenc_begin.tv_usec;
++
++		if (usec < 0) {
++			sec--;
++			usec = usec + 1000000;
++		}
++
++		tenc_time += (sec * 1000000) + usec;
++
+ 		ret = vpu_EncGetOutputInfo(handle, &outinfo);
+ 		unlock(enc->cmdl);
+ 		if (ret != RETCODE_SUCCESS) {
+@@ -384,7 +410,19 @@ encoder_start(struct encode *enc)
+ 			virt_bsbuf_end, phy_bsbuf_start, 0);
+ #endif
+ 
++	gettimeofday(&total_end, NULL);
++	sec = total_end.tv_sec - total_start.tv_sec;
++	usec = total_end.tv_usec - total_start.tv_usec;
++	if (usec < 0) {
++		sec--;
++		usec = usec + 1000000;
++	}
++	total_time = (sec * 1000000) + usec;
++
+ 	info_msg("Finished encoding: %d frames\n", frame_id);
++	info_msg("enc fps = %.2f\n", (frame_id / (tenc_time / 1000000)));
++	info_msg("total fps= %.2f \n",(frame_id / (total_time / 1000000)));
++
+ err2:
+ 	if (src_scheme == PATH_V4L2) {
+ 		v4l_stop_capturing();
+@@ -410,9 +448,19 @@ encoder_configure(struct encode *enc)
+ 	EncInitialInfo initinfo = {0};
+ 	RetCode ret;
+ 	MirrorDirection mirror;
++	iram_t iram;
++	int ram_size;
+ 
+ 	if (cpu_is_mx27()) {
+ 		search_pa.searchRamAddr = 0xFFFF4C00;
++	} else if (cpu_is_mx51()) {
++		memset(&iram, 0, sizeof(iram_t));
++		ram_size = ((enc->picwidth + 15) & ~15) * 36 + 2048;
++		IOGetIramBase(&iram);
++		if ((iram.end - iram.start) < ram_size)
++			ram_size = iram.end - iram.start;
++		search_pa.searchRamAddr = iram.start;
++		search_pa.SearchRamSize = ram_size;
+ 	}
+ 
+ 	lock(enc->cmdl);
+@@ -480,6 +528,9 @@ encoder_open(struct encode *enc)
+ {
+ 	EncHandle handle = {0};
+ 	EncOpenParam encop = {0};
++	Uint8 *huffTable = enc->huffTable;
++	Uint8 *qMatTable = enc->qMatTable;
++	int i;
+ 	RetCode ret;
+ 
+ 	/* Fill up parameters for encoding */
+@@ -504,7 +555,7 @@ encoder_open(struct encode *enc)
+ 	encop.frameRateInfo = 30;
+ 	encop.bitRate = enc->cmdl->bitrate;
+ 	encop.gopSize = enc->cmdl->gop;
+-	encop.slicemode.sliceMode = 1;
++	encop.slicemode.sliceMode = 0;	/* 0: 1 slice per picture; 1: Multiple slices per picture */
+ 	encop.slicemode.sliceSizeMode = 0;
+ 	encop.slicemode.sliceSize = 4000;
+ 
+@@ -519,6 +570,103 @@ encoder_open(struct encode *enc)
+ 	encop.ringBufferEnable = 0;
+ 	encop.dynamicAllocEnable = 0;
+ 
++	if( enc->cmdl->format == STD_MJPG )
++	{
++		qMatTable = calloc(192,1);
++		if (qMatTable == NULL) {
++			err_msg("Failed to allocate qMatTable\n");
++			return -1;
++		}
++		huffTable = calloc(432,1);
++		if (huffTable == NULL) {
++			free(qMatTable);
++			err_msg("Failed to allocate huffTable\n");
++			return -1;
++		}
++
++		/* Don't consider user defined hufftable this time */
++		/* Rearrange and insert pre-defined Huffman table to deticated variable. */
++		for(i = 0; i < 16; i += 4)
++		{
++			huffTable[i] = lumaDcBits[i + 3];
++			huffTable[i + 1] = lumaDcBits[i + 2];
++			huffTable[i + 2] = lumaDcBits[i + 1];
++			huffTable[i + 3] = lumaDcBits[i];
++		}
++		for(i = 16; i < 32 ; i += 4)
++		{
++			huffTable[i] = lumaDcValue[i + 3 - 16];
++			huffTable[i + 1] = lumaDcValue[i + 2 - 16];
++			huffTable[i + 2] = lumaDcValue[i + 1 - 16];
++			huffTable[i + 3] = lumaDcValue[i - 16];
++		}
++		for(i = 32; i < 48; i += 4)
++		{
++			huffTable[i] = lumaAcBits[i + 3 - 32];
++			huffTable[i + 1] = lumaAcBits[i + 2 - 32];
++			huffTable[i + 2] = lumaAcBits[i + 1 - 32];
++			huffTable[i + 3] = lumaAcBits[i - 32];
++		}
++		for(i = 48; i < 216; i += 4)
++		{
++			huffTable[i] = lumaAcValue[i + 3 - 48];
++			huffTable[i + 1] = lumaAcValue[i + 2 - 48];
++			huffTable[i + 2] = lumaAcValue[i + 1 - 48];
++			huffTable[i + 3] = lumaAcValue[i - 48];
++		}
++		for(i = 216; i < 232; i += 4)
++		{
++			huffTable[i] = chromaDcBits[i + 3 - 216];
++			huffTable[i + 1] = chromaDcBits[i + 2 - 216];
++			huffTable[i + 2] = chromaDcBits[i + 1 - 216];
++			huffTable[i + 3] = chromaDcBits[i - 216];
++		}
++		for(i = 232; i < 248; i += 4)
++		{
++			huffTable[i] = chromaDcValue[i + 3 - 232];
++			huffTable[i + 1] = chromaDcValue[i + 2 - 232];
++			huffTable[i + 2] = chromaDcValue[i + 1 - 232];
++			huffTable[i + 3] = chromaDcValue[i - 232];
++		}
++		for(i = 248; i < 264; i += 4)
++		{
++			huffTable[i] = chromaAcBits[i + 3 - 248];
++			huffTable[i + 1] = chromaAcBits[i + 2 - 248];
++			huffTable[i + 2] = chromaAcBits[i + 1 - 248];
++			huffTable[i + 3] = chromaAcBits[i - 248];
++		}
++		for(i = 264; i < 432; i += 4)
++		{
++			huffTable[i] = chromaAcValue[i + 3 - 264];
++			huffTable[i + 1] = chromaAcValue[i + 2 - 264];
++			huffTable[i + 2] = chromaAcValue[i + 1 - 264];
++			huffTable[i + 3] = chromaAcValue[i - 264];
++		}
++
++		/* Rearrange and insert pre-defined Q-matrix to deticated variable. */
++		for(i = 0; i < 64; i += 4)
++		{
++			qMatTable[i] = lumaQ2[i + 3];
++			qMatTable[i + 1] = lumaQ2[i + 2];
++			qMatTable[i + 2] = lumaQ2[i + 1];
++			qMatTable[i + 3] = lumaQ2[i];
++		}
++		for(i = 64; i < 128; i += 4)
++		{
++			qMatTable[i] = chromaBQ2[i + 3 - 64];
++			qMatTable[i + 1] = chromaBQ2[i + 2 - 64];
++			qMatTable[i + 2] = chromaBQ2[i + 1 - 64];
++			qMatTable[i + 3] = chromaBQ2[i - 64];
++		}
++		for(i = 128; i < 192; i += 4)
++		{
++			qMatTable[i] = chromaRQ2[i + 3 - 128];
++			qMatTable[i + 1] = chromaRQ2[i + 2 - 128];
++			qMatTable[i + 2] = chromaRQ2[i + 1 - 128];
++			qMatTable[i + 3] = chromaRQ2[i - 128];
++		}
++	}
++
+ 	if (enc->cmdl->format == STD_MPEG4) {
+ 		encop.EncStdParam.mp4Param.mp4_dataPartitionEnable = 0;
+ 		encop.EncStdParam.mp4Param.mp4_reversibleVlcEnable = 0;
+@@ -531,18 +679,31 @@ encoder_open(struct encode *enc)
+ 		encop.EncStdParam.h263Param.h263_annexTEnable = 0;
+ 	} else if (enc->cmdl->format == STD_AVC) {
+ 		encop.EncStdParam.avcParam.avc_constrainedIntraPredFlag = 0;
+-		encop.EncStdParam.avcParam.avc_disableDeblk = 0;
+-		encop.EncStdParam.avcParam.avc_deblkFilterOffsetAlpha = 0;
++		encop.EncStdParam.avcParam.avc_disableDeblk = 1;
++		encop.EncStdParam.avcParam.avc_deblkFilterOffsetAlpha = 6;
+ 		encop.EncStdParam.avcParam.avc_deblkFilterOffsetBeta = 0;
+-		encop.EncStdParam.avcParam.avc_chromaQpOffset = 0;
++		encop.EncStdParam.avcParam.avc_chromaQpOffset = 10;
+ 		encop.EncStdParam.avcParam.avc_audEnable = 0;
+ 		encop.EncStdParam.avcParam.avc_fmoEnable = 0;
+ 		encop.EncStdParam.avcParam.avc_fmoType = 0;
+-		encop.EncStdParam.avcParam.avc_fmoSliceNum = 0;
++		encop.EncStdParam.avcParam.avc_fmoSliceNum = 1;
++		encop.EncStdParam.avcParam.avc_fmoSliceSaveBufSize = 32; /* FMO_SLICE_SAVE_BUF_SIZE */
++	} else if (enc->cmdl->format == STD_MJPG) {
++		encop.EncStdParam.mjpgParam.mjpg_sourceFormat = 0; /* encConfig.mjpgChromaFormat */
++		encop.EncStdParam.mjpgParam.mjpg_restartInterval = 60;
++		encop.EncStdParam.mjpgParam.mjpg_thumbNailEnable = 0;
++		encop.EncStdParam.mjpgParam.mjpg_thumbNailWidth = 0;
++		encop.EncStdParam.mjpgParam.mjpg_thumbNailHeight = 0;
++		encop.EncStdParam.mjpgParam.mjpg_hufTable = huffTable;
++		encop.EncStdParam.mjpgParam.mjpg_qMatTable = qMatTable;
+ 	}
+ 
+ 	ret = vpu_EncOpen(&handle, &encop);
+ 	if (ret != RETCODE_SUCCESS) {
++		if (enc->cmdl->format == STD_MJPG) {
++			free(qMatTable);
++			free(huffTable);
++		}
+ 		err_msg("Encoder open failed %d\n", ret);
+ 		return -1;
+ 	}
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 55804e4..2286e17 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -38,7 +38,7 @@ decode()
+ 	struct vpu_display *disp = dec->disp;
+ 	RetCode ret;
+ 	
+-	decparam.prescanEnable = 1;
++	decparam.prescanEnable = 0;
+ 
+ 	ret = vpu_DecStartOneFrame(handle, &decparam);
+ 	if (ret != RETCODE_SUCCESS) {
+diff --git a/test/mxc_vpu_test/vpu_jpegtable.h b/test/mxc_vpu_test/vpu_jpegtable.h
+new file mode 100644
+index 0000000..68e729b
+--- /dev/null
++++ b/test/mxc_vpu_test/vpu_jpegtable.h
+@@ -0,0 +1,142 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ * Copyright (c) 2008, Chips & Media.  All rights reserved.
++ */
++
++#ifndef JPEG_TABLE_H
++#define JPEG_TABLE_H
++
++unsigned char lumaDcBits[16] = {
++0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01,
++0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++unsigned char lumaDcValue[16] = {
++0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++0x08, 0x09, 0x0A, 0x0B, 0x00, 0x00, 0x00, 0x00,
++};
++unsigned char lumaAcBits[16] = {
++0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03,
++0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
++};
++unsigned char lumaAcValue[168] = {
++0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12,
++0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
++0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
++0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
++0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16,
++0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
++0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
++0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
++0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
++0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
++0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
++0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
++0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
++0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
++0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
++0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
++0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4,
++0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
++0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA,
++0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
++0xF9, 0xFA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++unsigned char chromaDcBits[16] = {
++0x00, 0x03, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
++0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++unsigned char chromaDcValue[16] = {
++0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
++0x08, 0x09, 0x0A, 0x0B, 0x00, 0x00, 0x00, 0x00,
++};
++unsigned char chromaAcBits[16] = {
++0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04,
++0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77,
++};
++unsigned char chromaAcValue[168] = {
++0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21,
++0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
++0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
++0xA1, 0xB1, 0xC1, 0x09, 0x23, 0x33, 0x52, 0xF0,
++0x15, 0x62, 0x72, 0xD1, 0x0A, 0x16, 0x24, 0x34,
++0xE1, 0x25, 0xF1, 0x17, 0x18, 0x19, 0x1A, 0x26,
++0x27, 0x28, 0x29, 0x2A, 0x35, 0x36, 0x37, 0x38,
++0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
++0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
++0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
++0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
++0x79, 0x7A, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
++0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96,
++0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5,
++0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4,
++0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3,
++0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2,
++0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA,
++0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9,
++0xEA, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
++0xF9, 0xFA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++unsigned char lumaQ[64] = {
++0x0C, 0x08, 0x08, 0x08, 0x09, 0x08, 0x0C, 0x09,
++0x09, 0x0C, 0x11, 0x0B, 0x0A, 0x0B, 0x11, 0x15,
++0x0F, 0x0C, 0x0C, 0x0F, 0x15, 0x18, 0x13, 0x13,
++0x15, 0x13, 0x13, 0x18, 0x11, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++};
++unsigned char chromaBQ[64] = {
++0x0D, 0x0B, 0x0B, 0x0D, 0x0E, 0x0D, 0x10, 0x0E,
++0x0E, 0x10, 0x14, 0x0E, 0x0E, 0x0E, 0x14, 0x14,
++0x0E, 0x0E, 0x0E, 0x0E, 0x14, 0x11, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x11, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++};
++unsigned char chromaRQ[64] = {
++0x0D, 0x0B, 0x0B, 0x0D, 0x0E, 0x0D, 0x10, 0x0E,
++0x0E, 0x10, 0x14, 0x0E, 0x0E, 0x0E, 0x14, 0x14,
++0x0E, 0x0E, 0x0E, 0x0E, 0x14, 0x11, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x11, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++};
++unsigned char lumaQ2[64] = {
++0x06, 0x04, 0x04, 0x04, 0x05, 0x04, 0x06, 0x05,
++0x05, 0x06, 0x09, 0x06, 0x05, 0x06, 0x09, 0x0B,
++0x08, 0x06, 0x06, 0x08, 0x0B, 0x0C, 0x0A, 0x0A,
++0x0B, 0x0A, 0x0A, 0x0C, 0x10, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x10, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++};
++unsigned char chromaBQ2[64] = {
++0x07, 0x07, 0x07, 0x0D, 0x0C, 0x0D, 0x18, 0x10,
++0x10, 0x18, 0x14, 0x0E, 0x0E, 0x0E, 0x14, 0x14,
++0x0E, 0x0E, 0x0E, 0x0E, 0x14, 0x11, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x11, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++};
++unsigned char chromaRQ2[64] = {
++0x07, 0x07, 0x07, 0x0D, 0x0C, 0x0D, 0x18, 0x10,
++0x10, 0x18, 0x14, 0x0E, 0x0E, 0x0E, 0x14, 0x14,
++0x0E, 0x0E, 0x0E, 0x0E, 0x14, 0x11, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x11, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x11, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
++};
++
++#endif
++
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 2495787..7dff6b1 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -169,6 +169,8 @@ struct encode {
+ 	FrameBuffer *fb; /* frame buffer base given to encoder */
+ 	struct frame_buf **pfbpool; /* allocated fb pointers are stored here */
+ 	struct cmd_line *cmdl; /* command line */
++	u8 * huffTable;
++	u8 * qMatTable;
+ };
+ 
+ void framebuf_init();
+-- 
+1.8.0
+

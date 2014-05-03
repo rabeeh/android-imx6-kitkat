@@ -1,0 +1,613 @@
+From 11b8ef669075f4d31f32c6ad014a82aeeecf0f49 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Wed, 5 Sep 2012 14:33:24 +0800
+Subject: [PATCH 336/486] ENGR00221840-3 jb upgrade: remove ION lib
+
+Remove ION due to existed in system/core.git
+
+Change-Id: I982a755a79fb12a902bdb54950278d1a61cff3e4
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ ion/Android.mk |  17 ---
+ ion/ion.c      | 171 -----------------------------
+ ion/ion.h      |  37 -------
+ ion/ion_test.c | 341 ---------------------------------------------------------
+ 4 files changed, 566 deletions(-)
+ delete mode 100644 ion/Android.mk
+ delete mode 100644 ion/ion.c
+ delete mode 100644 ion/ion.h
+ delete mode 100644 ion/ion_test.c
+
+diff --git a/ion/Android.mk b/ion/Android.mk
+deleted file mode 100644
+index 5165171..0000000
+--- a/ion/Android.mk
++++ /dev/null
+@@ -1,17 +0,0 @@
+-ifeq ($(USE_ION_ALLOCATOR), true)
+-LOCAL_PATH:= $(call my-dir)
+-
+-include $(CLEAR_VARS)
+-LOCAL_SRC_FILES := ion.c
+-LOCAL_MODULE := libion
+-LOCAL_MODULE_TAGS := optional
+-LOCAL_SHARED_LIBRARIES := liblog
+-include $(BUILD_SHARED_LIBRARY)
+-
+-include $(CLEAR_VARS)
+-LOCAL_SRC_FILES := ion.c ion_test.c
+-LOCAL_MODULE := iontest
+-LOCAL_MODULE_TAGS := optional tests
+-LOCAL_SHARED_LIBRARIES := liblog
+-include $(BUILD_EXECUTABLE)
+-endif
+diff --git a/ion/ion.c b/ion/ion.c
+deleted file mode 100644
+index 480add0..0000000
+--- a/ion/ion.c
++++ /dev/null
+@@ -1,171 +0,0 @@
+-/*
+- *  ion.c
+- *
+- * Memory Allocator functions for ion
+- *
+- *   Copyright 2011 Google, Inc
+- *   Copyright (C) 2012 Freescale Semiconductor, Inc.
+- *
+- *  Licensed under the Apache License, Version 2.0 (the "License");
+- *  you may not use this file except in compliance with the License.
+- *  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-#include <errno.h>
+-#include <fcntl.h>
+-#include <stdio.h>
+-#include <sys/ioctl.h>
+-#include <sys/mman.h>
+-#include <sys/types.h>
+-
+-#define LOG_TAG "ion"
+-#include <cutils/log.h>
+-
+-#include <linux/ion.h>
+-#include <linux/omap_ion.h>
+-#include "ion.h"
+-
+-int ion_open()
+-{
+-        int fd = open("/dev/ion", O_RDWR);
+-        if (fd < 0)
+-                LOGE("open /dev/ion failed!\n");
+-        return fd;
+-}
+-
+-int ion_close(int fd)
+-{
+-        return close(fd);
+-}
+-
+-static int ion_ioctl(int fd, int req, void *arg)
+-{
+-        int ret = ioctl(fd, req, arg);
+-        if (ret < 0) {
+-                LOGE("ioctl %d failed with code %d: %s\n", req,
+-                       ret, strerror(errno));
+-                return -errno;
+-        }
+-        return ret;
+-}
+-
+-int ion_alloc(int fd, size_t len, size_t align, unsigned int flags,
+-              struct ion_handle **handle)
+-{
+-        int ret;
+-        struct ion_allocation_data data = {
+-                .len = len,
+-                .align = align,
+-                .flags = flags,
+-        };
+-
+-        ret = ion_ioctl(fd, ION_IOC_ALLOC, &data);
+-        if (ret < 0)
+-                return ret;
+-        *handle = data.handle;
+-        return ret;
+-}
+-
+-int ion_alloc_tiler(int fd, size_t w, size_t h, int fmt, unsigned int flags,
+-            struct ion_handle **handle, size_t *stride)
+-{
+-        int ret;
+-        struct omap_ion_tiler_alloc_data alloc_data = {
+-                .w = w,
+-                .h = h,
+-                .fmt = fmt,
+-                .flags = flags,
+-        };
+-
+-        struct ion_custom_data custom_data = {
+-                .cmd = OMAP_ION_TILER_ALLOC,
+-                .arg = (unsigned long)(&alloc_data),
+-        };
+-
+-        ret = ion_ioctl(fd, ION_IOC_CUSTOM, &custom_data);
+-        if (ret < 0)
+-                return ret;
+-        *stride = alloc_data.stride;
+-        *handle = alloc_data.handle;
+-        return ret;
+-}
+-
+-int ion_free(int fd, struct ion_handle *handle)
+-{
+-        struct ion_handle_data data = {
+-                .handle = handle,
+-        };
+-        return ion_ioctl(fd, ION_IOC_FREE, &data);
+-}
+-
+-int ion_map(int fd, struct ion_handle *handle, size_t length, int prot,
+-            int flags, off_t offset, unsigned char **ptr, int *map_fd)
+-{
+-        struct ion_fd_data data = {
+-                .handle = handle,
+-        };
+-        int ret = ion_ioctl(fd, ION_IOC_MAP, &data);
+-        if (ret < 0)
+-                return ret;
+-        *map_fd = data.fd;
+-        if (*map_fd < 0) {
+-                LOGE("map ioctl returned negative fd\n");
+-                return -EINVAL;
+-        }
+-        *ptr = mmap(NULL, length, prot, flags, *map_fd, offset);
+-        if (*ptr == MAP_FAILED) {
+-                LOGE("mmap failed: %s\n", strerror(errno));
+-                return -errno;
+-        }
+-        return ret;
+-}
+-
+-unsigned long ion_phys(int fd, struct ion_handle *handle)
+-{
+-        int ret;
+-        struct ion_phys_data data = {
+-                .handle = handle,
+-		.phys = 0,
+-        };
+-
+-        ret = ion_ioctl(fd, ION_IOC_PHYS, &data);
+-        if (ret == 0)
+-            return data.phys;
+-        return 0;
+-}
+-
+-int ion_share(int fd, struct ion_handle *handle, int *share_fd)
+-{
+-        int map_fd;
+-        struct ion_fd_data data = {
+-                .handle = handle,
+-        };
+-        int ret = ion_ioctl(fd, ION_IOC_SHARE, &data);
+-        if (ret < 0)
+-                return ret;
+-        *share_fd = data.fd;
+-        if (*share_fd < 0) {
+-                LOGE("map ioctl returned negative fd\n");
+-                return -EINVAL;
+-        }
+-        return ret;
+-}
+-
+-int ion_import(int fd, int share_fd, struct ion_handle **handle)
+-{
+-        struct ion_fd_data data = {
+-                .fd = share_fd,
+-        };
+-        int ret = ion_ioctl(fd, ION_IOC_IMPORT, &data);
+-        if (ret < 0)
+-                return ret;
+-        *handle = data.handle;
+-        return ret;
+-}
+diff --git a/ion/ion.h b/ion/ion.h
+deleted file mode 100644
+index 5d77751..0000000
+--- a/ion/ion.h
++++ /dev/null
+@@ -1,37 +0,0 @@
+-/*
+- *  ion.c
+- *
+- * Memory Allocator functions for ion
+- *
+- *   Copyright 2011 Google, Inc
+- *   Copyright (C) 2012 Freescale Semiconductor, Inc.
+- *
+- *  Licensed under the Apache License, Version 2.0 (the "License");
+- *  you may not use this file except in compliance with the License.
+- *  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-
+-#include <linux/ion.h>
+-#include <linux/omap_ion.h>
+-
+-int ion_open();
+-int ion_close(int fd);
+-int ion_alloc(int fd, size_t len, size_t align, unsigned int flags,
+-              struct ion_handle **handle);
+-int ion_alloc_tiler(int fd, size_t w, size_t h, int fmt, unsigned int flags,
+-		    struct ion_handle **handle, size_t *stride);
+-int ion_free(int fd, struct ion_handle *handle);
+-int ion_map(int fd, struct ion_handle *handle, size_t length, int prot,
+-            int flags, off_t offset, unsigned char **ptr, int *map_fd);
+-int ion_share(int fd, struct ion_handle *handle, int *share_fd);
+-int ion_import(int fd, int share_fd, struct ion_handle **handle);
+-unsigned long ion_phys(int fd, struct ion_handle *handle);
+-
+diff --git a/ion/ion_test.c b/ion/ion_test.c
+deleted file mode 100644
+index 62321f7..0000000
+--- a/ion/ion_test.c
++++ /dev/null
+@@ -1,341 +0,0 @@
+-/*
+- *  ion_test.c
+- *
+- * ion test programe
+- *
+- *   Copyright 2011 Google, Inc
+- *   Copyright (C) 2012 Freescale Semiconductor, Inc.
+- *
+- *  Licensed under the Apache License, Version 2.0 (the "License");
+- *  you may not use this file except in compliance with the License.
+- *  You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- */
+-#include <errno.h>
+-#include <fcntl.h>
+-#include <getopt.h>
+-#include <string.h>
+-#include <stdlib.h>
+-#include <stdio.h>
+-#include <sys/mman.h>
+-#include <sys/ioctl.h>
+-#include <sys/socket.h>
+-#include <sys/stat.h>
+-#include <sys/types.h>
+-#include <unistd.h>
+-
+-#include "ion.h"
+-#include <linux/ion.h>
+-#include <linux/omap_ion.h>
+-
+-size_t len = 1024*1024, align = 0;
+-int prot = PROT_READ | PROT_WRITE;
+-int map_flags = MAP_SHARED;
+-int alloc_flags = 0;
+-int test = -1;
+-size_t width = 1024*1024, height = 1024*1024;
+-int fmt = TILER_PIXEL_FMT_32BIT;
+-int tiler_test = 0;
+-size_t stride;
+-
+-int _ion_alloc_test(int *fd, struct ion_handle **handle)
+-{
+-	int ret;
+-
+-	*fd = ion_open();
+-	if (*fd < 0)
+-		return *fd;
+-
+-	if (tiler_test)
+-		ret = ion_alloc_tiler(*fd, width, height, fmt, alloc_flags,
+-					  handle, &stride);
+-	else
+-		ret = ion_alloc(*fd, len, align, alloc_flags, handle);
+-
+-	if (ret)
+-		printf("%s failed: %s\n", __func__, strerror(ret));
+-	return ret;
+-}
+-
+-void ion_alloc_test()
+-{
+-	int fd, ret;
+-	struct ion_handle *handle;
+-
+-	if(_ion_alloc_test(&fd, &handle))
+-			return;
+-
+-	ret = ion_free(fd, handle);
+-	if (ret) {
+-		printf("%s failed: %s %p\n", __func__, strerror(ret), handle);
+-		return;
+-	}
+-	ion_close(fd);
+-	printf("ion alloc test: passed\n");
+-}
+-
+-void _ion_tiler_map_test(unsigned char *ptr)
+-{
+-	size_t row, col;
+-
+-	for (row = 0; row < height; row++)
+-		for (col = 0; col < width; col++) {
+-			int i = (row * stride) + col;
+-			ptr[i] = (unsigned char)i;
+-		}
+-	for (row = 0; row < height; row++)
+-		for (col = 0; col < width; col++) {
+-			int i = (row * stride) + col;
+-			if (ptr[i] != (unsigned char)i)
+-				printf("%s failed wrote %d read %d from mapped "
+-					   "memory\n", __func__, i, ptr[i]);
+-		}
+-}
+-
+-
+-void ion_map_test()
+-{
+-	int fd, map_fd, ret;
+-	size_t i;
+-	struct ion_handle *handle;
+-	unsigned char *ptr;
+-
+-	if(_ion_alloc_test(&fd, &handle))
+-		return;
+-
+-	if (tiler_test)
+-		len = height * stride;
+-	ret = ion_map(fd, handle, len, prot, map_flags, 0, &ptr, &map_fd);
+-	if (ret)
+-		return;
+-
+-	if (tiler_test)
+-		_ion_tiler_map_test(ptr);
+-	else {
+-		for (i = 0; i < len; i++) {
+-			ptr[i] = (unsigned char)i;
+-		}
+-		for (i = 0; i < len; i++)
+-			if (ptr[i] != (unsigned char)i)
+-				printf("%s failed wrote %d read %d from mapped "
+-					   "memory\n", __func__, i, ptr[i]);
+-	}
+-	/* clean up properly */
+-	ret = ion_free(fd, handle);
+-	ion_close(fd);
+-	munmap(ptr, len);
+-	close(map_fd);
+-
+-	_ion_alloc_test(&fd, &handle);
+-	close(fd);
+-
+-#if 0
+-	munmap(ptr, len);
+-	close(map_fd);
+-	ion_close(fd);
+-
+-	_ion_alloc_test(len, align, flags, &fd, &handle);
+-	close(map_fd);
+-	ret = ion_map(fd, handle, len, prot, flags, 0, &ptr, &map_fd);
+-	/* don't clean up */
+-#endif
+-}
+-
+-void ion_share_test()
+-
+-{
+-	struct ion_handle *handle;
+-	int sd[2];
+-	int num_fd = 1;
+-	struct iovec count_vec = {
+-		.iov_base = &num_fd,
+-		.iov_len = sizeof num_fd,
+-	};
+-	char buf[CMSG_SPACE(sizeof(int))];
+-	socketpair(AF_UNIX, SOCK_STREAM, 0, sd);
+-	if (fork()) {
+-		struct msghdr msg = {
+-			.msg_control = buf,
+-			.msg_controllen = sizeof buf,
+-			.msg_iov = &count_vec,
+-			.msg_iovlen = 1,
+-		};
+-
+-		struct cmsghdr *cmsg;
+-		int fd, share_fd, ret;
+-		char *ptr;
+-		/* parent */
+-		if(_ion_alloc_test(&fd, &handle))
+-			return;
+-		ret = ion_share(fd, handle, &share_fd);
+-		if (ret)
+-			printf("share failed %s\n", strerror(errno));
+-		ptr = mmap(NULL, len, prot, map_flags, share_fd, 0);
+-		if (ptr == MAP_FAILED) {
+-			return;
+-		}
+-		strcpy(ptr, "master");
+-		cmsg = CMSG_FIRSTHDR(&msg);
+-		cmsg->cmsg_level = SOL_SOCKET;
+-		cmsg->cmsg_type = SCM_RIGHTS;
+-		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+-		*(int *)CMSG_DATA(cmsg) = share_fd;
+-		/* send the fd */
+-		printf("master? [%10s] should be [master]\n", ptr);
+-		printf("master sending msg 1\n");
+-		sendmsg(sd[0], &msg, 0);
+-		if (recvmsg(sd[0], &msg, 0) < 0)
+-			perror("master recv msg 2");
+-		printf("master? [%10s] should be [child]\n", ptr);
+-
+-		/* send ping */
+-		sendmsg(sd[0], &msg, 0);
+-		printf("master->master? [%10s]\n", ptr);
+-		if (recvmsg(sd[0], &msg, 0) < 0)
+-			perror("master recv 1");
+-	} else {
+-		struct msghdr msg;
+-		struct cmsghdr *cmsg;
+-		char* ptr;
+-		int fd, recv_fd;
+-		char* child_buf[100];
+-		/* child */
+-		struct iovec count_vec = {
+-			.iov_base = child_buf,
+-			.iov_len = sizeof child_buf,
+-		};
+-
+-		struct msghdr child_msg = {
+-			.msg_control = buf,
+-			.msg_controllen = sizeof buf,
+-			.msg_iov = &count_vec,
+-			.msg_iovlen = 1,
+-		};
+-
+-		if (recvmsg(sd[1], &child_msg, 0) < 0)
+-			perror("child recv msg 1");
+-		cmsg = CMSG_FIRSTHDR(&child_msg);
+-		if (cmsg == NULL) {
+-			printf("no cmsg rcvd in child");
+-			return;
+-		}
+-		recv_fd = *(int*)CMSG_DATA(cmsg);
+-		if (recv_fd < 0) {
+-			printf("could not get recv_fd from socket");
+-			return;
+-		}
+-		printf("child %d\n", recv_fd);
+-		fd = ion_open();
+-		ptr = mmap(NULL, len, prot, map_flags, recv_fd, 0);
+-		if (ptr == MAP_FAILED) {
+-			return;
+-		}
+-		printf("child? [%10s] should be [master]\n", ptr);
+-		strcpy(ptr, "child");
+-		printf("child sending msg 2\n");
+-		sendmsg(sd[1], &child_msg, 0);
+-	}
+-}
+-
+-int main(int argc, char* argv[]) {
+-	int c;
+-	enum tests {
+-		ALLOC_TEST = 0, MAP_TEST, SHARE_TEST,
+-	};
+-
+-	while (1) {
+-		static struct option opts[] = {
+-			{"alloc", no_argument, 0, 'a'},
+-			{"alloc_flags", required_argument, 0, 'f'},
+-			{"map", no_argument, 0, 'm'},
+-			{"share", no_argument, 0, 's'},
+-			{"len", required_argument, 0, 'l'},
+-			{"align", required_argument, 0, 'g'},
+-			{"map_flags", required_argument, 0, 'z'},
+-			{"prot", required_argument, 0, 'p'},
+-			{"alloc_tiler", no_argument, 0, 't'},
+-			{"width", required_argument, 0, 'w'},
+-			{"height", required_argument, 0, 'h'},
+-			{"fmt", required_argument, 0, 'r'},
+-		};
+-		int i = 0;
+-		c = getopt_long(argc, argv, "af:h:l:mr:stw:", opts, &i);
+-		if (c == -1)
+-			break;
+-
+-		switch (c) {
+-		case 'l':
+-			len = atol(optarg);
+-			break;
+-		case 'g':
+-			align = atol(optarg);
+-			break;
+-		case 'z':
+-			map_flags = 0;
+-			map_flags |= strstr(optarg, "PROT_EXEC") ?
+-				PROT_EXEC : 0;
+-			map_flags |= strstr(optarg, "PROT_READ") ?
+-				PROT_READ: 0;
+-			map_flags |= strstr(optarg, "PROT_WRITE") ?
+-				PROT_WRITE: 0;
+-			map_flags |= strstr(optarg, "PROT_NONE") ?
+-				PROT_NONE: 0;
+-			break;
+-		case 'p':
+-			prot = 0;
+-			prot |= strstr(optarg, "MAP_PRIVATE") ?
+-				MAP_PRIVATE	 : 0;
+-			prot |= strstr(optarg, "MAP_SHARED") ?
+-				MAP_PRIVATE	 : 0;
+-			break;
+-		case 'f':
+-			alloc_flags = atol(optarg);
+-			break;
+-		case 'a':
+-			test = ALLOC_TEST;
+-			break;
+-		case 'm':
+-			test = MAP_TEST;
+-			break;
+-		case 'r':
+-			fmt = atol(optarg);
+-			break;
+-		case 's':
+-			test = SHARE_TEST;
+-			break;
+-		case 'w':
+-			width = atol(optarg);
+-			break;
+-		case 'h':
+-			height = atol(optarg);
+-			break;
+-		case 't':
+-			tiler_test = 1;
+-			break;
+-		}
+-	}
+-	printf("test %d, len %u, width %u, height %u fmt %u align %u, "
+-		   "map_flags %d, prot %d, alloc_flags %d\n", test, len, width,
+-		   height, fmt, align, map_flags, prot, alloc_flags);
+-	switch (test) {
+-		case ALLOC_TEST:
+-			ion_alloc_test();
+-			break;
+-		case MAP_TEST:
+-			ion_map_test();
+-			break;
+-		case SHARE_TEST:
+-			ion_share_test();
+-			break;
+-		default:
+-			printf("must specify a test (alloc, map, share)\n");
+-	}
+-	return 0;
+-}
+-- 
+1.8.0
+

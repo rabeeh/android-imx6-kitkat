@@ -1,0 +1,618 @@
+From a6f4d0f4fdf47f52dfa9d17b69ba3acc3505b722 Mon Sep 17 00:00:00 2001
+From: Loren Huang <b02279@freescale.com>
+Date: Wed, 30 Oct 2013 17:57:07 +0800
+Subject: [PATCH 425/435] ENGR00285547 Add mmdc profiling tool
+
+Usage: mmdc [ARM:IPU1:IPU2:GPU2D:GPU2D1:GPU2D2:GPU3D:GPUVG:VPU:SUM] [...]
+export MMDC_SLEEPTIME can be used to define profiling duration.1 by default means 1s
+export MMDC_LOOPCOUNT can be used to define profiling times. 1 by default. -1 means infinite loop.
+export MMDC_CUST_MADPCR1 can be used to customize madpcr1. Will ignore it if defined master
+Note1: More than 1 master can be inputed. They will be profiled one by one.
+Note2: MX6DL can't profile master GPU2D, GPU2D1 and GPU2D2 are used instead.
+
+Signed-off-by: Loren Huang <b02279@freescale.com>
+---
+ test/mmdc/Makefile |  35 +++++
+ test/mmdc/mmdc.c   | 378 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ test/mmdc/mmdc.h   | 162 +++++++++++++++++++++++
+ 3 files changed, 575 insertions(+)
+ create mode 100644 test/mmdc/Makefile
+ create mode 100644 test/mmdc/mmdc.c
+ create mode 100644 test/mmdc/mmdc.h
+
+diff --git a/test/mmdc/Makefile b/test/mmdc/Makefile
+new file mode 100644
+index 0000000..3043ab5
+--- /dev/null
++++ b/test/mmdc/Makefile
+@@ -0,0 +1,35 @@
++# list of platforms which did not want this test case
++EXCLUDE_LIST:=
++
++CC :=$(CROSS_COMPILE)gcc
++LD :=$(CROSS_COMPILE)gcc
++LINK ?=$(CROSS_COMPILE)gcc
++STRIP ?=$(CROSS_COMPILE)strip
++
++OBJ = mmdc.o
++
++ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
++TARGET = $(OBJDIR)/mmdc2
++else
++TARGET =
++endif
++
++CFLAGS+= -Os
++
++LDFLAGS+= -lstdc++
++
++all : $(TARGET)
++
++$(TARGET):$(OBJ)
++	$(LINK) -o $(TARGET) $(OBJ) $(LDFLAGS) -Os
++	$(STRIP) $(TARGET)
++
++.PHONY: clean
++clean :
++	rm -f $(OBJ)
++
++#
++# include the Rules
++#
++include ../make.rules
++
+diff --git a/test/mmdc/mmdc.c b/test/mmdc/mmdc.c
+new file mode 100644
+index 0000000..54357fb
+--- /dev/null
++++ b/test/mmdc/mmdc.c
+@@ -0,0 +1,378 @@
++/*
++ * Copyright (C) 2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++
++#include "mmdc.h"
++#include <stdio.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/time.h>
++#include <stdlib.h>
++#include <string.h>
++
++const int AXI_BUS_WIDTH_IN_BYTE = 8;
++
++#define MMDC_P0_IPS_BASE_ADDR 0x021B0000
++#define MMDC_P1_IPS_BASE_ADDR 0x021B4000
++
++/************************* Global Variables ***********************************/
++pMMDC_t mmdc_p0 = (pMMDC_t)(MMDC_P0_IPS_BASE_ADDR);
++pMMDC_t mmdc_p1 = (pMMDC_t)(MMDC_P1_IPS_BASE_ADDR);
++int g_size = 4;
++unsigned int system_rev = 0;
++int g_quit = 0;
++/**************************** Functions ***************************************/
++static unsigned long getTickCount(void)
++{
++	struct timeval tv;
++	if(gettimeofday(&tv, NULL) != 0)
++	return 0;
++	return (tv.tv_sec * 1000) + (tv.tv_usec / 1000);
++}
++
++/************************ Profiler Functions **********************************/
++
++void start_mmdc_profiling(pMMDC_t mmdc)
++{
++
++	mmdc->madpcr0 = 0xA;		// Reset counters and clear Overflow bit
++	msync(&(mmdc->madpcr0),4,MS_SYNC);
++
++	mmdc->madpcr0 = 0x1;		// Enable counters
++	msync(&(mmdc->madpcr0),4,MS_SYNC);
++
++}
++
++void stop_mmdc_profiling(pMMDC_t mmdc)
++{
++	mmdc->madpcr0 = 0x0;		// Disable counters
++	msync(&(mmdc->madpcr0),4,MS_SYNC);
++
++}
++
++void pause_mmdc_profiling(pMMDC_t mmdc)
++{
++	mmdc->madpcr0 = 0x3;		// PRF_FRZ = 1
++	msync(&(mmdc->madpcr0),4,MS_SYNC);
++}
++
++void resume_mmdc_profiling(pMMDC_t mmdc)
++{
++	mmdc->madpcr0 = 0x1;		// PRF_FRZ = 0
++	msync(&(mmdc->madpcr0),4,MS_SYNC);
++}
++void load_mmdc_results(pMMDC_t mmdc)
++{
++	//printf("before : mmdc->madpcr0 0x%x\n",mmdc->madpcr0);
++	mmdc->madpcr0 |= 0x4; //sets the PRF_FRZ bit to 1 in order to load the results into the registers
++	//printf("after : mmdc->madpcr0 0x%x\n",mmdc->madpcr0);
++	msync(&(mmdc->madpcr0),4,MS_SYNC);
++}
++
++void clear_mmdc_results(pMMDC_t mmdc)
++{
++	mmdc->madpcr0 = 0xA;            // Reset counters and clear Overflow bit
++		msync(&(mmdc->madpcr0),4,MS_SYNC);
++}
++
++void get_mmdc_profiling_results(pMMDC_t mmdc, MMDC_PROFILE_RES_t *results)
++{
++	results->total_cycles 	= mmdc->madpsr0;
++	results->busy_cycles 	= mmdc->madpsr1;
++	results->read_accesses	= mmdc->madpsr2;
++	results->write_accesses	= mmdc->madpsr3;
++	results->read_bytes		= mmdc->madpsr4;
++	results->write_bytes	= mmdc->madpsr5;
++	if(results->read_bytes!=0 || results->write_bytes!=0)
++	{
++		results->utilization	= (int)(((float)results->read_bytes+(float)results->write_bytes)/((float)results->busy_cycles * 16) * 100);
++
++		results->data_load  	= (int)((float)results->busy_cycles/(float)results->total_cycles * 100);
++		results->access_utilization	= (int)(((float)results->read_bytes+(float)results->write_bytes)/((float)results->read_accesses + (float)results->write_accesses));
++		if(mmdc->madpsr3)
++			results->avg_write_burstsize = (int)mmdc->madpsr5 / mmdc->madpsr3;
++		else
++			results->avg_write_burstsize = 0;
++		if(mmdc->madpsr2)
++			results->avg_read_burstsize = (int)mmdc->madpsr4 / mmdc->madpsr2;
++		else
++			results->avg_read_burstsize = 0;
++	}
++	else
++	{
++		results->utilization	= 0;
++		results->data_load  	= 0;
++		results->access_utilization	= 0;
++		results->avg_write_burstsize = 0;
++		 results->avg_read_burstsize = 0;
++	}
++}
++void print_mmdc_profiling_results(MMDC_PROFILE_RES_t results, MMDC_RES_TYPE_t print_type, int time)
++{
++	if (print_type == RES_FULL)
++	{
++		printf("\nMMDC new Profiling results:\n");
++		printf("***********************\n");
++		printf("Measure time: %dms \n", time);
++		printf("Total cycles count: %u\n",results.total_cycles);
++		printf("Busy cycles count: %u\n",results.busy_cycles);
++		printf("Read accesses count: %u\n",results.read_accesses);
++		printf("Write accesses count: %u\n",results.write_accesses);
++		printf("Read bytes count: %u\n",results.read_bytes);
++		printf("Write bytes count: %u\n",results.write_bytes);
++		printf("Avg. Read burst size: %u\n",results.avg_read_burstsize);
++		printf("Avg. Write burst size: %u\n",results.avg_write_burstsize);
++
++		printf("Read: ");
++
++		printf("%0.2f MB/s / ", (float)results.read_bytes*1000/(1024*1024*time));
++
++		printf(" Write: ");
++		printf("%0.2f MB/s ", (float)results.write_bytes*1000/(1024*1024*(float)time));
++
++		printf(" Total: ");
++		printf("%0.2f MB/s ", (float)(results.write_bytes+results.read_bytes)*1000/(1024*1024*(float)time));
++
++		printf("\r\n");
++	}
++	printf("Utilization: %u%%\n",results.utilization);
++	printf("Bus Load: %u%%\n",results.data_load);
++	printf("Bytes Access: %u\n\n",results.access_utilization);
++}
++
++static int get_system_rev(void)
++{
++	FILE *fp;
++	char buf[2048];
++	int nread;
++	char *tmp, *rev;
++	int ret = -1;
++
++	fp = fopen("/proc/cpuinfo", "r");
++	if (fp == NULL) {
++		perror("/proc/cpuinfo\n");
++		return ret;
++	}
++
++	nread = fread(buf, 1, sizeof(buf), fp);
++	fclose(fp);
++	if ((nread == 0) || (nread == sizeof(buf))) {
++		printf("/proc/cpuinfo: %d\n",nread);
++		nread = 0;
++		ret = 0;
++	}
++
++	buf[nread] = '\0';
++
++	tmp = strstr(buf, "Revision");
++	if (tmp != NULL) {
++		rev = index(tmp, ':');
++		if (rev != NULL) {
++			rev++;
++			system_rev = strtoul(rev, NULL, 16);
++			ret = 0;
++		}
++	}
++
++	//cpuinfo is changed in 3.10.9 kernel, new way is used.
++	if((ret == 0) && (system_rev ==0))
++	{
++		ret = -1;
++		fp = fopen("/sys/devices/soc0/soc_id", "r");
++		if (fp == NULL) {
++			perror("/sys/devices/soc0/soc_id\n");
++			return ret;
++		}
++
++		nread = fread(buf, 1, sizeof(buf), fp);
++		fclose(fp);
++		if ((nread == 0) || (nread == sizeof(buf))) {
++			printf("/sys/devices/soc0/soc_id:%d\n",nread);
++			return ret;
++		}
++		buf[nread] = '\0';
++		if(strncmp(buf,"i.MX6Q",6)==0)
++		{
++			system_rev= 0x63000;
++			ret =0;
++			printf("i.MX6Q detected.\n");
++		}else if(strncmp(buf,"i.MX6DL",7)==0){
++			system_rev= 0x61000;
++			ret = 0;
++			printf("i.MX6DL detected.\n");
++		}else if(strncmp(buf,"i.MX6SL",7)==0)
++		{
++			system_rev= 0x60000;
++			ret = 0;
++			printf("i.MX6SL detected.\n");
++		}
++	}
++	return ret;
++}
++
++void signalhandler(int signal)
++{
++	printf("singal %d received, quit the application.\n", signal);
++	g_quit = 1;
++}
++void help(void)
++{
++	printf("======================MMDC v1.2===========================\n");
++	printf("Usage: mmdc [ARM:IPU1:IPU2:GPU2D:GPU2D1:GPU2D2:GPU3D:GPUVG:VPU:SUM] [...]\n");
++	printf("export MMDC_SLEEPTIME can be used to define profiling duration.1 by default means 1s\n");
++	printf("export MMDC_LOOPCOUNT can be used to define profiling times. 1 by default. -1 means infinite loop.\n");
++	printf("export MMDC_CUST_MADPCR1 can be used to customize madpcr1. Will ignore it if defined master\n");
++	printf("Note1: More than 1 master can be inputed. They will be profiled one by one.\n");
++	printf("Note2: MX6DL can't profile master GPU2D, GPU2D1 and GPU2D2 are used instead.\n");
++}
++int main(int argc, char **argv)
++{
++	int timeForSleep = 1;
++	void *A;
++	MMDC_PROFILE_RES_t results;
++	int ulStartTime = 0;
++	int i;
++	int loopcount= 1;
++	unsigned int customized_madpcr1= 0;
++	char *p;
++
++	p = getenv("MMDC_SLEEPTIME");
++	if (p != 0)
++	{
++		timeForSleep = strtol(p, 0, 10);
++		if(timeForSleep == 0)
++			timeForSleep = 1;
++	}
++	p = getenv("MMDC_LOOPCOUNT");
++	if (p != 0)
++	{
++		loopcount = strtol(p, 0, 10);
++	}
++	p = getenv("MMDC_CUST_MADPCR1");
++	if (p != 0)
++	{
++		customized_madpcr1 = strtol(p, 0, 16);
++	}
++
++	int fd = open("/dev/mem", O_RDWR, 0);
++		if (fd < 0)
++	{
++		printf("Could not open /dev/mem\n");
++		return -1;
++	}
++	A = (ulong*) mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, MMDC_P0_IPS_BASE_ADDR);
++		if (A == MAP_FAILED)
++	{
++		printf("Mapping failed mmdc_p0\n");
++		close(fd);
++		return -1;
++	}
++
++
++	if(get_system_rev()<0){
++		printf("Fail to get system revision,parameter will be ignored \n");
++		argc = 1;
++	}
++	g_quit = 0;
++	for(i=0; !g_quit && i!=loopcount; i++)
++	{
++		if(argc >= 2)
++		{
++			int j;
++			for(j=1; j<argc; j++)
++			{
++				if(strcmp(argv[j],"IPU1")==0){
++				  ((pMMDC_t)A)->madpcr1 = axi_ipu1;
++				  printf("MMDC IPU1 \n");
++				}else if((strcmp(argv[j], "IPU2")==0)&&(cpu_is_mx6q()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_ipu2_6q;
++				  printf("MMDC IPU2 \n");
++				}else if((strcmp(argv[j], "GPU3D")==0)&&(cpu_is_mx6dl()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_gpu3d_6dl;
++				  printf("MMDC GPU3D \n");
++				}else if((strcmp(argv[j], "GPU3D")==0)&&(cpu_is_mx6q()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_gpu3d_6q;
++				  printf("MMDC GPU3D \n");
++				}else if((strcmp(argv[j], "GPU2D1")==0)&&(cpu_is_mx6dl()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_gpu2d1_6dl;
++				  printf("MMDC GPU2D1 \n");
++				}else if((strcmp(argv[j], "GPU2D")==0)&&(cpu_is_mx6q()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_gpu2d_6q;
++				  printf("MMDC GPU2D \n");
++				}else if((strcmp(argv[j], "GPU2D2")==0)&&(cpu_is_mx6dl()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_gpu2d2_6dl;
++				  printf("MMDC GPU2D2 \n");
++				}else if((strcmp(argv[j], "GPU2D")==0)&&(cpu_is_mx6sl()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_gpu2d_6sl;
++				  printf("MMDC GPU2D \n");
++				}else if((strcmp(argv[j],"VPU")==0)&&(cpu_is_mx6dl()==1)){
++				  ((pMMDC_t)A)->madpcr1 = axi_vpu_6dl;
++				  printf("MMDC VPU \n");
++				}else if((strcmp(argv[j],"VPU")==0)&&(cpu_is_mx6q()==1)){
++				   ((pMMDC_t)A)->madpcr1 = axi_vpu_6q;
++				   printf("MMDC VPU \n");
++				}else if((strcmp(argv[j],"GPUVG")==0)&&(cpu_is_mx6q()==1)){
++				   ((pMMDC_t)A)->madpcr1 = axi_openvg_6q;
++				   printf("MMDC GPUVG \n");
++				}else if((strcmp(argv[j],"GPUVG")==0)&&(cpu_is_mx6sl()==1)){
++				   ((pMMDC_t)A)->madpcr1 = axi_openvg_6sl;
++				   printf("MMDC GPUVG \n");
++				}else if(strcmp(argv[j],"ARM")==0){
++				   ((pMMDC_t)A)->madpcr1 = axi_arm;
++				   printf("MMDC ARM \n");
++				}else if(strcmp(argv[j], "SUM")==0){
++				  ((pMMDC_t)A)->madpcr1 = axi_default;
++				  printf("MMDC SUM \n");
++				}else{
++					printf("MMDC DOES NOT KNOW %s \n",argv[j]);
++					help();
++					close(fd);
++					return 0;
++				}
++				msync(&(((pMMDC_t)A)->madpcr1),4,MS_SYNC);
++				clear_mmdc_results((pMMDC_t)A);
++				ulStartTime=getTickCount();
++				start_mmdc_profiling((pMMDC_t)A);
++				sleep(timeForSleep);
++				load_mmdc_results((pMMDC_t)A);
++				get_mmdc_profiling_results((pMMDC_t)A, &results);
++				print_mmdc_profiling_results(results , RES_FULL,getTickCount()-ulStartTime);
++				fflush(stdout);
++				stop_mmdc_profiling((pMMDC_t)A);
++			}
++		}else {
++			if(customized_madpcr1!= 0)
++			{
++				((pMMDC_t)A)->madpcr1 = customized_madpcr1;
++				msync(&(((pMMDC_t)A)->madpcr1),4,MS_SYNC);
++				printf("MMDC 0x%x \n",customized_madpcr1);
++			}else{
++				((pMMDC_t)A)->madpcr1 = axi_default;
++				msync(&(((pMMDC_t)A)->madpcr1),4,MS_SYNC);
++				printf("MMDC SUM \n");
++			}
++			clear_mmdc_results((pMMDC_t)A);
++			ulStartTime=getTickCount();
++			start_mmdc_profiling((pMMDC_t)A);
++			sleep(timeForSleep); //leave it collect 1sec data;
++			load_mmdc_results((pMMDC_t)A);
++			get_mmdc_profiling_results((pMMDC_t)A, &results);
++			print_mmdc_profiling_results(results , RES_FULL,getTickCount()-ulStartTime);
++			fflush(stdout);
++			stop_mmdc_profiling((pMMDC_t)A);
++		}
++	}
++	close(fd);
++	return 0;
++}
+diff --git a/test/mmdc/mmdc.h b/test/mmdc/mmdc.h
+new file mode 100644
+index 0000000..def7ce6
+--- /dev/null
++++ b/test/mmdc/mmdc.h
+@@ -0,0 +1,162 @@
++/*
++ * Copyright (C) 2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++#ifndef MMDC_H_
++#define MMDC_H_
++
++typedef struct
++{
++	unsigned int mdctl;
++	unsigned int mdpdc;
++	unsigned int mdotc;
++	unsigned int mdcfg0;
++	unsigned int mdcfg1;
++	unsigned int mdcfg2;
++	unsigned int mdmisc;
++	unsigned int mdscr;
++	unsigned int mdref;
++	unsigned int mdwcc;
++	unsigned int mdrcc;
++	unsigned int mdrwd;
++	unsigned int mdor;
++	unsigned int mdmrr;
++	unsigned int mdcfg3lp;
++	unsigned int mdmr4;
++	unsigned int mdasp;
++
++	unsigned int adopt_base_offset_fill[239];
++	unsigned int maarcr;
++	unsigned int mapsr;
++	unsigned int maexidr0;
++	unsigned int maexidr1;
++	unsigned int madpcr0;
++	unsigned int madpcr1;
++	unsigned int madpsr0;
++	unsigned int madpsr1;
++	unsigned int madpsr2;
++	unsigned int madpsr3;
++	unsigned int madpsr4;
++	unsigned int madpsr5;
++	unsigned int masbs0;
++	unsigned int masbs1;
++	unsigned int ma_reserved1;
++	unsigned int ma_reserved2;
++	unsigned int magenp;
++
++	unsigned int phy_base_offset_fill[239];
++	unsigned int mpzqhwctrl;
++	unsigned int mpzqswctrl;
++	unsigned int mpwlgcr;
++	unsigned int mpwldectrl0;
++	unsigned int mpwldectrl1;
++	unsigned int mpwldlst;
++	unsigned int mpodtctrl;
++	unsigned int mpredqby0dl;
++	unsigned int mpredqby1dl;
++	unsigned int mpredqby2dl;
++	unsigned int mpredqby3dl;
++	unsigned int mpwrdqby0dl;
++	unsigned int mpwrdqby1dl;
++	unsigned int mpwrdqby2dl;
++	unsigned int mpwrdqby3dl;
++	unsigned int mpdgctrl0;
++	unsigned int mpdgctrl1;
++	unsigned int mpdgdlst;
++	unsigned int mprddlctl;
++	unsigned int mprddlst;
++	unsigned int mpwrdlctl;
++	unsigned int mpwrdlst;
++	unsigned int mpsdctrl;
++	unsigned int mpzqlp2ctl;
++	unsigned int mprddlhwctl;
++	unsigned int mpwrdlhwctl;
++	unsigned int mprddlhwst0;
++	unsigned int mprddlhwst1;
++	unsigned int mpwrdlhwst0;
++	unsigned int mpwrdlhwst1;
++	unsigned int mpwlhwerr;
++	unsigned int mpdghwst0;
++	unsigned int mpdghwst1;
++	unsigned int mpdghwst2;
++	unsigned int mpdghwst3;
++	unsigned int mppdcmpr1;
++	unsigned int mppdcmpr2;
++	unsigned int mpswdar;
++	unsigned int mpswdrdr0;
++	unsigned int mpswdrdr1;
++	unsigned int mpswdrdr2;
++	unsigned int mpswdrdr3;
++	unsigned int mpswdrdr4;
++	unsigned int mpswdrdr5;
++	unsigned int mpswdrdr6;
++	unsigned int mpswdrdr7;
++	unsigned int mpmur;
++	unsigned int mpwrcadl;
++	unsigned int mpdccr;
++	unsigned int mpbc;
++} MMDC_t;
++
++typedef MMDC_t *pMMDC_t;
++
++/********************* Profiler Types & Functions ************************/
++typedef struct
++{
++	unsigned int total_cycles;
++	unsigned int busy_cycles;
++	unsigned int read_accesses;
++	unsigned int write_accesses;
++	unsigned int read_bytes;
++	unsigned int write_bytes;
++	unsigned int data_load;
++	unsigned int utilization;
++	unsigned int access_utilization;
++	unsigned int avg_write_burstsize;
++	unsigned int avg_read_burstsize;
++} MMDC_PROFILE_RES_t;
++
++typedef enum
++{
++    RES_FULL,
++    RES_UTILIZATION
++} MMDC_RES_TYPE_t;
++
++void start_mmdc_profiling(pMMDC_t mmdc);
++void stop_mmdc_profiling(pMMDC_t mmdc);
++void pause_mmdc_profiling(pMMDC_t mmdc);
++void resume_mmdc_profiling(pMMDC_t mmdc);
++void get_mmdc_profiling_results(pMMDC_t mmdc, MMDC_PROFILE_RES_t *results);
++void print_mmdc_profiling_results(MMDC_PROFILE_RES_t results, MMDC_RES_TYPE_t print_type,int time);
++
++extern unsigned int system_rev;
++
++#define cpu_is_mx6q()		mxc_is_cpu(0x63)
++#define cpu_is_mx6dl()		mxc_is_cpu(0x61)
++#define cpu_is_mx6sl()		mxc_is_cpu(0x60)
++#define mxc_is_cpu(part)        ((mxc_cpu() == (unsigned int)part) ? 1 : 0)
++#define mxc_cpu()               (system_rev >> 12)
++#define axi_ipu1                0x00070004
++#define axi_ipu2_6q             0x00070005
++#define axi_gpu3d_6dl           0x003F0002
++#define axi_gpu3d_6q            0x003E0002
++#define axi_gpu2d2_6dl          0x003F0003
++#define axi_gpu2d1_6dl          0x003F000A
++#define axi_gpu2d_6q            0x003E000B
++#define axi_gpu2d_6sl           0x0017000F
++#define axi_vpu_6dl             0x003F000B
++#define axi_vpu_6q              0x003F0013
++#define axi_openvg_6q           0x003F0022
++#define axi_openvg_6sl          0x001F0017
++#define axi_arm                 0x00060000
++#define axi_default             0x00000000
++
++#endif /*MMDC_H_*/
+-- 
+1.8.0
+

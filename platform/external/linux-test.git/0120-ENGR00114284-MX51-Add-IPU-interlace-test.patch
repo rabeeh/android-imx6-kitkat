@@ -1,0 +1,132 @@
+From 13582ab75b8e0e3df9a55f0f018b97a89acfe744 Mon Sep 17 00:00:00 2001
+From: Ran Ferderber <Ran.Ferderber@freescale.com>
+Date: Tue, 22 Sep 2009 10:36:10 +0300
+Subject: [PATCH 120/435]         ENGR00114284: MX51: Add IPU interlace test
+
+        Add algorithms option to test all 3 interlace algorithms
+
+        Signed-off-by: Ran Ferderber Ran.Ferderber@freescale.com
+---
+ test/mxc_vpu_test/display.c  | 29 ++++++++++++++++++++++++-----
+ test/mxc_vpu_test/main.c     |  7 ++++++-
+ test/mxc_vpu_test/vpu_test.h |  4 ++++
+ 3 files changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index c518c76..9dc11f6 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -26,6 +26,8 @@
+ #include <stdio.h>
+ #include <linux/mxcfb.h>
+ #include "vpu_test.h"
++#include <linux/ipu.h>
++#include <linux/mxc_v4l2.h>
+ 
+ #define V4L2_MXC_ROTATE_NONE                    0
+ #define V4L2_MXC_ROTATE_VERT_FLIP               1
+@@ -36,11 +38,6 @@
+ #define V4L2_MXC_ROTATE_90_RIGHT_HFLIP          6
+ #define V4L2_MXC_ROTATE_90_LEFT                 7
+ 
+-struct v4l2_mxc_offset {
+-	unsigned long u_offset;
+-	unsigned long v_offset;
+-};
+-
+ void v4l_free_bufs(int n, struct vpu_display *disp)
+ {
+ 	int i;
+@@ -106,6 +103,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	struct vpu_display *disp;
+ 	int fd_fb;
+ 	char *tv_mode;
++	char motion_mode = dec->cmdl->vdi_motion;
+ 	struct mxcfb_gbl_alpha alpha;
+ 
+ 	int ratio = 1;
+@@ -219,6 +217,27 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		goto err;
+ 	}
+ 
++	/* Set VDI motion algorithm. */
++	if (motion_mode) {
++		struct v4l2_control ctrl;
++		ctrl.id = V4L2_CID_MXC_MOTION;
++		if (motion_mode == 'h') {
++			ctrl.value = HIGH_MOTION;
++		} else if (motion_mode == 'l') {
++			ctrl.value = LOW_MOTION;
++		} else if (motion_mode == 'm') {
++			ctrl.value = MED_MOTION;
++		} else {
++			ctrl.value = MED_MOTION;
++			info_msg("%c unknown motion mode, medium, the default is used\n",motion_mode);
++		}
++		err = ioctl(fd, VIDIOC_S_CTRL, &ctrl);
++		if (err < 0) {
++			err_msg("VIDIOC_S_CTRL failed\n");
++			goto err;
++		}
++	}
++
+ 	if (rotation.ipu_rot_en && (rotation.rot_angle != 0)) {
+ 		/* Set rotation via V4L2 i/f */
+ 		struct v4l2_control ctrl;
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index ba501b0..fee4e14 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -55,6 +55,8 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "  -u <ipu rotation> Using IPU rotation for display - 1. IPU rotation \n "\
+ 	       "        default is VPU rotation(0).\n "\
+ 	       "        This flag is effective when 'r' flag is specified.\n "\
++	       "  -v <vdi motion> set IPU VDI motion algorithm l, m, h.\n "\
++	       "	default is m-medium. \n "\
+ 	       "  -w <width> display picture width \n "\
+ 	       "	default is source picture width. \n "\
+ 	       "  -h <height> display picture height \n "\
+@@ -125,7 +127,7 @@ int encdec_test(void *arg);
+ static char *mainopts = "HE:D:L:C:";
+ 
+ /* Options for encode and decode */
+-static char *options = "i:o:n:p:r:f:c:w:h:g:b:d:e:m:u:t:s:l:";
++static char *options = "i:o:n:p:r:f:c:w:h:g:b:d:e:m:u:t:s:l:v:";
+ 
+ int
+ parse_config_file(char *file_name)
+@@ -263,6 +265,9 @@ parse_args(int argc, char *argv[], int i)
+ 		case 'c':
+ 			input_arg[i].cmd.count = atoi(optarg);
+ 			break;
++		case 'v':
++			input_arg[i].cmd.vdi_motion = optarg[0];
++			break;
+ 		case 'w':
+ 			input_arg[i].cmd.width = atoi(optarg);
+ 			break;
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index d302136..51bb293 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -43,6 +43,9 @@
+ typedef unsigned long u32;
+ typedef unsigned short u16;
+ typedef unsigned char u8;
++typedef unsigned int  uint32_t;
++typedef unsigned short int  uint16_t;
++typedef unsigned char  uint8_t;
+ typedef signed int s32;
+ typedef signed short s16;
+ typedef signed char s8;
+@@ -137,6 +140,7 @@ struct cmd_line {
+ 	u16 complete; /* wait for the requested buf to be filled completely */
+ 	int iframe;
+ 	int mp4Class;
++	char vdi_motion;	/* VDI motion algorithm */
+ };
+ 
+ struct decode {
+-- 
+1.8.0
+

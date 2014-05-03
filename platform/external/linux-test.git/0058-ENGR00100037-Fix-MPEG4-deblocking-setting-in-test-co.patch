@@ -1,0 +1,55 @@
+From 513203d5aabf6a20ed8371cc57b888f3dac315f5 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Mon, 24 Nov 2008 17:59:53 +0800
+Subject: [PATCH 058/435] ENGR00100037 Fix MPEG4 deblocking setting in test
+ codes
+
+different platforms have different processing for mpeg4 deblocking.
+MX27 VPU doesnot support mpeg4 deblocking filtering.
+MX32 VPU support it but need set framebuffer externally.
+MX37/MX51 support it but not need set framebuffer externally, VPU
+control the buffer internally and return one more buffer after
+vpu_DecGetInitialInfo().
+This patch is intended to cover all above.
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ test/mxc_vpu_test/dec.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 1a8301b..e59d44c 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1099,8 +1099,27 @@ decoder_open(struct decode *dec)
+ 	oparam.bitstreamFormat = dec->cmdl->format;
+ 	oparam.bitstreamBuffer = dec->phy_bsbuf_addr;
+ 	oparam.bitstreamBufferSize = STREAM_BUF_SIZE;
+-	oparam.mp4DeblkEnable = dec->cmdl->deblock_en;
+ 	oparam.reorderEnable = dec->reorderEnable;
++	oparam.mp4DeblkEnable = dec->cmdl->deblock_en;
++
++	/*
++	 * mp4 deblocking filtering is optional out-loop filtering for image
++	 * quality. In other words, mpeg4 deblocking is post processing.
++	 * So, host application need to allocate new frame buffer.
++	 * - On MX27, VPU doesn't support mpeg4 out loop deblocking filtering.
++	 * - On MX37 and MX51, VPU control the buffer internally and return one
++	 *   more buffer after vpu_DecGetInitialInfo().
++	 * - On MX32, host application need to set frame buffer externally via
++	 *   the command DEC_SET_DEBLOCK_OUTPUT.
++	 */
++	if (oparam.mp4DeblkEnable == 1) {
++		if (cpu_is_mx27()) {
++			warn_msg("MP4 deblocking NOT supported on MX27 VPU.\n");
++			oparam.mp4DeblkEnable = dec->cmdl->deblock_en = 0;
++		} else if (!cpu_is_mx32()) {	/* do not need extra framebuf */
++			dec->cmdl->deblock_en = 0;
++		}
++	}
+ 
+ 	oparam.psSaveBuffer = dec->phy_ps_buf;
+ 	oparam.psSaveBufferSize = PS_SAVE_SIZE;
+-- 
+1.8.0
+

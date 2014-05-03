@@ -1,0 +1,156 @@
+From 588c1aab79a40cbcab63046df1131e10db1edb9c Mon Sep 17 00:00:00 2001
+From: Song Bing <b06498@freescale.com>
+Date: Thu, 11 Oct 2012 14:22:07 +0800
+Subject: [PATCH 02/50] ENGR00133115 Integrate VPU to StageFright.
+
+Add video color format map as OMX color format is diff with HAL pixel format.
+Dequeue all buffer from Native window as VPU need all buffer for registry.
+Send OMX flush command until send command success to avoid send command fail when OMX command is processing command
+
+Signed-off-by: Song Bing b06498@freescale.com
+---
+ media/libstagefright/ACodec.cpp   | 24 ++++++++++++++++++++--
+ media/libstagefright/OMXCodec.cpp | 42 +++++++++++++++++++++++++++++++--------
+ 2 files changed, 56 insertions(+), 10 deletions(-)
+
+diff --git a/include/media/stagefright/OMXCodec.h b/include/media/stagefright/OMXCodec.h
+old mode 100644
+new mode 100755
+diff --git a/media/libstagefright/ACodec.cpp b/media/libstagefright/ACodec.cpp
+index 5d5220f..692a9d7 100644
+--- a/media/libstagefright/ACodec.cpp
++++ b/media/libstagefright/ACodec.cpp
+@@ -569,14 +569,33 @@ status_t ACodec::configureOutputBuffersFromNativeWindow(
+             mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
+ 
+     if (err != OK) {
+-        return err;
++	    return err;
++    }
++
++    int color_fmt = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++    switch(def.format.video.eColorFormat) {
++	    case OMX_COLOR_FormatYUV420SemiPlanar:
++		    color_fmt = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++		    break;
++	    case OMX_COLOR_FormatYUV420Planar:
++		    color_fmt = HAL_PIXEL_FORMAT_YCbCr_420_P;
++		    break;
++	    case OMX_COLOR_Format16bitRGB565:
++		    color_fmt = HAL_PIXEL_FORMAT_RGB_565;
++		    break;
++	    case OMX_COLOR_FormatYUV422Planar:
++		    color_fmt = HAL_PIXEL_FORMAT_YCbCr_422_P;
++		    break;
++	    default:
++		    ALOGE("Not supported color format %d by surface!", def.format.video.eColorFormat);
++		    return UNKNOWN_ERROR;
+     }
+ 
+     err = native_window_set_buffers_geometry(
+             mNativeWindow.get(),
+             def.format.video.nFrameWidth,
+             def.format.video.nFrameHeight,
+-            def.format.video.eColorFormat);
++            color_fmt);
+ 
+     if (err != 0) {
+         ALOGE("native_window_set_buffers_geometry failed: %s (%d)",
+@@ -639,6 +658,7 @@ status_t ACodec::configureOutputBuffersFromNativeWindow(
+     // XXX: Is this the right logic to use?  It's not clear to me what the OMX
+     // buffer counts refer to - how do they account for the renderer holding on
+     // to buffers?
++    *minUndequeuedBuffers = 0;
+     if (def.nBufferCountActual < def.nBufferCountMin + *minUndequeuedBuffers) {
+         OMX_U32 newBufferCount = def.nBufferCountMin + *minUndequeuedBuffers;
+         def.nBufferCountActual = newBufferCount;
+diff --git a/media/libstagefright/OMXCodec.cpp b/media/libstagefright/OMXCodec.cpp
+index 43736ad..dcaef76 100644
+--- a/media/libstagefright/OMXCodec.cpp
++++ b/media/libstagefright/OMXCodec.cpp
+@@ -1713,11 +1713,30 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
+         return err;
+     }
+ 
++    int color_fmt = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++    switch(def.format.video.eColorFormat) {
++	    case OMX_COLOR_FormatYUV420SemiPlanar:
++		    color_fmt = HAL_PIXEL_FORMAT_YCbCr_420_SP;
++		    break;
++	    case OMX_COLOR_FormatYUV420Planar:
++		    color_fmt = HAL_PIXEL_FORMAT_YCbCr_420_P;
++		    break;
++	    case OMX_COLOR_Format16bitRGB565:
++		    color_fmt = HAL_PIXEL_FORMAT_RGB_565;
++		    break;
++	    case OMX_COLOR_FormatYUV422Planar:
++		    color_fmt = HAL_PIXEL_FORMAT_YCbCr_422_P;
++		    break;
++	    default:
++		    ALOGE("Not supported color format %d by surface!", def.format.video.eColorFormat);
++		    return UNKNOWN_ERROR;
++    }
++
+     err = native_window_set_buffers_geometry(
+             mNativeWindow.get(),
+             def.format.video.nFrameWidth,
+             def.format.video.nFrameHeight,
+-            def.format.video.eColorFormat);
++            color_fmt);
+ 
+     if (err != 0) {
+         ALOGE("native_window_set_buffers_geometry failed: %s (%d)",
+@@ -1781,6 +1800,7 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
+     // XXX: Is this the right logic to use?  It's not clear to me what the OMX
+     // buffer counts refer to - how do they account for the renderer holding on
+     // to buffers?
++    minUndequeuedBufs = 0;
+     if (def.nBufferCountActual < def.nBufferCountMin + minUndequeuedBufs) {
+         OMX_U32 newBufferCount = def.nBufferCountMin + minUndequeuedBufs;
+         def.nBufferCountActual = newBufferCount;
+@@ -1882,7 +1902,6 @@ OMXCodec::BufferInfo* OMXCodec::dequeueBufferFromNativeWindow() {
+     if (err != 0) {
+       CODEC_LOGE("dequeueBuffer failed w/ error 0x%08x", err);
+ 
+-      setState(ERROR);
+       return 0;
+     }
+ 
+@@ -2272,9 +2291,9 @@ void OMXCodec::on_message(const omx_message &msg) {
+                     mTargetTimeUs = -1;
+                 }
+ 
+-                mFilledBuffers.push_back(i);
+-                mBufferFilled.signal();
+-                if (mIsEncoder) {
++		mFilledBuffers.push_back(i);
++		mBufferFilled.signal();
++		if (mIsEncoder) {
+                     sched_yield();
+                 }
+             }
+@@ -2829,11 +2848,18 @@ bool OMXCodec::flushPortAsync(OMX_U32 portIndex) {
+         // No flush is necessary and this component fails to send a
+         // flush-complete event in this case.
+ 
+-        return false;
++	    return false;
+     }
+ 
+-    status_t err =
+-        mOMX->sendCommand(mNode, OMX_CommandFlush, portIndex);
++    status_t err = UNKNOWN_ERROR;
++    OMX_U32 nCnt = 0;
++    while (err != OK) {
++	    err = mOMX->sendCommand(mNode, OMX_CommandFlush, portIndex);
++	    if (nCnt ++ == 100)
++		    break;
++
++	    usleep(10000);
++    }
+     CHECK_EQ(err, (status_t)OK);
+ 
+     return true;
+-- 
+1.8.0
+

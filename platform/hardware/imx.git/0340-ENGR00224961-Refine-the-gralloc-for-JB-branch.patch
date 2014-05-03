@@ -1,0 +1,393 @@
+From b97a3e5fab2e057f118e46f53c2c81db0166b8d5 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Wed, 19 Sep 2012 15:25:04 +0800
+Subject: [PATCH 340/486] ENGR00224961 Refine the gralloc for JB branch
+
+Remove the xml parser on the resolution xml for dual display
+Move the DisplayCommand.h into gralloc directory
+Define GRALLOC_HARDWARE_FB and GRALLOC_VIV_HARDWARE_MODULE_ID
+in fsl gralloc header
+
+Change-Id: Ida137c342c642e7a23f8e4c92f0164bdee91d9d2
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libgralloc_wrapper/Android.mk       |   5 +-
+ mx6/libgralloc_wrapper/DisplayCommand.h |  78 ++++++++++++
+ mx6/libgralloc_wrapper/XmlTool.cpp      | 214 --------------------------------
+ mx6/libgralloc_wrapper/framebuffer.cpp  |   7 +-
+ mx6/libgralloc_wrapper/gralloc_priv.h   |   3 +
+ 5 files changed, 87 insertions(+), 220 deletions(-)
+ create mode 100755 mx6/libgralloc_wrapper/DisplayCommand.h
+ delete mode 100644 mx6/libgralloc_wrapper/XmlTool.cpp
+
+diff --git a/mx6/libgralloc_wrapper/Android.mk b/mx6/libgralloc_wrapper/Android.mk
+index d899b30..6a15227 100755
+--- a/mx6/libgralloc_wrapper/Android.mk
++++ b/mx6/libgralloc_wrapper/Android.mk
+@@ -21,17 +21,16 @@ ifeq ($(TARGET_HAVE_IMX_GRALLOC),true)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libhardware libutils libfsl_xmltool
++LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libhardware libutils
+ 
+ LOCAL_SRC_FILES := 	\
+ 	gralloc.cpp 	\
+ 	framebuffer.cpp \
+ 	mapper.cpp      \
+-        display_mode.cpp
++	display_mode.cpp
+ 
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX
+-LOCAL_C_INCLUDES = external/expat/lib
+ 
+ 
+ #ifeq ($(HAVE_FSL_EPDC_FB),true)
+diff --git a/mx6/libgralloc_wrapper/DisplayCommand.h b/mx6/libgralloc_wrapper/DisplayCommand.h
+new file mode 100755
+index 0000000..eb2cb2a
+--- /dev/null
++++ b/mx6/libgralloc_wrapper/DisplayCommand.h
+@@ -0,0 +1,78 @@
++/*
++* Copyright (C) 2012 Freescale Semiconductor, Inc.
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++* you may not use this file except in compliance with the License.
++* You may obtain a copy of the License at
++*
++*      http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing, software
++* distributed under the License is distributed on an "AS IS" BASIS,
++* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++* See the License for the specific language governing permissions and
++* limitations under the License.
++*/
++
++#ifndef ANDROID_DISPLAY_COMMAND_H
++#define ANDROID_DISPLAY_COMMAND_H
++
++#include <stdint.h>
++#include <sys/types.h>
++#include <binder/Parcel.h>
++#include <utils/Errors.h>
++#include <utils/String16.h>
++
++
++#define FSL_SETTINGS_PREFERENCE "data/data/com.android.settings/shared_prefs/com.android.settings_preferences.xml"
++#define FSL_PREFERENCE_KEEPRATE "display_keeprate_0"
++#define FSL_PREFERENCE_MODE "display_mode_0"
++#define FSL_PREFERENCE_COLORDEPTH "display_colordepth_0"
++#define FSL_PREFERENCE_MODE_DEFAULT "keepHighestMode"
++
++//namespace android {
++using namespace android;
++
++enum DISPLAY_OPERATE_CODE {
++    OPERATE_CODE_ENABLE = 0x1000,
++    OPERATE_CODE_DISABLE = 0x2000,
++    OPERATE_CODE_CHANGE = 0x4000,
++    OPERATE_CODE_INVALIDE = 0x8000,
++
++    OPERATE_CODE_CHANGE_RESOLUTION = 0x1,
++    OPERATE_CODE_CHANGE_OVERSCAN = 0x2,
++    OPERATE_CODE_CHANGE_MIRROR = 0x4,
++    OPERATE_CODE_CHANGE_COLORDEPTH = 0x8,
++    OPERATE_CODE_CHANGE_ROTATION = 0x10,
++    OPERATE_CODE_CHANGE_KEEPRATE = 0x20
++};
++
++enum DISPLAY_SETTING_MODE {
++    SETTING_MODE_FULL_SCREEN = 0x1000,
++    SETTING_MODE_KEEP_PRIMARY_RATE = 0x2000,
++    SETTING_MODE_KEEP_16_9_RATE = 0x4000,
++    SETTING_MODE_KEEP_4_3_RATE = 0x8000
++};
++
++struct configParam {
++    configParam() : displayId(-1), operateCode(OPERATE_CODE_INVALIDE),
++      rotation(0), xOverScan(0), yOverScan(0), mirror(0), colorDepth(0), keepRate(SETTING_MODE_FULL_SCREEN), mode()
++    {
++    }
++
++    status_t write(Parcel& output) const;
++    status_t read(const Parcel& input);
++    int displayId;
++    int operateCode; //operate code: enable, change or disable display.
++    int rotation;
++    int xOverScan;
++    int yOverScan;
++    int mirror;
++    int colorDepth;
++    int keepRate;
++    String16 mode;
++};
++
++//};
++#endif
++
+diff --git a/mx6/libgralloc_wrapper/XmlTool.cpp b/mx6/libgralloc_wrapper/XmlTool.cpp
+deleted file mode 100644
+index ca182da..0000000
+--- a/mx6/libgralloc_wrapper/XmlTool.cpp
++++ /dev/null
+@@ -1,214 +0,0 @@
+-
+-/* Copyright (C) 2012 Freescale Semiconductor, Inc. */
+-
+-#include <hardware/XmlTool.h>
+-
+-namespace android {
+-
+-
+-void XmlTool::handleStartElement(const XML_Char *name, const XML_Char **attrs)
+-{
+-    if(name == NULL) return;
+-
+-    if(!strcmp(name, "string")) {
+-        mIsString = true;
+-
+-        if(mPrint) {
+-            free(mPrint);
+-            mPrint = NULL;
+-        }
+-
+-        if(attrs[1] != NULL)
+-            mPrint = strdup(attrs[1]);
+-    }
+-    else if(!strcmp(name, "boolean") || !strcmp(name, "int") ||
+-            !strcmp(name, "long") || !strcmp(name, "float")) {
+-        if(attrs[1] == NULL || attrs[3] == NULL){
+-            return;
+-        }
+-
+-        String8 name(attrs[1]);
+-        String8 value(attrs[3]);
+-        mContent.insert(name, value);
+-    }
+-}
+-
+-void XmlTool::handleEndElement(const XML_Char *name)
+-{
+-    if(mPrint) {
+-        free(mPrint);
+-        mPrint = NULL;
+-    }
+-    mIsString = false;
+-}
+-
+-void XmlTool::handleDataElement(const XML_Char *s, int len)
+-{
+-    if(!mIsString) return;
+-
+-    if(s == NULL || mPrint == NULL) {
+-        return;
+-    }
+-
+-    String8 value(s, len);
+-    String8 name(mPrint);
+-    mContent.insert(name, value);
+-}
+-
+-void XmlTool::startElementHandler(void *userData, const XML_Char *name, const XML_Char **atts)
+-{
+-    XmlTool* pXmlTool = (XmlTool*)userData;
+-    return pXmlTool->handleStartElement(name, atts);
+-}
+-
+-void XmlTool::endElementHandler(void *userData, const XML_Char *name)
+-{
+-    XmlTool* pXmlTool = (XmlTool*)userData;
+-    return pXmlTool->handleEndElement(name);
+-}
+-
+-void XmlTool::characterDataHandler(void *userData, const XML_Char *s, int len)
+-{
+-    XmlTool* pXmlTool = (XmlTool*)userData;
+-    return pXmlTool->handleDataElement(s, len);
+-}
+-
+-XmlTool::XmlTool(const char* file)
+-    : mLoaded(false), mLock(), mParser(NULL),
+-      mBuffer(NULL), mDepth(0),
+-      mFileName(file), mFileHandle(NULL), mContent()
+-{
+-    ALOGI("XmlTool()");
+-    init();
+-    loadAndParseFile();
+-}
+-
+-void XmlTool::init()
+-{
+-    if(mFileName == NULL) {
+-        ALOGE("invalide file name");
+-        return;
+-    }
+-
+-    mFileHandle = fopen(mFileName, "r");
+-    if(mFileHandle == NULL) {
+-        ALOGE("open %s failed", mFileName);
+-        return;
+-    }
+-
+-    mParser = XML_ParserCreate(NULL);
+-    if(mParser == NULL)  {
+-        ALOGE("create parser failed");
+-        return;
+-    }
+-
+-    XML_SetElementHandler(mParser, startElementHandler, endElementHandler);
+-    XML_SetCharacterDataHandler(mParser, characterDataHandler);
+-    XML_SetUserData(mParser, (void*)this);
+-}
+-
+-void XmlTool::loadAndParseFile()
+-{
+-    Mutex::Autolock _l(mLock);
+-    if(mFileHandle == NULL || mParser == NULL){
+-        ALOGE("invalidate parameter in loadAndParseFile");
+-        return;
+-    }
+-
+-    mBuffer = (char*)malloc(BUFFSIZE);
+-    if(mBuffer == NULL) {
+-        ALOGE("malloc buffer failed");
+-        return;
+-    }
+-
+-    mPrint = NULL;
+-    mIsString = false;
+-
+-    while(1) {
+-        int done;
+-        int len;
+-
+-        len = fread(mBuffer, 1, BUFFSIZE, mFileHandle);
+-        if(ferror(mFileHandle)) {
+-            ALOGE("read file error");
+-            return;
+-        }
+-
+-        done = feof(mFileHandle);
+-        if(!XML_Parse(mParser, mBuffer, len, done)) {
+-            ALOGE("Parse error at line %d:/n%s", (int)XML_GetCurrentLineNumber(mParser),
+-                         XML_ErrorString(XML_GetErrorCode(mParser)));
+-            return;
+-        }
+-
+-        if(done) break;
+-    }
+-
+-    free(mBuffer);
+-    mBuffer = NULL;
+-    fclose(mFileHandle);
+-    mFileHandle = NULL;
+-    XML_ParserFree(mParser);
+-    mParser = NULL;
+-}
+-
+-String8 XmlTool::getString(const char* key, String8 defaultVal)
+-{
+-    const String8 nullValue;
+-    String8 name(key);
+-    String8 value = mContent.find(name);
+-    if(value != nullValue) {
+-        return value;//.string();
+-    }
+-    else {
+-        return defaultVal;
+-    }
+-}
+-
+-int XmlTool::getInt(const char* key, int defaultVal)
+-{
+-    const String8 nullValue;
+-    String8 name(key);
+-    String8 value = mContent.find(name);
+-    if(value != nullValue) {
+-        int nvalue = atoi(value.string());
+-        return nvalue;
+-    }
+-    else {
+-        return defaultVal;
+-    }
+-}
+-
+-int XmlTool::getHex(const char* key, int defaultVal)
+-{
+-    const String8 nullValue;
+-    String8 name(key);
+-    String8 value = mContent.find(name);
+-    if(value != nullValue) {
+-        int nvalue = (int)strtoimax(value.string(), NULL, 16);
+-        return nvalue;
+-    }
+-    else {
+-        return defaultVal;
+-    }
+-}
+-
+-bool XmlTool::getBool(const char* key, bool defaultVal)
+-{
+-    const String8 nullValue;
+-    String8 name(key);
+-    String8 value = mContent.find(name);
+-    if(value != nullValue) {
+-        bool bvalue = 0;
+-        if(!strcmp(value.string(), "true")) bvalue = 1;
+-        if(!strcmp(value.string(), "fale")) bvalue = 0;
+-
+-        return bvalue;
+-    }
+-    else {
+-        return defaultVal;
+-    }
+-}
+-
+-
+-};
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index b7b947e..a04e3b2 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -49,9 +49,10 @@
+ #include <pthread.h>
+ #include <semaphore.h>
+ 
+-#include <hardware/DisplayCommand.h>
+-#include "gralloc_priv.h"
+ #include <utils/String8.h>
++
++#include "DisplayCommand.h"
++#include "gralloc_priv.h"
+ /*****************************************************************************/
+ 
+ // numbers of buffers for page flipping
+@@ -695,7 +696,7 @@ static void fb_device_init(private_module_t* m, fb_context_t *dev)
+     const_cast<float&>(dev->device.fps) = m->fps;
+     const_cast<int&>(dev->device.minSwapInterval) = 1;
+     const_cast<int&>(dev->device.maxSwapInterval) = 1;
+-    const_cast<int &>(dev->device.bufferCount) = NUM_BUFFERS;
++    const_cast<int &>(dev->device.numFramebuffers) = NUM_BUFFERS;
+ 
+ }
+ 
+diff --git a/mx6/libgralloc_wrapper/gralloc_priv.h b/mx6/libgralloc_wrapper/gralloc_priv.h
+index c769606..8b2ddc2 100755
+--- a/mx6/libgralloc_wrapper/gralloc_priv.h
++++ b/mx6/libgralloc_wrapper/gralloc_priv.h
+@@ -30,6 +30,9 @@
+ 
+ #include <linux/fb.h>
+ 
++#define GRALLOC_HARDWARE_FB "fb"
++#define GRALLOC_VIV_HARDWARE_MODULE_ID "gralloc_viv"
++
+ #define  ALIGN_PIXEL(x)  ((x+ 31) & ~31)
+ #define  ALIGN_PIXEL_16(x)  ((x+ 15) & ~15)
+ /** z430 core need 4k aligned memory, since xres has been 32 aligned, make yres
+-- 
+1.8.0
+

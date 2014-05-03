@@ -1,0 +1,156 @@
+From 36d370b208d2bc5737c778e503844805c917884e Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Wed, 7 Jul 2010 12:11:07 +0800
+Subject: [PATCH 116/249] ENGR00124096 vpu: Change vpu lib to sync with v1.4.0
+ firmware
+
+Change vpu lib to sync with v1.4.0 firmware on mx51 and mx53;
+Remove underrun processing since the feature is dropped from
+firmware.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ vpu/vpu_lib.c | 34 ++++++++++++++--------------------
+ vpu/vpu_lib.h | 13 ++-----------
+ vpu/vpu_reg.h |  2 ++
+ 3 files changed, 18 insertions(+), 31 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 620ce8d..305fae2 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -700,30 +700,31 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 		data |= (encOP.sliceReport << 1) | encOP.mbReport;
+ 		data |= (encOP.mbQpReport << 3);
+ 	}
+-	if (encOP.rcIntraQp >= 0)
++	if (encOP.rcIntraQp >= 0) {
+ 		data |= (1 << 5);
+-
+-	VpuWriteReg(CMD_ENC_SEQ_INTRA_QP, encOP.rcIntraQp);
+-
++		VpuWriteReg(CMD_ENC_SEQ_INTRA_QP, encOP.rcIntraQp);
++	}
+ 	if (pCodecInst->codecMode == AVC_ENC) {
+ 		data |= (encOP.EncStdParam.avcParam.avc_audEnable << 2);
+ 		data |= (encOP.EncStdParam.avcParam.avc_fmoEnable << 4);
+ 	}
+-	if (pEncInfo->openParam.userQpMinEnable) {
++	if (encOP.userQpMinEnable) {
+ 		data |= (1 << 6);
+ 		VpuWriteReg(CMD_ENC_SEQ_RC_QP_MIN_MAX,
+-			    (pEncInfo->openParam.userQpMin << 8) |
+-			    (pEncInfo->openParam.userQpMax & 0xFF));
++			    (encOP.userQpMin << 8) | (encOP.userQpMax & 0xFF));
+ 	}
+-	if (pEncInfo->openParam.userQpMaxEnable) {
++	if (encOP.userQpMaxEnable) {
+ 		data |= (1 << 7);
+ 		VpuWriteReg(CMD_ENC_SEQ_RC_QP_MIN_MAX,
+-			    (pEncInfo->openParam.userQpMin << 8) |
+-			    (pEncInfo->openParam.userQpMax & 0xFF));
++			    (encOP.userQpMin << 8) | (encOP.userQpMax & 0xFF));
+ 	}
+-	if (pEncInfo->openParam.userGamma) {
++	if (encOP.userGamma) {
+ 		data |= (1 << 8);
+-		VpuWriteReg(CMD_ENC_SEQ_RC_GAMMA, pEncInfo->openParam.userGamma);
++		VpuWriteReg(CMD_ENC_SEQ_RC_GAMMA, encOP.userGamma);
++	}
++	if (pCodecInst->codecMode == AVC_ENC) {
++		if (encOP.avcIntra16x16OnlyModeEnable)
++			data |= (1 << 9);
+ 	}
+ 
+ 	VpuWriteReg(CMD_ENC_SEQ_OPTION, data);
+@@ -1151,10 +1152,6 @@ RetCode vpu_EncStartOneFrame(EncHandle handle, EncParam * param)
+ 	       pEncInfo->secAxiUse.useHostOvlEnable << 10 | pEncInfo->secAxiUse.useHostMeEnable << 11);
+ 	VpuWriteReg(BIT_AXI_SRAM_USE, val);
+ 
+-	val = (((param->refMbClk & 0xff) << 8) | ((param->pulseWidth & 0x3f) << 2) |
+-	       ((param->accumulativeMode & 0x1) << 1) | ((param->underrunEnable & 0x1)));
+-	VpuWriteReg(BIT_RTC_HOST_CTRL, val);
+-
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+@@ -2836,10 +2833,6 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 	       pDecInfo->secAxiUse.useHostDbkEnable << 9 | pDecInfo->secAxiUse.useHostOvlEnable << 10);
+ 	VpuWriteReg(BIT_AXI_SRAM_USE, val);
+ 
+-	val = (((param->refMbClk & 0xff) << 8) | ((param->pulseWidth & 0x3f) << 2) |
+-	       ((param->accumulativeMode & 0x1) << 1) | ((param->underrunEnable & 0x1)));
+-	VpuWriteReg(BIT_RTC_HOST_CTRL, val);
+-
+ 	BitIssueCommand(pCodecInst->instIndex, pCodecInst->codecMode, PIC_RUN);
+ 
+ 	*ppendingInst = pCodecInst;
+@@ -3123,6 +3116,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 
+ 	info->indexFrameDisplay = VpuReadReg(RET_DEC_PIC_FRAME_IDX);
+ 	info->indexFrameDecoded = VpuReadReg(RET_DEC_PIC_CUR_IDX);
++	info->NumDecFrameBuf = VpuReadReg(RET_DEC_PIC_FRAME_NEED);
+ 
+ 	if (pCodecInst->codecMode == VC1_DEC && info->indexFrameDisplay != -3) {
+ 		if (pDecInfo->vc1BframeDisplayValid == 0) {
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 72f94ac..5c2d4af 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -240,11 +240,6 @@ typedef struct {
+ 	int chunkSize;
+ 	int picStartByteOffset;
+ 	PhysicalAddress picStreamBufferAddr;
+-
+-	int underrunEnable;
+-	int accumulativeMode;
+-	int pulseWidth;
+-	int refMbClk;
+ } DecParam;
+ 
+ typedef	struct {
+@@ -264,6 +259,7 @@ typedef	struct {
+ typedef struct {
+ 	int indexFrameDisplay;
+ 	int indexFrameDecoded;
++	int NumDecFrameBuf;
+ 	int picType;
+ 	int numOfErrMBs;
+ 	Uint32 *qpInfo;
+@@ -405,11 +401,6 @@ typedef struct {
+ 	PhysicalAddress picStreamBufferAddr;
+ 	int picStreamBufferSize;
+ 	int enableAutoSkip;
+-
+-	int underrunEnable;
+-	int accumulativeMode;
+-	int pulseWidth;
+-	int refMbClk;
+ } EncParam;
+ 
+ typedef	struct {
+@@ -509,7 +500,7 @@ typedef struct vpu_versioninfo {
+  * v4.1.2 [2008.08.22] update MX37 VPU firmware to V1.0.5
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 0, 4)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 0, 5)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_reg.h b/vpu/vpu_reg.h
+index 6cfbe2e..5a793c0 100644
+--- a/vpu/vpu_reg.h
++++ b/vpu/vpu_reg.h
+@@ -262,6 +262,8 @@
+ #endif
+ 
+ #define RET_DEC_PIC_CUR_IDX		0x1DC
++#define RET_DEC_PIC_FRAME_NEED		0x1EC
++
+ #if !defined(IMX37_3STACK)
+ #define RET_DEC_PIC_CROP_LEFT_RIGHT	0x1E0
+ #define RET_DEC_PIC_CROP_TOP_BOTTOM	0x1E4
+-- 
+1.8.0
+

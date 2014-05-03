@@ -1,0 +1,124 @@
+From 998c9b73b6d6bdca34fec781aafc967d82bc297d Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 12 Jan 2012 15:54:00 +0800
+Subject: [PATCH 270/435] ENGR00171978 vpu: Add more buffer delay for V4L
+ buffer dequeue
+
+Add more buffers delay for v4l to start dequeue buffer to
+improve total performance.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      |  6 +++---
+ test/mxc_vpu_test/display.c  | 11 ++++++-----
+ test/mxc_vpu_test/loopback.c |  4 ++--
+ test/mxc_vpu_test/vpu_test.h |  4 ++--
+ 4 files changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 9945925..72022de 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -1204,12 +1204,12 @@ decoder_start(struct decode *dec)
+ 
+ 			if (!cpu_is_mx27())
+ 				if (dec->cmdl->dst_scheme == PATH_V4L2)
+-					err = v4l_put_data(disp, actual_display_index, field, dec->cmdl->fps);
++					err = v4l_put_data(dec, actual_display_index, field, dec->cmdl->fps);
+ 				else
+ 					err = ipu_put_data(disp, actual_display_index, field, dec->cmdl->fps);
+ 			else
+ 				if (dec->cmdl->dst_scheme == PATH_V4L2)
+-					err = v4l_put_data(disp, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
++					err = v4l_put_data(dec, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
+ 				else
+ 					err = ipu_put_data(disp, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
+ 
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 1f3193e..494a7ee 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -917,11 +917,14 @@ void v4l_display_close(struct vpu_display *disp)
+ 	}
+ }
+ 
+-int v4l_put_data(struct vpu_display *disp, int index, int field, int fps)
++int v4l_put_data(struct decode *dec, int index, int field, int fps)
+ {
+ 	struct timeval tv;
+ 	int err, type, threshold;
+ 	struct v4l2_format fmt = {0};
++	struct vpu_display *disp;
++
++	disp = dec->disp;
+ 
+ 	if (disp->ncount == 0) {
+ 		gettimeofday(&tv, 0);
+@@ -1011,9 +1014,7 @@ int v4l_put_data(struct vpu_display *disp, int index, int field, int fps)
+ 
+ 	disp->ncount++;
+ 
+-	threshold = 2;
+-	if (disp->buf.field == V4L2_FIELD_ANY || disp->buf.field == V4L2_FIELD_NONE)
+-		threshold = 1;
++	threshold = dec->regfbcount - dec->minfbcount;
+ 	if (disp->queued_count > threshold) {
+ 		if (vpu_v4l_performance_test) {
+ 			sem_post(&disp->avaiable_dequeue_frame);
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 2d3b519..33aa559 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -118,7 +118,7 @@ decode(void)
+ 	if ((dec->cmdl->format == STD_MJPG) && (outinfo.indexFrameDisplay == 0))
+ 		outinfo.indexFrameDisplay = rotid;
+ 
+-	ret = v4l_put_data(disp, outinfo.indexFrameDisplay, V4L2_FIELD_ANY, 30);
++	ret = v4l_put_data(dec, outinfo.indexFrameDisplay, V4L2_FIELD_ANY, 30);
+ 	if (ret) {
+ 		err_msg("V4L put data failed, ret=%d\n", ret);
+ 		return -1;
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 04fcb7c..2f58f08 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -269,7 +269,7 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode);
+ 
+ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ 					struct rot rotation, Rect rotCrop);
+-int v4l_put_data(struct vpu_display *disp, int index, int field, int fps);
++int v4l_put_data(struct decode *dec, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol);
+ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol, int mapType);
+-- 
+1.8.0
+

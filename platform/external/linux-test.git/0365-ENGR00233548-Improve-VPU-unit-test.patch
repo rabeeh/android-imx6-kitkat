@@ -1,0 +1,111 @@
+From e41743fac85d2a4611d3985bd8b7e9181e60716d Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 14 Nov 2012 10:58:00 +0800
+Subject: [PATCH 365/435] ENGR00233548 Improve VPU unit test
+
+- Set roll back mode as default because it's more widely used (VPU
+  wrapper only uses roll back mode)
+- Modify "FIXME for mx6x MJPG decoding with streaming mode" comments
+  to avoid misleading
+- Correct usage of MPEG2 interlace params in de-interlacing control
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/dec.c       | 21 ++++++++++++++++++---
+ test/mxc_vpu_test/main.c      |  4 ++++
+ test/mxc_vpu_test/transcode.c |  4 ++--
+ 3 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index b2a597a..77da8a6 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -961,8 +961,8 @@ decoder_start(struct decode *dec)
+ 		}
+ 
+ 		/*
+-		 * FIXME for mx6x MJPG decoding with streaming mode
+-		 * Currently bitstream buffer filling cannot be done when JPU is in decoding,
++		 * For mx6x MJPG decoding with streaming mode
++		 * bitstream buffer filling cannot be done when JPU is in decoding,
+ 		 * there are three places can do this:
+ 		 * 1. before vpu_DecStartOneFrame;
+ 		 * 2. in the case of RETCODE_JPEG_BIT_EMPTY returned in DecStartOneFrame() func;
+@@ -1155,6 +1155,21 @@ decoder_start(struct decode *dec)
+ 					dprintf(3, "Top Field First flag: %d, dec_idx %d\n",
+ 						  outinfo.topFieldFirst, decIndex);
+ 				}
++			} else if (dec->cmdl->format == STD_MPEG2) {
++				if ((outinfo.interlacedFrame)||(!outinfo.progressiveFrame)) {
++					if (outinfo.pictureStructure == 1)
++						field = V4L2_FIELD_INTERLACED_BT;
++					else if (outinfo.pictureStructure == 2)
++						field = V4L2_FIELD_INTERLACED_TB;
++					else if (outinfo.pictureStructure == 3) {
++						if (outinfo.topFieldFirst)
++							field = V4L2_FIELD_INTERLACED_TB;
++						else
++							field = V4L2_FIELD_INTERLACED_BT;
++					}
++				}
++				if (outinfo.repeatFirstField)
++					info_msg("frame_idx %d : Repeat First Field\n", decIndex);
+ 			} else if ((dec->cmdl->format != STD_MPEG4) &&
+ 				   (dec->cmdl->format != STD_H263) &&
+ 				   (dec->cmdl->format != STD_RV)){
+@@ -1801,7 +1816,7 @@ decoder_parse(struct decode *dec)
+ 			break;
+ 		case STD_MPEG2:
+ 			info_msg("Mpeg2 Profile: %d Level: %d Progressive Sequence Flag: %d\n",
+-				initinfo.profile, initinfo.level, initinfo.interlace);
++				initinfo.profile, initinfo.level, !initinfo.interlace);
+ 			/*
+ 			 * Profile: 3'b101: Simple, 3'b100: Main, 3'b011: SNR Scalable,
+ 			 * 3'b10: Spatially Scalable, 3'b001: High
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 1007cc2..a38b233 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -80,6 +80,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "  -s <prescan/bs_mode> Enable prescan in decoding on i.mx5x - 1. enabled \n "\
+ 	       "        default is disabled. Bitstream mode in decoding on i.mx6  \n "\
+ 	       "        0. Normal mode, 1. Rollback mode \n "\
++	       "        default is enabled. \n "\
+ 	       "  -y <maptype> Map type for GDI interface \n "\
+ 	       "        0 - Linear frame map, 1 - frame MB map, 2 - field MB map \n "\
+ 	       "        default is 0. \n "\
+@@ -170,6 +171,7 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "  -s <prescan/bs_mode> Enable prescan in decoding on i.mx5x - 1. enabled \n "\
+ 	       "        default is disabled. Bitstream mode in decoding on i.mx6  \n "\
+ 	       "        0. Normal mode, 1. Rollback mode \n "\
++	       "        default is enabled. \n "\
+ 	       "  -y <maptype> Map type for GDI interface \n "\
+ 	       "        0 - Linear frame map, 1 - frame MB map, 2 - field MB map \n "\
+ 	       "  -q <quantization parameter> \n "\
+@@ -304,6 +306,8 @@ parse_args(int argc, char *argv[], int i)
+ 	int status = 0, opt, val;
+ 
+ 	input_arg[i].cmd.chromaInterleave = 1;
++	if (cpu_is_mx6x())
++		input_arg[i].cmd.bs_mode = 1;
+ 
+ 	do {
+ 		opt = getopt(argc, argv, options);
+diff --git a/test/mxc_vpu_test/transcode.c b/test/mxc_vpu_test/transcode.c
+index bd6f9ac..b40dd30 100644
+--- a/test/mxc_vpu_test/transcode.c
++++ b/test/mxc_vpu_test/transcode.c
+@@ -706,8 +706,8 @@ transcode_start(struct decode *dec, struct encode *enc)
+ 		}
+ 
+ 		/*
+-		 * FIXME for mx6x MJPG decoding with streaming mode
+-		 * Currently bitstream buffer filling cannot be done when JPU is in decoding,
++		 * For mx6x MJPG decoding with streaming mode
++		 * bitstream buffer filling cannot be done when JPU is in decoding,
+ 		 * there are three places can do this:
+ 		 * 1. before vpu_DecStartOneFrame;
+ 		 * 2. in the case of RETCODE_JPEG_BIT_EMPTY returned in DecStartOneFrame() func;
+-- 
+1.8.0
+

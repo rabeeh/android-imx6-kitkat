@@ -1,0 +1,83 @@
+From acf9c92ce71da241ff18926fa683ab1bb1f425fd Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Mon, 24 Dec 2012 14:09:13 +0800
+Subject: [PATCH 02/32] ENGR00233809: Ethernet:fix two NFS issues as
+ filesystem
+
+Introduce property "ro.nfs.mode" default no to control two cases which will
+broken NFS boot as filesystem.
+1.For android4.2,drop_privilege in installd will let it have no permission
+to install packages because of security policy's limitation in NFSV3.
+2.Another case is suspend/resume in NFS mount.it will report "nfs: server
+10.192.*.* not responding, still trying",This is caused by clearing ethernet
+interface addresses. so the netd will not pass ethernet's link up message to
+framework. In this case, no need to clear it for we keep on connecting to the
+same network and no need to do dhcp again.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ core/java/android/net/EthernetDataTracker.java | 21 +++++++++++++++------
+ 1 file changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/core/java/android/net/EthernetDataTracker.java b/core/java/android/net/EthernetDataTracker.java
+index 501484c..5229328 100644
+--- a/core/java/android/net/EthernetDataTracker.java
++++ b/core/java/android/net/EthernetDataTracker.java
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2010 The Android Open Source Project
++ * Copyright (C) 2012 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -25,6 +26,7 @@ import android.os.Message;
+ import android.os.Messenger;
+ import android.os.RemoteException;
+ import android.os.ServiceManager;
++import android.os.SystemProperties;
+ import android.util.Log;
+ 
+ import com.android.server.net.BaseNetworkObserver;
+@@ -48,6 +50,10 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
+     private AtomicBoolean mDefaultRouteSet = new AtomicBoolean(false);
+ 
+     private static boolean mLinkUp;
++    private static boolean mNfsmode;
++    private LinkProperties mLinkProperties;
++    private LinkCapabilities mLinkCapabilities;
++    private NetworkInfo mNetworkInfo;
+     private InterfaceObserver mInterfaceObserver;
+     private String mHwAddr;
+ 
+@@ -78,6 +84,7 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
+             if (mIface.equals(iface)) {
+                 Log.d(TAG, "Interface " + iface + " link " + (up ? "up" : "down"));
+                 mLinkUp = up;
++                mNfsmode = "yes".equals(SystemProperties.get("ro.nfs.mode", "no"));
+                 mTracker.mNetworkInfo.setIsAvailable(up);
+ 
+                 // use DHCP
+@@ -144,12 +151,14 @@ public class EthernetDataTracker extends BaseNetworkStateTracker {
+         msg = mCsHandler.obtainMessage(EVENT_STATE_CHANGED, mNetworkInfo);
+         msg.sendToTarget();
+ 
+-        IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
+-        INetworkManagementService service = INetworkManagementService.Stub.asInterface(b);
+-        try {
+-            service.clearInterfaceAddresses(mIface);
+-        } catch (Exception e) {
+-            Log.e(TAG, "Failed to clear addresses or disable ipv6" + e);
++        if (!mNfsmode) {
++           IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
++           INetworkManagementService service = INetworkManagementService.Stub.asInterface(b);
++           try {
++               service.clearInterfaceAddresses(mIface);
++           } catch (Exception e) {
++               Log.e(TAG, "Failed to clear addresses or disable ipv6" + e);
++           }
+         }
+     }
+ 
+-- 
+1.8.0
+

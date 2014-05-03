@@ -1,0 +1,333 @@
+From 5fa911e715d6c1e9e7eb17514d392560c844a341 Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Sun, 26 Sep 2010 15:27:43 +0800
+Subject: [PATCH 181/435] ENGR00131659 vpu test: enhancement for better
+ performance test.
+
+1.Add display position set to vpu unit test.
+2.Add crop support for non-h264 format.
+3.Make v4l2 display free-run, original is fix 30fps.
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      | 65 ++++++++++++++++++++++++++++----------------
+ test/mxc_vpu_test/display.c  | 24 ++++++++++++----
+ test/mxc_vpu_test/loopback.c |  2 +-
+ test/mxc_vpu_test/main.c     | 19 +++++++++++--
+ test/mxc_vpu_test/vpu_test.h |  7 +++--
+ 5 files changed, 84 insertions(+), 33 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 13c4fd0..66708c0 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1022,7 +1022,7 @@ decoder_start(struct decode *dec)
+ 		/* BIT don't have picture to be displayed */
+ 		if ((outinfo.indexFrameDisplay == -3) ||
+ 				(outinfo.indexFrameDisplay == -2)) {
+-			warn_msg("VPU doesn't have picture to be displayed.\n"
++			dprintf(3, "VPU doesn't have picture to be displayed.\n"
+ 				"\toutinfo.indexFrameDisplay = %d\n",
+ 						outinfo.indexFrameDisplay);
+ 			if (dec->cmdl->dst_scheme != PATH_IPU) {
+@@ -1053,14 +1053,14 @@ decoder_start(struct decode *dec)
+ 
+ 			if (cpu_is_mx5x())
+ 				if (dec->cmdl->dst_scheme == PATH_V4L2)
+-					err = v4l_put_data(disp, actual_display_index, field);
++					err = v4l_put_data(disp, actual_display_index, field, dec->cmdl->fps);
+ 				else
+-					err = ipu_put_data(disp, actual_display_index, field);
++					err = ipu_put_data(disp, actual_display_index, field, dec->cmdl->fps);
+ 			else
+ 				if (dec->cmdl->dst_scheme == PATH_V4L2)
+-					err = v4l_put_data(disp, actual_display_index, V4L2_FIELD_ANY);
++					err = v4l_put_data(disp, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
+ 				else
+-					err = ipu_put_data(disp, actual_display_index, V4L2_FIELD_ANY);
++					err = ipu_put_data(disp, actual_display_index, V4L2_FIELD_ANY, dec->cmdl->fps);
+ 
+ 			if (err)
+ 				return -1;
+@@ -1474,6 +1474,7 @@ decoder_parse(struct decode *dec)
+ 		}
+ 	}
+ 
++
+ 	/* Parse bitstream and get width/height/framerate etc */
+ 	vpu_DecSetEscSeqInit(handle, 1);
+ 	ret = vpu_DecGetInitialInfo(handle, &initinfo);
+@@ -1624,24 +1625,6 @@ decoder_parse(struct decode *dec)
+ 			initinfo.frameRateInfo,
+ 			initinfo.minFrameBufferCount);
+ 
+-	/*
+-	 * Information about H.264 decoder picture cropping rectangle which
+-	 * presents the offset of top-left point and bottom-right point from
+-	 * the origin of frame buffer.
+-	 *
+-	 * By using these four offset values, host application can easily
+-	 * detect the position of target output window. When display cropping
+-	 * is off, the cropping window size will be 0.
+-	 *
+-	 * This structure for cropping rectangles is only valid for H.264
+-	 * decoder case.
+-	 */
+-	info_msg("CROP left/top/right/bottom %lu %lu %lu %lu\n",
+-					initinfo.picCropRect.left,
+-					initinfo.picCropRect.top,
+-					initinfo.picCropRect.right,
+-					initinfo.picCropRect.bottom);
+-
+ #ifdef COMBINED_VIDEO_SUPPORT
+ 	/* Following lines are sample code to support minFrameBuffer counter
+ 	   changed in combined video stream. */
+@@ -1689,6 +1672,38 @@ decoder_parse(struct decode *dec)
+ 	if ((dec->picwidth == 0) || (dec->picheight == 0))
+ 		return -1;
+ 
++	/*
++	 * Information about H.264 decoder picture cropping rectangle which
++	 * presents the offset of top-left point and bottom-right point from
++	 * the origin of frame buffer.
++	 *
++	 * By using these four offset values, host application can easily
++	 * detect the position of target output window. When display cropping
++	 * is off, the cropping window size will be 0.
++	 *
++	 * This structure for cropping rectangles is only valid for H.264
++	 * decoder case.
++	 */
++
++	/* Add non-h264 crop support, assume left=top=0 */
++	if ((dec->picwidth > initinfo.picWidth ||
++		dec->picheight > initinfo.picHeight) &&
++		(!initinfo.picCropRect.left &&
++		!initinfo.picCropRect.top &&
++		!initinfo.picCropRect.right &&
++		!initinfo.picCropRect.bottom)) {
++		initinfo.picCropRect.left = 0;
++		initinfo.picCropRect.top = 0;
++		initinfo.picCropRect.right = initinfo.picWidth;
++		initinfo.picCropRect.bottom = initinfo.picHeight;
++	}
++
++	info_msg("CROP left/top/right/bottom %lu %lu %lu %lu\n",
++					initinfo.picCropRect.left,
++					initinfo.picCropRect.top,
++					initinfo.picCropRect.right,
++					initinfo.picCropRect.bottom);
++
+ 	memcpy(&(dec->picCropRect), &(initinfo.picCropRect),
+ 					sizeof(initinfo.picCropRect));
+ 
+@@ -1713,6 +1728,10 @@ decoder_parse(struct decode *dec)
+ 			err_msg("malloc_error\n");
+ 	}
+ 
++	if (dec->cmdl->fps == 0)
++		dec->cmdl->fps = 30;
++	info_msg("Display fps will be %d\n", dec->cmdl->fps);
++
+ 	return 0;
+ }
+ 
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 0750339..9933c98 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -230,6 +230,8 @@ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	int bottom = cropRect.bottom;
+ 	int disp_width = dec->cmdl->width;
+ 	int disp_height = dec->cmdl->height;
++	int disp_left =  dec->cmdl->loff;
++	int disp_top =  dec->cmdl->toff;
+ 	char motion_mode = dec->cmdl->vdi_motion;
+ 	int err = 0, i;
+ 	struct vpu_display *disp;
+@@ -331,9 +333,14 @@ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		else if (rotation.rot_angle == 270)
+ 			disp->output.rot = IPU_ROTATE_90_LEFT;
+ 	}
++	disp->output.fb_disp.pos.x = disp_left;
++	disp->output.fb_disp.pos.y = disp_top;
+ 	disp->output.show_to_fb = 1;
+ 	disp->output.fb_disp.fb_num = 2;
+ 
++	info_msg("Display to %d %d, top offset %d, left offset %d\n",
++			disp_width, disp_height, disp_top, disp_left);
++
+ 	disp->ipu_q.tail = disp->ipu_q.head = 0;
+ 	disp->stopping = 0;
+ 
+@@ -368,8 +375,10 @@ void ipu_display_close(struct vpu_display *disp)
+ 	free(disp);
+ }
+ 
+-int ipu_put_data(struct vpu_display *disp, int index, int field)
++int ipu_put_data(struct vpu_display *disp, int index, int field, int fps)
+ {
++	/*TODO: ipu lib dose not support fps control yet*/
++
+ 	disp->ipu_bufs[index].field = field;
+ 	if (field == V4L2_FIELD_TOP || field == V4L2_FIELD_BOTTOM ||
+ 	    field == V4L2_FIELD_INTERLACED_TB ||
+@@ -435,6 +444,8 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	int bottom = cropRect.bottom;
+ 	int disp_width = dec->cmdl->width;
+ 	int disp_height = dec->cmdl->height;
++	int disp_left =  dec->cmdl->loff;
++	int disp_top =  dec->cmdl->toff;
+ 	int fd = -1, err = 0, out = 0, i = 0;
+ 	char v4l_device[32] = "/dev/video16";
+ 	struct v4l2_cropcap cropcap = {0};
+@@ -543,8 +554,8 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	}
+ 
+ 	crop.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+-	crop.c.top = 0;
+-	crop.c.left = 0;
++	crop.c.top = disp_top;
++	crop.c.left = disp_left;
+ 	crop.c.width = width / ratio;
+ 	crop.c.height = height / ratio;
+ 
+@@ -556,6 +567,9 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 		crop.c.height = cropcap.bounds.height;
+ 	}
+ 
++	info_msg("Display to %d %d, top offset %d, left offset %d\n",
++			crop.c.width, crop.c.height, disp_top, disp_left);
++
+ 	dprintf(1, "crop.c.width/height: %d/%d\n", crop.c.width, crop.c.height);
+ 
+ 	err = ioctl(fd, VIDIOC_S_CROP, &crop);
+@@ -757,7 +771,7 @@ void v4l_display_close(struct vpu_display *disp)
+ 	}
+ }
+ 
+-int v4l_put_data(struct vpu_display *disp, int index, int field)
++int v4l_put_data(struct vpu_display *disp, int index, int field, int fps)
+ {
+ 	struct timeval tv;
+ 	int err, type, threshold;
+@@ -784,7 +798,7 @@ int v4l_put_data(struct vpu_display *disp, int index, int field)
+ 	}
+ 
+ 	if (disp->ncount > 0) {
+-		disp->usec += (1000000 / 30);
++		disp->usec += (1000000 / fps);
+ 		if (disp->usec >= 1000000) {
+ 			disp->sec += 1;
+ 			disp->usec -= 1000000;
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 4157783..ef6d242 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -93,7 +93,7 @@ decode(void)
+ 		goto out;
+ 	}
+ 
+-	ret = v4l_put_data(disp, outinfo.indexFrameDisplay, V4L2_FIELD_ANY);
++	ret = v4l_put_data(disp, outinfo.indexFrameDisplay, V4L2_FIELD_ANY, 30);
+ 	if (ret)
+ 		return -1;
+ 
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index ec35583..ad21fdc 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2010 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2010 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -62,6 +62,12 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	default is source picture width. \n "\
+ 	       "  -h <height> display picture height \n "\
+ 	       "	default is source picture height \n "\
++	       "  -j <left offset> display picture left offset \n "\
++	       "	default is 0. \n "\
++	       "  -k <top offset> display picture top offset \n "\
++	       "	default is 0 \n "\
++	       "  -a <frame rate> display framerate \n "\
++	       "	default is 30 \n "\
+ 	       "  -t <chromaInterleave> CbCr interleaved \n "\
+ 	       "        default is none-interleave(0). \n "\
+ 	       "  -s <prescan> Enable prescan in decoding - 1. enabled \n "\
+@@ -128,7 +134,7 @@ int encdec_test(void *arg);
+ static char *mainopts = "HE:D:L:C:";
+ 
+ /* Options for encode and decode */
+-static char *options = "i:o:x:n:p:r:f:c:w:h:g:b:d:e:m:u:t:s:l:v:";
++static char *options = "i:o:x:n:p:r:f:c:w:h:g:b:d:e:m:u:t:s:l:j:k:a:v:";
+ 
+ int
+ parse_config_file(char *file_name)
+@@ -289,6 +295,12 @@ parse_args(int argc, char *argv[], int i)
+ 		case 'h':
+ 			input_arg[i].cmd.height = atoi(optarg);
+ 			break;
++		case 'j':
++			input_arg[i].cmd.loff = atoi(optarg);
++			break;
++		case 'k':
++			input_arg[i].cmd.toff = atoi(optarg);
++			break;
+ 		case 'g':
+ 			input_arg[i].cmd.gop = atoi(optarg);
+ 			break;
+@@ -313,6 +325,9 @@ parse_args(int argc, char *argv[], int i)
+ 		case 'l':
+ 		 	input_arg[i].cmd.mp4Class = atoi(optarg);
+ 			break;
++		case 'a':
++			input_arg[i].cmd.fps = atoi(optarg);
++			break;
+ 		case -1:
+ 			break;
+ 		default:
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 52cc560..c472d48 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -149,6 +149,8 @@ struct cmd_line {
+ 	int dst_fd;
+ 	int width;
+ 	int height;
++	int loff;
++	int toff;
+ 	int format;
+ 	int deblock_en;
+ 	int dering_en;
+@@ -171,6 +173,7 @@ struct cmd_line {
+ 	int iframe;
+ 	int mp4Class;
+ 	char vdi_motion;	/* VDI motion algorithm */
++	int fps;
+ };
+ 
+ struct decode {
+@@ -238,7 +241,7 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode);
+ 
+ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ 					struct rot rotation, Rect rotCrop);
+-int v4l_put_data(struct vpu_display *disp, int index, int field);
++int v4l_put_data(struct vpu_display *disp, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height);
+ void framebuf_free(struct frame_buf *fb);
+@@ -246,7 +249,7 @@ void framebuf_free(struct frame_buf *fb);
+ struct vpu_display *
+ ipu_display_open(struct decode *dec, int nframes, struct rot rotation, Rect cropRect);
+ void ipu_display_close(struct vpu_display *disp);
+-int ipu_put_data(struct vpu_display *disp, int index, int field);
++int ipu_put_data(struct vpu_display *disp, int index, int field, int fps);
+ 
+ int v4l_start_capturing(void);
+ void v4l_stop_capturing(void);
+-- 
+1.8.0
+

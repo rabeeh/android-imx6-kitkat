@@ -1,0 +1,212 @@
+From 9787b8d4073491aa41a43157742771461c30bf7c Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Fri, 30 Aug 2013 16:21:23 +0800
+Subject: [PATCH 470/486] ENGR00276339 support usb camera hot plug in
+
+if configured usb camera, always count to the camera number
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ mx6/libcamera/CameraModule.cpp  | 37 +++++++++++++++++++++++++----
+ mx6/libcamera/CameraUtil.h      |  4 ++++
+ mx6/libcamera/DeviceAdapter.cpp | 16 +++++++++++--
+ mx6/libcamera/UvcDevice.cpp     | 52 ++++-------------------------------------
+ 4 files changed, 55 insertions(+), 54 deletions(-)
+
+diff --git a/mx6/libcamera/CameraModule.cpp b/mx6/libcamera/CameraModule.cpp
+index 918bb4c..11081b6 100644
+--- a/mx6/libcamera/CameraModule.cpp
++++ b/mx6/libcamera/CameraModule.cpp
+@@ -622,7 +622,7 @@ fail:
+     return rv;
+ }
+ 
+-static int GetDevPath(const char  *pCameraName,
++int GetDevPath(const char  *pCameraName,
+                       char        *pCameraDevPath,
+                       unsigned int pathLen)
+ {
+@@ -713,6 +713,8 @@ static void GetCameraPropery(char *pFaceBackCameraName,
+ int camera_get_number_of_cameras()
+ {
+     int back_orient = 0,  front_orient = 0;
++	int ret = 0;
++	int numCamera = 0;
+ 
+     if (gCameraNum == 0) {
+         char name_back[CAMERA_SENSOR_LENGTH];
+@@ -728,7 +730,8 @@ int camera_get_number_of_cameras()
+             sCameraInfo[gCameraNum].facing      = CAMERA_FACING_BACK;
+             sCameraInfo[gCameraNum].orientation = back_orient;
+             memset(sCameraInfo[gCameraNum].devPath, 0, CAMAERA_FILENAME_LENGTH);
+-            GetDevPath(sCameraInfo[gCameraNum].name,
++
++			ret = GetDevPath(sCameraInfo[gCameraNum].name,
+                        sCameraInfo[gCameraNum].devPath,
+                        CAMAERA_FILENAME_LENGTH);
+             ALOGI("Camera ID %d: name %s, Facing %d, orientation %d, dev path %s",
+@@ -737,8 +740,21 @@ int camera_get_number_of_cameras()
+                     sCameraInfo[gCameraNum].facing,
+                     sCameraInfo[gCameraNum].orientation,
+                     sCameraInfo[gCameraNum].devPath);
+-            gCameraNum++;
++
++			if(ret == 0)
++				gCameraNum++;
++
++			if (gCameraNum == 0) {
++                if (strstr(name_back, UVC_NAME)) {
++                    strncpy(sCameraInfo[gCameraNum].name, UVC_NAME,
++                            CAMERA_SENSOR_LENGTH);
++                    gCameraNum++;
++                }
++            }
++
+         }
++
++		numCamera = gCameraNum;
+         if (name_front[0] != DEFAULT_ERROR_NAME) {
+             strncpy(sCameraInfo[gCameraNum].name,
+                     name_front,
+@@ -746,7 +762,7 @@ int camera_get_number_of_cameras()
+             sCameraInfo[gCameraNum].facing      = CAMERA_FACING_FRONT;
+             sCameraInfo[gCameraNum].orientation = front_orient;
+             memset(sCameraInfo[gCameraNum].devPath, 0, CAMAERA_FILENAME_LENGTH);
+-            GetDevPath(sCameraInfo[gCameraNum].name,
++            ret = GetDevPath(sCameraInfo[gCameraNum].name,
+                        sCameraInfo[gCameraNum].devPath,
+                        CAMAERA_FILENAME_LENGTH);
+             ALOGI("Camera ID %d: name %s, Facing %d, orientation %d, dev path %s",
+@@ -755,9 +771,20 @@ int camera_get_number_of_cameras()
+                     sCameraInfo[gCameraNum].facing,
+                     sCameraInfo[gCameraNum].orientation,
+                     sCameraInfo[gCameraNum].devPath);
+-            gCameraNum++;
++
++			if(ret == 0)
++				gCameraNum++;
++
++			if (gCameraNum == numCamera) {
++                if (strstr(name_front, UVC_NAME)) {
++                    strncpy(sCameraInfo[gCameraNum].name, UVC_NAME,
++                            CAMERA_SENSOR_LENGTH);
++                    gCameraNum++;
++                }
++            }
+         }
+     }
++
+     return gCameraNum;
+ }
+ 
+diff --git a/mx6/libcamera/CameraUtil.h b/mx6/libcamera/CameraUtil.h
+index 357ea88..91de557 100644
+--- a/mx6/libcamera/CameraUtil.h
++++ b/mx6/libcamera/CameraUtil.h
+@@ -98,6 +98,10 @@ PixelFormat convertV4L2FormatToPixelFormat(unsigned int format);
+ int         convertStringToPixelFormat(const char *pFormat);
+ int         convertStringToV4L2Format(const char *pFormat);
+ 
++int GetDevPath(const char  *pCameraName,
++               char        *pCameraDevPath,
++               unsigned int pathLen);
++
+ struct VideoMetadataBuffer
+ {
+     size_t phyOffset;
+diff --git a/mx6/libcamera/DeviceAdapter.cpp b/mx6/libcamera/DeviceAdapter.cpp
+index eaac478..25c46a3 100644
+--- a/mx6/libcamera/DeviceAdapter.cpp
++++ b/mx6/libcamera/DeviceAdapter.cpp
+@@ -79,9 +79,21 @@ status_t DeviceAdapter::initialize(const CameraInfo& info)
+ 
+     mCameraHandle = open(info.devPath, O_RDWR);
+     if (mCameraHandle < 0) {
+-        FLOGE("can not open camera devpath:%s", info.devPath);
+-        return BAD_VALUE;
++		memset((void*)info.devPath, 0, sizeof(info.devPath));
++		GetDevPath(info.name, (char*)info.devPath, CAMAERA_FILENAME_LENGTH);
++		if (info.devPath[0] != '\0') {
++			mCameraHandle = open(info.devPath, O_RDWR);
++			if (mCameraHandle < 0) {
++				FLOGE("can not open camera devpath:%s", info.devPath);
++				return BAD_VALUE;
++			}
++		}
++		else {
++			FLOGE("can not open camera devpath:%s", info.devPath);
++			return BAD_VALUE;
++		}
+     }
++
+     mVideoInfo = new VideoInfo();
+     if (mVideoInfo == NULL) {
+         close(mCameraHandle);
+diff --git a/mx6/libcamera/UvcDevice.cpp b/mx6/libcamera/UvcDevice.cpp
+index 41ad6a3..39f5cd5 100644
+--- a/mx6/libcamera/UvcDevice.cpp
++++ b/mx6/libcamera/UvcDevice.cpp
+@@ -403,55 +403,13 @@ status_t UvcDevice::registerCameraFrames(CameraFrame *pBuffer,
+ 
+ status_t UvcDevice::initialize(const CameraInfo& info)
+ {
+-	int ret = NO_ERROR;
+-	
+-    mVideoInfo = new VideoInfo();
+-    if (mVideoInfo == NULL) {
+-        FLOGE("new VideoInfo failed");
+-        return NO_MEMORY;
+-    }
+-	
+-
+-	
+-     if (info.name == NULL) {
+-        FLOGE("invalid camera sensor name in initialize");
+-        return BAD_VALUE;
+-    }
+-    if (info.devPath == NULL) {
+-        FLOGE("invalid camera devpath in initialize");
+-        return BAD_VALUE;
+-    }
+-	
+-    mCameraHandle = open(info.devPath, O_RDWR);
+-    if (mCameraHandle < 0) {
+-        FLOGE("can not open camera devpath:%s", info.devPath);
+-        return BAD_VALUE;
+-    }
++	status_t ret = NO_ERROR;
+ 
+-	
+-    ret = ioctl(mCameraHandle, VIDIOC_QUERYCAP, &mVideoInfo->cap);
+-    if (ret < 0) {
+-        close(mCameraHandle);
+-        delete mVideoInfo;
+-        FLOGE("query v4l2 capability failed");
+-        return BAD_VALUE;
+-    }
+-    if ((mVideoInfo->cap.capabilities & V4L2_CAP_VIDEO_CAPTURE) == 0)
+-    {
+-        close(mCameraHandle);
+-        delete mVideoInfo;
+-        FLOGE("v4l2 capability does not support capture");
+-        return BAD_VALUE;
+-    }
+-
+-	
+-    // Initialize flags
+-    mPreviewing            = false;
+-    mVideoInfo->isStreamOn = false;
+-    mImageCapture          = false;
+-	pDevPath = info.devPath;		
++	ret = DeviceAdapter::initialize(info);
++	if(ret == NO_ERROR)
++		pDevPath = info.devPath;
+ 		
+-    return NO_ERROR;
++    return ret;
+ }
+ 
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,193 @@
+From 1ec5311773b57bbdf3a11d035cb09db4aa17193d Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 13 Nov 2013 11:25:34 +0800
+Subject: [PATCH 244/249] ENGR00287751 New command and bug fixes
+
+VPU lib v5.4.20
+
+- Bug fix 1: Allow GetBitstreamBuffer/UpdateBitstreamBuffer after
+GetOutputInfo even mjpeg picture decoding is not successfully finished
+(e.g. rollback)
+
+- Bug fix 2: Do not check stride against original picture width in the
+case of mjpeg down scaling
+
+- Bug fix 3: Modify CC/AR in make file to fix random build breaks on
+build servers in Yocto
+
+- Add command ENC_SET_INTRA_REFRESH_MODE to select intra refresh
+mode. FW v3.1.1 added a new mode: consecutive intra refresh mode.
+This command must be called before vpu_EncGetInitialInfo to take
+effect for the initial mode. User cannot switch intra refresh
+mode on the fly according to current FW implementation.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/Makefile   |  4 ++--
+ vpu/vpu_lib.c  | 25 ++++++++++++++++++++-----
+ vpu/vpu_lib.h  |  5 +++--
+ vpu/vpu_util.c |  8 +++++++-
+ vpu/vpu_util.h |  2 ++
+ 5 files changed, 34 insertions(+), 10 deletions(-)
+
+diff --git a/vpu/Makefile b/vpu/Makefile
+index b106631..7c27be0 100644
+--- a/vpu/Makefile
++++ b/vpu/Makefile
+@@ -1,5 +1,5 @@
+-CC=$(CROSS_COMPILE)gcc
+-AR=$(CROSS_COMPILE)ar
++CC ?=$(CROSS_COMPILE)gcc
++AR ?=$(CROSS_COMPILE)ar
+ 
+ # list of platforms which want this test case
+ INCLUDE_LIST:= IMX27ADS IMX51 IMX53 IMX6Q
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 0e7644e..95af9ca 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -990,7 +990,10 @@ RetCode vpu_EncGetInitialInfo(EncHandle handle, EncInitialInfo * info)
+ 	}
+ 
+ 	VpuWriteReg(CMD_ENC_SEQ_RC_BUF_SIZE, pEncOP->vbvBufferSize);
+-	VpuWriteReg(CMD_ENC_SEQ_INTRA_REFRESH, pEncOP->intraRefresh);
++	data = pEncOP->intraRefresh;
++	if (pEncOP->intraRefresh > 0)
++		data |= pEncInfo->intraRefreshMode << 16;
++	VpuWriteReg(CMD_ENC_SEQ_INTRA_REFRESH, data);
+ 
+ 	VpuWriteReg(CMD_ENC_SEQ_BB_START, pEncInfo->streamBufStartAddr);
+ 	VpuWriteReg(CMD_ENC_SEQ_BB_SIZE, pEncInfo->streamBufSize / 1024);
+@@ -1878,6 +1881,7 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 					VpuReadReg(GDI_WPROT_ERR_RSN),
+ 					VpuReadReg(GDI_WPROT_ERR_ADR));
+ 			*ppendingInst = 0;
++			pEncInfo->jpgInfo.inProcess = 0;
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_MEMORY_ACCESS_VIOLATION;
+ 		}
+@@ -1885,6 +1889,7 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 		val = VpuReadReg(MJPEG_PIC_STATUS_REG);
+ 		if ((val & 0x4) >> 2) {
+ 			*ppendingInst = 0;
++			pEncInfo->jpgInfo.inProcess = 0;
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_WRONG_CALL_SEQUENCE;
+ 		}
+@@ -2519,6 +2524,12 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 			break;
+ 		}
+ 
++	case ENC_SET_INTRA_REFRESH_MODE:
++		{
++			pEncInfo->intraRefreshMode = *(int *)param;
++			break;
++		}
++
+ 	default:
+ 		err_msg("Invalid encoder command\n");
+ 		return RETCODE_INVALID_COMMAND;
+@@ -3277,8 +3288,9 @@ RetCode vpu_DecRegisterFrameBuffer(DecHandle handle,
+ 		return RETCODE_INSUFFICIENT_FRAME_BUFFERS;
+ 	}
+ 
+-	if (stride < pDecInfo->initialInfo.picWidth || stride % 8 != 0) {
+-		return RETCODE_INVALID_STRIDE;
++	if (!is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
++		if (stride < pDecInfo->initialInfo.picWidth || stride % 8 != 0)
++			return RETCODE_INVALID_STRIDE;
+ 	}
+ 
+ 	pDecInfo->frameBufPool = bufArray;
+@@ -4199,6 +4211,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			info->indexFrameDisplay = -1;
+ 			info->decodingSuccess = 1;
+ 			*ppendingInst = 0;
++			pDecInfo->jpgInfo.inProcess = 0;
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_SUCCESS;
+ 		}
+@@ -4208,6 +4221,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			info->indexFrameDisplay = -1;
+ 			pDecInfo->jpgInfo.rollBack = 0;
+ 			*ppendingInst = 0;
++			pDecInfo->jpgInfo.inProcess = 0;
+ 			UnlockVpu(vpu_semap);
+ 			return RETCODE_SUCCESS;
+ 		}
+@@ -4864,8 +4878,9 @@ RetCode vpu_DecGiveCommand(DecHandle handle, CodecCommand cmd, void *param)
+ 					return RETCODE_INVALID_STRIDE;
+ 				}
+ 			} else {
+-				if (pDecInfo->initialInfo.picWidth > stride) {
+-					return RETCODE_INVALID_STRIDE;
++				if (!is_mx6x_mjpg_codec(pCodecInst->codecMode)) {
++					if (pDecInfo->initialInfo.picWidth > stride)
++						return RETCODE_INVALID_STRIDE;
+ 				}
+ 			}
+ 
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index c790546..769c748 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -140,7 +140,8 @@ typedef enum {
+ 	ENC_ENABLE_SUB_FRAME_SYNC,
+ 	ENC_DISABLE_SUB_FRAME_SYNC,
+ 
+-	DEC_SET_FRAME_DELAY
++	DEC_SET_FRAME_DELAY,
++	ENC_SET_INTRA_REFRESH_MODE
+ } CodecCommand;
+ 
+ typedef struct {
+@@ -684,7 +685,7 @@ static const SocInfo soc_info[] = {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 19)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 20)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 1e15736..dba076a 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -903,13 +903,19 @@ RetCode SetIntraRefreshNum(EncHandle handle, Uint32 * pIntraRefreshNum)
+ 	CodecInst *pCodecInst;
+ 	Uint32 intraRefreshNum = *pIntraRefreshNum;
+ 	int data = 0;
++	EncInfo *pEncInfo;
+ 
+ 	IOClkGateSet(true);
+ 
+ 	pCodecInst = handle;
++	pEncInfo = &pCodecInst->CodecInfo.encInfo;
++
+ 	data = 1 << 4;
+ 	VpuWriteReg(CMD_ENC_SEQ_PARA_CHANGE_ENABLE, data);
+-	VpuWriteReg(CMD_ENC_SEQ_PARA_INTRA_MB_NUM, intraRefreshNum);
++	data = intraRefreshNum;
++	if (intraRefreshNum > 0)
++		data |= pEncInfo->intraRefreshMode << 16;
++	VpuWriteReg(CMD_ENC_SEQ_PARA_INTRA_MB_NUM, data);
+ 	BitIssueCommand(pCodecInst, RC_CHANGE_PARAMETER);
+ 	while (VpuReadReg(BIT_BUSY_FLAG)) ;
+ 	IOClkGateSet(false);
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index 118c259..0f4f599 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -395,6 +395,8 @@ typedef struct {
+ 	vpu_mem_desc picParaBaseMem;
+ 	vpu_mem_desc searchRamMem; /* Used if IRAM is disabled */
+ 
++	int intraRefreshMode;
++
+ } EncInfo;
+ 
+ typedef struct {
+-- 
+1.8.0
+

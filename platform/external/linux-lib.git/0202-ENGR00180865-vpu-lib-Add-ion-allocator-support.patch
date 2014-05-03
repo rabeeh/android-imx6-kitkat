@@ -1,0 +1,218 @@
+From 0f09d9b6b83eb119a5259186fe7b878710798f49 Mon Sep 17 00:00:00 2001
+From: Xinyu Chen <xinyu.chen@freescale.com>
+Date: Thu, 26 Apr 2012 11:11:40 +0800
+Subject: [PATCH 202/249] ENGR00180865 vpu lib: Add ion allocator support
+
+Still keep the pmem allocator for mx5x.
+Use ion allocator for mx6 and it's successor.
+
+Signed-off-by: Xinyu Chen <xinyu.chen@freescale.com>
+---
+ vpu/Android.mk |   8 ++++-
+ vpu/vpu_io.c   | 111 ++++++++++++++++++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 105 insertions(+), 14 deletions(-)
+
+diff --git a/vpu/Android.mk b/vpu/Android.mk
+index 6620784..6bbfeb8 100755
+--- a/vpu/Android.mk
++++ b/vpu/Android.mk
+@@ -14,8 +14,14 @@ LOCAL_CFLAGS += -DBUILD_FOR_ANDROID -DIMX6Q
+ else
+ LOCAL_CFLAGS += -DBUILD_FOR_ANDROID -D$(BOARD_SOC_TYPE)
+ endif
+-LOCAL_C_INCLUDES += $(LOCAL_PATH)
++ifeq ($(USE_ION_ALLOCATOR), true)
++LOCAL_CFLAGS += -DUSE_ION
++LOCAL_SHARED_LIBRARIES := libutils libc liblog libion
++LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../../hardware/imx/ion/
++else
+ LOCAL_SHARED_LIBRARIES := libutils libc liblog
++endif
++LOCAL_C_INCLUDES += $(LOCAL_PATH)
+ LOCAL_MODULE := libvpu
+ LOCAL_LD_FLAGS += -nostartfiles
+ LOCAL_PRELINK_MODULE := false
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index bbbd86d..7fe4abd 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2011 Freescale Semiconductor, Inc.
++ * Copyright 2004-2012 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -41,9 +41,15 @@
+ #include "vpu_util.h"
+ 
+ #ifdef BUILD_FOR_ANDROID
++#define LOG_TAG "vpu-ion"
+ #include <utils/Log.h>
++#ifdef USE_ION
++#include <linux/ion.h>
++#include <ion.h>
++#else
+ #include <linux/android_pmem.h>
+ #endif
++#endif
+ 
+ static int vpu_fd = -1;
+ static unsigned long vpu_reg_base;
+@@ -317,11 +323,16 @@ static unsigned int sz_alloc;
+ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ {
+ #ifdef BUILD_FOR_ANDROID
+-	/* Get memory from pmem space for android */
+-	int err;
+ 	const size_t pagesize = getpagesize();
++	int err, fd;
++#ifdef USE_ION
++	struct ion_handle *handle;
++	int share_fd, ret = -1;
++	unsigned char *ptr;
++#else
++	/* Get memory from pmem space for android */
+ 	struct pmem_region region;
+-	int fd_pem = 0;
++#endif
+ 
+ 	if ((!buff) || (!buff->size)) {
+ 		LOGE("Error!_IOGetPhyMem:Invalid parameters");
+@@ -348,36 +359,78 @@ int _IOGetPhyMem(int which, vpu_mem_desc *buff)
+ 	}
+ 
+ 	buff->size = (buff->size + pagesize-1) & ~(pagesize - 1);
+-	fd_pem = (unsigned long)open("/dev/pmem_adsp", O_RDWR | O_SYNC);
+-	if (fd_pem < 0) {
++
++#ifdef USE_ION
++	fd = ion_open();
++	if (fd <= 0) {
++		LOGE("ion open failed!\n");
++		return -1;
++	}
++
++	err = ion_alloc(fd, buff->size, pagesize, 1, &handle);
++	if (err) {
++		LOGE("ion allocation failed!\n");
++		goto error;
++	}
++
++	err = ion_map(fd, handle, buff->size,
++			    PROT_READ|PROT_WRITE, MAP_SHARED,
++			    0, &ptr, &share_fd);
++	if (err) {
++		LOGE("ion map failed!\n");
++		goto error;
++	}
++
++	err = ion_phys(fd, handle);
++	if (err == 0) {
++		LOGE("ion get physical address failed!\n");
++		goto error;
++	}
++
++	buff->virt_uaddr = (unsigned long)ptr;
++	buff->phy_addr = (unsigned long)err;
++	buff->cpu_addr = (unsigned long)handle;
++	memset((void*)buff->virt_uaddr, 0, buff->size);
++	ret = 0;
++	LOGD("<ion> alloc handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
++			(unsigned int)handle, (unsigned int)buff->phy_addr,
++			(unsigned int)buff->virt_uaddr);
++error:
++	close(share_fd);
++	ion_close(fd);
++	return ret;
++#else
++	fd = (unsigned long)open("/dev/pmem_adsp", O_RDWR | O_SYNC);
++	if (fd < 0) {
+ 		LOGE("Error!_IOGetPhyMem Error,cannot open pmem");
+ 		return -1;
+ 	}
+ 
+-	err = ioctl(fd_pem, PMEM_GET_TOTAL_SIZE, &region);
++	err = ioctl(fd, PMEM_GET_TOTAL_SIZE, &region);
+ 
+ 	buff->virt_uaddr = (unsigned long)mmap(0, buff->size,
+-			    PROT_READ|PROT_WRITE, MAP_SHARED, fd_pem, 0);
++			    PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+ 
+ 	if (buff->virt_uaddr == (unsigned long)MAP_FAILED) {
+ 		LOGE("Error!mmap(fd=%d, size=%u) failed (%s)",
+-			fd_pem, buff->size, strerror(errno));
+-		close(fd_pem);
++			fd, buff->size, strerror(errno));
++		close(fd);
+ 		return -1;
+ 	}
+ 
+ 	memset(&region, 0, sizeof(region));
+ 
+-	if (ioctl(fd_pem, PMEM_GET_PHYS, &region) == -1) {
++	if (ioctl(fd, PMEM_GET_PHYS, &region) == -1) {
+ 		LOGE("Error!Failed to get physical address of source!");
+ 		munmap((void *)buff->virt_uaddr, buff->size);
+-		close(fd_pem);
++		close(fd);
+ 		return -1;
+ 	}
+ 
+ 	buff->phy_addr = (unsigned long)region.offset;
+-	buff->cpu_addr = (unsigned long)fd_pem;
++	buff->cpu_addr = (unsigned long)fd;
+ 	memset((void*)buff->virt_uaddr, 0, buff->size);
++#endif
+ #else
+ 	if (ioctl(vpu_fd, which, buff) < 0) {
+ 		err_msg("mem allocation failed!\n");
+@@ -419,6 +472,37 @@ int IOGetPhyShareMem(vpu_mem_desc * buff)
+ int _IOFreePhyMem(int which, vpu_mem_desc * buff)
+ {
+ #ifdef BUILD_FOR_ANDROID
++#ifdef USE_ION
++	struct ion_handle *handle;
++	int fd;
++
++	if (!buff || !(buff->size) || ((unsigned long)buff->cpu_addr == 0)) {
++		LOGE("Error!_IOFreePhyMem:Invalid parameters");
++		return -1;
++	}
++
++	if (which != VPU_IOC_PHYMEM_FREE) {
++		LOGE("Error!_IOFreePhyMem unsupported memtype: %d",which);
++		return -1;
++	}
++
++	handle = (struct ion_handle *)buff->cpu_addr;
++
++	fd = ion_open();
++	if (fd <= 0) {
++		LOGE("ion open failed!\n");
++		return -1;
++	}
++
++	ion_free(fd, handle);
++	LOGD("<ion> free handle: 0x%x, paddr: 0x%x, vaddr: 0x%x",
++			(unsigned int)handle, (unsigned int)buff->phy_addr,
++			(unsigned int)buff->virt_uaddr);
++	ion_close(fd);
++
++	munmap((void *)buff->virt_uaddr, buff->size);
++	memset((void*)buff, 0, sizeof(*buff));
++#else
+ 	int fd_pmem;
+ 
+ 	if (!buff || !(buff->size) || ((int)buff->cpu_addr <= 0)) {
+@@ -437,6 +521,7 @@ int _IOFreePhyMem(int which, vpu_mem_desc * buff)
+ 		close(fd_pmem);
+ 	}
+ 	memset((void*)buff, 0, sizeof(*buff));
++#endif
+ #else
+ 	if (buff->phy_addr != 0) {
+ 		dprintf(3, "%s: phy addr = %08lx\n", __func__, buff->phy_addr);
+-- 
+1.8.0
+

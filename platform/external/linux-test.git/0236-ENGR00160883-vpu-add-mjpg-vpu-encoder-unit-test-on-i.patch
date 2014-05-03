@@ -1,0 +1,290 @@
+From 9c66d740c84d25139518dbddb7c68ba15627795c Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Thu, 27 Oct 2011 20:45:17 +0800
+Subject: [PATCH 236/435] ENGR00160883 vpu: add mjpg vpu encoder unit test on
+ i.mx6q
+
+Add MJPG vpu encoder support in unit test for i.mx6q platform.
+And add mjpg decoder to support more format, like, YUV422, YUV444.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c           | 21 ++++++++-
+ test/mxc_vpu_test/enc.c           | 93 ++++++++++++++++++++++++++++++++++-----
+ test/mxc_vpu_test/vpu_jpegtable.h | 10 ++++-
+ test/mxc_vpu_test/vpu_test.h      |  1 +
+ 4 files changed, 109 insertions(+), 16 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 4d30cb1..abd238f 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -395,6 +395,9 @@ saveCropYuvImageHelper(struct decode *dec, u8 *buf, Rect cropRect)
+ 		pCropYuv += width;
+ 	}
+ 
++	if (dec->cmdl->format == STD_MJPG && dec->mjpg_fmt == MODE400)
++		return;
++
+ 	cropWidth /= 2;
+ 	cropHeight /= 2;
+ 	pCropYuv = buf + (width * height);
+@@ -672,7 +675,17 @@ write_to_file(struct decode *dec, Rect cropRect, int index)
+ 
+ 	pfb = dec->pfbpool[index];
+ 	buf = (u8 *)(pfb->addrY + pfb->desc.virt_uaddr - pfb->desc.phy_addr);
++
+ 	img_size = stride * height * 3 / 2;
++	if (dec->cmdl->format == STD_MJPG) {
++		if (dec->mjpg_fmt == MODE422 || dec->mjpg_fmt == MODE224)
++			img_size = stride * height * 2;
++		else if (dec->mjpg_fmt == MODE400)
++			img_size = stride * height;
++		else if (dec->mjpg_fmt == MODE444)
++			img_size = stride * height * 3;
++	}
++
+ 	if (chromaInterleave == 0 && cropping == 0) {
+ 		fwriten(dec->cmdl->dst_fd, buf, img_size);
+ 		goto out;
+@@ -886,8 +899,12 @@ decoder_start(struct decode *dec)
+ 
+ 		gettimeofday(&tdec_begin, NULL);
+ 		ret = vpu_DecStartOneFrame(handle, &decparam);
++		if (ret == RETCODE_JPEG_EOS) {
++			warn_msg(" JPEG bitstream is end\n");
++			return -1;
++		}
+ 		if (ret != RETCODE_SUCCESS) {
+-			err_msg("DecStartOneFrame failed\n");
++			err_msg("DecStartOneFrame failed, ret=%d\n", ret);
+ 			return -1;
+ 		}
+ 
+@@ -1494,7 +1511,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	bufinfo.maxDecFrmInfo.maxMbNum = dec->stride * dec->picheight / 256;
+ 	ret = vpu_DecRegisterFrameBuffer(handle, fb, fbcount, stride, &bufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+-		err_msg("Register frame buffer failed\n");
++		err_msg("Register frame buffer failed, ret=%d\n", ret);
+ 		goto err1;
+ 	}
+ 
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 23f3124..621893c 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -115,6 +115,39 @@ void SaveEncSliceInfo(u8 *SliceParaBuf, int size, int EncNum)
+ 	fflush(fpEncSliceInfo);
+ }
+ 
++void jpgGetHuffTable(EncMjpgParam *param)
++{
++	/* Rearrange and insert pre-defined Huffman table to deticated variable. */
++	memcpy(param->huffBits[DC_TABLE_INDEX0], lumaDcBits, 16);   /* Luma DC BitLength */
++	memcpy(param->huffVal[DC_TABLE_INDEX0], lumaDcValue, 16);   /* Luma DC HuffValue */
++
++	memcpy(param->huffBits[AC_TABLE_INDEX0], lumaAcBits, 16);   /* Luma DC BitLength */
++	memcpy(param->huffVal[AC_TABLE_INDEX0], lumaAcValue, 162);  /* Luma DC HuffValue */
++
++	memcpy(param->huffBits[DC_TABLE_INDEX1], chromaDcBits, 16); /* Chroma DC BitLength */
++	memcpy(param->huffVal[DC_TABLE_INDEX1], chromaDcValue, 16); /* Chroma DC HuffValue */
++
++	memcpy(param->huffBits[AC_TABLE_INDEX1], chromaAcBits, 16); /* Chroma AC BitLength */
++	memcpy(param->huffVal[AC_TABLE_INDEX1], chromaAcValue, 162); /* Chorma AC HuffValue */
++}
++
++void jpgGetQMatrix(EncMjpgParam *param)
++{
++	/* Rearrange and insert pre-defined Q-matrix to deticated variable. */
++	memcpy(param->qMatTab[DC_TABLE_INDEX0], lumaQ2, 64);
++	memcpy(param->qMatTab[AC_TABLE_INDEX0], chromaBQ2, 64);
++
++	memcpy(param->qMatTab[DC_TABLE_INDEX1], param->qMatTab[DC_TABLE_INDEX0], 64);
++	memcpy(param->qMatTab[AC_TABLE_INDEX1], param->qMatTab[AC_TABLE_INDEX0], 64);
++}
++
++void jpgGetCInfoTable(EncMjpgParam *param)
++{
++	int format = param->mjpg_sourceFormat;
++
++	memcpy(param->cInfoTab, cInfoTable[format], 6 * 4);
++}
++
+ static int
+ enc_readbs_reset_buffer(struct encode *enc, PhysicalAddress paBsBufAddr, int bsBufsize)
+ {
+@@ -259,6 +292,21 @@ put_mp4header:
+ 			free(enc->huffTable);
+ 		if (enc->qMatTable)
+ 			free(enc->qMatTable);
++		if (cpu_is_mx6q()) {
++			EncParamSet enchdr_param = {0};
++			enchdr_param.size = STREAM_BUF_SIZE;
++			enchdr_param.pParaSet = malloc(STREAM_BUF_SIZE);
++			if (enchdr_param.pParaSet) {
++				vpu_EncGiveCommand(handle,ENC_GET_JPEG_HEADER, &enchdr_param);
++				vpu_write(enc->cmdl, (void *)enchdr_param.pParaSet, enchdr_param.size);
++				if (ret < 0)
++					return -1;
++				free(enchdr_param.pParaSet);
++			} else {
++				err_msg("memory allocate failure\n");
++				return -1;
++			}
++		}
+ 	}
+ 
+ 	return 0;
+@@ -289,7 +337,10 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	struct frame_buf **pfbpool;
+ 
+ 	if (cpu_is_mx6q())
+-		needFrameBufCount = fbcount + 3; // minFrameBufferCount + Subsamp buffer [2] + Src frame
++		if (enc->cmdl->format == STD_MJPG)
++			needFrameBufCount = fbcount + 1;
++		else
++			needFrameBufCount = fbcount + 3; /* minFrameBufferCount + Subsamp buffer [2] + Src frame */
+ 	else
+ 		needFrameBufCount = fbcount + 1;
+ 
+@@ -308,7 +359,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	for (i = 0; i < fbcount; i++) {
+-		pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420,
++		pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+ 				(enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
+ 		if (pfbpool[i] == NULL) {
+ 			fbcount = i;
+@@ -323,9 +374,9 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		fb[i].strideC = pfbpool[i]->strideC;
+ 	}
+ 
+-	if (cpu_is_mx6q() &&  enc->cmdl->format != STD_MJPG) {
+-		for (i = fbcount + 1; i < fbcount + 3; i++) {
+-			pfbpool[i] = framebuf_alloc(enc->cmdl->format, MODE420,
++	if (cpu_is_mx6q() && (enc->cmdl->format != STD_MJPG)) {
++		for (i = fbcount + 1; i < needFrameBufCount; i++) {
++			pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+ 					(enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
+ 			if (pfbpool[i] == NULL) {
+ 				fbcount = i;
+@@ -366,7 +417,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		}
+ 	} else {
+ 		/* Allocate a single frame buffer for source frame */
+-		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, MODE420, enc->src_picwidth,
++		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt, enc->src_picwidth,
+ 						   enc->src_picheight);
+ 		if (pfbpool[src_fbid] == NULL) {
+ 			err_msg("failed to allocate single framebuf\n");
+@@ -473,6 +524,12 @@ encoder_start(struct encode *enc)
+ 		img_size = enc->src_picwidth * enc->src_picheight;
+ 	} else {
+ 		img_size = enc->src_picwidth * enc->src_picheight * 3 / 2;
++		if (enc->cmdl->format == STD_MJPG) {
++			if (enc->mjpg_fmt == MODE422 || enc->mjpg_fmt == MODE224)
++				img_size = enc->src_picwidth * enc->src_picheight * 2;
++			else if (enc->mjpg_fmt == MODE400)
++				img_size = enc->src_picwidth * enc->src_picheight;
++		}
+ 	}
+ 
+ 	gettimeofday(&total_start, NULL);
+@@ -488,8 +545,11 @@ encoder_start(struct encode *enc)
+ 			fb[src_fbid].myIndex = v4l2_buf.index;
+ 			fb[src_fbid].bufY = cap_buffers[v4l2_buf.index].offset;
+ 			fb[src_fbid].bufCb = fb[src_fbid].bufY + img_size;
+-			fb[src_fbid].bufCr = fb[src_fbid].bufCb +
+-						(img_size >> 2);
++			if ((enc->cmdl->format == STD_MJPG) &&
++			    (enc->mjpg_fmt == MODE422 || enc->mjpg_fmt == MODE224))
++				fb[src_fbid].bufCr = fb[src_fbid].bufCb + (img_size >> 1);
++			else
++				fb[src_fbid].bufCr = fb[src_fbid].bufCb + (img_size >> 2);
+ 		} else {
+ 			pfb = pfbpool[src_fbid];
+ 			yuv_addr = pfb->addrY + pfb->desc.virt_uaddr -
+@@ -790,7 +850,7 @@ encoder_open(struct encode *enc)
+ 	encop.dynamicAllocEnable = 0;
+ 	encop.chromaInterleave = enc->cmdl->chromaInterleave;
+ 
+-	if( enc->cmdl->format == STD_MJPG )
++	if(!cpu_is_mx6q() &&  enc->cmdl->format == STD_MJPG )
+ 	{
+ 		qMatTable = calloc(192,1);
+ 		if (qMatTable == NULL) {
+@@ -933,13 +993,19 @@ encoder_open(struct encode *enc)
+ 			encop.EncStdParam.avcParam.avc_fmoSliceSaveBufSize = 32; /* FMO_SLICE_SAVE_BUF_SIZE */
+ 		}
+ 	} else if (enc->cmdl->format == STD_MJPG) {
+-		encop.EncStdParam.mjpgParam.mjpg_sourceFormat = 0; /* encConfig.mjpgChromaFormat */
++		encop.EncStdParam.mjpgParam.mjpg_sourceFormat = enc->mjpg_fmt; /* encConfig.mjpgChromaFormat */
+ 		encop.EncStdParam.mjpgParam.mjpg_restartInterval = 60;
+ 		encop.EncStdParam.mjpgParam.mjpg_thumbNailEnable = 0;
+ 		encop.EncStdParam.mjpgParam.mjpg_thumbNailWidth = 0;
+ 		encop.EncStdParam.mjpgParam.mjpg_thumbNailHeight = 0;
+-		encop.EncStdParam.mjpgParam.mjpg_hufTable = huffTable;
+-		encop.EncStdParam.mjpgParam.mjpg_qMatTable = qMatTable;
++		if (cpu_is_mx6q()) {
++			jpgGetHuffTable(&encop.EncStdParam.mjpgParam);
++			jpgGetQMatrix(&encop.EncStdParam.mjpgParam);
++			jpgGetCInfoTable(&encop.EncStdParam.mjpgParam);
++		} else {
++			encop.EncStdParam.mjpgParam.mjpg_hufTable = huffTable;
++			encop.EncStdParam.mjpgParam.mjpg_qMatTable = qMatTable;
++		}
+ 	}
+ 
+ 	ret = vpu_EncOpen(&handle, &encop);
+@@ -998,6 +1064,9 @@ encode_test(void *arg)
+ 	enc->phy_bsbuf_addr = mem_desc.phy_addr;
+ 	enc->cmdl = cmdl;
+ 
++	if (enc->cmdl->format == STD_MJPG)
++		enc->mjpg_fmt = MODE420;  /* Please change this per your needs */
++
+ 	/* open the encoder */
+ 	ret = encoder_open(enc);
+ 	if (ret)
+diff --git a/test/mxc_vpu_test/vpu_jpegtable.h b/test/mxc_vpu_test/vpu_jpegtable.h
+index 68e729b..2c0f4fc 100644
+--- a/test/mxc_vpu_test/vpu_jpegtable.h
++++ b/test/mxc_vpu_test/vpu_jpegtable.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2008-2011 Freescale Semiconductor, Inc.
+  *
+  * Copyright (c) 2008, Chips & Media.  All rights reserved.
+  */
+@@ -137,6 +137,12 @@ unsigned char chromaRQ2[64] = {
+ 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
+ 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,
+ };
+-
++static unsigned char cInfoTable[5][24] = {
++    { 00, 02, 02, 00, 00, 00, 01, 01, 01, 01, 01, 01, 02, 01, 01, 01, 01, 01, 03, 00, 00, 00, 00, 00 }, //420
++    { 00, 02, 01, 00, 00, 00, 01, 01, 01, 01, 01, 01, 02, 01, 01, 01, 01, 01, 03, 00, 00, 00, 00, 00 }, //422H
++    { 00, 01, 02, 00, 00, 00, 01, 01, 01, 01, 01, 01, 02, 01, 01, 01, 01, 01, 03, 00, 00, 00, 00, 00 }, //422V
++    { 00, 01, 01, 00, 00, 00, 01, 01, 01, 01, 01, 01, 02, 01, 01, 01, 01, 01, 03, 00, 00, 00, 00, 00 }, //444
++    { 00, 01, 01, 00, 00, 00, 01, 00, 00, 00, 00, 00, 02, 00, 00, 00, 00, 00, 03, 00, 00, 00, 00, 00 }, //400
++};
+ #endif
+ 
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 93c03fd..0980dfd 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -237,6 +237,7 @@ struct encode {
+ 	ExtBufCfg scratchBuf;
+ 	int mp4_dataPartitionEnable;
+ 	int ringBufferEnable;
++	int mjpg_fmt;
+ 
+         EncReportInfo mbInfo;
+         EncReportInfo mvInfo;
+-- 
+1.8.0
+

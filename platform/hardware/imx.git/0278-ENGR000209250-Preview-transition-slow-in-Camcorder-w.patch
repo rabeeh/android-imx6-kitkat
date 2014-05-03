@@ -1,0 +1,197 @@
+From 62f613f3a1058f4488b7fcd540bec4bf83465031 Mon Sep 17 00:00:00 2001
+From: Jeff Kudrick <jeff.kudrick@freescale.com>
+Date: Wed, 23 May 2012 22:24:17 -0500
+Subject: [PATCH 278/486] ENGR000209250 Preview transition slow in Camcorder
+ when selecting quality
+
+In the process of resolving the above issue, picked up the latest commits
+from the i.MX6 Camera HAL.
+
+commit fe7b21dd217415cc4506390110b128050a069f5e
+Author: YangYonggang <b31664@freescale.com>
+Date:   Tue May 15 10:00:28 2012 +0800
+
+commit e1eef7c1f0e7e0b9754c471a0ae2b2c93696b69c
+Author: YangYonggang <b31664@freescale.com>
+Date:   Fri May 11 16:09:21 2012 +0800
+
+Signed-off-by: Jeff Kudrick <jeff.kudrick@freescale.com>
+---
+ mx5x/libcamera/CameraHal.cpp | 73 +++++++++++++++++++++++++++++---------------
+ 1 file changed, 48 insertions(+), 25 deletions(-)
+
+diff --git a/mx5x/libcamera/CameraHal.cpp b/mx5x/libcamera/CameraHal.cpp
+index fe832fb..c6323a4 100755
+--- a/mx5x/libcamera/CameraHal.cpp
++++ b/mx5x/libcamera/CameraHal.cpp
+@@ -648,7 +648,7 @@ namespace android {
+ 
+         framerate = params.getPreviewFrameRate();
+         CAMERA_HAL_LOG_INFO("##the set frame rate is %d ##", framerate);
+-        if (framerate >30 || framerate<0 ){
++        if ((framerate > 30) || (framerate < 0) ){
+             CAMERA_HAL_ERR("The framerate is not corrected");
+             return BAD_VALUE;
+         }
+@@ -832,7 +832,7 @@ namespace android {
+             mWaitForTakingPicture = true;
+             sem_wait(&mTakingPicture);
+             mWaitForTakingPicture = false;
+-	}
++        }
+         Mutex::Autolock lock(mLock);
+         //isPreviewFinsh = 0;
+         mEnqueuedBufs = 0;
+@@ -1102,15 +1102,15 @@ namespace android {
+         mCaptureDeviceCfg.tv.numerator = 1;
+         mCaptureDevice->GetDevName(mCameraSensorName);
+         if (strstr(mCameraSensorName, "uvc") == NULL){
+-        //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
+-        // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
+-        if (mParameters.getPreviewFrameRate() >= 15)
+-            mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
+-        else{
+-            mParameters.getPreviewFpsRange(&min_fps, &max_fps);
+-            CAMERA_HAL_LOG_INFO("###start the preview the fps is %d###", max_fps);
+-            mCaptureDeviceCfg.tv.denominator = max_fps/1000;
+-        }
++            //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
++            // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
++            if (mParameters.getPreviewFrameRate() >= 15)
++                mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++            else{
++                mParameters.getPreviewFpsRange(&min_fps, &max_fps);
++                CAMERA_HAL_LOG_INFO("###start the preview the fps is %d###", max_fps);
++                mCaptureDeviceCfg.tv.denominator = max_fps/1000;
++            }
+         }else{
+                 mCaptureDeviceCfg.tv.denominator = 15;
+         }
+@@ -1593,15 +1593,15 @@ Pic_out:
+         mCaptureDeviceCfg.tv.numerator = 1;
+         mCaptureDevice->GetDevName(mCameraSensorName);
+         if (strstr(mCameraSensorName, "uvc") == NULL){
+-        //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
+-        // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
+-        if (mParameters.getPreviewFrameRate() >= 15)
+-            mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
+-        else{
+-            mParameters.getPreviewFpsRange(&min_fps, &max_fps);
+-            CAMERA_HAL_LOG_INFO("###start the capture the fps is %d###", max_fps);
+-            mCaptureDeviceCfg.tv.denominator = max_fps/1000;
+-        }
++            //according to google's doc getPreviewFrameRate & getPreviewFpsRange should support both.
++            // so here just a walkaround, if the app set the frameRate, will follow this frame rate.
++            if (mParameters.getPreviewFrameRate() >= 15)
++                mCaptureDeviceCfg.tv.denominator = mParameters.getPreviewFrameRate();
++            else{
++                mParameters.getPreviewFpsRange(&min_fps, &max_fps);
++                CAMERA_HAL_LOG_INFO("###start the capture the fps is %d###", max_fps);
++                mCaptureDeviceCfg.tv.denominator = max_fps/1000;
++            }
+         }else{
+                 mCaptureDeviceCfg.tv.denominator = 15;
+         }
+@@ -1981,11 +1981,14 @@ Pic_out:
+                 
+         switch(msg->what) {
+             case CMESSAGE_TYPE_NORMAL:
++
+                 ret = mCaptureDevice->DevDequeue(&bufIndex);
+                 //handle the error return.
+                 if(ret < 0) {
+                     CAMERA_HAL_ERR("%s: get invalide buffer", __FUNCTION__);
+-                    mCaptureThreadQueue.postQuitMessage();
++                    mCaptureRunning = false;
++                    mCaptureThreadQueue.clearMessage();
++                    sem_post(&mCaptureStoppedCondition);
+                     return NO_ERROR;
+                 }
+                 //handle the normal return.
+@@ -2009,9 +2012,12 @@ Pic_out:
+                 break;
+             case CMESSAGE_TYPE_QUITE:
+                 mExitCaptureThread = 1;
+-                mPreviewThreadQueue.postQuitMessage();
+-                mEncodeThreadQueue.postQuitMessage();
+-                mPostProcessThreadQueue.postQuitMessage();
++                if (mExitPreviewThread == 0)
++                    mPreviewThreadQueue.postQuitMessage();
++                if (mExitEncodeThread == 0)
++                    mEncodeThreadQueue.postQuitMessage();
++                if (mPPDeviceNeed && (mExitPostProcessThread == 0))
++                    mPostProcessThreadQueue.postQuitMessage();
+                 break;
+             default:
+                 CAMERA_HAL_ERR("%s: wrong msg type %d", __FUNCTION__, msg->what);
+@@ -2129,7 +2135,8 @@ Pic_out:
+             }
+             ret = previewshowFrameThread();
+             if(ret < 0) {
+-                CAMERA_HAL_ERR("%s: capture thread exit with exception", __FUNCTION__);
++                CAMERA_HAL_ERR("%s: preview thread exit with exception", __FUNCTION__);
++                mExitPreviewThread = 1;
+                 return ret;
+             }            
+         }
+@@ -2182,6 +2189,9 @@ Pic_out:
+                 display_index = msg->arg0;
+                 if(display_index < 0 || (unsigned int)display_index >= mCaptureBufNum) {
+                     CAMERA_HAL_ERR("%s: get invalide buffer index", __FUNCTION__);
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
+                     return BAD_VALUE;  
+                 }
+                 if(!mPPDeviceNeed) {
+@@ -2202,6 +2212,9 @@ Pic_out:
+                 if (mNativeWindow != 0) {
+                     if (mNativeWindow->enqueue_buffer(mNativeWindow, &((android_native_buffer_t * )pInBuf->native_buf)->handle) < 0){
+                         CAMERA_HAL_ERR("queueBuffer failed. May be bcos stream was not turned on yet.");
++                        mPreviewRunning = false;
++                        mPreviewThreadQueue.clearMessage();
++                        sem_post(&mPreviewStoppedCondition);
+                         return BAD_VALUE;
+                     }
+                     pInBuf->buf_state = WINDOW_BUFS_QUEUED;
+@@ -2215,6 +2228,9 @@ Pic_out:
+                 err = mNativeWindow->dequeue_buffer(mNativeWindow, &buf_h, &stride);
+                 if((err != 0) || buf_h == NULL) {
+                     CAMERA_HAL_ERR("%s: dequeueBuffer failed.", __FUNCTION__);
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
+                     return INVALID_OPERATION;
+                 }
+                 buf = container_of(buf_h, ANativeWindowBuffer, handle);
+@@ -2224,6 +2240,9 @@ Pic_out:
+                 if(buf_index >= mCaptureBufNum || (buf_index < 0)) {
+                     mNativeWindow->cancel_buffer(mNativeWindow, &buf->handle);
+                     CAMERA_HAL_ERR("dequeue invalide buffer!!!!");
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
+                     return INVALID_OPERATION;
+                 }
+ 
+@@ -2259,6 +2278,7 @@ Pic_out:
+             ret = encodeframeThread();
+             if(ret < 0) {
+                 CAMERA_HAL_ERR("%s: encode thread exit with exception", __FUNCTION__);
++                mExitEncodeThread = 1;
+                 return ret;
+             }
+         }
+@@ -2282,6 +2302,9 @@ Pic_out:
+                 unsigned int i;
+                 if(enc_index < 0 || (unsigned int)enc_index >= mCaptureBufNum) {
+                     CAMERA_HAL_ERR("%s: get invalide buffer index", __FUNCTION__);
++                    mRecordRunning = false;
++                    mEncodeThreadQueue.clearMessage();
++                    sem_post(&mEncodeStoppedCondition);
+                     return BAD_VALUE;  
+                 }
+                 
+-- 
+1.8.0
+

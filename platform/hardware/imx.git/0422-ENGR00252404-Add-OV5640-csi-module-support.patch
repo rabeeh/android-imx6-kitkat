@@ -1,0 +1,1005 @@
+From 53e5df71dc88cf85d06e65cc43d65dea2b67b5c3 Mon Sep 17 00:00:00 2001
+From: "guoyin.chen" <guoyin.chen@freescale.com>
+Date: Fri, 1 Mar 2013 17:33:11 +0800
+Subject: [PATCH 422/486] ENGR00252404 Add OV5640 csi module support
+
+Rename current Ov56xxx code to be Ov56xxCsi or Ov56xxMipi
+Restrict Ov5640 csi camera preview resolution to exclude the
+1080P and XGA due to FPS cannnot traget to 30FPS
+
+Signed-off-by: guoyin.chen <guoyin.chen@freescale.com>
+---
+ mx6/libcamera2/Android.mk        |   5 +-
+ mx6/libcamera2/CameraUtil.h      |   5 +-
+ mx6/libcamera2/DeviceAdapter.cpp |  21 +++---
+ mx6/libcamera2/Ov5640.cpp        | 139 -------------------------------------
+ mx6/libcamera2/Ov5640.h          |  27 --------
+ mx6/libcamera2/Ov5640Csi.cpp     | 145 +++++++++++++++++++++++++++++++++++++++
+ mx6/libcamera2/Ov5640Csi.h       |  27 ++++++++
+ mx6/libcamera2/Ov5640Mipi.cpp    | 139 +++++++++++++++++++++++++++++++++++++
+ mx6/libcamera2/Ov5640Mipi.h      |  27 ++++++++
+ mx6/libcamera2/Ov5642.cpp        | 138 -------------------------------------
+ mx6/libcamera2/Ov5642.h          |  27 --------
+ mx6/libcamera2/Ov5642Csi.cpp     | 138 +++++++++++++++++++++++++++++++++++++
+ mx6/libcamera2/Ov5642Csi.h       |  27 ++++++++
+ 13 files changed, 522 insertions(+), 343 deletions(-)
+ delete mode 100755 mx6/libcamera2/Ov5640.cpp
+ delete mode 100755 mx6/libcamera2/Ov5640.h
+ create mode 100755 mx6/libcamera2/Ov5640Csi.cpp
+ create mode 100755 mx6/libcamera2/Ov5640Csi.h
+ create mode 100755 mx6/libcamera2/Ov5640Mipi.cpp
+ create mode 100755 mx6/libcamera2/Ov5640Mipi.h
+ delete mode 100755 mx6/libcamera2/Ov5642.cpp
+ delete mode 100755 mx6/libcamera2/Ov5642.h
+ create mode 100755 mx6/libcamera2/Ov5642Csi.cpp
+ create mode 100755 mx6/libcamera2/Ov5642Csi.h
+
+diff --git a/mx6/libcamera2/Android.mk b/mx6/libcamera2/Android.mk
+index 16f5f51..199da4a 100755
+--- a/mx6/libcamera2/Android.mk
++++ b/mx6/libcamera2/Android.mk
+@@ -32,8 +32,9 @@ LOCAL_SRC_FILES:=    \
+     MetadaManager.cpp \
+     messageQueue.cpp \
+     OvDevice.cpp \
+-    Ov5640.cpp \
+-    Ov5642.cpp \
++    Ov5640Mipi.cpp \
++    Ov5642Csi.cpp \
++    Ov5640Csi.cpp \
+     TVINDevice.cpp \
+     UvcDevice.cpp \
+     PhysMemAdapter.cpp \
+diff --git a/mx6/libcamera2/CameraUtil.h b/mx6/libcamera2/CameraUtil.h
+index 23cfaee..40aea78 100755
+--- a/mx6/libcamera2/CameraUtil.h
++++ b/mx6/libcamera2/CameraUtil.h
+@@ -70,8 +70,9 @@ using namespace android;
+ #define fAssert(e) ((e) ? (void)0 : __assert2(__FILE__, __LINE__, __func__, #e))
+ 
+ #define UVC_SENSOR_NAME "uvc"
+-#define OV5640_SENSOR_NAME "ov5640"
+-#define OV5642_SENSOR_NAME "ov5642"
++#define OV5640MIPI_SENSOR_NAME "ov5640_mipi"
++#define OV5642CSI_SENSOR_NAME "ov5642_camera"
++#define OV5640CSI_SENSOR_NAME "ov5640_camera"
+ #define ADV7180_TVIN_NAME "adv7180_decoder"
+ #define V4LSTREAM_WAKE_LOCK "V4LCapture"
+ 
+diff --git a/mx6/libcamera2/DeviceAdapter.cpp b/mx6/libcamera2/DeviceAdapter.cpp
+index 721851c..afcadb8 100755
+--- a/mx6/libcamera2/DeviceAdapter.cpp
++++ b/mx6/libcamera2/DeviceAdapter.cpp
+@@ -16,8 +16,9 @@
+ 
+ #include "DeviceAdapter.h"
+ #include "UvcDevice.h"
+-#include "Ov5640.h"
+-#include "Ov5642.h"
++#include "Ov5640Mipi.h"
++#include "Ov5642Csi.h"
++#include "Ov5640Csi.h"
+ #include "TVINDevice.h"
+ 
+ sp<DeviceAdapter>DeviceAdapter::Create(const CameraInfo& info)
+@@ -27,13 +28,17 @@ sp<DeviceAdapter>DeviceAdapter::Create(const CameraInfo& info)
+         FLOGI("DeviceAdapter: Create uvc device");
+         devAdapter = new UvcDevice();
+     }
+-    else if (strstr(info.name, OV5640_SENSOR_NAME)) {
+-        FLOGI("DeviceAdapter: Create ov5640 device");
+-        devAdapter = new Ov5640();
++    else if (strstr(info.name, OV5640MIPI_SENSOR_NAME)) {
++        FLOGI("DeviceAdapter: Create ov5640 mipi device");
++        devAdapter = new Ov5640Mipi();
+     }
+-    else if (strstr(info.name, OV5642_SENSOR_NAME)) {
+-        FLOGI("DeviceAdapter: Create ov5642 device");
+-        devAdapter = new Ov5642();
++    else if (strstr(info.name, OV5642CSI_SENSOR_NAME)) {
++        FLOGI("DeviceAdapter: Create ov5642 csi device");
++        devAdapter = new Ov5642Csi();
++    }
++    else if (strstr(info.name, OV5640CSI_SENSOR_NAME)) {
++        FLOGI("DeviceAdapter: Create ov5640 csi device");
++        devAdapter = new Ov5640Csi();
+     }
+     else if (strstr(info.name, ADV7180_TVIN_NAME)) {
+         FLOGI("DeviceAdapter: Create adv7180 device");
+diff --git a/mx6/libcamera2/Ov5640.cpp b/mx6/libcamera2/Ov5640.cpp
+deleted file mode 100755
+index 20b2b30..0000000
+--- a/mx6/libcamera2/Ov5640.cpp
++++ /dev/null
+@@ -1,139 +0,0 @@
+-/*
+- * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "Ov5640.h"
+-
+-
+-status_t Ov5640::initSensorInfo(const CameraInfo& info)
+-{
+-    if (mCameraHandle < 0) {
+-        FLOGE("OvDevice: initParameters sensor has not been opened");
+-        return BAD_VALUE;
+-    }
+-
+-    // first read sensor format.
+-    int ret = 0, index = 0;
+-    int sensorFormats[MAX_SENSOR_FORMAT];
+-    memset(mAvailableFormats, 0, sizeof(mAvailableFormats));
+-    memset(sensorFormats, 0, sizeof(sensorFormats));
+-#if 0
+-    struct v4l2_fmtdesc vid_fmtdesc;
+-    while (ret == 0) {
+-        vid_fmtdesc.index = index;
+-        vid_fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        ret               = ioctl(mCameraHandle, VIDIOC_ENUM_FMT, &vid_fmtdesc);
+-        FLOG_RUNTIME("index:%d,ret:%d, format:%c%c%c%c", index, ret,
+-                     vid_fmtdesc.pixelformat & 0xFF,
+-                     (vid_fmtdesc.pixelformat >> 8) & 0xFF,
+-                     (vid_fmtdesc.pixelformat >> 16) & 0xFF,
+-                     (vid_fmtdesc.pixelformat >> 24) & 0xFF);
+-        if (ret == 0) {
+-            sensorFormats[index++] = vid_fmtdesc.pixelformat;
+-        }
+-    }
+-    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
+-    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
+-#endif
+-
+-    // v4l2 does not support enum format, now hard code here.
+-    sensorFormats[index++] = v4l2_fourcc('N', 'V', '1', '2');
+-    sensorFormats[index++] = v4l2_fourcc('Y', 'V', '1', '2');
+-    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
+-    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
+-    //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
+-    mAvailableFormatCount = index;
+-    changeSensorFormats(sensorFormats, index);
+-
+-    index = 0;
+-    char TmpStr[20];
+-    int  previewCnt = 0, pictureCnt = 0;
+-    struct v4l2_frmsizeenum vid_frmsize;
+-    struct v4l2_frmivalenum vid_frmval;
+-    while (ret == 0) {
+-        memset(TmpStr, 0, 20);
+-        memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
+-        vid_frmsize.index        = index++;
+-        vid_frmsize.pixel_format = v4l2_fourcc('N', 'V', '1', '2');
+-        ret = ioctl(mCameraHandle,
+-                    VIDIOC_ENUM_FRAMESIZES, &vid_frmsize);
+-        if (ret == 0) {
+-            FLOG_RUNTIME("enum frame size w:%d, h:%d",
+-                         vid_frmsize.discrete.width, vid_frmsize.discrete.height);
+-            memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
+-            vid_frmval.index        = 0;
+-            vid_frmval.pixel_format = vid_frmsize.pixel_format;
+-            vid_frmval.width        = vid_frmsize.discrete.width;
+-            vid_frmval.height       = vid_frmsize.discrete.height;
+-
+-            // ret = ioctl(mCameraHandle, VIDIOC_ENUM_FRAMEINTERVALS,
+-            // &vid_frmval);
+-            // v4l2 does not support, now hard code here.
+-            if (ret == 0) {
+-                FLOG_RUNTIME("vid_frmval denominator:%d, numeraton:%d",
+-                             vid_frmval.discrete.denominator,
+-                             vid_frmval.discrete.numerator);
+-                if ((vid_frmsize.discrete.width > 1920) ||
+-                    (vid_frmsize.discrete.height > 1080)) {
+-                    vid_frmval.discrete.denominator = 15;
+-                    vid_frmval.discrete.numerator   = 1;
+-                }
+-                else {
+-                    vid_frmval.discrete.denominator = 30;
+-                    vid_frmval.discrete.numerator   = 1;
+-                }
+-
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
+-
+-                if (vid_frmval.discrete.denominator /
+-                    vid_frmval.discrete.numerator > 15) {
+-                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.width;
+-                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.height;;
+-                }
+-            }
+-        }
+-    } // end while
+-
+-    mPreviewResolutionCount = previewCnt;
+-    mPictureResolutionCount = pictureCnt;
+-
+-    mMinFrameDuration = 33331760L;
+-    mMaxFrameDuration = 30000000000L;
+-    int i;
+-    for (i=0; i<MAX_RESOLUTION_SIZE  && i<pictureCnt; i+=2) {
+-        FLOGI("SupportedPictureSizes: %d x %d", mPictureResolutions[i], mPictureResolutions[i+1]);
+-    }
+-
+-    adjustPreviewResolutions();
+-    for (i=0; i<MAX_RESOLUTION_SIZE  && i<previewCnt; i+=2) {
+-        FLOGI("SupportedPreviewSizes: %d x %d", mPreviewResolutions[i], mPreviewResolutions[i+1]);
+-    }
+-    FLOGI("FrameDuration is %lld, %lld", mMinFrameDuration, mMaxFrameDuration);
+-
+-    i = 0;
+-    mTargetFpsRange[i++] = 12;
+-    mTargetFpsRange[i++] = 15;
+-    mTargetFpsRange[i++] = 27;
+-    mTargetFpsRange[i++] = 30;
+-
+-    setMaxPictureResolutions();
+-    FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
+-    mFocalLength = 10.001;
+-
+-    return NO_ERROR;
+-}
+-
+-
+diff --git a/mx6/libcamera2/Ov5640.h b/mx6/libcamera2/Ov5640.h
+deleted file mode 100755
+index ce0db85..0000000
+--- a/mx6/libcamera2/Ov5640.h
++++ /dev/null
+@@ -1,27 +0,0 @@
+-/*
+- * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#ifndef _OV5640_H_
+-#define _OV5640_H_
+-
+-#include "OvDevice.h"
+-
+-class Ov5640 : public OvDevice {
+-public:
+-    virtual status_t initSensorInfo(const CameraInfo& info);
+-};
+-
+-#endif // ifndef _OV_DEVICE_H_
+diff --git a/mx6/libcamera2/Ov5640Csi.cpp b/mx6/libcamera2/Ov5640Csi.cpp
+new file mode 100755
+index 0000000..873c06c
+--- /dev/null
++++ b/mx6/libcamera2/Ov5640Csi.cpp
+@@ -0,0 +1,145 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Ov5640Csi.h"
++
++status_t Ov5640Csi::initSensorInfo(const CameraInfo& info)
++{
++    if (mCameraHandle < 0) {
++        FLOGE("OvDevice: initParameters sensor has not been opened");
++        return BAD_VALUE;
++    }
++
++    // first read sensor format.
++    int ret = 0, index = 0;
++    int sensorFormats[MAX_SENSOR_FORMAT];
++    memset(mAvailableFormats, 0, sizeof(mAvailableFormats));
++    memset(sensorFormats, 0, sizeof(sensorFormats));
++#if 0
++    struct v4l2_fmtdesc vid_fmtdesc;
++    while (ret == 0) {
++        vid_fmtdesc.index = index;
++        vid_fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        ret               = ioctl(mCameraHandle, VIDIOC_ENUM_FMT, &vid_fmtdesc);
++        FLOG_RUNTIME("index:%d,ret:%d, format:%c%c%c%c", index, ret,
++                     vid_fmtdesc.pixelformat & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 8) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 16) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 24) & 0xFF);
++        if (ret == 0) {
++            sensorFormats[index++] = vid_fmtdesc.pixelformat;
++        }
++    }
++    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
++    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
++#endif
++
++    // v4l2 does not support enum format, now hard code here.
++    sensorFormats[index++] = v4l2_fourcc('N', 'V', '1', '2');
++    sensorFormats[index++] = v4l2_fourcc('Y', 'V', '1', '2');
++    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
++    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
++    //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
++    mAvailableFormatCount = index;
++    changeSensorFormats(sensorFormats, index);
++
++    index = 0;
++    char TmpStr[20];
++    int  previewCnt = 0, pictureCnt = 0;
++    struct v4l2_frmsizeenum vid_frmsize;
++    struct v4l2_frmivalenum vid_frmval;
++    while (ret == 0) {
++        memset(TmpStr, 0, 20);
++        memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
++        vid_frmsize.index        = index++;
++        vid_frmsize.pixel_format = v4l2_fourcc('N', 'V', '1', '2');
++        ret = ioctl(mCameraHandle,
++                    VIDIOC_ENUM_FRAMESIZES, &vid_frmsize);
++        if (ret == 0) {
++            FLOG_RUNTIME("enum frame size w:%d, h:%d",
++                         vid_frmsize.discrete.width, vid_frmsize.discrete.height);
++            memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
++            vid_frmval.index        = 0;
++            vid_frmval.pixel_format = vid_frmsize.pixel_format;
++            vid_frmval.width        = vid_frmsize.discrete.width;
++            vid_frmval.height       = vid_frmsize.discrete.height;
++
++            // ret = ioctl(mCameraHandle, VIDIOC_ENUM_FRAMEINTERVALS,
++            // &vid_frmval);
++            // v4l2 does not support, now hard code here.
++            if (ret == 0) {
++                FLOG_RUNTIME("vid_frmval denominator:%d, numeraton:%d",
++                             vid_frmval.discrete.denominator,
++                             vid_frmval.discrete.numerator);
++                if ((vid_frmsize.discrete.width > 1280) ||
++                    (vid_frmsize.discrete.height > 800)) {
++                    vid_frmval.discrete.denominator = 15;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++                else if ((vid_frmsize.discrete.width == 1024) ||
++                    (vid_frmsize.discrete.height == 768)) {
++                    // Max fps for ov5640 csi xga cannot reach to 30fps
++                    vid_frmval.discrete.denominator = 15;
++                    vid_frmval.discrete.numerator   = 1;
++
++                }
++                else {
++                    vid_frmval.discrete.denominator = 30;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++
++                if (vid_frmval.discrete.denominator /
++                    vid_frmval.discrete.numerator > 15) {
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.width;
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.height;;
++                }
++            }
++        }
++    } // end while
++
++    mPreviewResolutionCount = previewCnt;
++    mPictureResolutionCount = pictureCnt;
++
++    mMinFrameDuration = 33331760L;
++    mMaxFrameDuration = 30000000000L;
++    int i;
++    for (i=0; i<MAX_RESOLUTION_SIZE && i<pictureCnt; i+=2) {
++        FLOGI("SupportedPictureSizes: %d x %d", mPictureResolutions[i], mPictureResolutions[i+1]);
++    }
++
++    adjustPreviewResolutions();
++    for (i=0; i<MAX_RESOLUTION_SIZE && i<previewCnt; i+=2) {
++        FLOGI("SupportedPreviewSizes: %d x %d", mPreviewResolutions[i], mPreviewResolutions[i+1]);
++    }
++    FLOGI("FrameDuration is %lld, %lld", mMinFrameDuration, mMaxFrameDuration);
++
++    i = 0;
++    mTargetFpsRange[i++] = 12;
++    mTargetFpsRange[i++] = 15;
++    mTargetFpsRange[i++] = 27;
++    mTargetFpsRange[i++] = 30;
++
++    setMaxPictureResolutions();
++    FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
++    mFocalLength = 10.001;
++
++    return NO_ERROR;
++}
++
++
+diff --git a/mx6/libcamera2/Ov5640Csi.h b/mx6/libcamera2/Ov5640Csi.h
+new file mode 100755
+index 0000000..016d787
+--- /dev/null
++++ b/mx6/libcamera2/Ov5640Csi.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _OV5640CSI_H_
++#define _OV5640CSI_H_
++
++#include "OvDevice.h"
++
++class Ov5640Csi : public OvDevice {
++public:
++    virtual status_t initSensorInfo(const CameraInfo& info);
++};
++
++#endif // ifndef _OV_DEVICE_H_
+diff --git a/mx6/libcamera2/Ov5640Mipi.cpp b/mx6/libcamera2/Ov5640Mipi.cpp
+new file mode 100755
+index 0000000..81e4398
+--- /dev/null
++++ b/mx6/libcamera2/Ov5640Mipi.cpp
+@@ -0,0 +1,139 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Ov5640Mipi.h"
++
++
++status_t Ov5640Mipi::initSensorInfo(const CameraInfo& info)
++{
++    if (mCameraHandle < 0) {
++        FLOGE("OvDevice: initParameters sensor has not been opened");
++        return BAD_VALUE;
++    }
++
++    // first read sensor format.
++    int ret = 0, index = 0;
++    int sensorFormats[MAX_SENSOR_FORMAT];
++    memset(mAvailableFormats, 0, sizeof(mAvailableFormats));
++    memset(sensorFormats, 0, sizeof(sensorFormats));
++#if 0
++    struct v4l2_fmtdesc vid_fmtdesc;
++    while (ret == 0) {
++        vid_fmtdesc.index = index;
++        vid_fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        ret               = ioctl(mCameraHandle, VIDIOC_ENUM_FMT, &vid_fmtdesc);
++        FLOG_RUNTIME("index:%d,ret:%d, format:%c%c%c%c", index, ret,
++                     vid_fmtdesc.pixelformat & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 8) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 16) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 24) & 0xFF);
++        if (ret == 0) {
++            sensorFormats[index++] = vid_fmtdesc.pixelformat;
++        }
++    }
++    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
++    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
++#endif
++
++    // v4l2 does not support enum format, now hard code here.
++    sensorFormats[index++] = v4l2_fourcc('N', 'V', '1', '2');
++    sensorFormats[index++] = v4l2_fourcc('Y', 'V', '1', '2');
++    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
++    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
++    //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
++    mAvailableFormatCount = index;
++    changeSensorFormats(sensorFormats, index);
++
++    index = 0;
++    char TmpStr[20];
++    int  previewCnt = 0, pictureCnt = 0;
++    struct v4l2_frmsizeenum vid_frmsize;
++    struct v4l2_frmivalenum vid_frmval;
++    while (ret == 0) {
++        memset(TmpStr, 0, 20);
++        memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
++        vid_frmsize.index        = index++;
++        vid_frmsize.pixel_format = v4l2_fourcc('N', 'V', '1', '2');
++        ret = ioctl(mCameraHandle,
++                    VIDIOC_ENUM_FRAMESIZES, &vid_frmsize);
++        if (ret == 0) {
++            FLOG_RUNTIME("enum frame size w:%d, h:%d",
++                         vid_frmsize.discrete.width, vid_frmsize.discrete.height);
++            memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
++            vid_frmval.index        = 0;
++            vid_frmval.pixel_format = vid_frmsize.pixel_format;
++            vid_frmval.width        = vid_frmsize.discrete.width;
++            vid_frmval.height       = vid_frmsize.discrete.height;
++
++            // ret = ioctl(mCameraHandle, VIDIOC_ENUM_FRAMEINTERVALS,
++            // &vid_frmval);
++            // v4l2 does not support, now hard code here.
++            if (ret == 0) {
++                FLOG_RUNTIME("vid_frmval denominator:%d, numeraton:%d",
++                             vid_frmval.discrete.denominator,
++                             vid_frmval.discrete.numerator);
++                if ((vid_frmsize.discrete.width > 1920) ||
++                    (vid_frmsize.discrete.height > 1080)) {
++                    vid_frmval.discrete.denominator = 15;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++                else {
++                    vid_frmval.discrete.denominator = 30;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++
++                if (vid_frmval.discrete.denominator /
++                    vid_frmval.discrete.numerator > 15) {
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.width;
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.height;;
++                }
++            }
++        }
++    } // end while
++
++    mPreviewResolutionCount = previewCnt;
++    mPictureResolutionCount = pictureCnt;
++
++    mMinFrameDuration = 33331760L;
++    mMaxFrameDuration = 30000000000L;
++    int i;
++    for (i=0; i<MAX_RESOLUTION_SIZE  && i<pictureCnt; i+=2) {
++        FLOGI("SupportedPictureSizes: %d x %d", mPictureResolutions[i], mPictureResolutions[i+1]);
++    }
++
++    adjustPreviewResolutions();
++    for (i=0; i<MAX_RESOLUTION_SIZE  && i<previewCnt; i+=2) {
++        FLOGI("SupportedPreviewSizes: %d x %d", mPreviewResolutions[i], mPreviewResolutions[i+1]);
++    }
++    FLOGI("FrameDuration is %lld, %lld", mMinFrameDuration, mMaxFrameDuration);
++
++    i = 0;
++    mTargetFpsRange[i++] = 12;
++    mTargetFpsRange[i++] = 15;
++    mTargetFpsRange[i++] = 27;
++    mTargetFpsRange[i++] = 30;
++
++    setMaxPictureResolutions();
++    FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
++    mFocalLength = 10.001;
++
++    return NO_ERROR;
++}
++
++
+diff --git a/mx6/libcamera2/Ov5640Mipi.h b/mx6/libcamera2/Ov5640Mipi.h
+new file mode 100755
+index 0000000..1f16e83
+--- /dev/null
++++ b/mx6/libcamera2/Ov5640Mipi.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _OV5640MIPI_H_
++#define _OV5640MIPI_H_
++
++#include "OvDevice.h"
++
++class Ov5640Mipi : public OvDevice {
++public:
++    virtual status_t initSensorInfo(const CameraInfo& info);
++};
++
++#endif // ifndef _OV_DEVICE_H_
+diff --git a/mx6/libcamera2/Ov5642.cpp b/mx6/libcamera2/Ov5642.cpp
+deleted file mode 100755
+index fc3706e..0000000
+--- a/mx6/libcamera2/Ov5642.cpp
++++ /dev/null
+@@ -1,138 +0,0 @@
+-/*
+- * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "Ov5642.h"
+-
+-status_t Ov5642::initSensorInfo(const CameraInfo& info)
+-{
+-    if (mCameraHandle < 0) {
+-        FLOGE("OvDevice: initParameters sensor has not been opened");
+-        return BAD_VALUE;
+-    }
+-
+-    // first read sensor format.
+-    int ret = 0, index = 0;
+-    int sensorFormats[MAX_SENSOR_FORMAT];
+-    memset(mAvailableFormats, 0, sizeof(mAvailableFormats));
+-    memset(sensorFormats, 0, sizeof(sensorFormats));
+-#if 0
+-    struct v4l2_fmtdesc vid_fmtdesc;
+-    while (ret == 0) {
+-        vid_fmtdesc.index = index;
+-        vid_fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-        ret               = ioctl(mCameraHandle, VIDIOC_ENUM_FMT, &vid_fmtdesc);
+-        FLOG_RUNTIME("index:%d,ret:%d, format:%c%c%c%c", index, ret,
+-                     vid_fmtdesc.pixelformat & 0xFF,
+-                     (vid_fmtdesc.pixelformat >> 8) & 0xFF,
+-                     (vid_fmtdesc.pixelformat >> 16) & 0xFF,
+-                     (vid_fmtdesc.pixelformat >> 24) & 0xFF);
+-        if (ret == 0) {
+-            sensorFormats[index++] = vid_fmtdesc.pixelformat;
+-        }
+-    }
+-    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
+-    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
+-#endif
+-
+-    // v4l2 does not support enum format, now hard code here.
+-    sensorFormats[index++] = v4l2_fourcc('N', 'V', '1', '2');
+-    sensorFormats[index++] = v4l2_fourcc('Y', 'V', '1', '2');
+-    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
+-    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
+-    //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
+-    mAvailableFormatCount = index;
+-    changeSensorFormats(sensorFormats, index);
+-
+-    index = 0;
+-    char TmpStr[20];
+-    int  previewCnt = 0, pictureCnt = 0;
+-    struct v4l2_frmsizeenum vid_frmsize;
+-    struct v4l2_frmivalenum vid_frmval;
+-    while (ret == 0) {
+-        memset(TmpStr, 0, 20);
+-        memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
+-        vid_frmsize.index        = index++;
+-        vid_frmsize.pixel_format = v4l2_fourcc('N', 'V', '1', '2');
+-        ret = ioctl(mCameraHandle,
+-                    VIDIOC_ENUM_FRAMESIZES, &vid_frmsize);
+-        if (ret == 0) {
+-            FLOG_RUNTIME("enum frame size w:%d, h:%d",
+-                         vid_frmsize.discrete.width, vid_frmsize.discrete.height);
+-            memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
+-            vid_frmval.index        = 0;
+-            vid_frmval.pixel_format = vid_frmsize.pixel_format;
+-            vid_frmval.width        = vid_frmsize.discrete.width;
+-            vid_frmval.height       = vid_frmsize.discrete.height;
+-
+-            // ret = ioctl(mCameraHandle, VIDIOC_ENUM_FRAMEINTERVALS,
+-            // &vid_frmval);
+-            // v4l2 does not support, now hard code here.
+-            if (ret == 0) {
+-                FLOG_RUNTIME("vid_frmval denominator:%d, numeraton:%d",
+-                             vid_frmval.discrete.denominator,
+-                             vid_frmval.discrete.numerator);
+-                if ((vid_frmsize.discrete.width > 1280) ||
+-                    (vid_frmsize.discrete.height > 800)) {
+-                    vid_frmval.discrete.denominator = 15;
+-                    vid_frmval.discrete.numerator   = 1;
+-                }
+-                else {
+-                    vid_frmval.discrete.denominator = 30;
+-                    vid_frmval.discrete.numerator   = 1;
+-                }
+-
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
+-                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
+-
+-                if (vid_frmval.discrete.denominator /
+-                    vid_frmval.discrete.numerator > 15) {
+-                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.width;
+-                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.height;;
+-                }
+-            }
+-        }
+-    } // end while
+-
+-    mPreviewResolutionCount = previewCnt;
+-    mPictureResolutionCount = pictureCnt;
+-
+-    mMinFrameDuration = 33331760L;
+-    mMaxFrameDuration = 30000000000L;
+-    int i;
+-    for (i=0; i<MAX_RESOLUTION_SIZE && i<pictureCnt; i+=2) {
+-        FLOGI("SupportedPictureSizes: %d x %d", mPictureResolutions[i], mPictureResolutions[i+1]);
+-    }
+-
+-    adjustPreviewResolutions();
+-    for (i=0; i<MAX_RESOLUTION_SIZE && i<previewCnt; i+=2) {
+-        FLOGI("SupportedPreviewSizes: %d x %d", mPreviewResolutions[i], mPreviewResolutions[i+1]);
+-    }
+-    FLOGI("FrameDuration is %lld, %lld", mMinFrameDuration, mMaxFrameDuration);
+-
+-    i = 0;
+-    mTargetFpsRange[i++] = 12;
+-    mTargetFpsRange[i++] = 15;
+-    mTargetFpsRange[i++] = 27;
+-    mTargetFpsRange[i++] = 30;
+-
+-    setMaxPictureResolutions();
+-    FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
+-    mFocalLength = 10.001;
+-
+-    return NO_ERROR;
+-}
+-
+-
+diff --git a/mx6/libcamera2/Ov5642.h b/mx6/libcamera2/Ov5642.h
+deleted file mode 100755
+index ef05fa8..0000000
+--- a/mx6/libcamera2/Ov5642.h
++++ /dev/null
+@@ -1,27 +0,0 @@
+-/*
+- * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#ifndef _OV5642_H_
+-#define _OV5642_H_
+-
+-#include "OvDevice.h"
+-
+-class Ov5642 : public OvDevice {
+-public:
+-    virtual status_t initSensorInfo(const CameraInfo& info);
+-};
+-
+-#endif // ifndef _OV_DEVICE_H_
+diff --git a/mx6/libcamera2/Ov5642Csi.cpp b/mx6/libcamera2/Ov5642Csi.cpp
+new file mode 100755
+index 0000000..a3b756a
+--- /dev/null
++++ b/mx6/libcamera2/Ov5642Csi.cpp
+@@ -0,0 +1,138 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "Ov5642Csi.h"
++
++status_t Ov5642Csi::initSensorInfo(const CameraInfo& info)
++{
++    if (mCameraHandle < 0) {
++        FLOGE("OvDevice: initParameters sensor has not been opened");
++        return BAD_VALUE;
++    }
++
++    // first read sensor format.
++    int ret = 0, index = 0;
++    int sensorFormats[MAX_SENSOR_FORMAT];
++    memset(mAvailableFormats, 0, sizeof(mAvailableFormats));
++    memset(sensorFormats, 0, sizeof(sensorFormats));
++#if 0
++    struct v4l2_fmtdesc vid_fmtdesc;
++    while (ret == 0) {
++        vid_fmtdesc.index = index;
++        vid_fmtdesc.type  = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++        ret               = ioctl(mCameraHandle, VIDIOC_ENUM_FMT, &vid_fmtdesc);
++        FLOG_RUNTIME("index:%d,ret:%d, format:%c%c%c%c", index, ret,
++                     vid_fmtdesc.pixelformat & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 8) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 16) & 0xFF,
++                     (vid_fmtdesc.pixelformat >> 24) & 0xFF);
++        if (ret == 0) {
++            sensorFormats[index++] = vid_fmtdesc.pixelformat;
++        }
++    }
++    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
++    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
++#endif
++
++    // v4l2 does not support enum format, now hard code here.
++    sensorFormats[index++] = v4l2_fourcc('N', 'V', '1', '2');
++    sensorFormats[index++] = v4l2_fourcc('Y', 'V', '1', '2');
++    sensorFormats[index++] = v4l2_fourcc('B', 'L', 'O', 'B');
++    sensorFormats[index++] = v4l2_fourcc('R', 'A', 'W', 'S');
++    //mAvailableFormats[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
++    mAvailableFormatCount = index;
++    changeSensorFormats(sensorFormats, index);
++
++    index = 0;
++    char TmpStr[20];
++    int  previewCnt = 0, pictureCnt = 0;
++    struct v4l2_frmsizeenum vid_frmsize;
++    struct v4l2_frmivalenum vid_frmval;
++    while (ret == 0) {
++        memset(TmpStr, 0, 20);
++        memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
++        vid_frmsize.index        = index++;
++        vid_frmsize.pixel_format = v4l2_fourcc('N', 'V', '1', '2');
++        ret = ioctl(mCameraHandle,
++                    VIDIOC_ENUM_FRAMESIZES, &vid_frmsize);
++        if (ret == 0) {
++            FLOG_RUNTIME("enum frame size w:%d, h:%d",
++                         vid_frmsize.discrete.width, vid_frmsize.discrete.height);
++            memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
++            vid_frmval.index        = 0;
++            vid_frmval.pixel_format = vid_frmsize.pixel_format;
++            vid_frmval.width        = vid_frmsize.discrete.width;
++            vid_frmval.height       = vid_frmsize.discrete.height;
++
++            // ret = ioctl(mCameraHandle, VIDIOC_ENUM_FRAMEINTERVALS,
++            // &vid_frmval);
++            // v4l2 does not support, now hard code here.
++            if (ret == 0) {
++                FLOG_RUNTIME("vid_frmval denominator:%d, numeraton:%d",
++                             vid_frmval.discrete.denominator,
++                             vid_frmval.discrete.numerator);
++                if ((vid_frmsize.discrete.width > 1280) ||
++                    (vid_frmsize.discrete.height > 800)) {
++                    vid_frmval.discrete.denominator = 15;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++                else {
++                    vid_frmval.discrete.denominator = 30;
++                    vid_frmval.discrete.numerator   = 1;
++                }
++
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.width;
++                mPictureResolutions[pictureCnt++] = vid_frmsize.discrete.height;
++
++                if (vid_frmval.discrete.denominator /
++                    vid_frmval.discrete.numerator > 15) {
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.width;
++                    mPreviewResolutions[previewCnt++] = vid_frmsize.discrete.height;;
++                }
++            }
++        }
++    } // end while
++
++    mPreviewResolutionCount = previewCnt;
++    mPictureResolutionCount = pictureCnt;
++
++    mMinFrameDuration = 33331760L;
++    mMaxFrameDuration = 30000000000L;
++    int i;
++    for (i=0; i<MAX_RESOLUTION_SIZE && i<pictureCnt; i+=2) {
++        FLOGI("SupportedPictureSizes: %d x %d", mPictureResolutions[i], mPictureResolutions[i+1]);
++    }
++
++    adjustPreviewResolutions();
++    for (i=0; i<MAX_RESOLUTION_SIZE && i<previewCnt; i+=2) {
++        FLOGI("SupportedPreviewSizes: %d x %d", mPreviewResolutions[i], mPreviewResolutions[i+1]);
++    }
++    FLOGI("FrameDuration is %lld, %lld", mMinFrameDuration, mMaxFrameDuration);
++
++    i = 0;
++    mTargetFpsRange[i++] = 12;
++    mTargetFpsRange[i++] = 15;
++    mTargetFpsRange[i++] = 27;
++    mTargetFpsRange[i++] = 30;
++
++    setMaxPictureResolutions();
++    FLOGI("mMaxWidth:%d, mMaxHeight:%d", mMaxWidth, mMaxHeight);
++    mFocalLength = 10.001;
++
++    return NO_ERROR;
++}
++
++
+diff --git a/mx6/libcamera2/Ov5642Csi.h b/mx6/libcamera2/Ov5642Csi.h
+new file mode 100755
+index 0000000..daa8d7e
+--- /dev/null
++++ b/mx6/libcamera2/Ov5642Csi.h
+@@ -0,0 +1,27 @@
++/*
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef _OV5642CSI_H_
++#define _OV5642CSI_H_
++
++#include "OvDevice.h"
++
++class Ov5642Csi : public OvDevice {
++public:
++    virtual status_t initSensorInfo(const CameraInfo& info);
++};
++
++#endif // ifndef _OV_DEVICE_H_
+-- 
+1.8.0
+

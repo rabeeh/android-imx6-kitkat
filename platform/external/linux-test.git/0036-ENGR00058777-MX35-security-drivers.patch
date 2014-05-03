@@ -1,0 +1,988 @@
+From 053e05bd198664fb57ed19f6d630ab012714f17e Mon Sep 17 00:00:00 2001
+From: Yan Wang <r65094@freescale.com>
+Date: Fri, 25 Jul 2008 10:57:41 +0800
+Subject: [PATCH 036/435] ENGR00058777 MX35: security drivers
+
+This CR is required to support security drivers in MX35 platform
+
+Signed-off-by: Yan Wang <r65094@freescale.com>
+---
+ include/scc_test_driver.h             |  25 ++++--
+ module_test/scc_test_driver.c         | 149 ++++++++++++++--------------------
+ test/mxc_rng_test/Makefile            |   8 +-
+ test/mxc_scc/Makefile                 |   6 +-
+ test/mxc_scc/encrypt_decrypt_tests.sh |  96 +++++++++++-----------
+ test/mxc_scc/fail_mode_tests.sh       |  18 ++--
+ test/mxc_scc/key_slot_tests.sh        |  22 ++---
+ test/mxc_scc/scc_setup.sh             |   8 +-
+ test/mxc_scc/scc_test.c               |  55 ++++---------
+ test/mxc_scc/test_subs.sh             |  10 +--
+ 10 files changed, 177 insertions(+), 220 deletions(-)
+
+diff --git a/include/scc_test_driver.h b/include/scc_test_driver.h
+index 2ddf12f..4c83c72 100644
+--- a/include/scc_test_driver.h
++++ b/include/scc_test_driver.h
+@@ -16,6 +16,7 @@
+ 
+ #ifdef __KERNEL__
+ 
++#include <portable_os.h>
+ #include <linux/version.h>
+ #include <linux/module.h>
+ #include <linux/init.h>
+@@ -27,11 +28,18 @@
+ #include <asm/memory.h>
+ 
+ #include <linux/mm.h>           /* for io_remap_page_range() */
+-#include <linux/fs.h>
+-#include <asm/hardware.h>
+ 
+-#endif /* kernel */
++#ifdef TAHITI
++#include <asm/arch/mx2.h>           /* MX21 board memory map*/
++#define SCC_BASE SMN_BASE_ADDR
++#elif defined(MXC)
++#include <asm/arch/hardware.h>
+ 
++#else
++DO_NOT_KNOW_TARGET_ARCH;
++#endif
++
++#endif /* kernel */
+ 
+ #include <asm/arch/mxc_scc_driver.h>
+ 
+@@ -39,11 +47,10 @@
+ 
+ static int scc_test_init(void);
+ static void scc_test_cleanup(void);
+-static int scc_test_open(struct inode *inode, struct file *file);
+-static int scc_test_release(struct inode *inode, struct file *file);
+-static int scc_test_ioctl(struct inode *inode, struct file *file,
+-                          unsigned int cmd, unsigned long scc_data);
+-static int scc_test_mmap(struct file *filep, struct vm_area_struct *vma);
++OS_DEV_IOCTL(scc_test_ioctl);
++OS_DEV_OPEN(scc_test_open);
++OS_DEV_CLOSE(scc_test_release);
++OS_DEV_MMAP(scc_test_mmap);
+ 
+ static int scc_test_get_configuration(unsigned long scc_data);
+ static int scc_test_read_register(unsigned long scc_data);
+@@ -69,7 +76,7 @@ extern int scc_test_major_node;
+ 
+ #ifndef SCC_TEST_MAJOR_NODE
+ /** Linux major node value for the device special file (/dev/scc_test) */
+-#define SCC_TEST_MAJOR_NODE  206
++#define SCC_TEST_MAJOR_NODE  240
+ #endif
+ 
+ #endif /* kernel */
+diff --git a/module_test/scc_test_driver.c b/module_test/scc_test_driver.c
+index f556650..483ef73 100644
+--- a/module_test/scc_test_driver.c
++++ b/module_test/scc_test_driver.c
+@@ -46,7 +46,7 @@
+  *
+  */
+ 
+-#include <linux/device.h>
++//#include <linux/device.h>
+ #include "../include/scc_test_driver.h"
+ 
+ /*
+@@ -65,10 +65,13 @@ MODULE_DESCRIPTION("Test Device Driver for SCC (SMN/SCM) Driver");
+ 
+ 
+ /** Allow user to configure major node value at insmod */
+-//MODULE_PARM(scc_test_major_node, "i");
++#if  LINUX_VERSION_CODE < KERNEL_VERSION(2,6,11)
++MODULE_PARM(scc_test_major_node, "i");
++#else
++module_param(scc_test_major_node, int, SCC_TEST_MAJOR_NODE);
++#endif
+ MODULE_PARM_DESC(scc_test_major_node, "Device Major Node number");
+ 
+-/** look into module_param()  in 2.6*/
+ 
+ /** Create a place to track/notify sleeping processes */
+ DECLARE_WAIT_QUEUE_HEAD(waitQueue);
+@@ -76,27 +79,12 @@ DECLARE_WAIT_QUEUE_HEAD(waitQueue);
+ /** The /dev/node value for user-kernel interaction */
+ int scc_test_major_node = SCC_TEST_MAJOR_NODE;
+ 
+-static struct class *scc_tm_class;
++static os_driver_reg_t reg_handle;
+ 
+ 
+ /** saved-off pointer of configuration information */
+ scc_config_t* scc_cfg;
+ 
+-/**
+- * Interface jump vector for calls into the device driver.
+- *
+- * This struct changes frequently in Linux kernel versions.  By initializing
+- * elements by name, we can avoid structure mismatches.  Other elements get
+- * NULL/0 by default (after all, this is a global initializer).
+- */
+-static struct file_operations scc_test_fops = {
+-    .owner = THIS_MODULE,
+-    .open = scc_test_open,
+-    .ioctl = scc_test_ioctl,
+-    .mmap = scc_test_mmap,
+-    .release = scc_test_release
+-};
+-
+ 
+ /***********************************************************************
+  * scc_test_init()                                                     *
+@@ -118,6 +106,8 @@ static int scc_test_init (void)
+ {
+     int      error_code = 0;
+     uint32_t smn_status;
++    printk("SCC: Loading test interface, availabe at /dev/%s\n",
++           SCC_TEST_DRIVER_NAME);
+ 
+     /* call the real driver here */
+     scc_cfg = scc_get_configuration();
+@@ -171,8 +161,7 @@ static int scc_test_init (void)
+  *
+  * @return 0 if successful, error code if not
+  */
+-static int
+-scc_test_open(struct inode *inode, struct file *file)
++OS_DEV_OPEN(scc_test_open)
+ {
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,0)
+     try_module_get(THIS_MODULE);
+@@ -201,8 +190,7 @@ scc_test_open(struct inode *inode, struct file *file)
+  *
+  * @return 0 (always - errors are ignored)
+  */
+-static int
+-scc_test_release(struct inode *inode, struct file *file)
++OS_DEV_CLOSE(scc_test_release)
+ {
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,0)
+     module_put(THIS_MODULE);
+@@ -238,8 +226,6 @@ scc_test_cleanup (void)
+ {
+     /* turn off the mapping to the device special file */
+     if (scc_test_major_node) {
+-	class_device_destroy(scc_tm_class, MKDEV(scc_test_major_node, 0));
+-	class_destroy(scc_tm_class);
+ 	unregister_chrdev(scc_test_major_node, SCC_TEST_DRIVER_NAME);
+         scc_test_major_node = 0;
+     }
+@@ -284,11 +270,11 @@ scc_test_cleanup (void)
+  *
+  * @return 0 or an error code (IOCTL_SCC_xxx)
+  */
+-static int
+-scc_test_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
+-               unsigned long scc_data)
++OS_DEV_IOCTL(scc_test_ioctl)
+ {
+-    int   error_code = IOCTL_SCC_OK;
++    os_error_code error_code = OS_ERROR_OK_S;
++    unsigned cmd = os_dev_get_ioctl_op();
++    unsigned long scc_data = os_dev_get_ioctl_arg();
+ 
+     switch (cmd) {
+     case SCC_TEST_GET_CONFIGURATION:
+@@ -350,7 +336,7 @@ scc_test_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
+ 
+     } /* End switch */
+ 
+-    return error_code;
++    os_dev_ioctl_return(error_code);
+ }
+ 
+ 
+@@ -365,35 +351,19 @@ scc_test_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
+  * This is some test code for a) allowing user access to ASC/AIC features,
+  * and b) experiments for how SCC2 would work.
+  */
+-static int
+-scc_test_mmap(struct file *filep, struct vm_area_struct *vma)
++OS_DEV_MMAP(scc_test_mmap)
+ {
+ 
+-#if 0
+-    /*
+-     * Disable this system call.  This feature is not available in the driver.
+-     */
+-    return -EFAULT;
+-#else
+     /* This version is allowing the User App to touch the SCC, but the SMN
+      * is turning on its CACHEABLE_ACCESS and USER_ACCESS bits and giving
+      * zero on reads (and killing processes which write??)
+      */
+     printk("Mapping SCC at %p for user\n", (void*)SCC_BASE_ADDR);
+-#if 1
+-    vma->vm_pgoff = SCC_BASE_ADDR >> PAGE_SHIFT;
+-    vma->vm_flags |= VM_IO;
+-    return remap_pfn_range(vma, vma->vm_start,
++    vma_->vm_pgoff = SCC_BASE_ADDR >> PAGE_SHIFT;
++    vma_->vm_flags |= VM_IO;
++    return remap_pfn_range(vma_, vma_->vm_start,
+                            SCC_BASE_ADDR >> PAGE_SHIFT,
+-                           8192, vma->vm_page_prot);
+-#elif 0
+-    return io_remap_page_range(vma, vma->vm_start,
+-                               SCC_BASE_ADDR,
+-                               8192,
+-                               vma->vm_page_prot);
+-#endif
+-
+-#endif
++                           8192, vma_->vm_page_prot);
+ }
+ 
+ 
+@@ -452,6 +422,7 @@ scc_test_read_register(unsigned long scc_data)
+ {
+     scc_reg_access reg_struct;
+     scc_return_t   scc_return = -1;
++    unsigned long  copy_code;
+     int            error_code = IOCTL_SCC_OK;
+ 
+     if (copy_from_user(&reg_struct, (void *)scc_data, sizeof(reg_struct))) {
+@@ -471,7 +442,11 @@ scc_test_read_register(unsigned long scc_data)
+     }
+ 
+     reg_struct.function_return_code = scc_return;
+-    copy_to_user((void *)scc_data, &reg_struct, sizeof(reg_struct));
++    copy_code = copy_to_user((void *)scc_data, &reg_struct,
++                             sizeof(reg_struct));
++    if (copy_code != 0) {
++        error_code = IOCTL_SCC_FAILURE;
++    }
+     return error_code;
+ }
+ 
+@@ -491,6 +466,7 @@ static int
+ scc_test_write_register(unsigned long scc_data) {
+     scc_reg_access reg_struct;
+     scc_return_t   scc_return = -1;
++    unsigned long  copy_code;
+     int            error_code = IOCTL_SCC_OK;
+ 
+     /* Try to copy user's reg_struct */
+@@ -511,7 +487,12 @@ scc_test_write_register(unsigned long scc_data) {
+     }
+ 
+     reg_struct.function_return_code = scc_return;
+-    copy_to_user((void *)scc_data, &reg_struct, sizeof(reg_struct));
++    copy_code = copy_to_user((void *)scc_data, &reg_struct,
++                             sizeof(reg_struct));
++
++    if (copy_code != 0) {
++        error_code = IOCTL_SCC_FAILURE;
++    }
+     return error_code;
+ }
+ 
+@@ -543,6 +524,7 @@ scc_test_cipher (uint32_t cmd, unsigned long scc_data)
+     char* input;
+     char* output;
+     scc_return_t return_code = -1;
++    unsigned long copy_code = 0;
+ 
+     int error_code = IOCTL_SCC_OK;
+ 
+@@ -567,7 +549,6 @@ scc_test_cipher (uint32_t cmd, unsigned long scc_data)
+             error_code = -IOCTL_SCC_NO_MEMORY;
+         }
+         else {
+-            int copy_code = 0;
+ 
+             /* For testing, set up internal pointers to reflect the block/word
+                offset of user memory. */
+@@ -621,7 +602,7 @@ scc_test_cipher (uint32_t cmd, unsigned long scc_data)
+ #ifdef SCC_DEBUG
+                     if (copy_code) {
+                         printk("SCC TEST: copy_to_user returned %d\n",
+-                               copy_code);
++                               (int)copy_code);
+                     }
+ #endif
+                     error_code = ENOMEM;
+@@ -633,7 +614,11 @@ scc_test_cipher (uint32_t cmd, unsigned long scc_data)
+     } /* else copy of user struct succeeded */
+ 
+     cipher_struct.function_return_code = return_code;
+-    copy_to_user((void *)scc_data, &cipher_struct, sizeof(cipher_struct));
++    copy_code = copy_to_user((void *)scc_data, &cipher_struct,
++                             sizeof(cipher_struct));
++    if (copy_code != 0) {
++        error_code = IOCTL_SCC_FAILURE;
++    }
+ 
+ 
+     /* clean up */
+@@ -837,55 +822,43 @@ scc_test_get_slot_info(unsigned long cmd, unsigned long scc_data)
+  *
+  * @return 0 on success, -errno on failure.
+  */
+-static int
++static os_error_code
+ setup_user_driver_interaction(void)
+ {
+-    struct class_device *temp_class;
+-    int result;
+-    int error_code = 0;
+-
+-    /* Tell Linux kernel the user interface to the driver looks like */
+-    result = register_chrdev(scc_test_major_node, SCC_TEST_DRIVER_NAME,
+-                             &scc_test_fops);
+-    if (result < 0) {
++    os_error_code code = OS_ERROR_OK_S;
++
++    os_driver_init_registration(reg_handle);
++    os_driver_add_registration(reg_handle, OS_FN_OPEN,
++                               OS_DEV_OPEN_REF(scc_test_open));
++    os_driver_add_registration(reg_handle, OS_FN_IOCTL,
++                               OS_DEV_IOCTL_REF(scc_test_ioctl));
++    os_driver_add_registration(reg_handle, OS_FN_CLOSE,
++                               OS_DEV_CLOSE_REF(scc_test_release));
++    os_driver_add_registration(reg_handle, OS_FN_MMAP,
++                               OS_DEV_MMAP_REF(scc_test_release));
++    code = os_driver_complete_registration(reg_handle, scc_test_major_node,
++                                               SCC_TEST_DRIVER_NAME);
++
++    if (code != OS_ERROR_OK_S) {
+         /* failure ! */
+ #ifdef SCC_DEBUG
+         printk ("SCC TEST Driver: register device driver failed: %d\n",
+-                result);
++                code);
+ #endif
+-        return result;
++        return code;
+     }
+ 
+     /* Save the major node value */
+     if (scc_test_major_node == 0) {
+         /* We passed in a zero value, then one was assigned to us.  */
+-        scc_test_major_node = result;
++        scc_test_major_node = code;
+     }
+ 
+-	scc_tm_class = class_create(THIS_MODULE, SCC_TEST_DRIVER_NAME);
+-	if (IS_ERR(scc_tm_class)) {
+-		printk(KERN_ERR "Error creating scc test module class.\n");
+-		unregister_chrdev(scc_test_major_node, SCC_TEST_DRIVER_NAME);
+-		class_device_destroy(scc_tm_class, MKDEV(scc_test_major_node, 0));
+-		return PTR_ERR(scc_tm_class);
+-	}
+- 
+-	temp_class = class_device_create(scc_tm_class, NULL,
+-					     MKDEV(scc_test_major_node, 0), NULL,
+-					     SCC_TEST_DRIVER_NAME);
+-	if (IS_ERR(temp_class)) {
+-		printk(KERN_ERR "Error creating scc test module class device.\n");
+-		class_device_destroy(scc_tm_class, MKDEV(scc_test_major_node, 0));
+-		class_destroy(scc_tm_class);
+-		unregister_chrdev(scc_test_major_node, SCC_TEST_DRIVER_NAME);
+-		return -1;
+-	}
+-
+ #ifdef SCC_DEBUG
+     printk("SCC TEST Driver:  Major node is %d\n", scc_test_major_node);
+ #endif
+ 
+-    return error_code;
++    return code;
+ }
+ 
+ 
+diff --git a/test/mxc_rng_test/Makefile b/test/mxc_rng_test/Makefile
+index 2038be8..12b64d7 100644
+--- a/test/mxc_rng_test/Makefile
++++ b/test/mxc_rng_test/Makefile
+@@ -5,7 +5,7 @@
+ #****************************************************************************/
+ 
+ # list of platforms which did not want this test case
+-EXCLUDE_LIST:="IMX27ADS IMX27EVB MXC27530EVB MXC30030ADS MXC30030EVB MXC30031ADS IMX35_3STACK"
++EXCLUDE_LIST:="IMX27ADS IMX27EVB MXC27530EVB MXC30030ADS MXC30030EVB MXC30031ADS"
+ 
+ ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
+ OBJS = apitest rng_test move
+@@ -31,11 +31,15 @@ endif
+ ifeq ("$(PLATFORM)", "IMX37_3STACK")
+ TARGET_ARCH=-DCONFIG_ARCH_MX37
+ endif
++ifeq ("$(PLATFORM)", "IMX35_3STACK")
++TARGET_ARCH=-DCONFIG_ARCH_MX35
++endif
++
+ 
+ # Location of local headers and API "common" sources
+ INCLUDEDIR= -I. -I../../include -I../mxc_sahara_test $(INC)
+ 
+-AR = ar -crv
++AR = $(CROSS_COMPILE)ar -crv
+ RM = rm -f
+ 
+ # Add compilation checks
+diff --git a/test/mxc_scc/Makefile b/test/mxc_scc/Makefile
+index 00cd641..ec74db9 100644
+--- a/test/mxc_scc/Makefile
++++ b/test/mxc_scc/Makefile
+@@ -1,12 +1,12 @@
+ # list of platforms which did not want this test case
+-EXCLUDE_LIST:="IMX21ADS MXC30031ADS IMX31_3STACK IMX35_3STACK"
++EXCLUDE_LIST:="IMX21ADS MXC30031ADS"
+ 
+ ifeq (,$(findstring $(PLATFORM), $(EXCLUDE_LIST)))
+-OBJS = $(OBJDIR)/scc_test.out $(OBJDIR)/autorun-scc.sh
++OBJS = $(OBJDIR)/scc_test $(OBJDIR)/autorun-scc.sh
+ else
+-OBJS =
+ endif
+ 
++
+ all : $(OBJS)
+ 	cp -rf *.sh $(OBJDIR)
+ 
+diff --git a/test/mxc_scc/encrypt_decrypt_tests.sh b/test/mxc_scc/encrypt_decrypt_tests.sh
+index 7e0c152..330183b 100755
+--- a/test/mxc_scc/encrypt_decrypt_tests.sh
++++ b/test/mxc_scc/encrypt_decrypt_tests.sh
+@@ -24,41 +24,41 @@
+ # Test strategy - Encrypt / Decrypt feature of SCC driver
+ 
+ # Test a straightforward 24-byte encryption in ECB then CBC modes.
+-pos_test scc_test.out -S+p0 -Le
+-pos_test scc_test.out -S+p0 -S+m -Le
++pos_test scc_test -S+p0 -Le
++pos_test scc_test -S+p0 -S+m -Le
+ 
+ # Test various byte offsets for plaintext and ciphertext strings.
+-pos_test scc_test.out -S+p0 -S+o1 -Le
+-pos_test scc_test.out -S+p0 -S+o2 -Le
+-pos_test scc_test.out -S+p0 -S+o3 -Le
++pos_test scc_test -S+p0 -S+o1 -Le
++pos_test scc_test -S+p0 -S+o2 -Le
++pos_test scc_test -S+p0 -S+o3 -Le
+ 
+ # Test various boundary cases in normal mode.
+-pos_test scc_test.out -S+l8 -Le
+-pos_test scc_test.out -S+l1016 -Le
+-pos_test scc_test.out -S+l1024 -Le
+-pos_test scc_test.out -S+l1032 -Le
++pos_test scc_test -S+l8 -Le
++pos_test scc_test -S+l1016 -Le
++pos_test scc_test -S+l1024 -Le
++pos_test scc_test -S+l1032 -Le
+ 
+ # Test various boundary cases in verify mode - memory boundaries of 1K
+ # SCC RAM size.
+-pos_test scc_test.out -S+v -S+l1014 -Le
+-pos_test scc_test.out -S+v -S+l1015 -Le
+-pos_test scc_test.out -S+v -S+l1016 -Le
+-pos_test scc_test.out -S+v -S+l1017 -Le
+-pos_test scc_test.out -S+v -S+l1022 -Le
+-pos_test scc_test.out -S+v -S+l1023 -Le
+-pos_test scc_test.out -S+v -S+l1024 -Le
+-pos_test scc_test.out -S+v -S+l1025 -Le
++pos_test scc_test -S+v -S+l1014 -Le
++pos_test scc_test -S+v -S+l1015 -Le
++pos_test scc_test -S+v -S+l1016 -Le
++pos_test scc_test -S+v -S+l1017 -Le
++pos_test scc_test -S+v -S+l1022 -Le
++pos_test scc_test -S+v -S+l1023 -Le
++pos_test scc_test -S+v -S+l1024 -Le
++pos_test scc_test -S+v -S+l1025 -Le
+ 
+ # Test various boundary cases in verify mode - block boundaries within
+ # the 8-byte 3DES block - provide exact amount of ciphertext padding.
+-pos_test scc_test.out -S+v -S+p7  -S+l1  -Le
+-pos_test scc_test.out -S+v -S+p6  -S+l2  -Le
+-pos_test scc_test.out -S+v -S+p5  -S+l3  -Le
+-pos_test scc_test.out -S+v -S+p4  -S+l4  -Le
+-pos_test scc_test.out -S+v -S+p3  -S+l5  -Le
+-pos_test scc_test.out -S+v -S+p10 -S+l6  -Le
+-pos_test scc_test.out -S+v -S+p9  -S+l7  -Le
+-pos_test scc_test.out -S+v -S+p8  -S+l8  -Le
++pos_test scc_test -S+v -S+p7  -S+l1  -Le
++pos_test scc_test -S+v -S+p6  -S+l2  -Le
++pos_test scc_test -S+v -S+p5  -S+l3  -Le
++pos_test scc_test -S+v -S+p4  -S+l4  -Le
++pos_test scc_test -S+v -S+p3  -S+l5  -Le
++pos_test scc_test -S+v -S+p10 -S+l6  -Le
++pos_test scc_test -S+v -S+p9  -S+l7  -Le
++pos_test scc_test -S+v -S+p8  -S+l8  -Le
+ 
+ 
+ # Test some expected failures - Bad arguments to encrypt/decrypt:
+@@ -66,45 +66,45 @@ pos_test scc_test.out -S+v -S+p8  -S+l8  -Le
+ echo
+ echo "Expected failures -- bad arguments"
+ #  - Plaintext count not multiple of block size in normal mode
+-neg_test scc_test.out -S+l1 -Le
+-neg_test scc_test.out -S+l10 -Le
+-neg_test scc_test.out -S+l1027 -Le
+-neg_test scc_test.out -S+l1028 -Le
+-neg_test scc_test.out -S+l1029 -Le
+-neg_test scc_test.out -S+l22 -Le
+-neg_test scc_test.out -S+l23 -Le
++neg_test scc_test -S+l1 -Le
++neg_test scc_test -S+l10 -Le
++neg_test scc_test -S+l1027 -Le
++neg_test scc_test -S+l1028 -Le
++neg_test scc_test -S+l1029 -Le
++neg_test scc_test -S+l22 -Le
++neg_test scc_test -S+l23 -Le
+ 
+ echo
+ echo "Expected failures - Insufficient space"
+ # - One byte too few of ciphertext space in normal mode encryption.
+-neg_test scc_test.out -S+p-1 -Le
++neg_test scc_test -S+p-1 -Le
+ 
+ # - One byte too few of ciphertext space in verify mode encryption.
+-neg_test scc_test.out -S+v -S+p6 -S+l1  -Le
+-neg_test scc_test.out -S+v -S+p5 -S+l2  -Le
+-neg_test scc_test.out -S+v -S+p4 -S+l3  -Le
+-neg_test scc_test.out -S+v -S+p3 -S+l4  -Le
+-neg_test scc_test.out -S+v -S+p2 -S+l5  -Le
+-neg_test scc_test.out -S+v -S+p9 -S+l6  -Le
+-neg_test scc_test.out -S+v -S+p8 -S+l7  -Le
+-neg_test scc_test.out -S+v -S+p7 -S+l8  -Le
++neg_test scc_test -S+v -S+p6 -S+l1  -Le
++neg_test scc_test -S+v -S+p5 -S+l2  -Le
++neg_test scc_test -S+v -S+p4 -S+l3  -Le
++neg_test scc_test -S+v -S+p3 -S+l4  -Le
++neg_test scc_test -S+v -S+p2 -S+l5  -Le
++neg_test scc_test -S+v -S+p9 -S+l6  -Le
++neg_test scc_test -S+v -S+p8 -S+l7  -Le
++neg_test scc_test -S+v -S+p7 -S+l8  -Le
+ 
+ # - One byte too few of output plaintext space in normal mode decryption.
+-neg_test scc_test.out -S-p-1 -Le
++neg_test scc_test -S-p-1 -Le
+ 
+ # - One byte too few of output plaintext space in verify mode decryption.
+-neg_test scc_test.out -S+v -S-p-1 -Le
++neg_test scc_test -S+v -S-p-1 -Le
+ 
+ 
+ # Test some verification failures by generating error in ciphertext before
+ # trying to decrypt in verify mode.
+ echo
+ echo "Expected failures - Verification failure"
+-neg_test scc_test.out -S+v -S+c -S+l1 -Le
+-neg_test scc_test.out -S+v -S+c -S+l1016 -Le
+-neg_test scc_test.out -S+v -S+c -S+l1020 -Le
+-neg_test scc_test.out -S+v -S+c -S+l1024 -Le
+-neg_test scc_test.out -S+v -S+c -S+l1028 -Le
++neg_test scc_test -S+v -S+c -S+l1 -Le
++neg_test scc_test -S+v -S+c -S+l1016 -Le
++neg_test scc_test -S+v -S+c -S+l1020 -Le
++neg_test scc_test -S+v -S+c -S+l1024 -Le
++neg_test scc_test -S+v -S+c -S+l1028 -Le
+ 
+ 
+ echo
+diff --git a/test/mxc_scc/fail_mode_tests.sh b/test/mxc_scc/fail_mode_tests.sh
+index cc694c7..3167bd1 100755
+--- a/test/mxc_scc/fail_mode_tests.sh
++++ b/test/mxc_scc/fail_mode_tests.sh
+@@ -23,13 +23,13 @@ fi
+ 
+ 
+ # Dump all registers
+-pos_test scc_test.out -Lr
++pos_test scc_test -Lr
+ 
+ 
+ # Verify that a register can be written and does change
+ start_test Changing SCM_LENGTH register to 4
+-scc_test.out -W${SCM_LENGTH}:4
+-length_value=`scc_test.out -S+Q -R${SCM_LENGTH}`
++scc_test -W${SCM_LENGTH}:4
++length_value=`scc_test -S+Q -R${SCM_LENGTH}`
+ if [  -z $length_value ]; then
+     record_failure Reading result of changed SCM_LENGTH failed.
+ else
+@@ -42,8 +42,8 @@ fi
+ 
+ # Verify it can changed to something else
+ start_test Changing SCM_LENGTH register to 8
+-scc_test.out -W${SCM_LENGTH}:8
+-length_value=`scc_test.out -S+Q -R${SCM_LENGTH}`
++scc_test -W${SCM_LENGTH}:8
++length_value=`scc_test -S+Q -R${SCM_LENGTH}`
+ if [  -z $length_value ]; then
+     record_failure Reading result of changed SCM_LENGTH failed.
+ else
+@@ -56,11 +56,11 @@ fi
+ 
+ 
+ # This will invoke the Software Alarm and put the SMN into FAIL mode
+-pos_test scc_test.out -La
++pos_test scc_test -La
+ 
+ 
+ # Read all 'safe' registers when SCC has gone to alarm/FAILED state
+-pos_test scc_test.out -Ls
++pos_test scc_test -Ls
+ 
+ 
+ echo
+@@ -68,8 +68,8 @@ echo
+ echo "The rest of tests should have errors (but pass)"
+ 
+ # Test SCM Length and SMN Sequence Start
+-neg_test scc_test.out -R${SCM_LENGTH}
+-neg_test scc_test.out -R${SMN_SEQUENCE_START}
++neg_test scc_test -R${SCM_LENGTH}
++neg_test scc_test -R${SMN_SEQUENCE_START}
+ 
+ # Let the world know how things went
+ print_test_results
+diff --git a/test/mxc_scc/key_slot_tests.sh b/test/mxc_scc/key_slot_tests.sh
+index 67d81b3..98c8019 100755
+--- a/test/mxc_scc/key_slot_tests.sh
++++ b/test/mxc_scc/key_slot_tests.sh
+@@ -15,7 +15,7 @@
+ 
+ OWNER_ID=01234567fedcba98
+ KEY_VALUE8=ffeeddcc00112233
+-KEY_VALUE16=ffaaeebbdd44cc550066117722883399ffaaeebbdd44cc5500661177228833992
++KEY_VALUE33=ffaaeebbdd44cc550066117722883399ffaaeebbdd44cc550066117722883399ff
+ SHORT_KEY=1234
+ 
+ ############################################################################
+@@ -26,7 +26,7 @@ SHORT_KEY=1234
+ # Test strategy - Encrypt / Decrypt feature of SCC driver
+ 
+ echo Allocate slot
+-pos_test scc_test.out -Ka8:$OWNER_ID > /tmp/slot_$$
++pos_test scc_test -Ka8:$OWNER_ID > /tmp/slot_$$
+ cat /tmp/slot_$$
+ 
+ SLOT=`grep "^Slot.*is now al" /tmp/slot_$$`
+@@ -34,25 +34,25 @@ SLOT=`echo $SLOT | sed -e 's/^Slot //' -e 's/ at .* is now allocated$//'`
+ if [ -z $SLOT ]; then SLOT=-1; fi
+ 
+ # Load slot with a key
+-pos_test scc_test.out -Kl$SLOT:$OWNER_ID:r:$KEY_VALUE8
++pos_test scc_test -Kl$SLOT:$OWNER_ID:r:$KEY_VALUE8
+ 
+ # Make invalid attempt to deallocate it (bad uid)
+-neg_test scc_test.out -K$SLOT:1234
++neg_test scc_test -K$SLOT:1234
+ 
+ # Try to load a too-large key into the slot
+-neg_test scc_test.out -Kl$SLOT:$OWNER_ID:r:$KEY_VALUE16
++neg_test scc_test -Kl$SLOT:$OWNER_ID:r:$KEY_VALUE33
+ 
+ # "Unload" a black version of our key
+-pos_test scc_test.out -Ku$SLOT:$OWNER_ID > /tmp/key1_$$
++pos_test scc_test -Ku$SLOT:$OWNER_ID > /tmp/key1_$$
+ cat /tmp/key1_$$
+ BLACK1=`grep "^Encrypted val" /tmp/key1_$$ | sed -e 's/Encrypted value is //'`
+ if [ -z $BLACK1 ]; then BLACK1=a; fi
+ 
+ # Load a different key into the slot
+-pos_test scc_test.out -Kl$SLOT:$OWNER_ID:r:$SHORT_KEY
++pos_test scc_test -Kl$SLOT:$OWNER_ID:r:$SHORT_KEY
+ 
+ # Unload this value
+-pos_test scc_test.out -Ku$SLOT:$OWNER_ID > /tmp/key2_$$
++pos_test scc_test -Ku$SLOT:$OWNER_ID > /tmp/key2_$$
+ cat /tmp/key2_$$
+ BLACK2=`grep "^Encrypted val" /tmp/key2_$$ | sed -e 's/Encrypted value is //'`
+ if [ -z $BLACK2 ]; then BLACK2=b; fi
+@@ -61,10 +61,10 @@ if [ -z $BLACK2 ]; then BLACK2=b; fi
+ neg_test cmp /tmp/key1_$$ /tmp/key2_$$
+ 
+ # Load original key in by its black version
+-pos_test scc_test.out -Kl$SLOT:$OWNER_ID:b:$BLACK1
++pos_test scc_test -Kl$SLOT:$OWNER_ID:b:$BLACK1
+ 
+ # Unload it
+-pos_test scc_test.out -Ku$SLOT:$OWNER_ID > /tmp/key3_$$
++pos_test scc_test -Ku$SLOT:$OWNER_ID > /tmp/key3_$$
+ BLACK3=`grep "^Encrypted val" /tmp/key3_$$ | sed -e 's/Encrypted value is //'`
+ if [ -z $BLACK3 ]; then echo Broken > /tmp/key3_$$; fi
+ 
+@@ -72,7 +72,7 @@ if [ -z $BLACK3 ]; then echo Broken > /tmp/key3_$$; fi
+ pos_test cmp /tmp/key1_$$ /tmp/key3_$$
+ 
+ # Deallocate slot
+-pos_test scc_test.out -Kd$SLOT:$OWNER_ID
++pos_test scc_test -Kd$SLOT:$OWNER_ID
+ 
+ # Clean up
+ rm -f /tmp/key?_$$ /tmp/slot_$$
+diff --git a/test/mxc_scc/scc_setup.sh b/test/mxc_scc/scc_setup.sh
+index adb3c6f..758ea82 100755
+--- a/test/mxc_scc/scc_setup.sh
++++ b/test/mxc_scc/scc_setup.sh
+@@ -3,7 +3,7 @@
+ ## This command should be checked for error status.  It has numerous side
+ ## effects relating to exportation of symbols
+ ##
+-## The command 'scc_test.out' must be in its PATH
++## The command 'scc_test' must be in its PATH
+ 
+ 
+ ############################################################################
+@@ -95,7 +95,7 @@ determine_offsets()
+     # Try to read the SCM Configuration register.  The SCC driver will cause
+     # this to generate an error on one platform, succeed on another, since the
+     # SCM and SMN base addresses are swapped on some platforms.
+-    config=`scc_test.out -S+Q -R1c`
++    config=`scc_test -S+Q -R1c`
+ 
+     # See whether command executed successful
+     if [ $? -eq 0 ]; then
+@@ -106,9 +106,9 @@ determine_offsets()
+         fi
+     else
+         # Try again with same register, but in the other bank
+-        config=`scc_test.out -S+Q -R101c`
++        config=`scc_test -S+Q -R101c`
+         if [ $? -eq 0 ]; then
+-        # No errors.  Good.  Check its value. 
++        # No errors.  Good.  Check its value.
+             if [ $config = 09004008 ]; then
+                 platform=2              # SMN First
+             fi
+diff --git a/test/mxc_scc/scc_test.c b/test/mxc_scc/scc_test.c
+index a70b997..05dd687 100644
+--- a/test/mxc_scc/scc_test.c
++++ b/test/mxc_scc/scc_test.c
+@@ -31,7 +31,7 @@
+ #include <stdarg.h>
+ 
+ #include <inttypes.h>
+-#include "../include/scc_test_driver.h"
++#include "../../include/scc_test_driver.h"
+ 
+ 
+ /* test routines */
+@@ -145,7 +145,7 @@ scc_configuration_access *get_scc_configuration(int);
+ int
+ main(int arg_count,             /* # command-line arguments */
+      char *arg_list[])            /* pointers to command-line arguments */
+-{
++{ 
+     /* Declare and initialize variables */
+     int scc_fd;                 /* The SCC device */
+     char *scc_device_path = "/dev/scc_test";
+@@ -154,22 +154,9 @@ main(int arg_count,             /* # command-line arguments */
+     uint32_t timer_value = 0x5f0000;
+     char *test_to_run = "Cres"; /* default list of tests to be run in order */
+     int test_status = 0;
+-
+-#if 0
+-    int one = 1;                /* little-endian test vector */
+-#endif
+-
++       
+     init_plaintext();
+ 
+-#if 0
+-    if (*(char *)&one == 1) {
+-        printf("This CPU is little-endian\n");
+-    }
+-    else {
+-        printf("This CPU is big-endian\n");
+-    }
+-#endif
+-
+     /* Open up the SCC device */
+     /* Yes, I know, there is a command option to change the device path. */
+     scc_fd = open(scc_device_path, O_RDWR);
+@@ -179,8 +166,8 @@ main(int arg_count,             /* # command-line arguments */
+     }
+ 
+     /* Process command line arguments - until we come up empty */
+-    while ((argument_switch = getopt(arg_count, arg_list, "K:L:MP:R:S:T:W:"))
+-            != EOF) {
++    while ( (argument_switch = getopt(arg_count, arg_list, "K:L:MP:R:S:T:W:"))
++            != EOF ) {
+         switch (argument_switch) {
+         case 'K':               /* Key slot functions */
+             test_status |= do_slot_function(scc_fd, optarg);
+@@ -416,7 +403,7 @@ main(int arg_count,             /* # command-line arguments */
+         default:
+             fprintf(stderr, "Test switch %c unknown\n", test_switch);
+         }
+-
++        
+     }
+ 
+     close(scc_fd);
+@@ -429,7 +416,7 @@ main(int arg_count,             /* # command-line arguments */
+ void
+ display_configuration(int scc_fd) {
+     scc_configuration_access *config;
+-
++    
+     config = get_scc_configuration(scc_fd);
+     if (config == NULL) {
+         perror("\nCannot display SCC Configuration");
+@@ -842,7 +829,7 @@ run_cipher_tests(int scc_fd)
+             read_scc_register(scc_fd, SMN_STATUS, &value);
+             printf("SMN Status                  (0x%08x): ", value);
+             print_smn_status_register(value);
+-
++  
+             read_scc_register(scc_fd, SCM_ERROR_STATUS, &value);
+             printf("SCM Error Register          (0x%08x):", value);
+             print_scc_error_status_register(value);
+@@ -861,7 +848,7 @@ run_cipher_tests(int scc_fd)
+             cipher_control.data_out = new_plaintext;
+             cipher_control.data_out_length = plaintext_length +
+                 decrypt_padding_allowance;
+-
++        
+             if (inject_crc_error) {
+                 ciphertext[rand()%cipher_control.data_in_length] ^= 1;
+             }
+@@ -913,7 +900,7 @@ run_cipher_tests(int scc_fd)
+                     printf("SCM Error Register          (0x%08x):", value);
+                     print_scc_error_status_register(value);
+                 }
+-
++ 
+                 if (cipher_control.data_out_length != plaintext_length) {
+                     printf("Error:  input plaintext length (%d) and output "
+                            "plaintext length (%ld) do not match.\n",
+@@ -1001,7 +988,7 @@ run_aic_tests(int scc_fd) {
+     printf("SMN Status: ");
+     print_smn_status_register(value);
+ 
+-
++    
+     return 0;
+ }
+ 
+@@ -1147,12 +1134,6 @@ run_mmap_tests(int fd)
+     else {
+         printf("SMN appears at %08x\n", (unsigned)smn);
+         printf("SMN_SEQUENCE_CHECK: %08x\n", *(smn+SMN_SEQUENCE_CHECK));
+-#if 0 /* this is a write-only register */
+-        printf("SMN_BITBANK_DECREMENT: %08x\n", *(smn+SMN_BITBANK_DECREMENT));
+-#endif
+-#if 0  /* this is killing the process */
+-        *(smn+SMN_PLAINTEXT_CHECK) = 42;
+-#endif
+         printf("SMN_PLAINTEXT_CHECK: %08x\n", *(smn+SMN_PLAINTEXT_CHECK));
+         printf("SMN_CIPHERTEXT_CHECK: %08x\n", *(smn+SMN_CIPHERTEXT_CHECK));
+     }
+@@ -1175,7 +1156,7 @@ run_wrap_tests (int scc_fd)
+     scc_get_slot_info_access info_acc;
+     scc_encrypt_slot_access unload_acc;
+     int slot_allocated = 0;
+-
++    
+     strcpy((char *)key,"abcdefgh");
+ 
+     alloc_acc.owner_id = owner1;
+@@ -1249,7 +1230,7 @@ run_wrap_tests (int scc_fd)
+             }
+         }
+     }
+-
++                            
+     /* Now unload the key */
+     if (status == 0) {
+         unload_acc.slot = alloc_acc.slot;
+@@ -1269,7 +1250,7 @@ run_wrap_tests (int scc_fd)
+             }
+         }
+     }
+-
++    
+     /* Reacquire a slot */
+     if ((status == 0) && !slot_allocated) {
+         status = ioctl(scc_fd, SCC_TEST_ALLOC_SLOT, &alloc_acc);
+@@ -1456,7 +1437,7 @@ do_slot_function(int scc_fd, char *arg)
+             }
+             else {
+                 scc_load_slot_access acc;
+-                int i;
++                uint32_t i;
+ 
+                 status = 0;
+                 for (i = 0; i < strlen(hex_value); i+= 2) {
+@@ -1591,7 +1572,7 @@ print_smn_status_register(uint32_t status)
+ {
+     int version_id;
+     uint8_t state;
+-
++          
+     version_id = (status&SMN_STATUS_VERSION_ID_MASK)
+         >> SMN_STATUS_VERSION_ID_SHIFT;
+     state = (status&SMN_STATUS_STATE_MASK) >> SMN_STATUS_STATE_SHIFT;
+@@ -1666,7 +1647,7 @@ print_scm_status_register(uint32_t status)
+            (status&SCM_STATUS_CIPHERING) ? ", CIPHERING" : "",
+            (status&SCM_STATUS_ZEROIZING) ? ", ZEROIZING" : "",
+            (status&SCM_STATUS_BUSY) ? ", BUSY" : "");
+-
++           
+ 
+ }
+ 
+@@ -1703,7 +1684,7 @@ print_scc_error_status_register(uint32_t error)
+            (error&SCM_ERR_CIPHERING) ? ", CIPHERING" : "",
+            (error&SCM_ERR_ZEROIZING) ? ", ZEROIZING" : "",
+            (error&SCM_ERR_BUSY) ? ", BUSY" : "");
+-
++           
+ }
+ 
+ 
+diff --git a/test/mxc_scc/test_subs.sh b/test/mxc_scc/test_subs.sh
+index 8847c7a..dfc163f 100755
+--- a/test/mxc_scc/test_subs.sh
++++ b/test/mxc_scc/test_subs.sh
+@@ -90,8 +90,6 @@ pos_test()
+     else
+         echo "Test Failed"
+     fi
+-    # sleep a little to allow logging to catch up
+-    sleep 2
+ }
+ 
+ 
+@@ -114,8 +112,6 @@ neg_test()
+     else
+         echo "Test Failed"
+     fi
+-    # sleep a little to allow logging to catch up
+-    sleep 2
+ }
+ 
+ 
+@@ -131,8 +127,6 @@ record_failure()
+ {
+     echo $*
+     echo "Test Failed"
+-    # sleep a little to allow logging to catch up
+-    sleep 2
+ }
+ 
+ 
+@@ -148,9 +142,7 @@ record_success()
+ {
+     echo $*
+     echo "Test Passed"
+-    test_pass_count=$(($test_pass_count+1))    
+-    # sleep a little to allow logging to catch up
+-    sleep 2
++    test_pass_count=$(($test_pass_count+1))
+ }
+ 
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,2339 @@
+From 9c9e7ffc882bb2473244dd17e6039eedfd522d80 Mon Sep 17 00:00:00 2001
+From: Jason Chen <b02280@freescale.com>
+Date: Tue, 10 Mar 2009 11:02:49 +0800
+Subject: [PATCH 080/435] ENGR00107699 ipu lib test: ipu device lib unit test
+
+Unit tests for ipu device lib:
+1. user define config file test.
+2. 4 test patterns:
+  * video pattern with user define dma buffer queue, one full-screen
+    output
+  * video pattern with user define dma buffer queue, with two output.
+    Note: ipuv1 can not support output to 2 display together.
+  * hopping block screen saver, with pan display method to update
+    overlay framebuffer.
+  * color bar thread + hopping block thread
+
+Signed-off-by: Jason Chen <b02280@freescale.com>
+---
+ test/mxc_ipudev_test/Makefile           |   9 +-
+ test/mxc_ipudev_test/ipudev_config_file |  80 +++
+ test/mxc_ipudev_test/mxc_ipu_dev.c      | 855 --------------------------------
+ test/mxc_ipudev_test/mxc_ipudev_test.c  | 194 ++++++++
+ test/mxc_ipudev_test/mxc_ipudev_test.h  |  48 ++
+ test/mxc_ipudev_test/test_pattern.c     | 604 ++++++++++++++++++++++
+ test/mxc_ipudev_test/utils.c            | 462 +++++++++++++++++
+ 7 files changed, 1393 insertions(+), 859 deletions(-)
+ create mode 100644 test/mxc_ipudev_test/ipudev_config_file
+ delete mode 100644 test/mxc_ipudev_test/mxc_ipu_dev.c
+ create mode 100644 test/mxc_ipudev_test/mxc_ipudev_test.c
+ create mode 100644 test/mxc_ipudev_test/mxc_ipudev_test.h
+ create mode 100644 test/mxc_ipudev_test/test_pattern.c
+ create mode 100644 test/mxc_ipudev_test/utils.c
+
+diff --git a/test/mxc_ipudev_test/Makefile b/test/mxc_ipudev_test/Makefile
+index 208243b..b501781 100644
+--- a/test/mxc_ipudev_test/Makefile
++++ b/test/mxc_ipudev_test/Makefile
+@@ -1,14 +1,15 @@
+ # list of platforms which want this test case
+ INCLUDE_LIST:=IMX31_3STACK IMX35_3STACK IMX37_3STACK IMX51_3STACK
+ 
+-SRCS = mxc_ipu_dev.c
++SRCS = mxc_ipudev_test.c utils.c test_pattern.c
++CFLAGS += -lipu -lm
+ 
+ ifeq ($(PLATFORM),$(findstring $(PLATFORM),$(INCLUDE_LIST)))
+-OBJS = mxc_ipu_dev.out
++OBJS = $(OBJDIR)/mxc_ipudev_test.out
+ $(OBJS): $(SRCS)
+-	$(VERBOSE) $(CC) -g $(INC) $(CFLAGS) $^ $(LIBS) -lipu -o $@
+ 	mkdir -p $(OBJDIR)
+-	mv $@ $(OBJDIR)
++	$(VERBOSE) $(CC) -g $(INC) $(CFLAGS) $^ $(LIBS) -o $@
++	cp ipudev_config_file $(OBJDIR)
+ else
+ OBJS =
+ endif
+diff --git a/test/mxc_ipudev_test/ipudev_config_file b/test/mxc_ipudev_test/ipudev_config_file
+new file mode 100644
+index 0000000..7f65456
+--- /dev/null
++++ b/test/mxc_ipudev_test/ipudev_config_file
+@@ -0,0 +1,80 @@
++#####   ipu dev test config file ##########
++#
++# fourcc ref:
++#	RGB565->RGBP
++#	BGR24 ->BGR3
++#	RGB24 ->RGB3
++#	BGR32 ->BGR4
++#	BGRA32->BGRA
++#	RGB32 ->RGB4
++#	RGBA32->RGBA
++#	ABGR32->ABGR
++#	YUYV  ->YUYV
++#	UYVY  ->UYVY
++#	YUV444->Y444
++#	NV12  ->NV12
++#	YUV420P->I420
++#	YUV422P->422P
++#	YVU422P->YV16
++#
++# rotation ref:
++# 	IPU_ROTATE_NONE = 0,
++#	IPU_ROTATE_VERT_FLIP = 1,
++#	IPU_ROTATE_HORIZ_FLIP = 2,
++#	IPU_ROTATE_180 = 3,
++#	IPU_ROTATE_90_RIGHT = 4,
++#	IPU_ROTATE_90_RIGHT_VFLIP = 5,
++#	IPU_ROTATE_90_RIGHT_HFLIP = 6,
++#	IPU_ROTATE_90_LEFT = 7,
++#
++# mode ref:
++# 	TASK_ENC = 0x1
++# 	TASK_VF = 0x2
++# 	TASK_PP = 0x4
++# 	NORMAL_MODE = 0x10
++# 	STREAM_MODE = 0x20
++
++#### mode
++mode=0x22
++
++#### operation frame count
++fcount=50
++
++#### output1 enable?
++output1_enable=0
++
++#### input
++in_width=320
++in_height=240
++in_fmt=I420
++#input crop
++in_posx=0
++in_posy=0
++in_win_w=0
++in_win_h=0
++
++#### output0
++out0_width=320
++out0_height=240
++out0_fmt=RGBP
++out0_rot=0
++#output to framebuffer
++out0_to_fb=1
++out0_fb_num=0
++out0_posx=0
++out0_posy=0
++#output to file
++out0_filename=output0.dat
++
++#### output1
++out1_width=320
++out1_height=240
++out1_fmt=RGBP
++out1_rot=0
++#output to framebuffer
++out1_to_fb=1
++out1_fb_num=2
++out1_posx=0
++out1_posy=0
++#output to file
++out1_filename=output1.dat
+diff --git a/test/mxc_ipudev_test/mxc_ipu_dev.c b/test/mxc_ipudev_test/mxc_ipu_dev.c
+deleted file mode 100644
+index d8ad8be..0000000
+--- a/test/mxc_ipudev_test/mxc_ipu_dev.c
++++ /dev/null
+@@ -1,855 +0,0 @@
+-/*
+- * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+- *
+- */
+-
+-/*
+- * The code contained herein is licensed under the GNU Lesser General
+- * Public License.  You may obtain a copy of the GNU Lesser General
+- * Public License Version 2.1 or later at the following locations:
+- *
+- * http://www.opensource.org/licenses/lgpl-license.html
+- * http://www.gnu.org/copyleft/lgpl.html
+- */
+-
+-/*!
+- * @file mxc_ipu_dev.c
+- *
+- * @brief IPU device implementation
+- *
+- * @ingroup IPU
+- */
+-
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <errno.h>
+-#include <unistd.h>
+-#include <fcntl.h>
+-#include <stdint.h>
+-#include <malloc.h>
+-#include <string.h>
+-#include <signal.h>
+-#include <sys/ioctl.h>
+-#include <sys/mman.h>
+-#include <linux/videodev.h>
+-#include <linux/autoconf.h>
+-#include <linux/ipu.h>
+-#include <linux/mxcfb.h>
+-
+-#ifdef CONFIG_MXC_IPU_V1
+-#define ROT_BEGIN	IPU_ROTATE_90_RIGHT
+-#else
+-#define ROT_BEGIN	IPU_ROTATE_HORIZ_FLIP
+-#endif
+-
+-int ipu_get_interrupt_event(ipu_event_info *ev);
+-
+-static ipu_channel_t ic_chan = MEM_PRP_VF_MEM;
+-static ipu_channel_t rot_chan = MEM_ROT_VF_MEM;
+-static ipu_channel_t fb_chan = MEM_BG_SYNC;
+-static ipu_channel_t begin_chan, end_chan;
+-static int rot_out_eof_irq = IPU_IRQ_PRP_VF_ROT_OUT_EOF;
+-static int ic_out_eof_irq = IPU_IRQ_PRP_VF_OUT_EOF;
+-static int rot_in_eof_irq = IPU_IRQ_PRP_VF_ROT_IN_EOF;
+-static int ic_in_eof_irq = IPU_IRQ_PRP_IN_EOF;
+-static int fcount = 1, irq = -1;
+-static char * outfile = NULL;
+-static void * fb_mem = NULL;
+-static int show_to_fb = 0, fb_stride = 0;
+-static int fd_fb, screen_size = 0;
+-
+-typedef enum
+-{
+-	NULL_MODE = 0,
+-	IC_MODE = 0x1,
+-	ROT_MODE = 0x2
+-} pp_mode_t;
+-
+-typedef enum {
+-	RGB_CS,
+-	YUV_CS,
+-	NULL_CS
+-} cs_t;
+-
+-typedef struct{
+-	int width;
+-	int height;
+-	int rot;
+-	int fmt;
+-}ipu_ic_param;
+-
+-static u32 fmt_to_bpp(u32 pixelformat)
+-{
+-	u32 bpp;
+-
+-	switch (pixelformat)
+-	{
+-		case IPU_PIX_FMT_RGB565:
+-		/*interleaved 422*/
+-		case IPU_PIX_FMT_YUYV:
+-		case IPU_PIX_FMT_UYVY:
+-		/*non-interleaved 422*/
+-		case IPU_PIX_FMT_YUV422P:
+-		case IPU_PIX_FMT_YVU422P:
+-			bpp = 16;
+-			break;
+-		case IPU_PIX_FMT_BGR24:
+-		case IPU_PIX_FMT_RGB24:
+-		case IPU_PIX_FMT_YUV444:
+-			bpp = 24;
+-			break;
+-		case IPU_PIX_FMT_BGR32:
+-		case IPU_PIX_FMT_BGRA32:
+-		case IPU_PIX_FMT_RGB32:
+-		case IPU_PIX_FMT_RGBA32:
+-		case IPU_PIX_FMT_ABGR32:
+-			bpp = 32;
+-			break;
+-		/*non-interleaved 420*/
+-		case IPU_PIX_FMT_YUV420P:
+-		case IPU_PIX_FMT_YUV420P2:
+-			bpp = 12;
+-			break;
+-		default:
+-			bpp = 8;
+-			break;
+-	}
+-	return bpp;
+-}
+-
+-static cs_t colorspaceofpixel(int fmt)
+-{
+-	switch(fmt)
+-	{
+-		case IPU_PIX_FMT_RGB565:
+-		case IPU_PIX_FMT_BGR24:
+-		case IPU_PIX_FMT_RGB24:
+-		case IPU_PIX_FMT_BGRA32:
+-		case IPU_PIX_FMT_BGR32:
+-		case IPU_PIX_FMT_RGBA32:
+-		case IPU_PIX_FMT_RGB32:
+-		case IPU_PIX_FMT_ABGR32:
+-			return RGB_CS;
+-			break;
+-		case IPU_PIX_FMT_UYVY:
+-		case IPU_PIX_FMT_YUV420P2:
+-		case IPU_PIX_FMT_YUV420P:
+-		case IPU_PIX_FMT_YVU422P:
+-		case IPU_PIX_FMT_YUV422P:
+-		case IPU_PIX_FMT_YUV444:
+-			return YUV_CS;
+-			break;
+-		default:
+-			return NULL_CS;
+-	}
+-}
+-
+-static int need_csc(int ifmt, int ofmt)
+-{
+-	cs_t ics,ocs;
+-
+-	ics = colorspaceofpixel(ifmt);
+-	ocs = colorspaceofpixel(ofmt);
+-
+-	if((ics == NULL_CS) || (ocs == NULL_CS)){
+-		printf("Color Space not recognized!\n");
+-		return -1;
+-	}else if(ics != ocs)
+-		return 1;
+-
+-	return 0;
+-}
+-
+-static pp_mode_t ipu_ic_task_check(ipu_ic_param *i_para, ipu_ic_param *o_para)
+-{
+-	pp_mode_t pp_mode = NULL_MODE;
+-	int tmp;
+-
+-	if(o_para->rot >= ROT_BEGIN){
+-		if(o_para->rot >= IPU_ROTATE_90_RIGHT){
+-			/*output swap*/
+-			tmp = o_para->width;
+-			o_para->width = o_para->height;
+-			o_para->height = tmp;
+-		}
+-		pp_mode |= ROT_MODE;
+-	}
+-
+-	/*need resize or CSC?*/
+-	if((i_para->width != o_para->width) ||
+-			(i_para->height != o_para->height) ||
+-			need_csc(i_para->fmt,o_para->fmt))
+-		pp_mode |= IC_MODE;
+-
+-	/*need flip?*/
+-	if((pp_mode == NULL_MODE) && (o_para->rot > IPU_ROTATE_NONE ))
+-		pp_mode |= IC_MODE;
+-
+-	/*need IDMAC do format(same color space)?*/
+-	if((pp_mode == NULL_MODE) && (i_para->fmt != o_para->fmt))
+-		pp_mode |= IC_MODE;
+-
+-	return pp_mode;
+-}
+-
+-static int ipu_ic_mem_alloc(ipu_ic_param *i_para, ipu_ic_param *o_para,
+-		ipu_mem_info i_minfo[], void * inbuf_start[],
+-		ipu_mem_info o_minfo[], void * outbuf_start[],
+-		ipu_mem_info r_minfo[], pp_mode_t pp_mode,
+-		int bufcnt, int fd_ipu)
+-{
+-	int i, ret = 0;
+-
+-	for (i=0;i<bufcnt;i++) {
+-		i_minfo[i].size = i_para->width/8*i_para->height*fmt_to_bpp(i_para->fmt);
+-		if (ioctl(fd_ipu, IPU_ALOC_MEM, &(i_minfo[i])) < 0) {
+-			printf("Ioctl IPU_ALOC_MEM failed!\n");
+-			ret = -1;
+-			goto err;
+-		}
+-		inbuf_start[i] = mmap (NULL, i_minfo[i].size,
+-				PROT_READ | PROT_WRITE, MAP_SHARED,
+-				fd_ipu, i_minfo[i].paddr);
+-		if (inbuf_start[i] == MAP_FAILED) {
+-			printf("mmap failed!\n");
+-			ret = -1;
+-			goto err;
+-		}
+-
+-		if (show_to_fb == 0) {
+-			o_minfo[i].size = o_para->width/8*o_para->height*fmt_to_bpp(o_para->fmt);
+-			if (ioctl(fd_ipu, IPU_ALOC_MEM, &(o_minfo[i])) < 0) {
+-				printf("Ioctl IPU_ALOC_MEM failed!\n");
+-				ret = -1;
+-				goto err;
+-			}
+-			outbuf_start[i] = mmap (NULL, o_minfo[i].size,
+-					PROT_READ | PROT_WRITE, MAP_SHARED,
+-					fd_ipu, o_minfo[i].paddr);
+-			if (outbuf_start[i] == MAP_FAILED) {
+-				printf("mmap failed!\n");
+-				ret = -1;
+-				goto err;
+-			}
+-		}
+-
+-		if(pp_mode == (ROT_MODE | IC_MODE)) {
+-			r_minfo[i].size = o_para->width/8*o_para->height*fmt_to_bpp(o_para->fmt);
+-			if (ioctl(fd_ipu, IPU_ALOC_MEM, &r_minfo[i]) < 0) {
+-				printf("Ioctl IPU_ALOC_MEM failed!\n");
+-				ret = -1;
+-				goto err;
+-			}
+-		}
+-	}
+-
+-	/*for the case output direct to framebuffer*/
+-	if (show_to_fb) {
+-		int owidth, oheight;
+-        	struct fb_fix_screeninfo fb_fix;
+-        	struct fb_var_screeninfo fb_var;
+-
+-                if ((fd_fb = open("/dev/fb0", O_RDWR, 0)) < 0)
+-                {
+-                        printf("Unable to open /dev/fb0\n");
+-                        ret = -1;
+-                        goto err;
+-                }
+-
+-                if ( ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix) < 0) {
+-			printf("Get FB fix info failed!\n");
+-			close(fd_fb);
+-			ret = -1;
+-                        goto err;
+-                }
+-        	if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
+-			printf("Get FB var info failed!\n");
+-			close(fd_fb);
+-			ret = -1;
+-                        goto err;
+-                }
+-
+-		if (pp_mode & ROT_MODE){
+-			owidth = o_para->height;
+-			oheight = o_para->width;
+-		} else {
+-			owidth = o_para->width;
+-			oheight = o_para->height;
+-		}
+-
+-		if ((owidth > fb_var.xres) || (oheight > fb_var.yres)
+-			|| (colorspaceofpixel(o_para->fmt) != RGB_CS)
+-			|| (fmt_to_bpp(o_para->fmt) != fb_var.bits_per_pixel)) {
+-			printf("Output image is not fit for /dev/fb0!\n");
+-			close(fd_fb);
+-			ret = -1;
+-			goto err;
+-		}
+-
+-		screen_size = fb_var.yres * fb_fix.line_length;
+-		o_minfo[0].paddr = fb_fix.smem_start + screen_size;
+-
+-		fb_mem = mmap(0, 2*screen_size,
+-				PROT_READ | PROT_WRITE, MAP_SHARED, fd_fb, 0);
+-		if (fb_mem == MAP_FAILED) {
+-			printf("mmap failed!\n");
+-			ret = -1;
+-			goto err;
+-		}
+-
+-		if (bufcnt > 1) {
+-			o_minfo[1].paddr = fb_fix.smem_start;
+-			/*make two buffer as the same origin to avoid flick*/
+-			memcpy(fb_mem + screen_size, fb_mem, screen_size);
+-		}
+-		fb_stride = fb_var.xres * fb_var.bits_per_pixel/8;
+-
+-	}
+-err:
+-	return ret;
+-}
+-
+-static void ipu_ic_mem_free(ipu_mem_info i_minfo[], void * inbuf_start[],
+-		ipu_mem_info o_minfo[], void * outbuf_start[],
+-		ipu_mem_info r_minfo[], int bufcnt, int fd_ipu)
+-{
+-	int i;
+-
+-	for (i=0;i<bufcnt;i++) {
+-		if (i_minfo[i].vaddr) {
+-			if (inbuf_start[i])
+-				munmap(inbuf_start[i], i_minfo[i].size);
+-			ioctl(fd_ipu, IPU_FREE_MEM, &(i_minfo[i]));
+-		}
+-		if (show_to_fb == 0) {
+-			if (o_minfo[i].vaddr) {
+-				if (outbuf_start[i])
+-					munmap(outbuf_start[i], o_minfo[i].size);
+-				ioctl(fd_ipu, IPU_FREE_MEM, &(o_minfo[i]));
+-			}
+-		}
+-		if (r_minfo[i].vaddr)
+-			ioctl(fd_ipu, IPU_FREE_MEM, &(r_minfo[i]));
+-	}
+-	if (show_to_fb){
+-		if (fb_mem)
+-			munmap(fb_mem, 2*screen_size);
+-		close(fd_fb);
+-	}
+-}
+-
+-static int ipu_ic_task_setup(ipu_ic_param *i_para, ipu_ic_param *o_para,
+-		ipu_mem_info i_minfo[], ipu_mem_info o_minfo[],
+-		ipu_mem_info r_minfo[], pp_mode_t pp_mode)
+-{
+-	ipu_channel_params_t params;
+-	int tmp, ret = 0, out_stride;
+-
+-
+-	printf("Enabling:");
+-
+-	/*Setup ipu channel*/
+-	/*Only IC*/
+-	if(pp_mode == IC_MODE){
+-		printf("Only IC!\n");
+-
+-		memset(&params, 0, sizeof (params));
+-
+-		params.mem_prp_vf_mem.in_width = i_para->width;
+-		params.mem_prp_vf_mem.in_height = i_para->height;
+-		params.mem_prp_vf_mem.in_pixel_fmt = i_para->fmt;
+-
+-		params.mem_prp_vf_mem.out_width = o_para->width;
+-		params.mem_prp_vf_mem.out_height = o_para->height;
+-		params.mem_prp_vf_mem.out_pixel_fmt = o_para->fmt;
+-
+-		ipu_init_channel(ic_chan, &params);
+-
+-		ipu_init_channel_buffer(ic_chan,
+-				IPU_INPUT_BUFFER,
+-				i_para->fmt,
+-				i_para->width,
+-				i_para->height,
+-				i_para->width*bytes_per_pixel(i_para->fmt),
+-				IPU_ROTATE_NONE,
+-				i_minfo[0].paddr,
+-				i_minfo[1].paddr,
+-				0, 0);
+-
+-		if (show_to_fb)
+-			out_stride = fb_stride;
+-		else
+-			out_stride = o_para->width*bytes_per_pixel(o_para->fmt);
+-
+-		ipu_init_channel_buffer(ic_chan,
+-				IPU_OUTPUT_BUFFER,
+-				o_para->fmt,
+-				o_para->width,
+-				o_para->height,
+-				out_stride,
+-				o_para->rot,
+-				o_minfo[0].paddr,
+-				o_minfo[1].paddr,
+-				0, 0);
+-
+-		begin_chan = end_chan = ic_chan;
+-	}
+-	/*Only ROT*/
+-	else if (pp_mode == ROT_MODE){
+-		printf("Only ROT\n");
+-
+-		ipu_init_channel(rot_chan, NULL);
+-
+-		ipu_init_channel_buffer(rot_chan,
+-				IPU_INPUT_BUFFER,
+-				i_para->fmt,
+-				i_para->width,
+-				i_para->height,
+-				i_para->width*bytes_per_pixel(i_para->fmt),
+-				o_para->rot,
+-				i_minfo[0].paddr,
+-				i_minfo[1].paddr,
+-				0, 0);
+-
+-		if(o_para->rot >= IPU_ROTATE_90_RIGHT){
+-			/*output swap*/
+-			tmp = o_para->width;
+-			o_para->width = o_para->height;
+-			o_para->height = tmp;
+-		}
+-
+-		if (show_to_fb)
+-			out_stride = fb_stride;
+-		else
+-			out_stride = o_para->width*bytes_per_pixel(o_para->fmt);
+-
+-		ipu_init_channel_buffer(rot_chan,
+-				IPU_OUTPUT_BUFFER,
+-				o_para->fmt,
+-				o_para->width,
+-				o_para->height,
+-				out_stride,
+-				IPU_ROTATE_NONE,
+-				o_minfo[0].paddr,
+-				o_minfo[1].paddr,
+-				0, 0);
+-
+-		begin_chan = end_chan = rot_chan;
+-	}
+-	/*IC ROT*/
+-	else if(pp_mode == (IC_MODE | ROT_MODE)){
+-		printf("IC + ROT\n");
+-
+-		memset(&params, 0, sizeof (params));
+-
+-		params.mem_prp_vf_mem.in_width = i_para->width;
+-		params.mem_prp_vf_mem.in_height = i_para->height;
+-		params.mem_prp_vf_mem.in_pixel_fmt = i_para->fmt;
+-
+-		params.mem_prp_vf_mem.out_width = o_para->width;
+-		params.mem_prp_vf_mem.out_height = o_para->height;
+-		params.mem_prp_vf_mem.out_pixel_fmt = o_para->fmt;
+-
+-		ipu_init_channel(ic_chan, &params);
+-
+-		ipu_init_channel_buffer(ic_chan,
+-				IPU_INPUT_BUFFER,
+-				i_para->fmt,
+-				i_para->width,
+-				i_para->height,
+-				i_para->width*bytes_per_pixel(i_para->fmt),
+-				IPU_ROTATE_NONE,
+-				i_minfo[0].paddr,
+-				i_minfo[1].paddr,
+-				0, 0);
+-
+-		ipu_init_channel_buffer(ic_chan,
+-				IPU_OUTPUT_BUFFER,
+-				o_para->fmt,
+-				o_para->width,
+-				o_para->height,
+-				o_para->width*bytes_per_pixel(o_para->fmt),
+-				IPU_ROTATE_NONE,
+-				r_minfo[0].paddr,
+-				r_minfo[1].paddr,
+-				0, 0);
+-
+-		ipu_init_channel(rot_chan, NULL);
+-
+-		ipu_init_channel_buffer(rot_chan,
+-				IPU_INPUT_BUFFER,
+-				o_para->fmt,
+-				o_para->width,
+-				o_para->height,
+-				o_para->width*bytes_per_pixel(o_para->fmt),
+-				o_para->rot,
+-				r_minfo[0].paddr,
+-				r_minfo[1].paddr,
+-				0, 0);
+-
+-		if(o_para->rot >= IPU_ROTATE_90_RIGHT){
+-			/*output swap*/
+-			tmp = o_para->width;
+-			o_para->width = o_para->height;
+-			o_para->height = tmp;
+-		}
+-
+-		if (show_to_fb)
+-			out_stride = fb_stride;
+-		else
+-			out_stride = o_para->width*bytes_per_pixel(o_para->fmt);
+-
+-		ipu_init_channel_buffer(rot_chan,
+-				IPU_OUTPUT_BUFFER,
+-				o_para->fmt,
+-				o_para->width,
+-				o_para->height,
+-				out_stride,
+-				IPU_ROTATE_NONE,
+-				o_minfo[0].paddr,
+-				o_minfo[1].paddr,
+-				0, 0);
+-
+-		ipu_link_channels(ic_chan, rot_chan);
+-
+-		begin_chan = ic_chan;
+-		end_chan = rot_chan;
+-	}
+-
+-	if (show_to_fb)
+-		ipu_link_channels(end_chan, fb_chan);
+-
+-	return ret;
+-}
+-
+-static int ipu_ic_task_enable(pp_mode_t pp_mode, int bufcnt)
+-{
+-	int ret = 0;
+-
+-	/*setup irq*/
+-	if(pp_mode & ROT_MODE)
+-		irq = rot_out_eof_irq;
+-	else
+-		irq = ic_out_eof_irq;
+-
+-	if (show_to_fb) {
+-		if (pp_mode == ROT_MODE)
+-			irq = rot_in_eof_irq;
+-		else
+-			irq = ic_in_eof_irq;
+-	}
+-
+-	ipu_clear_irq(irq);
+-	ret = ipu_register_generic_isr(irq, NULL);
+-	if (ret < 0) {
+-		printf("Ioctl IPU_REGISTER_GENERIC_ISR failed!\n");
+-		return ret;
+-	}
+-
+-	if(pp_mode == IC_MODE){
+-		ipu_select_buffer(ic_chan, IPU_INPUT_BUFFER, 0);
+-		ipu_select_buffer(ic_chan, IPU_OUTPUT_BUFFER, 0);
+-		if (bufcnt == 2) {
+-			ipu_select_buffer(ic_chan, IPU_INPUT_BUFFER, 1);
+-			ipu_select_buffer(ic_chan, IPU_OUTPUT_BUFFER, 1);
+-		}
+-		ipu_enable_channel(ic_chan);
+-	} else if (pp_mode == ROT_MODE){
+-		ipu_select_buffer(rot_chan, IPU_INPUT_BUFFER, 0);
+-		ipu_select_buffer(rot_chan, IPU_OUTPUT_BUFFER, 0);
+-		if (bufcnt == 2) {
+-			ipu_select_buffer(rot_chan, IPU_INPUT_BUFFER, 1);
+-			ipu_select_buffer(rot_chan, IPU_OUTPUT_BUFFER, 1);
+-		}
+-		ipu_enable_channel(rot_chan);
+-	} else if(pp_mode == (IC_MODE | ROT_MODE)){
+-		ipu_select_buffer(rot_chan, IPU_OUTPUT_BUFFER, 0);
+-		if (bufcnt == 2)
+-			ipu_select_buffer(rot_chan, IPU_OUTPUT_BUFFER, 1);
+-		ipu_enable_channel(rot_chan);
+-
+-		ipu_select_buffer(ic_chan, IPU_INPUT_BUFFER, 0);
+-		ipu_select_buffer(ic_chan, IPU_OUTPUT_BUFFER, 0);
+-		if (bufcnt == 2) {
+-			ipu_select_buffer(ic_chan, IPU_INPUT_BUFFER, 1);
+-			ipu_select_buffer(ic_chan, IPU_OUTPUT_BUFFER, 1);
+-		}
+-		ipu_enable_channel(ic_chan);
+-	}
+-	return ret;
+-}
+-
+-static void ipu_ic_task_disable(pp_mode_t pp_mode)
+-{
+-	ipu_free_irq(irq, NULL);
+-
+-	if (show_to_fb)
+-		ipu_unlink_channels(end_chan, fb_chan);
+-
+-	if((pp_mode & ROT_MODE) && (pp_mode & IC_MODE))
+-		ipu_unlink_channels(ic_chan, rot_chan);
+-
+-	if(pp_mode & IC_MODE){
+-		ipu_clear_irq(ic_in_eof_irq);
+-		ipu_clear_irq(ic_out_eof_irq);
+-		ipu_disable_channel(ic_chan, 1);
+-		ipu_uninit_channel(ic_chan);
+-	}
+-
+-	if(pp_mode & ROT_MODE){
+-		ipu_clear_irq(rot_in_eof_irq);
+-		ipu_clear_irq(rot_out_eof_irq);
+-		ipu_disable_channel(rot_chan, 1);
+-		ipu_uninit_channel(rot_chan);
+-	}
+-}
+-
+-static int ctrl_c_rev = 0;
+-void ctrl_c_handler(int signum, siginfo_t *info, void *myact)
+-{
+-	ctrl_c_rev = 1;
+-}
+-
+-int ipu_ic_task(int fd_ipu, FILE *file_in, FILE *file_out,
+-		ipu_ic_param *i_para, ipu_ic_param *o_para, int fcount)
+-{
+-	/*memory info for input/output/rotation buffers*/
+-	ipu_mem_info i_minfo[2] = {{0}, {0}};
+-	ipu_mem_info o_minfo[2] = {{0}, {0}};
+-	ipu_mem_info r_minfo[2] = {{0}, {0}};
+-	/*input/output buffer addr for mmap*/
+-	void * inbuf_start[2] = {0};
+-	void * outbuf_start[2] = {0};
+-	/*task mode*/
+-	pp_mode_t pp_mode = NULL_MODE;
+-	ipu_event_info einfo;
+-	int ret = 0, i, bufcnt = 1;
+-	struct sigaction act;
+-
+-	pp_mode = ipu_ic_task_check(i_para, o_para);
+-	if (pp_mode == NULL_MODE){
+-		printf("Dont want do any IC processing!\n");
+-		goto done;
+-	}
+-
+-	/*for ctrl-c*/
+-	sigemptyset(&act.sa_mask);
+-	act.sa_flags = SA_SIGINFO;
+-	act.sa_sigaction = ctrl_c_handler;
+-
+-	if(sigaction(SIGINT, &act, NULL) < 0)
+-	{
+-		printf("install sigal error\n");
+-		goto done;
+-	}
+-
+-	if (file_out == NULL) show_to_fb = 1;
+-	if (fcount > 1) bufcnt = 2;
+-	if (ipu_ic_mem_alloc(i_para, o_para, i_minfo, inbuf_start,
+-		o_minfo, outbuf_start, r_minfo, pp_mode, bufcnt, fd_ipu) < 0)
+-		goto done;
+-
+-	if (ipu_ic_task_setup(i_para, o_para, i_minfo, o_minfo, r_minfo, pp_mode) < 0)
+-		goto done;
+-
+-	/*prepare bufcnt input buffer*/
+-	for (i=0;i<bufcnt;i++) {
+-		if (fread(inbuf_start[i], 1, i_minfo[i].size, file_in) < i_minfo[i].size) {
+-			ret = -1;
+-			printf("Can not read enough data from input file!\n");
+-			goto done;
+-		}
+-	}
+-
+-	if ((ret = ipu_ic_task_enable(pp_mode, bufcnt)) < 0)
+-		goto done;
+-
+-	/*loop to finish fcount frame*/
+-	for(i=0;i<fcount;i++) {
+-		static int pingpang = 0;
+-
+-		/*wait for IPU task finish*/
+-		einfo.irq = 0;
+-		do {
+-			ipu_get_interrupt_event(&einfo);
+-		} while ((einfo.irq != irq) && !ctrl_c_rev);
+-
+-		if (!show_to_fb)
+-			if(fwrite(outbuf_start[pingpang], 1, o_minfo[pingpang].size, file_out) < o_minfo[pingpang].size) {
+-				ret = -1;
+-				printf("Can not write enough data into output file!\n");
+-			}
+-
+-		/*need fill in more data?*/
+-		if ((fcount > 2) && (i < (fcount-2))) {
+-			if (fread(inbuf_start[pingpang], 1, i_minfo[pingpang].size, file_in) < i_minfo[pingpang].size) {
+-				ret = -1;
+-				printf("Can not read enough data from input file!\n");
+-				break;
+-			}
+-			if (!show_to_fb)
+-				ipu_select_buffer(end_chan, IPU_OUTPUT_BUFFER, pingpang);
+-			ipu_select_buffer(begin_chan, IPU_INPUT_BUFFER, pingpang);
+-		}
+-		pingpang = (pingpang == 0) ? 1 : 0;
+-
+-		if (ctrl_c_rev) {
+-			if (einfo.irq == irq)
+-				i++;
+-			break;
+-		}
+-	}
+-
+-	printf("Frame %d done!\n",i);
+-
+-	ipu_ic_task_disable(pp_mode);
+-
+-	/*make sure buffer1 still at fbmem base*/
+-	if (show_to_fb && (i % 2)) {
+-		memcpy(fb_mem, fb_mem + screen_size, screen_size);
+-		ipu_select_buffer(fb_chan, IPU_INPUT_BUFFER, 1);
+-	}
+-
+-done:
+-	ipu_ic_mem_free(i_minfo, inbuf_start, o_minfo, outbuf_start, r_minfo, bufcnt, fd_ipu);
+-
+-	return ret;
+-}
+-
+-int process_cmdline(int argc, char **argv, ipu_ic_param *i_para, ipu_ic_param *o_para)
+-{
+-	int i;
+-
+-	for (i = 1; i < argc; i++) {
+-		if (strcmp(argv[i], "-iw") == 0) {
+-			i_para->width = atoi(argv[++i]);
+-		}
+-		else if (strcmp(argv[i], "-ih") == 0) {
+-			i_para->height = atoi(argv[++i]);
+-		}
+-		else if (strcmp(argv[i], "-ow") == 0) {
+-			o_para->width = atoi(argv[++i]);
+-		}
+-		else if (strcmp(argv[i], "-oh") == 0) {
+-			o_para->height = atoi(argv[++i]);
+-		}
+-		else if (strcmp(argv[i], "-r") == 0) {
+-			o_para->rot = atoi(argv[++i]);
+-		}
+-		else if (strcmp(argv[i], "-c") == 0) {
+-			fcount = atoi(argv[++i]);
+-		}
+-		else if (strcmp(argv[i], "-t") == 0) {
+-			i++;
+-			if (strcmp(argv[i], "PP") == 0)	{
+-				printf("Using PP task:\n");
+-				ic_chan = MEM_PP_MEM;
+-				rot_chan = MEM_ROT_PP_MEM;
+-				rot_out_eof_irq = IPU_IRQ_PP_ROT_OUT_EOF;
+-				ic_out_eof_irq = IPU_IRQ_PP_OUT_EOF;
+-				rot_in_eof_irq = IPU_IRQ_PP_ROT_IN_EOF;
+-				ic_in_eof_irq = IPU_IRQ_PP_IN_EOF;
+-			} else if (strcmp(argv[i], "ENC") == 0)	{
+-				printf("Using PRP ENC task:\n");
+-				ic_chan = MEM_PRP_ENC_MEM;
+-				rot_chan = MEM_ROT_ENC_MEM;
+-				rot_out_eof_irq = IPU_IRQ_PRP_ENC_ROT_OUT_EOF;
+-				ic_out_eof_irq = IPU_IRQ_PRP_ENC_OUT_EOF;
+-				rot_in_eof_irq = IPU_IRQ_PRP_ENC_ROT_IN_EOF;
+-				ic_in_eof_irq = IPU_IRQ_PRP_IN_EOF;
+-			} else if (strcmp(argv[i], "VF") == 0)	{
+-				printf("Using PRP VF task:\n");
+-				ic_chan = MEM_PRP_VF_MEM;
+-				rot_chan = MEM_ROT_VF_MEM;
+-				rot_out_eof_irq = IPU_IRQ_PRP_VF_ROT_OUT_EOF;
+-				ic_out_eof_irq = IPU_IRQ_PRP_VF_OUT_EOF;
+-				rot_in_eof_irq = IPU_IRQ_PRP_VF_ROT_IN_EOF;
+-				ic_in_eof_irq = IPU_IRQ_PRP_IN_EOF;
+-			}
+-		}
+-		else if (strcmp(argv[i], "-if") == 0) {
+-			i++;
+-			i_para->fmt = v4l2_fourcc(argv[i][0], argv[i][1],argv[i][2],argv[i][3]);
+-		}
+-		else if (strcmp(argv[i], "-of") == 0) {
+-			i++;
+-			o_para->fmt = v4l2_fourcc(argv[i][0], argv[i][1],argv[i][2],argv[i][3]);
+-		}
+-		else if (strcmp(argv[i], "-out") == 0) {
+-			outfile = argv[++i];
+-		}
+-	}
+-
+-	if ((i_para->width == 0) || (i_para->height == 0) ||
+-			(o_para->width == 0) || (o_para->height == 0)
+-			|| (fcount < 1))
+-		return -1;
+-
+-	return 0;
+-}
+-
+-int main(int argc, char *argv[])
+-{
+-	int fd_ipu;
+-	FILE *file_in = NULL, *file_out = NULL;
+-	ipu_ic_param i_para = {0}, o_para = {0};
+-
+-	i_para.fmt = v4l2_fourcc('R','G','B','P');
+-	o_para.fmt = v4l2_fourcc('R','G','B','P');
+-
+-	if (process_cmdline(argc, argv, &i_para, &o_para) < 0) {
+-		printf("\nMXC IPU device IC process Test\n\n" \
+-				"Usage: mxc_ipu_dev.out\n" \
+-				"-iw <input width>\n" \
+-				"-ih <input height>\n" \
+-				"-if <input fourcc format>\n" \
+-				"-ow <output width>\n" \
+-				"-oh <output height>\n" \
+-				"-of <output fourcc format>\n" \
+-				"-r <output rotation>\n" \
+-				"-t <IC task:PP,ENC,VF>\n" \
+-				"-c <frame count>\n" \
+-				"-out <output file name>\n" \
+-				"<input raw file>\n\n" \
+-			"fourcc ref:\n" \
+-				"RGB565->RGBP\n" \
+-				"BGR24 ->BGR3\n" \
+-				"RGB24 ->RGB3\n" \
+-				"BGR32 ->BGR4\n" \
+-				"BGRA32->BGRA\n" \
+-				"RGB32 ->RGB4\n" \
+-				"RGBA32->RGBA\n" \
+-				"ABGR32->ABGR\n" \
+-				"YUYV  ->YUYV\n" \
+-				"UYVY  ->UYVY\n" \
+-				"YUV444->Y444\n" \
+-				"NV12  ->NV12\n" \
+-				"YUV420P->I420\n" \
+-				"YUV422P->422P\n" \
+-				"YVU422P->YV16\n\n");
+-		return -1;
+-	}
+-
+-	fd_ipu = ipu_open();
+-	if (fd_ipu < 0)
+-		return -1;
+-
+-	file_in = fopen(argv[argc-1], "rb");
+-	if (file_in == NULL){
+-		printf("there is no such file for reading %s\n", argv[argc-1]);
+-		ipu_close();
+-		return -1;
+-	}
+-
+-	if (outfile)
+-		file_out = fopen(outfile, "wb");
+-
+-	ipu_ic_task(fd_ipu, file_in, file_out, &i_para, &o_para, fcount);
+-
+-	fclose(file_in);
+-	if (file_out)
+-		fclose(file_out);
+-	ipu_close();
+-
+-	return 0;
+-}
+diff --git a/test/mxc_ipudev_test/mxc_ipudev_test.c b/test/mxc_ipudev_test/mxc_ipudev_test.c
+new file mode 100644
+index 0000000..5575b08
+--- /dev/null
++++ b/test/mxc_ipudev_test/mxc_ipudev_test.c
+@@ -0,0 +1,194 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++/*!
++ * @file mxc_ipudev_test.c
++ *
++ * @brief IPU device lib test implementation
++ *
++ * @ingroup IPU
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <string.h>
++#include <signal.h>
++#include "mxc_ipudev_test.h"
++
++int ctrl_c_rev = 0;
++
++void ctrl_c_handler(int signum, siginfo_t *info, void *myact)
++{
++	ctrl_c_rev = 1;
++}
++
++void output_to_file_cb(void * arg, int index)
++{
++	ipu_test_handle_t * test_handle = (ipu_test_handle_t *)arg;
++
++	if (test_handle->file_out0)
++		if(fwrite(test_handle->ipu_handle->outbuf_start0[index], 1,
++				test_handle->ipu_handle->ofr_size[0],
++				test_handle->file_out0) < test_handle->ipu_handle->ofr_size[0]) {
++			printf("Can not write enough data into output file!\n");
++		}
++	if (test_handle->file_out1)
++		if(fwrite(test_handle->ipu_handle->outbuf_start1[index], 1,
++				test_handle->ipu_handle->ofr_size[1],
++				test_handle->file_out1) < test_handle->ipu_handle->ofr_size[1]) {
++			printf("Can not write enough data into output file!\n");
++		}
++}
++
++int process_cmdline(int argc, char **argv, ipu_test_handle_t * test_handle)
++{
++	int i;
++
++	if (argc == 1)
++		return -1;
++
++	for (i = 1; i < argc; i++) {
++		if (strcmp(argv[i], "-C") == 0) {
++			parse_config_file(argv[++i], test_handle);
++		} else if (strcmp(argv[i], "-P") == 0) {
++			test_handle->test_pattern = atoi(argv[++i]);
++		} else if (strcmp(argv[i], "-bw") == 0) {
++			test_handle->block_width = atoi(argv[++i]);
++			if (test_handle->block_width < 16)
++				test_handle->block_width = 16;
++		}
++	}
++
++	if (test_handle->test_pattern)
++		return 0;
++
++	if ((test_handle->input.width == 0) || (test_handle->input.height == 0) ||
++			(test_handle->output0.width == 0) ||
++			(test_handle->output0.height == 0)
++			|| (test_handle->fcount < 1))
++		return -1;
++
++	return 0;
++}
++
++int main(int argc, char *argv[])
++{
++	int ret = 0, next_update_idx = 0, done_cnt = 0, first_time = 1;
++	ipu_lib_handle_t ipu_handle;
++	ipu_test_handle_t test_handle;
++	FILE * file_in = NULL;
++	struct sigaction act;
++
++	memset(&ipu_handle, 0, sizeof(ipu_lib_handle_t));
++	memset(&test_handle, 0, sizeof(ipu_test_handle_t));
++	test_handle.ipu_handle = &ipu_handle;
++	test_handle.mode = OP_NORMAL_MODE;
++	test_handle.block_width = 80;
++
++	/*for ctrl-c*/
++	sigemptyset(&act.sa_mask);
++	act.sa_flags = SA_SIGINFO;
++	act.sa_sigaction = ctrl_c_handler;
++
++	if((ret = sigaction(SIGINT, &act, NULL)) < 0) {
++		printf("install sigal error\n");
++		goto done;
++	}
++
++	if (process_cmdline(argc, argv, &test_handle) < 0) {
++		printf("\nMXC IPU device Test\n\n" \
++				"Usage: %s\n" \
++				"-C <config file>\n" \
++				"-P <test pattern>\n" \
++				"[-bw <block width for pattern 3>]\n" \
++				"<input raw file>\n\n", argv[0]);
++		printf("test pattern:\n" \
++			"1: video pattern with user define dma buffer queue, one full-screen output\n" \
++			"2: video pattern with user define dma buffer queue, with two output\n" \
++			"3: hopping block screen save\n" \
++			"4: color bar + hopping block\n\n");
++		return -1;
++	}
++
++	if (test_handle.test_pattern)
++		return run_test_pattern(test_handle.test_pattern, &test_handle);
++
++	if (test_handle.mode & OP_STREAM_MODE) {
++		if (test_handle.fcount == 1) {
++			test_handle.mode &= ~(OP_STREAM_MODE);
++			test_handle.mode |= OP_NORMAL_MODE;
++		}
++	}
++
++	file_in = fopen(argv[argc-1], "rb");
++	if (file_in == NULL){
++		printf("there is no such file for reading %s\n", argv[argc-1]);
++		return -1;
++	}
++
++	if (test_handle.outfile0 && !test_handle.output0.show_to_fb)
++		test_handle.file_out0 = fopen(test_handle.outfile0, "wb");
++	if (test_handle.outfile1 && !test_handle.output1.show_to_fb &&
++		test_handle.output1_enabled)
++		test_handle.file_out1 = fopen(test_handle.outfile1, "wb");
++
++	if (test_handle.output1_enabled)
++		ret = mxc_ipu_lib_task_init(&(test_handle.input), &(test_handle.output0),
++				&(test_handle.output1), test_handle.mode, test_handle.ipu_handle);
++	else
++		ret = mxc_ipu_lib_task_init(&(test_handle.input), &(test_handle.output0),
++				NULL, test_handle.mode, test_handle.ipu_handle);
++	if (ret < 0) {
++		printf("mxc_ipu_lib_task_init failed!\n");
++		goto done;
++	}
++
++	while((done_cnt < test_handle.fcount) && (ctrl_c_rev == 0)) {
++		if (fread(test_handle.ipu_handle->inbuf_start[next_update_idx], 1, test_handle.ipu_handle->ifr_size, file_in)
++				< test_handle.ipu_handle->ifr_size) {
++			ret = -1;
++			printf("Can not read enough data from input file!\n");
++			break;
++		}
++		if (first_time && (test_handle.mode & OP_STREAM_MODE)) {
++			if (fread(test_handle.ipu_handle->inbuf_start[1], 1, test_handle.ipu_handle->ifr_size, file_in)
++					< test_handle.ipu_handle->ifr_size) {
++				ret = -1;
++				printf("Can not read enough data from input file!\n");
++				break;
++			}
++			first_time = 0;
++			done_cnt++;
++		}
++		next_update_idx = mxc_ipu_lib_task_buf_update(test_handle.ipu_handle, 0, output_to_file_cb, &test_handle);
++		if (next_update_idx < 0)
++			break;
++		done_cnt++;
++	}
++
++	mxc_ipu_lib_task_uninit(test_handle.ipu_handle);
++
++done:
++	fclose(file_in);
++	if (test_handle.file_out0)
++		fclose(test_handle.file_out0);
++	if (test_handle.file_out1)
++		fclose(test_handle.file_out1);
++
++	return ret;
++}
+diff --git a/test/mxc_ipudev_test/mxc_ipudev_test.h b/test/mxc_ipudev_test/mxc_ipudev_test.h
+new file mode 100644
+index 0000000..7b1cc24
+--- /dev/null
++++ b/test/mxc_ipudev_test/mxc_ipudev_test.h
+@@ -0,0 +1,48 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++/*!
++ * @file mxc_ipudev_test.h
++ *
++ * @brief IPU device lib test implementation
++ *
++ * @ingroup IPU
++ */
++#ifndef __MXC_IPUDEV_TEST_H__
++#define __MXC_IPUDEV_TEST_H__
++
++#include <linux/ipu.h>
++#include <linux/videodev.h>
++#include "mxc_ipu_hl_lib.h"
++
++typedef struct {
++	ipu_lib_handle_t * ipu_handle;
++	int fcount;
++	int mode;
++	int test_pattern;
++	int block_width;
++	int output1_enabled;
++	char outfile0[128];
++	char outfile1[128];
++	FILE * file_out0;
++	FILE * file_out1;
++	ipu_lib_input_param_t input;
++	ipu_lib_output_param_t output0;
++	ipu_lib_output_param_t output1;
++} ipu_test_handle_t;
++
++int parse_config_file(char *file_name, ipu_test_handle_t *test_handle);
++int run_test_pattern(int pattern, ipu_test_handle_t * test_handle);
++
++#endif
+diff --git a/test/mxc_ipudev_test/test_pattern.c b/test/mxc_ipudev_test/test_pattern.c
+new file mode 100644
+index 0000000..ce24e90
+--- /dev/null
++++ b/test/mxc_ipudev_test/test_pattern.c
+@@ -0,0 +1,604 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++/*!
++ * @file test_pattern.c
++ *
++ * @brief IPU device lib test pattern implementation
++ *
++ * @ingroup IPU
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <fcntl.h>
++#include <string.h>
++#include <stdint.h>
++#include <unistd.h>
++#include <time.h>
++#include <pthread.h>
++#include <math.h>
++#include <sys/mman.h>
++#include <sys/ioctl.h>
++#include <linux/mxcfb.h>
++#include "mxc_ipudev_test.h"
++
++/*
++       Y = R *  .299 + G *  .587 + B *  .114;
++       U = R * -.169 + G * -.332 + B *  .500 + 128.;
++       V = R *  .500 + G * -.419 + B * -.0813 + 128.;*/
++
++#define red(x) (((x & 0xE0) >> 5) * 0x24)
++#define green(x) (((x & 0x1C) >> 2) * 0x24)
++#define blue(x) ((x & 0x3) * 0x55)
++#define y(rgb) ((red(rgb)*299L + green(rgb)*587L + blue(rgb)*114L) / 1000)
++#define u(rgb) ((((blue(rgb)*500L) - (red(rgb)*169L) - (green(rgb)*332L)) / 1000))
++#define v(rgb) (((red(rgb)*500L - green(rgb)*419L - blue(rgb)*81L) / 1000))
++#define BUF_CNT		5
++
++extern int ctrl_c_rev;
++
++static int get_system_rev(unsigned int * system_rev)
++{
++        FILE *fp;
++        char buf[1024];
++        int nread;
++        char *tmp, *rev;
++        int ret = -1;
++
++        fp = fopen("/proc/cpuinfo", "r");
++        if (fp == NULL) {
++                printf("Open /proc/cpuinfo failed!\n");
++                return ret;
++        }
++
++        nread = fread(buf, 1, sizeof(buf), fp);
++        fclose(fp);
++        if ((nread == 0) || (nread == sizeof(buf))) {
++                fclose(fp);
++                return ret;
++        }
++
++        buf[nread] = '\0';
++
++        tmp = strstr(buf, "Revision");
++        if (tmp != NULL) {
++                rev = index(tmp, ':');
++                if (rev != NULL) {
++                        rev++;
++                        *system_rev = strtoul(rev, NULL, 16);
++                        ret = 0;
++                }
++        }
++
++        return ret;
++}
++
++void gen_fill_pattern(char * buf, int in_width, int in_height)
++{
++	int y_size = in_width * in_height;
++	int h_step = in_height / 16;
++	int w_step = in_width / 16;
++	int h, w;
++	uint32_t y_color = 0;
++	int32_t u_color = 0;
++	int32_t v_color = 0;
++	uint32_t rgb = 0;
++	static int32_t alpha = 0;
++	static int inc_alpha = 1;
++
++	for (h = 0; h < in_height; h++) {
++		int32_t rgb_temp = rgb;
++
++		for (w = 0; w < in_width; w++) {
++			if (w % w_step == 0) {
++				y_color = y(rgb_temp);
++				y_color = (y_color * alpha) / 255;
++
++				u_color = u(rgb_temp);
++				u_color = (u_color * alpha) / 255;
++				u_color += 128;
++
++				v_color = v(rgb_temp);
++				v_color = (v_color * alpha) / 255;
++				v_color += 128;
++
++				rgb_temp++;
++				if (rgb_temp > 255)
++					rgb_temp = 0;
++			}
++			buf[(h*in_width) + w] = y_color;
++			if (!(h & 0x1) && !(w & 0x1)) {
++				buf[y_size + (((h*in_width)/4) + (w/2)) ] = u_color;
++				buf[y_size + y_size/4 + (((h*in_width)/4) + (w/2))] = v_color;
++			}
++		}
++		if ((h > 0) && (h % h_step == 0)) {
++			rgb += 16;
++			if (rgb > 255)
++				rgb = 0;
++		}
++
++	}
++	if (inc_alpha) {
++		alpha+=4;
++		if (alpha >= 255) {
++			inc_alpha = 0;
++		}
++	} else {
++		alpha-=4;
++		if (alpha <= 0) {
++			inc_alpha = 1;
++		}
++	}
++}
++
++int foreground_fb(void)
++{
++	int fd_fb;
++	struct fb_fix_screeninfo fb_fix;
++
++	fd_fb = open("/dev/fb2", O_RDWR, 0);
++	ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix);
++	if (strcmp(fb_fix.id, "DISP3 FG") == 0) {
++		close(fd_fb);
++		return 2;
++	}
++
++	fd_fb = open("/dev/fb1", O_RDWR, 0);
++	ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix);
++	if (strcmp(fb_fix.id, "DISP3 FG") == 0) {
++		close(fd_fb);
++		return 1;
++	}
++
++	return 0;
++}
++
++int color_bar(int two_output, ipu_test_handle_t * test_handle)
++{
++	int ret = 0, fd_fb = 0, size = 0, i, done_cnt = 0;
++	void * buf[BUF_CNT] = {0};
++	int paddr[BUF_CNT] = {0};
++	struct fb_var_screeninfo fb_var;
++	unsigned int system_rev = 0, ipu_version;
++
++	get_system_rev(&system_rev);
++	if (((system_rev & 0xff000) == 0x37000) ||
++		(((system_rev & 0xff000) == 0x51000)))
++		ipu_version = 3;
++	else
++		ipu_version = 1;
++
++	if ((ipu_version == 1) && two_output) {
++		printf("ipuv1 can not support dispaly 2 output together!\n");
++		printf("because ipuv1 ENC channel can not be linked to disp channel!\n");
++		ret = -1;
++		goto done;
++	}
++
++	if ((fd_fb = open("/dev/fb0", O_RDWR, 0)) < 0) {
++		printf("Unable to open /dev/fb0\n");
++		ret = -1;
++		goto done;
++	}
++
++	if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
++		printf("Get FB var info failed!\n");
++		ret = -1;
++		goto done;
++	}
++
++	/* use I420 input format as fix*/
++	test_handle->mode = OP_STREAM_MODE;
++	test_handle->fcount = 300;
++	test_handle->input.width = 320;
++	test_handle->input.height = 240;
++	test_handle->input.fmt = v4l2_fourcc('I', '4', '2', '0');
++	if (fb_var.bits_per_pixel == 24)
++		test_handle->output0.fmt = v4l2_fourcc('B', 'G', 'R', '3');
++	else
++		test_handle->output0.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++	test_handle->output0.show_to_fb = 1;
++	test_handle->output0.fb_disp.fb_num = 0;
++	/* ipuv1 only support display on PP & VF task mode */
++	if (ipu_version == 1)
++		test_handle->mode |= TASK_PP_MODE;
++	test_handle->output0.rot = 3;
++	if (two_output) {
++		test_handle->output0.width = fb_var.xres;
++		test_handle->output0.height = fb_var.yres/3;
++		test_handle->output0.fb_disp.pos.x = 0;
++		test_handle->output0.fb_disp.pos.y = 0;
++		test_handle->output1.width = fb_var.xres;
++		test_handle->output1.height = fb_var.yres/3;
++		if (fb_var.bits_per_pixel == 24)
++			test_handle->output1.fmt = v4l2_fourcc('B', 'G', 'R', '3');
++		else
++			test_handle->output1.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++		test_handle->output1.show_to_fb = 1;
++		test_handle->output1.fb_disp.fb_num = foreground_fb();
++		test_handle->output1.rot = 3;
++		test_handle->output1.fb_disp.pos.x = 0;
++		test_handle->output1.fb_disp.pos.y = fb_var.yres/2;
++	} else {
++		test_handle->output0.width = fb_var.xres;
++		test_handle->output0.height = fb_var.yres;
++	}
++
++	/*allocate dma buffers from fb dev*/
++	size = test_handle->input.width * test_handle->input.height * 3/2;
++	for (i=0;i<BUF_CNT;i++) {
++		/*alloc mem from DMA zone*/
++		/*input as request mem size */
++		paddr[i] = size;
++		if ( ioctl(fd_fb, FBIO_ALLOC, &(paddr[i])) < 0) {
++			printf("Unable alloc mem from /dev/fb0\n");
++			close(fd_fb);
++			if ((fd_fb = open("/dev/fb1", O_RDWR, 0)) < 0) {
++				printf("Unable to open /dev/fb1\n");
++				if ((fd_fb = open("/dev/fb2", O_RDWR, 0)) < 0) {
++					printf("Unable to open /dev/fb2\n");
++					ret = -1;
++					goto done;
++				} else if ( ioctl(fd_fb, FBIO_ALLOC, &(paddr[i])) < 0) {
++					printf("Unable alloc mem from /dev/fb2\n");
++					ret = -1;
++					goto done;
++				}
++			} else if ( ioctl(fd_fb, FBIO_ALLOC, &(paddr[i])) < 0) {
++				printf("Unable alloc mem from /dev/fb1\n");
++				close(fd_fb);
++				if ((fd_fb = open("/dev/fb2", O_RDWR, 0)) < 0) {
++					printf("Unable to open /dev/fb2\n");
++					ret = -1;
++					goto done;
++				} else if ( ioctl(fd_fb, FBIO_ALLOC, &(paddr[i])) < 0) {
++					printf("Unable alloc mem from /dev/fb2\n");
++					ret = -1;
++					goto done;
++				}
++			}
++		}
++
++		buf[i] = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
++				fd_fb, paddr[i]);
++		if (buf[i] == MAP_FAILED) {
++			printf("mmap failed!\n");
++			ret = -1;
++			goto done;
++		}
++	}
++
++	/* we are using stream mode and we set dma addr by ourselves*/
++	test_handle->input.paddr[0] = paddr[0];
++	test_handle->input.paddr[1] = paddr[1];
++	gen_fill_pattern(buf[0], test_handle->input.width, test_handle->input.height);
++	gen_fill_pattern(buf[1], test_handle->input.width, test_handle->input.height);
++	done_cnt = i = 1;
++
++	if (two_output)
++		ret = mxc_ipu_lib_task_init(&(test_handle->input), &(test_handle->output0),
++				&(test_handle->output1), test_handle->mode, test_handle->ipu_handle);
++	else
++		ret = mxc_ipu_lib_task_init(&(test_handle->input), &(test_handle->output0),
++				NULL, test_handle->mode, test_handle->ipu_handle);
++	if (ret < 0) {
++		printf("mxc_ipu_lib_task_init failed!\n");
++		goto done;
++	}
++
++	while((done_cnt < test_handle->fcount) && (ctrl_c_rev == 0)) {
++		if (mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, paddr[i], NULL, NULL) < 0)
++			break;
++		i++;
++		if (i == BUF_CNT)
++			i = 0;
++		done_cnt++;
++		gen_fill_pattern(buf[i], test_handle->input.width, test_handle->input.height);
++	}
++
++	mxc_ipu_lib_task_uninit(test_handle->ipu_handle);
++
++done:
++	for (i=0;i<BUF_CNT;i++) {
++		if (buf[i])
++			munmap(buf[i], size);
++		if (paddr[i])
++			ioctl(fd_fb, FBIO_FREE, &(paddr[i]));
++	}
++	if (fd_fb)
++		close(fd_fb);
++
++	return ret;
++}
++
++int update_block_pos(int *x, int *y, int angle_start, int block_width,
++	int limit_w, int limit_h, int fd_fb)
++{
++	static int angle = 0;
++	static double steps = 0.0;
++	struct mxcfb_pos pos;
++	int need_change = 0;
++	double ra;
++	double nx, ny;
++
++	if (angle == 0)
++		angle = angle_start;
++	steps += 0.1;
++	ra = ((double)angle)*3.1415926/180.0;
++	nx = *x + steps*cos(ra);
++	ny = *y + steps*sin(ra);
++	if (nx < 0) {
++		if (ny < *y) /* x+, y-*/
++			angle = 360 - angle_start;
++		else /* x+, y+ */
++			angle = angle_start;
++		need_change = 1;
++	} else if (nx > (limit_w - block_width)) {
++		if (ny < *y) /* x-, y-*/
++			angle = 180 + angle_start;
++		else /* x-, y+ */
++			angle = 180 - angle_start;
++		need_change = 1;
++	} else if (ny < 0) {
++		if (nx < *x) /* x-, y+*/
++			angle = 180 - angle_start;
++		else /* x+, y+ */
++			angle = angle_start;
++		need_change = 1;
++	} else if (ny > (limit_h - block_width)) {
++		if (nx < *x) /* x-, y-*/
++			angle = 180 + angle_start;
++		else /* x+, y- */
++			angle = 360 - angle_start;
++		need_change = 1;
++	}
++
++	if (need_change) {
++		steps = 0.0;
++		ra = ((double)angle)*3.1415926/180.0;
++		nx = *x;
++		ny = *y;
++		//printf("change angle to %d\n", angle);
++		//printf("pos %d, %d\n", *x, *y);
++	}
++
++	pos.x = nx;
++	pos.y = ny;
++	ioctl(fd_fb, MXCFB_SET_OVERLAY_POS, &pos);
++	*x = nx;
++	*y = ny;
++
++	return need_change;
++}
++
++static void my_msleep(int ms)
++{
++      struct timeval tv;
++
++      tv.tv_sec = ms/1000;
++      tv.tv_usec = (ms % 1000) * 1000;
++      select(0, NULL, NULL, NULL, &tv);
++}
++
++/*
++ * This call-back function provide one method to update
++ * framebuffer by pan_display.
++ */
++void hop_block_output_cb(void * arg, int index)
++{
++	int fd_fb = *((int *)arg);
++	struct fb_var_screeninfo fb_var;
++
++	ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var);
++	/* for buf index 0, its phyaddr is fb buf1*/
++	/* for buf index 1, its phyaddr is fb buf0*/
++	if (index == 0)
++		fb_var.yoffset = fb_var.yres;
++	else
++		fb_var.yoffset = 0;
++	ioctl(fd_fb, FBIOPAN_DISPLAY, &fb_var);
++}
++
++int hop_block(ipu_test_handle_t * test_handle)
++{
++	int ret = 0, x = 0, y = 0, fd_fb = 0, next_update_idx = 0;
++	int lcd_w, lcd_h;
++	int blank;
++	char random_color;
++	int start_angle, screen_size;
++	void * buf;
++	struct mxcfb_pos pos;
++	struct fb_var_screeninfo fb_var;
++	struct fb_fix_screeninfo fb_fix;
++
++	/* clear background fb, get the lcd frame info */
++	if ((fd_fb = open("/dev/fb0", O_RDWR, 0)) < 0) {
++		printf("Unable to open /dev/fb0\n");
++		ret = -1;
++		goto done;
++	}
++
++	if ( ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix) < 0) {
++		printf("Get FB fix info failed!\n");
++		ret = -1;
++		goto done;
++	}
++
++	if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
++		printf("Get FB var info failed!\n");
++		ret = -1;
++		goto done;
++	}
++	lcd_w = fb_var.xres;
++	lcd_h = fb_var.yres;
++	screen_size = fb_var.yres_virtual * fb_fix.line_length;
++
++	buf = mmap(NULL, screen_size, PROT_READ | PROT_WRITE, MAP_SHARED,
++			fd_fb, 0);
++	if (buf == MAP_FAILED) {
++		printf("mmap failed!\n");
++		ret = -1;
++		goto done;
++	}
++	memset(buf, 0, screen_size);
++	close(fd_fb);
++
++	/* display hop block to overlay */
++	if (foreground_fb() == 2) {
++		if ((fd_fb = open("/dev/fb2", O_RDWR, 0)) < 0) {
++			printf("Unable to open /dev/fb2\n");
++			ret = -1;
++			goto done;
++		}
++	} else {
++		if ((fd_fb = open("/dev/fb1", O_RDWR, 0)) < 0) {
++			printf("Unable to open /dev/fb1\n");
++			ret = -1;
++			goto done;
++		}
++	}
++
++	fb_var.xres = test_handle->block_width
++			- test_handle->block_width%8;
++	fb_var.xres_virtual = fb_var.xres;
++	fb_var.yres = test_handle->block_width;
++	fb_var.yres_virtual = fb_var.yres * 2;
++	if ( ioctl(fd_fb, FBIOPUT_VSCREENINFO, &fb_var) < 0) {
++		printf("Set FB var info failed!\n");
++		ret = -1;
++		goto done;
++	}
++
++	if ( ioctl(fd_fb, FBIOGET_FSCREENINFO, &fb_fix) < 0) {
++		printf("Get FB fix info failed!\n");
++		ret = -1;
++		goto done;
++	}
++
++	if ( ioctl(fd_fb, FBIOGET_VSCREENINFO, &fb_var) < 0) {
++		printf("Get FB var info failed!\n");
++		ret = -1;
++		goto done;
++	}
++	blank = FB_BLANK_UNBLANK;
++	if ( ioctl(fd_fb, FBIOBLANK, blank) < 0) {
++		printf("UNBLANK FB failed!\n");
++		ret = -1;
++		goto done;
++	}
++
++	test_handle->mode = OP_STREAM_MODE;
++	test_handle->input.width = 400;
++	test_handle->input.height = 400;
++	test_handle->input.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++	test_handle->output0.width = test_handle->block_width
++					- test_handle->block_width%8;
++	test_handle->output0.height = test_handle->block_width;
++	if (fb_var.bits_per_pixel == 24)
++		test_handle->output0.fmt = v4l2_fourcc('B', 'G', 'R', '3');
++	else
++		test_handle->output0.fmt = v4l2_fourcc('R', 'G', 'B', 'P');
++	test_handle->output0.show_to_fb = 0;
++	screen_size = fb_var.yres * fb_fix.line_length;
++	test_handle->output0.paddr[0] = fb_fix.smem_start + screen_size;
++	test_handle->output0.paddr[1] = fb_fix.smem_start;
++
++	ret = mxc_ipu_lib_task_init(&(test_handle->input), &(test_handle->output0),
++			NULL, test_handle->mode, test_handle->ipu_handle);
++	if (ret < 0) {
++		printf("mxc_ipu_lib_task_init failed!\n");
++		goto done;
++	}
++
++	srand((unsigned int)time(0));
++	random_color = (char)(rand()%255);
++	/* for stream mode, fill two input frame to prepare */
++	memset(test_handle->ipu_handle->inbuf_start[0], random_color, test_handle->ipu_handle->ifr_size);
++	memset(test_handle->ipu_handle->inbuf_start[1], random_color, test_handle->ipu_handle->ifr_size);
++	start_angle = rand()%90;
++	if (start_angle == 90) start_angle = 89;
++	if (start_angle == 0) start_angle = 1;
++	printf("Start angle is %d\n", start_angle);
++
++	/* start first frame */
++	if((next_update_idx = mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, hop_block_output_cb, &fd_fb)) < 0)
++		goto err;
++
++	while(ctrl_c_rev == 0) {
++		my_msleep(100);
++		/* update frame if only hop block hit the LCD frame */
++		if(update_block_pos(&x, &y, start_angle, test_handle->block_width, lcd_w, lcd_h, fd_fb)) {
++			random_color = (char)(rand()%255);
++			memset(test_handle->ipu_handle->inbuf_start[next_update_idx], random_color,
++					test_handle->ipu_handle->ifr_size);
++			if((next_update_idx = mxc_ipu_lib_task_buf_update(test_handle->ipu_handle, 0, hop_block_output_cb, &fd_fb)) < 0)
++				break;
++		}
++	}
++
++	/* ipu need reset position to 0,0 */
++	pos.x = 0;
++	pos.y = 0;
++	ioctl(fd_fb, MXCFB_SET_OVERLAY_POS, &pos);
++
++	blank = FB_BLANK_POWERDOWN;
++	if ( ioctl(fd_fb, FBIOBLANK, blank) < 0) {
++		printf("POWERDOWN FB failed!\n");
++		ret = -1;
++		goto done;
++	}
++err:
++	mxc_ipu_lib_task_uninit(test_handle->ipu_handle);
++
++done:
++	if (fd_fb)
++		close(fd_fb);
++	return ret;
++}
++
++void * thread_func(void *arg)
++{
++	ipu_test_handle_t test_handle;
++	ipu_lib_handle_t ipu_handle;
++
++	memset(&ipu_handle, 0, sizeof(ipu_lib_handle_t));
++	memset(&test_handle, 0, sizeof(ipu_test_handle_t));
++	test_handle.ipu_handle = &ipu_handle;
++
++	color_bar(0, &test_handle);
++
++	return NULL;
++}
++
++int run_test_pattern(int pattern, ipu_test_handle_t * test_handle)
++{
++	if (pattern == 1)
++		return color_bar(0, test_handle);
++	if (pattern == 2)
++		return color_bar(1, test_handle);
++	if (pattern == 3)
++		return hop_block(test_handle);
++	if (pattern == 4) {
++		pthread_t thread1;
++
++		pthread_create(&thread1, NULL, thread_func, NULL);
++
++		return hop_block(test_handle);
++	}
++
++	printf("No such test pattern %d\n", pattern);
++	return -1;
++}
+diff --git a/test/mxc_ipudev_test/utils.c b/test/mxc_ipudev_test/utils.c
+new file mode 100644
+index 0000000..f8ecb9e
+--- /dev/null
++++ b/test/mxc_ipudev_test/utils.c
+@@ -0,0 +1,462 @@
++/*
++ * Copyright 2009 Freescale Semiconductor, Inc. All Rights Reserved.
++ *
++ */
++
++/*
++ * The code contained herein is licensed under the GNU Lesser General
++ * Public License.  You may obtain a copy of the GNU Lesser General
++ * Public License Version 2.1 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/lgpl-license.html
++ * http://www.gnu.org/copyleft/lgpl.html
++ */
++
++/*!
++ * @file utils.c
++ *
++ * @brief IPU device lib test utils implementation
++ *
++ * @ingroup IPU
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <string.h>
++#include <fcntl.h>
++#include "mxc_ipudev_test.h"
++
++#define MAX_PATH	128
++
++char * skip_unwanted(char *ptr)
++{
++	int i = 0;
++	static char buf[MAX_PATH];
++	while (*ptr != '\0') {
++		if (*ptr == ' ' || *ptr == '\t' || *ptr == '\n') {
++			ptr++;
++			continue;
++		}
++
++		if (*ptr == '#')
++			break;
++
++		buf[i++] = *ptr;
++		ptr++;
++	}
++
++	buf[i] = 0;
++	return (buf);
++}
++
++int parse_options(char *buf, ipu_test_handle_t *test_handle)
++{
++	char *str;
++
++	/* general */
++	str = strstr(buf, "mode");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->mode = strtol(str, NULL, 16);
++				printf("mode\t\t= 0x%x\n", test_handle->mode);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "fcount");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->fcount = strtol(str, NULL, 10);
++				printf("fcount\t\t= %d\n", test_handle->fcount);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "output1_enable");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1_enabled = strtol(str, NULL, 10);
++				printf("output1_enable\t= %d\n", test_handle->output1_enabled);
++			}
++			return 0;
++		}
++	}
++
++	/* input */
++	str = strstr(buf, "in_width");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->input.width = strtol(str, NULL, 10);
++				printf("in_width\t= %d\n", test_handle->input.width);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "in_height");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->input.height = strtol(str, NULL, 10);
++				printf("in_height\t= %d\n", test_handle->input.height);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "in_fmt");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->input.fmt =
++					v4l2_fourcc(str[0], str[1], str[2], str[3]);
++				printf("in_fmt\t\t= %s\n", str);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "in_posx");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->input.input_crop_win.pos.x =
++					strtol(str, NULL, 10);
++				printf("in_posx\t\t= %d\n",
++					test_handle->input.input_crop_win.pos.x);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "in_posy");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->input.input_crop_win.pos.y =
++					strtol(str, NULL, 10);
++				printf("in_posy\t\t= %d\n",
++					test_handle->input.input_crop_win.pos.y);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "in_win_w");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->input.input_crop_win.win_w =
++					strtol(str, NULL, 10);
++				printf("in_win_w\t= %d\n",
++					test_handle->input.input_crop_win.win_w);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "in_win_h");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->input.input_crop_win.win_h =
++					strtol(str, NULL, 10);
++				printf("in_win_h\t= %d\n",
++					test_handle->input.input_crop_win.win_h);
++			}
++			return 0;
++		}
++	}
++
++	/* output0 */
++	str = strstr(buf, "out0_width");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.width = strtol(str, NULL, 10);
++				printf("out0_width\t= %d\n", test_handle->output0.width);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_height");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.height = strtol(str, NULL, 10);
++				printf("out0_height\t= %d\n", test_handle->output0.height);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_fmt");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.fmt =
++					v4l2_fourcc(str[0], str[1], str[2], str[3]);
++				printf("out0_fmt\t= %s\n", str);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_rot");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.rot = strtol(str, NULL, 10);
++				printf("out0_rot\t= %d\n", test_handle->output0.rot);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_to_fb");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.show_to_fb = strtol(str, NULL, 10);
++				printf("out0_to_fb\t= %d\n", test_handle->output0.show_to_fb);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_fb_num");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.fb_disp.fb_num = strtol(str, NULL, 10);
++				printf("out0_fb_num\t= %d\n", test_handle->output0.fb_disp.fb_num);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_posx");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.fb_disp.pos.x = strtol(str, NULL, 10);
++				printf("out0_posx\t= %d\n", test_handle->output0.fb_disp.pos.x);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_posy");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output0.fb_disp.pos.y = strtol(str, NULL, 10);
++				printf("out0_posy\t= %d\n", test_handle->output0.fb_disp.pos.y);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out0_filename");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				memcpy(test_handle->outfile0, str, strlen(str));
++				printf("out0_filename\t= %s\n", test_handle->outfile0);
++			}
++			return 0;
++		}
++	}
++
++	/* output1 */
++	str = strstr(buf, "out1_width");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.width = strtol(str, NULL, 10);
++				printf("out1_width\t= %d\n", test_handle->output1.width);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_height");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.height = strtol(str, NULL, 10);
++				printf("out1_height\t= %d\n", test_handle->output1.height);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_fmt");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.fmt =
++					v4l2_fourcc(str[0], str[1], str[2], str[3]);
++				printf("out1_fmt\t= %s\n", str);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_rot");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.rot = strtol(str, NULL, 10);
++				printf("out1_rot\t= %d\n", test_handle->output1.rot);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_to_fb");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.show_to_fb = strtol(str, NULL, 10);
++				printf("out1_to_fb\t= %d\n", test_handle->output1.show_to_fb);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_fb_num");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.fb_disp.fb_num = strtol(str, NULL, 10);
++				printf("out1_fb_num\t= %d\n", test_handle->output1.fb_disp.fb_num);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_posx");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.fb_disp.pos.x = strtol(str, NULL, 10);
++				printf("out1_posx\t= %d\n", test_handle->output1.fb_disp.pos.x);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_posy");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				test_handle->output1.fb_disp.pos.y = strtol(str, NULL, 10);
++				printf("out1_posy\t= %d\n", test_handle->output1.fb_disp.pos.y);
++			}
++			return 0;
++		}
++	}
++
++	str = strstr(buf, "out1_filename");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				memcpy(test_handle->outfile1, str, strlen(str));
++				printf("out1_filename\t= %s\n", test_handle->outfile1);
++			}
++			return 0;
++		}
++	}
++
++	return 0;
++}
++
++int parse_config_file(char *file_name, ipu_test_handle_t *test_handle)
++{
++	FILE *fp;
++	char line[128];
++	char *ptr;
++
++	fp = fopen(file_name, "r");
++	if (fp == NULL) {
++		printf("Failed to open config file\n");
++		return -1;
++	}
++
++	printf("\nGet config from config file %s:\n\n", file_name);
++
++	while (fgets(line, MAX_PATH, fp) != NULL) {
++		ptr = skip_unwanted(line);
++		parse_options(ptr, test_handle);
++	}
++
++	printf("\n");
++
++	fclose(fp);
++	return 0;
++}
++
+-- 
+1.8.0
+

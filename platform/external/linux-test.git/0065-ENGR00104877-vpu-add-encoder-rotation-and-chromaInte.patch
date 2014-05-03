@@ -1,0 +1,368 @@
+From bac95e93402f9af8b10418847689e30261144986 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Fri, 16 Jan 2009 10:57:01 +0800
+Subject: [PATCH 065/435] ENGR00104877 vpu: add encoder rotation and
+ chromaInterleave to unit test
+
+1) Support chromaInterleave and rotation in encoder;
+2) Add chromaInterleave to command option in both encoder and decoder;
+3) Remove input width and height 16-multiple limitation in encoder;
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/capture.c          | 10 +++++++---
+ test/mxc_vpu_test/configs/config_dec |  3 +++
+ test/mxc_vpu_test/configs/config_enc |  3 +++
+ test/mxc_vpu_test/dec.c              |  8 +++-----
+ test/mxc_vpu_test/display.c          | 10 +++++-----
+ test/mxc_vpu_test/enc.c              | 17 ++++++++++++-----
+ test/mxc_vpu_test/main.c             | 17 +++++++++++++----
+ test/mxc_vpu_test/utils.c            | 18 +++++++++++++++---
+ test/mxc_vpu_test/vpu_test.h         |  6 +++---
+ 9 files changed, 64 insertions(+), 28 deletions(-)
+
+diff --git a/test/mxc_vpu_test/capture.c b/test/mxc_vpu_test/capture.c
+index 04fb208..fe9e427 100644
+--- a/test/mxc_vpu_test/capture.c
++++ b/test/mxc_vpu_test/capture.c
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -81,7 +81,7 @@ v4l_stop_capturing(void)
+ }
+ 
+ int
+-v4l_capture_setup(int width, int height, int fps)
++v4l_capture_setup(struct encode *enc, int width, int height, int fps)
+ {
+ 	char v4l_device[32] = "/dev/video0";
+ 	struct v4l2_format fmt = {0};
+@@ -99,13 +99,17 @@ v4l_capture_setup(int width, int height, int fps)
+ 	}
+ 
+ 	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+ 	fmt.fmt.pix.width = width;
+ 	fmt.fmt.pix.height = height;
+ 	fmt.fmt.pix.bytesperline = width;
+ 	fmt.fmt.pix.priv = 0;
+ 	fmt.fmt.pix.sizeimage = 0;
+ 
++	if (enc->cmdl->chromaInterleave == 0)
++		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
++	else
++		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
++
+ 	if (ioctl(cap_fd, VIDIOC_S_FMT, &fmt) < 0) {
+ 		err_msg("set format failed\n");
+ 		close(cap_fd);
+diff --git a/test/mxc_vpu_test/configs/config_dec b/test/mxc_vpu_test/configs/config_dec
+index ccff6f0..c6a3b39 100644
+--- a/test/mxc_vpu_test/configs/config_dec
++++ b/test/mxc_vpu_test/configs/config_dec
+@@ -14,6 +14,9 @@ output=
+ # 6 - RV, 7 - MJPG
+ format=0
+ 
++# chromaInterleave, 1 - CbCr is interleaved
++chromaInterleave=
++
+ # rotation angle (0, 90, 180, 270). Do not specify anything if not needed.
+ # Default is VPU rotation.
+ rotation=
+diff --git a/test/mxc_vpu_test/configs/config_enc b/test/mxc_vpu_test/configs/config_enc
+index f924cbf..7148b5a 100644
+--- a/test/mxc_vpu_test/configs/config_enc
++++ b/test/mxc_vpu_test/configs/config_enc
+@@ -13,6 +13,9 @@ output=test.264
+ # format; 0 - MPEG4, 1 - H.263, 2 - H.264, 7 - MJPG
+ format=2
+ 
++# chromaInterleave, 1 - CbCr is interleaved
++chromaInterleave=
++
+ # rotation angle (0, 90, 180, 270). Do not specify anything if not needed.
+ rotation=
+ 
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index dd831f1..8b9feaf 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -532,7 +532,7 @@ write_to_file(struct decode *dec, u8 *buf, Rect cropRect)
+ {
+ 	int height = dec->picheight;
+ 	int stride = dec->stride;
+-	int chromaInterleave = dec->chromaInterleave;
++	int chromaInterleave = dec->cmdl->chromaInterleave;
+ 	int img_size;
+ 	u8 *pYuv = NULL, *pYuv0 = NULL;
+ 	int cropping;
+@@ -1334,6 +1334,7 @@ decoder_open(struct decode *dec)
+ 	oparam.bitstreamBufferSize = STREAM_BUF_SIZE;
+ 	oparam.reorderEnable = dec->reorderEnable;
+ 	oparam.mp4DeblkEnable = dec->cmdl->deblock_en;
++	oparam.chromaInterleave = dec->cmdl->chromaInterleave;
+ 
+ 	/*
+ 	 * mp4 deblocking filtering is optional out-loop filtering for image
+@@ -1357,8 +1358,6 @@ decoder_open(struct decode *dec)
+ 	oparam.psSaveBuffer = dec->phy_ps_buf;
+ 	oparam.psSaveBufferSize = PS_SAVE_SIZE;
+ 
+-	oparam.chromaInterleave = dec->chromaInterleave;
+-
+ 	ret = vpu_DecOpen(&handle, &oparam);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("vpu_DecOpen failed\n");
+@@ -1416,7 +1415,6 @@ decode_test(void *arg)
+ 	dec->phy_bsbuf_addr = mem_desc.phy_addr;
+ 	dec->virt_bsbuf_addr = mem_desc.virt_uaddr;
+ 
+-	dec->chromaInterleave = 0;
+ 	dec->reorderEnable = 1;
+ 	dec->cmdl = cmdl;
+ 
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index d2952e4..39bda40 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -1,6 +1,5 @@
+-
+ /*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -254,11 +253,12 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation)
+ 	dprintf(1, "fmt.fmt.pix.width = %d\n\tfmt.fmt.pix.height = %d\n",
+ 				fmt.fmt.pix.width, fmt.fmt.pix.height);
+ 
+-	if (dec->chromaInterleave == 0)
++	if (dec->cmdl->chromaInterleave == 0)
+ 		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+-	else
++	else {
++		info_msg("Display: NV12\n");
+ 		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+-
++	}
+ 	err = ioctl(fd, VIDIOC_S_FMT, &fmt);
+ 	if (err < 0) {
+ 		err_msg("VIDIOC_S_FMT failed\n");
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 210c403..6392e7b 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -195,7 +195,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	for (i = 0; i < fbcount; i++) {
+-		pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->picwidth, enc->picheight);
++		pfbpool[i] = framebuf_alloc(enc->cmdl->format, (enc->picwidth + 15) & ~15,  (enc->picheight + 15) & ~15);
+ 		if (pfbpool[i] == NULL) {
+ 			fbcount = i;
+ 			goto err1;
+@@ -207,7 +207,10 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 	
+ 	/* Must be a multiple of 16 */
+-	stride = (enc->picwidth + 15) & ~15;
++	if (enc->cmdl->rot_angle == 90 || enc->cmdl->rot_angle == 270)
++		stride = (enc->picheight + 15 ) & ~15;
++	else
++		stride = (enc->picwidth + 15) & ~15;
+ 
+ 	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, stride);
+ 	if (ret != RETCODE_SUCCESS) {
+@@ -216,7 +219,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 	
+ 	if (enc->cmdl->src_scheme == PATH_V4L2) {
+-		ret = v4l_capture_setup(enc->picwidth, enc->picheight, 30);
++		ret = v4l_capture_setup(enc, enc->picwidth, enc->picheight, 30);
+ 		if (ret < 0) {
+ 			goto err1;
+ 		}
+@@ -438,7 +441,10 @@ encoder_configure(struct encode *enc)
+ 		search_pa.searchRamAddr = 0xFFFF4C00;
+ 	} else if (cpu_is_mx51()) {
+ 		memset(&iram, 0, sizeof(iram_t));
+-		ram_size = ((enc->picwidth + 15) & ~15) * 36 + 2048;
++		if (enc->cmdl->rot_angle == 90 || enc->cmdl->rot_angle == 270)
++			ram_size = ((enc->picheight + 15) & ~15) * 36 + 2048;
++		else
++			ram_size = ((enc->picwidth + 15) & ~15) * 36 + 2048;
+ 		IOGetIramBase(&iram);
+ 		if ((iram.end - iram.start) < ram_size)
+ 			ram_size = iram.end - iram.start;
+@@ -547,6 +553,7 @@ encoder_open(struct encode *enc)
+ 	encop.rcIntraQp = -1;
+ 	encop.ringBufferEnable = 0;
+ 	encop.dynamicAllocEnable = 0;
++	encop.chromaInterleave = enc->cmdl->chromaInterleave;
+ 
+ 	if( enc->cmdl->format == STD_MJPG )
+ 	{
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 7dff100..f49b7da 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -54,8 +54,10 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "        This flag is effective when 'r' flag is specified.\n "\
+ 	       "  -w <width> display picture width \n "\
+ 	       "	default is source picture width. \n "\
+-	       "  -h <height> disiplay picture height \n "\
++	       "  -h <height> display picture height \n "\
+ 	       "	default is source picture height \n "\
++	       "  -t <chromaInterleave> CbCr interleaved \n "\
++	       "        default is none-interleave(0). \n "\
+ 	       "\n"\
+ 	       "encode options \n "\
+ 	       "  -i <input file> Read input from file (yuv) \n "\
+@@ -80,7 +82,9 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "  -b <bitrate in kbps> \n "\
+ 	       "	default is auto (0) \n "\
+ 	       "  -g <gop size> \n "\
+-	       "	default is 0 \n"
++	       "	default is 0 \n "\
++	       "  -t <chromaInterleave> CbCr interleaved \n "\
++	       "        default is none-interleave(0). \n "\
+ 	       "\n"\
+ 	       "loopback options \n "\
+ 	       "  -f <format> 0 - MPEG4, 1 - H.263, 2 - H.264, 3 - VC1, 7 - MJPG \n "\
+@@ -89,6 +93,8 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	default is 176. \n "\
+ 	       "  -h <height>capture image height \n "\
+ 	       "	default is 144 \n "\
++	       "  -t <chromaInterleave> CbCr interleaved \n "\
++               "        default is none-interleave(0). \n "\
+ 	       "\n"\
+ 	       "config file - Use config file for specifying options \n";
+ 
+@@ -114,7 +120,7 @@ int encdec_test(void *arg);
+ static char *mainopts = "HE:D:L:C:";
+ 
+ /* Options for encode and decode */
+-static char *options = "i:o:n:p:r:f:c:w:h:g:b:d:e:m:u:";
++static char *options = "i:o:n:p:r:f:c:w:h:g:b:d:e:m:u:t:";
+ 
+ int
+ parse_config_file(char *file_name)
+@@ -271,6 +277,9 @@ parse_args(int argc, char *argv[], int i)
+ 		case 'm':
+ 			input_arg[i].cmd.mirror = atoi(optarg);
+ 			break;
++		case 't':
++			input_arg[i].cmd.chromaInterleave = atoi(optarg);
++			break;
+ 		case -1:
+ 			break;
+ 		default:
+diff --git a/test/mxc_vpu_test/utils.c b/test/mxc_vpu_test/utils.c
+index 4b63f5c..e0be397 100644
+--- a/test/mxc_vpu_test/utils.c
++++ b/test/mxc_vpu_test/utils.c
+@@ -1,6 +1,6 @@
+ 
+ /*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -469,8 +469,7 @@ check_params(struct cmd_line *cmd, int op)
+ 	}
+ 	
+ 	if (cmd->src_scheme == PATH_FILE && op == ENCODE) {
+-		if ((cmd->width == 0) || (cmd->width % 16 != 0) ||
+-			(cmd->height == 0) || (cmd->height % 16 != 0)) {
++		if (cmd->width == 0 || cmd->height == 0) {
+ 			warn_msg("Enter width and height for YUV file\n");
+ 			return -1;
+ 		}
+@@ -688,6 +687,19 @@ int parse_options(char *buf, struct cmd_line *cmd, int *mode)
+ 		return 0;
+ 	}
+ 
++	str = strstr(buf, "chromaInterleave");
++	if (str != NULL) {
++		str = index(buf, '=');
++		if (str != NULL) {
++			str++;
++			if (*str != '\0') {
++				cmd->chromaInterleave = strtol(str, NULL, 10);
++			}
++		}
++
++		return 0;
++	}
++
+ 	str = strstr(buf, "deblock");
+ 	if (str != NULL) {
+ 		str = index(buf, '=');
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index 797a98a..4381888 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2004-2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright 2004-2009 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Copyright (c) 2006, Chips & Media.  All rights reserved.
+  */
+@@ -122,6 +122,7 @@ struct cmd_line {
+ 	int ipu_rot_en;
+ 	int rot_angle;
+ 	int mirror;
++	int chromaInterleave;
+ 	int bitrate;
+ 	int gop;
+ 	int save_enc_hdr;
+@@ -153,7 +154,6 @@ struct decode {
+ 	vpu_mem_desc *mvcol_memdesc;
+ 	Rect picCropRect;
+ 	int reorderEnable;
+-	int chromaInterleave;
+ 	struct cmd_line *cmdl;
+ };
+ 
+@@ -193,7 +193,7 @@ void framebuf_free(struct frame_buf *fb);
+ 
+ int v4l_start_capturing(void);
+ void v4l_stop_capturing(void);
+-int v4l_capture_setup(int width, int height, int fps);
++int v4l_capture_setup(struct encode *enc, int width, int height, int fps);
+ int v4l_get_capture_data(struct v4l2_buffer *buf);
+ void v4l_put_capture_data(struct v4l2_buffer *buf);
+ 
+-- 
+1.8.0
+

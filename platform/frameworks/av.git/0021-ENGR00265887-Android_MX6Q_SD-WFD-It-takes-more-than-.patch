@@ -1,0 +1,105 @@
+From 6738910f37c17ad3e0195bdf0bddfe182a528f24 Mon Sep 17 00:00:00 2001
+From: Song Bing <b06498@freescale.com>
+Date: Wed, 3 Jul 2013 11:02:48 +0800
+Subject: [PATCH 21/50] ENGR00265887: [Android_MX6Q_SD]WFD: It takes more than
+ 50s to disconnect WFD if switch Wireless trigger to
+ off. 100%
+
+When stop WIFI-display source, stop will be blocked in RepeateSource stop function.
+The root cause is onMessageReceived function be blocked on SurfaceMediaSource
+read function mSource->read(). The block read will fininsh after SurfaceMediaSource
+got one frame from BufferQueue. So WIFI-display stop depends on screen refresh.
+Solution: call SurfaceMediaSource stop before mLooper->stop() in RepeateSource
+to remove SurfaceMediaSource read block. So WIFI-display can be stopped immediately.
+
+Signed-off-by: Song Bing b06498@freescale.com
+---
+ .../wifi-display/source/RepeaterSource.cpp         | 31 +++++++++++++++-------
+ .../wifi-display/source/RepeaterSource.h           |  1 +
+ 2 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/media/libstagefright/wifi-display/source/RepeaterSource.cpp b/media/libstagefright/wifi-display/source/RepeaterSource.cpp
+index cc8dee3..78a6876 100644
+--- a/media/libstagefright/wifi-display/source/RepeaterSource.cpp
++++ b/media/libstagefright/wifi-display/source/RepeaterSource.cpp
+@@ -14,6 +14,7 @@ namespace android {
+ 
+ RepeaterSource::RepeaterSource(const sp<MediaSource> &source, double rateHz)
+     : mStarted(false),
++      mStopping(false),
+       mSource(source),
+       mRateHz(rateHz),
+       mBuffer(NULL),
+@@ -70,6 +71,7 @@ status_t RepeaterSource::start(MetaData *params) {
+     postRead();
+ 
+     mStarted = true;
++    mStopping = false;
+ 
+     return OK;
+ }
+@@ -78,6 +80,18 @@ status_t RepeaterSource::stop() {
+     CHECK(mStarted);
+ 
+     ALOGV("stopping");
++    {
++        Mutex::Autolock autoLock(mLock);
++        mStopping = true;
++        if (mBuffer != NULL) {
++            ALOGV("releasing mbuf %p", mBuffer);
++            mBuffer->release();
++            mBuffer = NULL;
++        }
++
++    }
++
++    status_t err = mSource->stop();
+ 
+     if (mLooper != NULL) {
+         mLooper->stop();
+@@ -86,14 +100,6 @@ status_t RepeaterSource::stop() {
+         mReflector.clear();
+     }
+ 
+-    if (mBuffer != NULL) {
+-        ALOGV("releasing mbuf %p", mBuffer);
+-        mBuffer->release();
+-        mBuffer = NULL;
+-    }
+-
+-    status_t err = mSource->stop();
+-
+     ALOGV("stopped");
+ 
+     mStarted = false;
+@@ -196,7 +202,14 @@ void RepeaterSource::onMessageReceived(const sp<AMessage> &msg) {
+             mCondition.broadcast();
+ 
+             if (err == OK) {
+-                postRead();
++                if (mStopping) {
++                    if (mBuffer != NULL) {
++                        mBuffer->release();
++                        mBuffer = NULL;
++                    }
++                } else {
++                    postRead();
++                }
+             }
+             break;
+         }
+diff --git a/media/libstagefright/wifi-display/source/RepeaterSource.h b/media/libstagefright/wifi-display/source/RepeaterSource.h
+index 8d414fd..a1fc6ea 100644
+--- a/media/libstagefright/wifi-display/source/RepeaterSource.h
++++ b/media/libstagefright/wifi-display/source/RepeaterSource.h
+@@ -43,6 +43,7 @@ private:
+     Condition mCondition;
+ 
+     bool mStarted;
++    bool mStopping;
+ 
+     sp<MediaSource> mSource;
+     double mRateHz;
+-- 
+1.8.0
+

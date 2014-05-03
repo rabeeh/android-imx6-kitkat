@@ -1,0 +1,153 @@
+From 3dfa15b43b92ecd5daf78793c38f52269e22ddb3 Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Tue, 13 Aug 2013 16:39:40 +0800
+Subject: [PATCH 464/486] ENGR00275011  [EVK_6SL]: enable camera
+
+enable camera ov5640 on evk_6sl
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ mx6/libcamera/Android.mk        |  5 +++++
+ mx6/libcamera/CameraBridge.cpp  |  9 +++++++--
+ mx6/libcamera/DeviceAdapter.cpp |  6 +++++-
+ mx6/libcamera/Ov5640.cpp        | 24 ++++++++++++++++++++----
+ 4 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/mx6/libcamera/Android.mk b/mx6/libcamera/Android.mk
+index e6715d0..cd3ef71 100755
+--- a/mx6/libcamera/Android.mk
++++ b/mx6/libcamera/Android.mk
+@@ -72,6 +72,11 @@ else
+     LOCAL_CPPFLAGS += -DRECORDING_FORMAT_YUV420
+ endif
+ 
++ 
++ifeq ($(PRODUCT_MODEL), EVK_MX6SL)
++    LOCAL_CPPFLAGS += -DEVK_6SL
++endif
++
+ #Define this for switch the Camera through V4L2 MXC IOCTL
+ #LOCAL_CPPFLAGS += -DV4L2_CAMERA_SWITCH
+ 
+diff --git a/mx6/libcamera/CameraBridge.cpp b/mx6/libcamera/CameraBridge.cpp
+index f73c957..9b57f5e 100644
+--- a/mx6/libcamera/CameraBridge.cpp
++++ b/mx6/libcamera/CameraBridge.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -30,7 +30,12 @@ CameraBridge::CameraBridge()
+     memset(mSupprotedThumbnailSizes, 0, sizeof(mSupprotedThumbnailSizes));
+     mMetaDataBufsMap.clear();
+     mVpuSupportFmt[0] = v4l2_fourcc('N', 'V', '1', '2');
+-    mVpuSupportFmt[1] = v4l2_fourcc('Y', 'U', '1', '2');
++#ifdef EVK_6SL
++	mVpuSupportFmt[1] = v4l2_fourcc('Y', 'U', 'Y', 'V');
++#else
++	mVpuSupportFmt[1] = v4l2_fourcc('Y', 'U', '1', '2');
++#endif
++
+ }
+ 
+ CameraBridge::~CameraBridge()
+diff --git a/mx6/libcamera/DeviceAdapter.cpp b/mx6/libcamera/DeviceAdapter.cpp
+index 23058d9..f894819 100644
+--- a/mx6/libcamera/DeviceAdapter.cpp
++++ b/mx6/libcamera/DeviceAdapter.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -130,12 +130,15 @@ status_t DeviceAdapter::setDeviceConfig(int         width,
+     }
+ 
+     status_t ret = NO_ERROR;
++	
++#ifndef EVK_6SL //VIDIOC_S_INPUT not support in evk_6sl
+     int input    = 1;
+     ret = ioctl(mCameraHandle, VIDIOC_S_INPUT, &input);
+     if (ret < 0) {
+         FLOGE("Open: VIDIOC_S_INPUT Failed: %s", strerror(errno));
+         return ret;
+     }
++#endif
+ 
+     int vformat;
+     vformat = convertPixelFormatToV4L2Format(format);
+@@ -171,6 +174,7 @@ status_t DeviceAdapter::setDeviceConfig(int         width,
+         return ret;
+     }
+ 
++	memset(&mVideoInfo->format, 0, sizeof(mVideoInfo->format));
+     mVideoInfo->format.type                 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+     mVideoInfo->format.fmt.pix.width        = width & 0xFFFFFFF8;
+     mVideoInfo->format.fmt.pix.height       = height & 0xFFFFFFF8;
+diff --git a/mx6/libcamera/Ov5640.cpp b/mx6/libcamera/Ov5640.cpp
+index a5c9c23..5a02a09 100644
+--- a/mx6/libcamera/Ov5640.cpp
++++ b/mx6/libcamera/Ov5640.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -61,11 +61,15 @@ status_t Ov5640::initParameters(CameraParameters& params,
+ #endif // if 0
+ 
+     // v4l2 does not support enum format, now hard code here.
+-    sensorFormat[0] = v4l2_fourcc('N', 'V', '1', '2');
++#ifdef EVK_6SL
++	sensorFormat[0] = v4l2_fourcc('Y', 'U', 'Y', 'V');
++    index           = 1;
++#else
++	sensorFormat[0] = v4l2_fourcc('N', 'V', '1', '2');
+     sensorFormat[1] = v4l2_fourcc('Y', 'U', '1', '2');
+     sensorFormat[2] = v4l2_fourcc('Y', 'U', 'Y', 'V');
+-    index           = 3;
+-
++    index           = 3;	
++#endif
+     // second check match sensor format with vpu support format and picture
+     // format.
+     mPreviewPixelFormat = getMatchFormat(supportRecordingFormat,
+@@ -95,13 +99,25 @@ status_t Ov5640::initParameters(CameraParameters& params,
+         memset(TmpStr, 0, 20);
+         memset(&vid_frmsize, 0, sizeof(struct v4l2_frmsizeenum));
+         vid_frmsize.index        = index++;
++#ifdef EVK_6SL
++		vid_frmsize.pixel_format = v4l2_fourcc('Y', 'U', 'Y', 'V');
++#else
+         vid_frmsize.pixel_format = v4l2_fourcc('N', 'V', '1', '2');
++
++#endif
+         ret                      = ioctl(mCameraHandle,
+                                          VIDIOC_ENUM_FRAMESIZES,
+                                          &vid_frmsize);
+         if (ret == 0) {
+             FLOG_RUNTIME("enum frame size w:%d, h:%d",
+                          vid_frmsize.discrete.width, vid_frmsize.discrete.height);
++			
++#ifdef EVK_6SL //in evk_6sl, omit large resolution
++			if((vid_frmsize.discrete.width > 640) || (vid_frmsize.discrete.height > 480))
++			{
++				continue;
++			}
++#endif
+             memset(&vid_frmval, 0, sizeof(struct v4l2_frmivalenum));
+             vid_frmval.index        = 0;
+             vid_frmval.pixel_format = vid_frmsize.pixel_format;
+-- 
+1.8.0
+

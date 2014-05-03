@@ -1,0 +1,578 @@
+From 00568e1a7f709afd475c8f5c50af6f7ca9138047 Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Sat, 17 Dec 2011 00:27:31 +0800
+Subject: [PATCH 254/435] ENGR00170278 vpu: Change test to support tiled
+ format in encoder
+
+Change test to support tiled format in encoder for mx6q, and
+make the new test code is align with vpu lib API change in
+vpu_GetXY2AXIAddr() function change.
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/dec.c      |  70 ++++++++++++++------------
+ test/mxc_vpu_test/display.c  |   2 +-
+ test/mxc_vpu_test/enc.c      | 116 ++++++++++++++++++++++++-------------------
+ test/mxc_vpu_test/fb.c       |  24 +++++----
+ test/mxc_vpu_test/loopback.c |   4 +-
+ test/mxc_vpu_test/vpu_test.h |  12 +++--
+ 6 files changed, 128 insertions(+), 100 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index 83894ed..cf755de 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -451,7 +451,7 @@ int SaveTiledYuvImageHelper(struct decode *dec, int yuvFp,
+ 
+ 	for (y = 0; y < nY; y++) {
+ 		for (x = 0; x < picWidth; x += 8) {
+-			pix_addr = vpu_GetXY2AXIAddr(0, y, x, picWidth,
++			pix_addr = vpu_GetXY2AXIAddr(dec->handle, 0, y, x, picWidth,
+                                         addrY, addrCb, addrCr);
+ 			pix_addr += offset;
+ 			memcpy(puc + y * picWidth + x, (Uint8 *)pix_addr, 8);
+@@ -463,7 +463,7 @@ int SaveTiledYuvImageHelper(struct decode *dec, int yuvFp,
+ 
+ 	for (y = 0; y < nCb ; y++) {
+ 		for (x = 0; x < picWidth; x += 8) {
+-			pix_addr = vpu_GetXY2AXIAddr(2, y, x, picWidth,
++			pix_addr = vpu_GetXY2AXIAddr(dec->handle, 2, y, x, picWidth,
+ 					addrY, addrCb, addrCr);
+ 			pix_addr += offset;
+ 			memcpy(temp_buf, (Uint8 *)pix_addr, 8);
+@@ -655,7 +655,7 @@ swapCropRect(struct decode *dec, Rect *rotCrop)
+ static void
+ write_to_file(struct decode *dec, Rect cropRect, int index)
+ {
+-	int height = dec->picheight;
++	int height = (dec->picheight + 15) & ~15 ;
+ 	int stride = dec->stride;
+ 	int chromaInterleave = dec->cmdl->chromaInterleave;
+ 	int img_size;
+@@ -668,7 +668,7 @@ write_to_file(struct decode *dec, Rect cropRect, int index)
+ 	cropping = cropRect.left | cropRect.top | cropRect.bottom | cropRect.right;
+ 
+ 	if (cpu_is_mx6q() && (dec->cmdl->mapType != LINEAR_FRAME_MAP) &&
+-	    !dec->tiled2LinearEnable) {
++	    !dec->tiled2LinearEnable && !dec->cmdl->rot_en) {
+ 		SaveTiledYuvImageHelper(dec, dec->cmdl->dst_fd, stride, height, index);
+ 		goto out;
+ 	}
+@@ -769,12 +769,12 @@ decoder_start(struct decode *dec)
+ 
+ 	/* deblock_en is zero on none mx27 since it is cleared in decode_open() function. */
+ 	if (rot_en || dering_en || tiled2LinearEnable) {
+-		rotid = dec->fbcount;
++		rotid = dec->regfbcount;
+ 		if (deblock_en) {
+-			dblkid = dec->fbcount + dec->rot_buf_count;
++			dblkid = dec->regfbcount + dec->rot_buf_count;
+ 		}
+ 	} else if (deblock_en) {
+-		dblkid = dec->fbcount;
++		dblkid = dec->regfbcount;
+ 	}
+ 	if (dec->cmdl->format == STD_MJPG)
+ 		rotid = 0;
+@@ -1119,7 +1119,7 @@ decoder_start(struct decode *dec)
+ 
+ 		if (outinfo.indexFrameDisplay == -1)
+ 			decodefinish = 1;
+-		else if ((outinfo.indexFrameDisplay > dec->fbcount) &&
++		else if ((outinfo.indexFrameDisplay > dec->regfbcount) &&
+ 			 (outinfo.prescanresult != 0) && !cpu_is_mx6q())
+ 			decodefinish = 1;
+ 
+@@ -1222,7 +1222,7 @@ decoder_start(struct decode *dec)
+ 
+ 				if (dec->cmdl->format == STD_MJPG) {
+ 					rotid++;
+-					rotid %= dec->fbcount;
++					rotid %= dec->regfbcount;
+ 				} else if (rot_en || dering_en || tiled2LinearEnable) {
+ 					disp_clr_index = outinfo.indexFrameDisplay;
+ 					if (disp->buf.index != -1)
+@@ -1310,7 +1310,7 @@ decoder_free_framebuffer(struct decode *dec)
+ 	vpu_mem_desc *mvcol_md = dec->mvcol_memdesc;
+ 	int deblock_en = dec->cmdl->deblock_en;
+ 
+-	totalfb = dec->fbcount + dec->extrafb;
++	totalfb = dec->regfbcount + dec->extrafb;
+ 
+ 	if ((dec->cmdl->dst_scheme == PATH_V4L2) || (dec->cmdl->dst_scheme == PATH_IPU)) {
+ 		if (dec->disp) {
+@@ -1400,7 +1400,7 @@ int
+ decoder_allocate_framebuffer(struct decode *dec)
+ {
+ 	DecBufInfo bufinfo;
+-	int i, fbcount = dec->fbcount, totalfb, img_size;
++	int i, regfbcount = dec->regfbcount, totalfb, img_size;
+        	int dst_scheme = dec->cmdl->dst_scheme, rot_en = dec->cmdl->rot_en;
+ 	int deblock_en = dec->cmdl->deblock_en;
+ 	int dering_en = dec->cmdl->dering_en;
+@@ -1439,7 +1439,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 		dec->extrafb++;
+ 	}
+ 
+-	totalfb = fbcount + dec->extrafb;
++	totalfb = regfbcount + dec->extrafb;
+ 
+ 	fb = dec->fb = calloc(totalfb, sizeof(FrameBuffer));
+ 	if (fb == NULL) {
+@@ -1457,24 +1457,32 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 
+ 	if (((dst_scheme != PATH_V4L2) && (dst_scheme != PATH_IPU)) ||
+ 			(((dst_scheme == PATH_V4L2) || (dst_scheme == PATH_IPU)) && deblock_en)) {
+-
+-		for (i = 0; i < totalfb; i++) {
+-			/*
+-			 * Tiled framebuffer allocation is needed for decoding
+-			 * buffers for none linear frame map type on mx6q platform.
+-			 */
+-			if (cpu_is_mx6q() && (i < fbcount) &&
+-			    (dec->cmdl->mapType != LINEAR_FRAME_MAP))
+-				pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
+-							dec->stride, dec->picheight);
+-			else
++		if (dec->cmdl->mapType == LINEAR_FRAME_MAP) {
++			/* All buffers are linear */
++			for (i = 0; i < totalfb; i++) {
+ 				pfbpool[i] = framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
+-						    dec->stride, dec->picheight);
+-			if (pfbpool[i] == NULL) {
+-				totalfb = i;
+-				goto err;
++						    dec->stride, dec->picheight, 1);
++				if (pfbpool[i] == NULL)
++					goto err;
++			}
++                } else {
++			/* decoded buffers are tiled */
++			for (i = 0; i < regfbcount; i++) {
++				pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++						    dec->stride, dec->picheight, 1);
++				if (pfbpool[i] == NULL)
++					goto err;
+ 			}
++			/* deblock and rotation is linear */
++			for (i = regfbcount; i < totalfb; i++) {
++				pfbpool[i] = tiled_framebuf_alloc(dec->cmdl->format, dec->mjpg_fmt,
++						    dec->stride, dec->picheight, 1);
++				if (pfbpool[i] == NULL)
++					goto err1;
++			}
++		 }
+ 
++		for (i = 0; i < totalfb; i++) {
+ 			fb[i].myIndex = i;
+ 			fb[i].bufY = pfbpool[i]->addrY;
+ 			fb[i].bufCb = pfbpool[i]->addrCb;
+@@ -1558,7 +1566,7 @@ decoder_allocate_framebuffer(struct decode *dec)
+ 	bufinfo.maxDecFrmInfo.maxMbX = dec->stride / 16;
+ 	bufinfo.maxDecFrmInfo.maxMbY = dec->picheight / 16;
+ 	bufinfo.maxDecFrmInfo.maxMbNum = dec->stride * dec->picheight / 256;
+-	ret = vpu_DecRegisterFrameBuffer(handle, fb, fbcount, stride, &bufinfo);
++	ret = vpu_DecRegisterFrameBuffer(handle, fb, dec->regfbcount, stride, &bufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed, ret=%d\n", ret);
+ 		goto err1;
+@@ -1832,7 +1840,7 @@ decoder_parse(struct decode *dec)
+ 	 *
+ 	 * Two more buffers may be needed for interlace stream from IPU DVI view
+ 	 */
+-	dec->minFrameBufferCount = initinfo.minFrameBufferCount;
++	dec->minfbcount = initinfo.minFrameBufferCount;
+ 	count = getenv("VPU_EXTENDED_BUFFER_COUNT");
+ 	if (count)
+ 		extended_fbcount = atoi(count);
+@@ -1840,9 +1848,9 @@ decoder_parse(struct decode *dec)
+ 		extended_fbcount = 2;
+ 
+ 	if (initinfo.interlace)
+-		dec->fbcount = initinfo.minFrameBufferCount + extended_fbcount + 2;
++		dec->regfbcount = dec->minfbcount + extended_fbcount + 2;
+ 	else
+-		dec->fbcount = initinfo.minFrameBufferCount + extended_fbcount;
++		dec->regfbcount = dec->minfbcount + extended_fbcount;
+ 
+ 	dec->picwidth = ((initinfo.picWidth + 15) & ~15);
+ 
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index c587d21..8ba5468 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -860,7 +860,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	if (vpu_v4l_performance_test) {
+ 		dec->disp = disp;
+ 		sem_init(&disp->avaiable_decoding_frame, 0,
+-			    dec->fbcount - dec->minFrameBufferCount);
++			    dec->regfbcount - dec->minfbcount);
+ 		sem_init(&disp->avaiable_dequeue_frame, 0, 0);
+ 		pthread_mutex_init(&v4l_mutex, NULL);
+ 		/* start v4l disp loop thread */
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index ab21d9c..286070f 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -337,7 +337,7 @@ encoder_free_framebuffer(struct encode *enc)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < enc->fbcount; i++) {
++	for (i = 0; i < enc->totalfb; i++) {
+ 		framebuf_free(enc->pfbpool[i]);
+ 	}
+ 
+@@ -350,34 +350,44 @@ encoder_allocate_framebuffer(struct encode *enc)
+ {
+ 	EncHandle handle = enc->handle;
+ 	int i, enc_stride, src_stride, src_fbid;
+-	int needFrameBufCount, fbcount = enc->fbcount;
++	int totalfb, minfbcount, srcfbcount, regfbcount;
+ 	RetCode ret;
+ 	FrameBuffer *fb;
+ 	PhysicalAddress subSampBaseA = 0, subSampBaseB = 0;
+-	PhysicalAddress	subSampBaseAMvc = 0, subSampBaseBMvc = 0;
+ 	struct frame_buf **pfbpool;
+ 	EncExtBufInfo extbufinfo = {0};
++	int enc_fbwidth, enc_fbheight, src_fbwidth, src_fbheight;
+ 
+-	if (cpu_is_mx6q())
+-		if (enc->cmdl->format == STD_MJPG)
+-			needFrameBufCount = fbcount + 1;
+-		else if (enc->cmdl->format == STD_AVC && enc->mvc_extension) /* MVC */
+-			 needFrameBufCount = fbcount + 3 + 2;
++	minfbcount = enc->minFrameBufferCount;
++	srcfbcount = 1;
++
++	enc_fbwidth = (enc->enc_picwidth + 15) & ~15;
++	enc_fbheight = (enc->enc_picheight + 15) & ~15;
++	src_fbwidth = (enc->src_picwidth + 15) & ~15;
++	src_fbheight = (enc->src_picheight + 15) & ~15;
++
++	if (cpu_is_mx6q()) {
++		if (enc->cmdl->format == STD_AVC && enc->mvc_extension) /* MVC */
++			regfbcount = minfbcount + 2 + 2; /* min + Subsamp buffer [2] */
++		else if (enc->cmdl->format == STD_MJPG)
++			regfbcount = minfbcount; /* min */
+ 		else
+-			needFrameBufCount = fbcount + 3; /* minFrameBufferCount + Subsamp buffer [2] + Src frame */
+-	else
+-		needFrameBufCount = fbcount + 1;
++			regfbcount = minfbcount + 2; /* min +  Subsamp buffer [2] */
++	} else
++		regfbcount = minfbcount; /* min */
++
++	enc->totalfb = totalfb = regfbcount + srcfbcount;
+ 
+ 	/* last framebuffer is used as src frame in the test */
+-	enc->src_fbid = src_fbid = needFrameBufCount - 1;
++	enc->src_fbid = src_fbid = totalfb - 1;
+ 
+-	fb = enc->fb = calloc(needFrameBufCount, sizeof(FrameBuffer));
++	fb = enc->fb = calloc(totalfb, sizeof(FrameBuffer));
+ 	if (fb == NULL) {
+ 		err_msg("Failed to allocate enc->fb\n");
+ 		return -1;
+ 	}
+ 
+-	pfbpool = enc->pfbpool = calloc(needFrameBufCount,
++	pfbpool = enc->pfbpool = calloc(totalfb,
+ 					sizeof(struct frame_buf *));
+ 	if (pfbpool == NULL) {
+ 		err_msg("Failed to allocate enc->pfbpool\n");
+@@ -385,14 +395,33 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		return -1;
+ 	}
+ 
+-	for (i = 0; i < fbcount; i++) {
+-		pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+-				(enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
+-		if (pfbpool[i] == NULL) {
+-			fbcount = i;
+-			goto err1;
++	if (enc->cmdl->mapType == LINEAR_FRAME_MAP) {
++		/* All buffers are linear */
++		for (i = 0; i < regfbcount; i++) {
++			pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++						    enc_fbwidth, enc_fbheight, 0);
++			if (pfbpool[i] == NULL) {
++				goto err1;
++			}
++		}
++	 } else {
++		/* Encoded buffers are tiled */
++		for (i = 0; i < minfbcount; i++) {
++			pfbpool[i] = tiled_framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++					    enc_fbwidth, enc_fbheight, 0);
++			if (pfbpool[i] == NULL)
++				goto err1;
++		}
++		/* sub frames are linear */
++		for (i = minfbcount; i < regfbcount; i++) {
++			pfbpool[i] = tiled_framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
++						    enc_fbwidth, enc_fbheight, 0);
++			if (pfbpool[i] == NULL)
++				goto err1;
+ 		}
++	}
+ 
++	for (i = 0; i < regfbcount; i++) {
+ 		fb[i].myIndex = i;
+ 		fb[i].bufY = pfbpool[i]->addrY;
+ 		fb[i].bufCb = pfbpool[i]->addrCb;
+@@ -402,28 +431,11 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	if (cpu_is_mx6q() && (enc->cmdl->format != STD_MJPG)) {
+-		for (i = fbcount; i < needFrameBufCount - 1; i++) {
+-			pfbpool[i] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+-					(enc->enc_picwidth + 15) & ~15,  (enc->enc_picheight + 15) & ~15);
+-			if (pfbpool[i] == NULL) {
+-				fbcount = i;
+-				goto err1;
+-			}
+-			fb[i].myIndex = i;
+-			fb[i].bufY = pfbpool[i]->addrY;
+-			fb[i].bufCb = pfbpool[i]->addrCb;
+-			fb[i].bufCr = pfbpool[i]->addrCr;
+-			fb[i].strideY = pfbpool[i]->strideY;
+-			fb[i].strideC = pfbpool[i]->strideC;
+-		}
+-		subSampBaseA = fb[fbcount].bufY;
+-		subSampBaseB = fb[fbcount + 1].bufY;
+-		enc->fbcount += 2;
+-
++		subSampBaseA = fb[minfbcount].bufY;
++		subSampBaseB = fb[minfbcount + 1].bufY;
+ 		if (enc->cmdl->format == STD_AVC && enc->mvc_extension) { /* MVC */
+-			extbufinfo.subSampBaseAMvc = fb[fbcount].bufY;
+-			extbufinfo.subSampBaseBMvc = fb[fbcount + 1].bufY;
+-			enc->fbcount += 2;
++			extbufinfo.subSampBaseAMvc = fb[minfbcount + 2].bufY;
++			extbufinfo.subSampBaseBMvc = fb[minfbcount + 3].bufY;
+ 		}
+ 	}
+ 
+@@ -435,7 +447,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	src_stride = (enc->src_picwidth + 15 ) & ~15;
+ 
+ 	extbufinfo.scratchBuf = enc->scratchBuf;
+-	ret = vpu_EncRegisterFrameBuffer(handle, fb, fbcount, enc_stride, src_stride,
++	ret = vpu_EncRegisterFrameBuffer(handle, fb, regfbcount, enc_stride, src_stride,
+ 					    subSampBaseA, subSampBaseB, &extbufinfo);
+ 	if (ret != RETCODE_SUCCESS) {
+ 		err_msg("Register frame buffer failed\n");
+@@ -450,8 +462,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	} else {
+ 		/* Allocate a single frame buffer for source frame */
+ 		pfbpool[src_fbid] = framebuf_alloc(enc->cmdl->format, enc->mjpg_fmt,
+-						   (enc->enc_picwidth + 15) & ~15,
+-						   (enc->enc_picheight + 15 ) & ~15);
++						   src_fbwidth, src_fbheight, 0);
+ 		if (pfbpool[src_fbid] == NULL) {
+ 			err_msg("failed to allocate single framebuf\n");
+ 			goto err1;
+@@ -463,13 +474,12 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 		fb[src_fbid].bufCr = pfbpool[src_fbid]->addrCr;
+ 		fb[src_fbid].strideY = pfbpool[src_fbid]->strideY;
+ 		fb[src_fbid].strideC = pfbpool[src_fbid]->strideC;
+-		enc->fbcount++;
+ 	}
+ 
+ 	return 0;
+ 
+ err1:
+-	for (i = 0; i < fbcount; i++) {
++	for (i = 0; i < totalfb; i++) {
+ 		framebuf_free(pfbpool[i]);
+ 	}
+ 
+@@ -776,8 +786,7 @@ encoder_configure(struct encode *enc)
+ 		return -1;
+ 	}
+ 
+-	enc->fbcount = initinfo.minFrameBufferCount;
+-
++	enc->minFrameBufferCount = initinfo.minFrameBufferCount;
+ 	if (enc->cmdl->save_enc_hdr) {
+ 		if (enc->cmdl->format == STD_MPEG4) {
+ 			SaveGetEncodeHeader(handle, ENC_GET_VOS_HEADER,
+@@ -844,7 +853,8 @@ encoder_open(struct encode *enc)
+ 	encop.bitstreamBuffer = enc->phy_bsbuf_addr;
+ 	encop.bitstreamBufferSize = STREAM_BUF_SIZE;
+ 	encop.bitstreamFormat = enc->cmdl->format;
+-
++	encop.mapType = enc->cmdl->mapType;
++	encop.linear2TiledEnable = enc->linear2TiledEnable;
+ 	/* width and height in command line means source image size */
+ 	if (enc->cmdl->width && enc->cmdl->height) {
+ 		enc->src_picwidth = enc->cmdl->width;
+@@ -1125,6 +1135,12 @@ encode_test(void *arg)
+ 	if (enc->cmdl->format == STD_MJPG)
+ 		enc->mjpg_fmt = MODE420;  /* Please change this per your needs */
+ 
++	if (enc->cmdl->mapType) {
++                enc->linear2TiledEnable = 1;
++		enc->cmdl->chromaInterleave = 1; /* Must be CbCrInterleave for tiled */
++        } else
++		enc->linear2TiledEnable = 0;
++
+ 	/* open the encoder */
+ 	ret = encoder_open(enc);
+ 	if (ret)
+@@ -1154,7 +1170,7 @@ encode_test(void *arg)
+ 
+ 	/* start encoding */
+ 	ret = encoder_start(enc);
+-
++	printf("222\n");
+ 	/* free the allocated framebuffers */
+ 	encoder_free_framebuffer(enc);
+ err1:
+diff --git a/test/mxc_vpu_test/fb.c b/test/mxc_vpu_test/fb.c
+index 8097352..a8911f3 100644
+--- a/test/mxc_vpu_test/fb.c
++++ b/test/mxc_vpu_test/fb.c
+@@ -63,7 +63,7 @@ void put_framebuf(struct frame_buf *fb)
+ 	fbarray[fb_index] = fb;
+ }
+ 
+-struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height)
++struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height, int mvCol)
+ {
+ 	struct frame_buf *fb;
+ 	int err;
+@@ -78,7 +78,7 @@ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int heigh
+ 
+ 	memset(&(fb->desc), 0, sizeof(vpu_mem_desc));
+ 	fb->desc.size = (strideY * height  + strideY / divX * height / divY * 2);
+-	if (!cpu_is_mx27())
++	if (mvCol)
+ 		fb->desc.size += strideY / divX * height / divY;
+ 
+ 	err = IOGetPhyMem(&fb->desc);
+@@ -93,13 +93,9 @@ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int heigh
+ 	fb->addrCr = fb->addrCb + strideY / divX * height / divY;
+ 	fb->strideY = strideY;
+ 	fb->strideC =  strideY / divX;
++	if (mvCol)
++		fb->mvColBuf = fb->addrCr + strideY / divX * height / divY;
+ 
+-	if (!cpu_is_mx27()) {
+-		if (stdMode==STD_MJPG)
+-			fb->mvColBuf = fb->addrCr;
+-		else
+-			fb->mvColBuf = fb->addrCr + strideY / divX * height / divY;
+-	}
+ 	fb->desc.virt_uaddr = IOGetVirtMem(&(fb->desc));
+ 	if (fb->desc.virt_uaddr <= 0) {
+ 		IOFreePhyMem(&fb->desc);
+@@ -110,7 +106,7 @@ struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int heigh
+ 	return fb;
+ }
+ 
+-struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height)
++struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int mvCol)
+ {
+ 	struct frame_buf *fb;
+ 	int err;
+@@ -136,7 +132,9 @@ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int
+ 	luma_aligned_size = (((strideY * height / 2 + 4095) >> 12) << 12) * 2;
+ 	chroma_aligned_size = ((strideY / divX * height / divY + 4095) >> 12) << 12;
+ 	fb->desc.size = luma_aligned_size + chroma_aligned_size * 2;
+-	fb->desc.size += strideY / divX * height / divY;
++
++	if (mvCol)
++		fb->desc.size += strideY / divX * height / divY;
+ 
+ 	err = IOGetPhyMem(&fb->desc);
+ 	if (err) {
+@@ -167,13 +165,17 @@ struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int
+ 	fb->addrCr = chr_bot_20bits << 16;
+ 	fb->strideY = strideY;
+ 	fb->strideC = strideY / divX;
+-	fb->mvColBuf = chr_bot_base + chroma_aligned_size;
++	if (mvCol)
++		fb->mvColBuf = chr_bot_base + chroma_aligned_size;
+ 
+     return fb;
+ }
+ 
+ void framebuf_free(struct frame_buf *fb)
+ {
++	if (fb == NULL)
++		return;
++
+ 	if (fb->desc.virt_uaddr) {
+ 		IOFreeVirtMem(&fb->desc);
+ 	}
+diff --git a/test/mxc_vpu_test/loopback.c b/test/mxc_vpu_test/loopback.c
+index 1d40f32..2d3b519 100644
+--- a/test/mxc_vpu_test/loopback.c
++++ b/test/mxc_vpu_test/loopback.c
+@@ -95,7 +95,7 @@ decode(void)
+ 	}
+ 
+ 	if ((outinfo.indexFrameDisplay == -1) ||
+-			(outinfo.indexFrameDisplay > dec->fbcount))
++			(outinfo.indexFrameDisplay > dec->regfbcount))
+ 		return -1;
+ 
+ 	if (!cpu_is_mx6q() && (outinfo.prescanresult == 0) && (decparam.dispReorderBuf == 0)) {
+@@ -134,7 +134,7 @@ decode(void)
+ 
+ 	if (dec->cmdl->format == STD_MJPG) {
+ 		rotid++;
+-		rotid %= dec->fbcount;
++		rotid %= dec->regfbcount;
+ 	}
+ 
+ out:
+diff --git a/test/mxc_vpu_test/vpu_test.h b/test/mxc_vpu_test/vpu_test.h
+index ddd8769..b01ce9a 100644
+--- a/test/mxc_vpu_test/vpu_test.h
++++ b/test/mxc_vpu_test/vpu_test.h
+@@ -202,8 +202,8 @@ struct decode {
+ 	int picheight;
+ 	int stride;
+ 	int mjpg_fmt;
+-	int fbcount;
+-	int minFrameBufferCount;
++	int regfbcount;
++	int minfbcount;
+ 	int rot_buf_count;
+ 	int extrafb;
+ 	FrameBuffer *fb;
+@@ -230,7 +230,7 @@ struct encode {
+ 	int enc_picheight;	/* Encoded Picture height */
+ 	int src_picwidth;        /* Source Picture width */
+ 	int src_picheight;       /* Source Picture height */
+-	int fbcount;	/* Total number of framebuffers allocated */
++	int totalfb;	/* Total number of framebuffers allocated */
+ 	int src_fbid;	/* Index of frame buffer that contains YUV image */
+ 	FrameBuffer *fb; /* frame buffer base given to encoder */
+ 	struct frame_buf **pfbpool; /* allocated fb pointers are stored here */
+@@ -240,6 +240,8 @@ struct encode {
+ 	int mjpg_fmt;
+ 	int mvc_paraset_refresh_en;
+ 	int mvc_extension;
++	int linear2TiledEnable;
++	int minFrameBufferCount;
+ 
+         EncReportInfo mbInfo;
+         EncReportInfo mvInfo;
+@@ -266,8 +268,8 @@ struct vpu_display *v4l_display_open(struct decode *dec, int nframes,
+ 					struct rot rotation, Rect rotCrop);
+ int v4l_put_data(struct vpu_display *disp, int index, int field, int fps);
+ void v4l_display_close(struct vpu_display *disp);
+-struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height);
+-struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height);
++struct frame_buf *framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol);
++struct frame_buf *tiled_framebuf_alloc(int stdMode, int format, int strideY, int height, int movCol);
+ void framebuf_free(struct frame_buf *fb);
+ 
+ struct vpu_display *
+-- 
+1.8.0
+

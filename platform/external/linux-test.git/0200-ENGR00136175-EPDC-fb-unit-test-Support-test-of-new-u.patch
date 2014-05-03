@@ -1,0 +1,173 @@
+From 4f148a4af77ec05df0647ddd713439b2672ed903 Mon Sep 17 00:00:00 2001
+From: Danny Nold <dannynold@freescale.com>
+Date: Wed, 8 Dec 2010 16:52:32 -0600
+Subject: [PATCH 200/435] ENGR00136175 - EPDC fb unit test: Support test of
+ new update schemes
+
+- Added command line option to select the update scheme
+- Added code to kernel test module to set update scheme
+
+Signed-off-by: Danny Nold <dannynold@freescale.com>
+---
+ module_test/epdc_test_driver.c      |  9 ++++++
+ test/mxc_fb_test/mxc_epdc_fb_test.c | 59 ++++++++++++++++++++-----------------
+ 2 files changed, 41 insertions(+), 27 deletions(-)
+
+diff --git a/module_test/epdc_test_driver.c b/module_test/epdc_test_driver.c
+index dc2caef..fb15aec 100644
+--- a/module_test/epdc_test_driver.c
++++ b/module_test/epdc_test_driver.c
+@@ -93,6 +93,15 @@ static int epdc_test_ioctl(struct file *file, unsigned int cmd,
+ 					NULL);
+ 			break;
+ 		}
++	case MXCFB_SET_UPDATE_SCHEME:
++		{
++			u32 update_scheme = 0;
++			if (!get_user(update_scheme, (__u32 __user *) arg))
++				ret =
++				    mxc_epdc_fb_set_upd_scheme(update_scheme,
++					NULL);
++			break;
++		}
+ 	case MXCFB_SEND_UPDATE:
+ 		{
+ 			struct mxcfb_update_data upd_data;
+diff --git a/test/mxc_fb_test/mxc_epdc_fb_test.c b/test/mxc_fb_test/mxc_epdc_fb_test.c
+index 4e4984d..c71ad36 100644
+--- a/test/mxc_fb_test/mxc_epdc_fb_test.c
++++ b/test/mxc_fb_test/mxc_epdc_fb_test.c
+@@ -79,6 +79,7 @@ extern "C"{
+ 
+ #define NUM_TESTS		9
+ 
++__u32 scheme = UPDATE_SCHEME_SNAPSHOT;
+ int test_map[NUM_TESTS];
+ typedef int (*testfunc)();
+ testfunc testfunc_array[NUM_TESTS] = {NULL};
+@@ -136,7 +137,7 @@ static void update_to_display(int left, int top, int width, int height, int wave
+ 	struct mxcfb_update_data upd_data;
+ 	int retval;
+ 
+-	upd_data.update_mode = UPDATE_MODE_FULL;
++	upd_data.update_mode = UPDATE_MODE_PARTIAL;
+ 	upd_data.waveform_mode = wave_mode;
+ 	upd_data.update_region.left = left;
+ 	upd_data.update_region.width = width;
+@@ -205,6 +206,8 @@ static void draw_rgb_crosshatch(struct fb_var_screeninfo * var, int mode)
+ 				memset_dword(stripe_start, horizontal_color, stripe_width / 2);
+ 			}
+ 
++			upd_data.update_marker = 0;
++
+ 			upd_data.update_mode = UPDATE_MODE_PARTIAL;
+ 			upd_data.waveform_mode = WAVEFORM_MODE_AUTO;
+ 			upd_data.update_region.left = stripe_width*2*stripe_cnt;
+@@ -244,6 +247,8 @@ static void draw_rgb_crosshatch(struct fb_var_screeninfo * var, int mode)
+ 				memset_dword(stripe_start, vertical_color, square_area_side / 2);
+ 			}
+ 
++			upd_data.update_marker = 0;
++
+ 			upd_data.update_mode = UPDATE_MODE_PARTIAL;
+ 			upd_data.waveform_mode = WAVEFORM_MODE_AUTO;
+ 			upd_data.update_region.left = 0;
+@@ -1133,23 +1138,9 @@ static int test_fast_square(void)
+ 	int xpos, ypos, last_pos;
+ 	int side_len, increment;
+ 	int first_go;
+-	int wait_upd_compl = NO_COLLISIONS;
++	int wait_upd_compl = ALLOW_COLLISIONS;
+ 	int wave_mode = use_animation ? WAVEFORM_MODE_A2 : WAVEFORM_MODE_AUTO;
+ 
+-	printf("Set the background to 16-bpp\n");
+-	screen_info.bits_per_pixel = 16;
+-	screen_info.xres = 800;
+-	screen_info.yres = 600;
+-	screen_info.grayscale = 0;
+-	screen_info.yoffset = 0;
+-	screen_info.rotate = FB_ROTATE_UR;
+-	screen_info.activate = FB_ACTIVATE_FORCE;
+-	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
+-	if (retval < 0)
+-	{
+-		return TFAIL;
+-	}
+-
+ 	/********************************************
+ 	* RGB image tests
+ 	********************************************/
+@@ -1218,16 +1209,6 @@ static int test_fast_square(void)
+ 		ypos += increment;
+ 	}
+ 
+-	printf("Return rotation to 0 degrees and go to RGB565\n");
+-	screen_info.rotate = FB_ROTATE_UR;
+-	screen_info.bits_per_pixel = 16;
+-	screen_info.grayscale = 0;
+-	retval = ioctl(fd_fb, FBIOPUT_VSCREENINFO, &screen_info);
+-	if (retval < 0)
+-	{
+-		printf("Rotation failed\n");
+-	}
+-
+ 	return retval;
+ }
+ void usage(char *app)
+@@ -1236,6 +1217,10 @@ void usage(char *app)
+ 	printf("Usage: mxc_epdc_fb_test [-h] [-a] [-n <expression>]\n");
+ 	printf("\t-h\t  Print this message\n");
+ 	printf("\t-a\t  Enabled animation waveforms for fast updates (tests 8-9)\n");
++	printf("\t-u\t  Select an update scheme\n");
++	printf("\t\t  s - Snapshot update scheme\n");
++	printf("\t\t  q - Queued update scheme\n");
++	printf("\t\t  m - Queued update scheme with update merging\n");
+ 	printf("\t-n\t  Execute the tests specified in expression\n");
+ 	printf("\t\t  Expression is a set of comma-separated numeric ranges\n");
+ 	printf("Example:\n");
+@@ -1309,7 +1294,7 @@ main(int argc, char **argv)
+ 	for(i = 0; i < NUM_TESTS; i++)
+ 		test_map[i] = TRUE;
+ 
+-	while ((rt = getopt(argc, argv, "han:")) >= 0) {
++	while ((rt = getopt(argc, argv, "hau:n:")) >= 0) {
+ 		switch (rt) {
+ 		case 'h':
+ 			usage(argv[0]);
+@@ -1317,6 +1302,19 @@ main(int argc, char **argv)
+ 		case 'a':
+ 			use_animation = 1;
+ 			break;
++		case 'u':
++			if (strcmp(optarg, "s") == 0) {
++				scheme = UPDATE_SCHEME_SNAPSHOT;
++			} else if (strcmp(optarg, "q") == 0) {
++				scheme = UPDATE_SCHEME_QUEUE;
++			} else if (strcmp(optarg, "m") == 0) {
++				scheme = UPDATE_SCHEME_QUEUE_AND_MERGE;
++			} else {
++				printf("%s: -d Requires either an "
++					"'s', 'q', or 'm' argument\n");
++				usage(argv[0]);
++			}
++			break;
+ 		case 'n':
+ 			if (parse_test_nums(optarg) < 0) {
+ 				usage(argv[0]);
+@@ -1419,6 +1417,13 @@ main(int argc, char **argv)
+ 		goto err2;
+ 	}
+ 
++	printf("Set update scheme - %d\n", scheme);
++	retval = ioctl(fd_fb_ioctl, MXCFB_SET_UPDATE_SCHEME, &scheme);
++	if (retval < 0)
++	{
++		goto err2;
++	}
++
+ 	testfunc_array[0] = &test_updates;
+ 	testfunc_array[1] = &test_rotation;
+ 	testfunc_array[2] = &test_y8;
+-- 
+1.8.0
+

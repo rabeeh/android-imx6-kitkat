@@ -1,0 +1,208 @@
+From 67fb27b4a1bc2066f3daed362b26555be4d3c97f Mon Sep 17 00:00:00 2001
+From: Sammy He <r62914@freescale.com>
+Date: Sat, 11 Apr 2009 12:51:45 +0800
+Subject: [PATCH 084/435] ENGR00109990 Upgrade mx51 vpu firmware to v1.1.3
+
+Upgrade mx51 vpu firmware to v1.1.3
+
+Signed-off-by: Sammy He <r62914@freescale.com>
+---
+ test/mxc_vpu_test/capture.c |  9 ++++++++
+ test/mxc_vpu_test/dec.c     | 54 ++++++++++++++++++++++++++++++++++-----------
+ test/mxc_vpu_test/display.c |  4 ++--
+ test/mxc_vpu_test/enc.c     |  1 +
+ 4 files changed, 53 insertions(+), 15 deletions(-)
+
+diff --git a/test/mxc_vpu_test/capture.c b/test/mxc_vpu_test/capture.c
+index 7f6e526..e789575 100644
+--- a/test/mxc_vpu_test/capture.c
++++ b/test/mxc_vpu_test/capture.c
+@@ -87,6 +87,7 @@ v4l_capture_setup(struct encode *enc, int width, int height, int fps)
+ 	struct v4l2_format fmt = {0};
+ 	struct v4l2_streamparm parm = {0};
+ 	struct v4l2_requestbuffers req = {0};
++	struct v4l2_control ctl;
+ 
+ 	if (cap_fd > 0) {
+ 		warn_msg("capture device already opened\n");
+@@ -117,6 +118,14 @@ v4l_capture_setup(struct encode *enc, int width, int height, int fps)
+ 		return -1;
+ 	}
+ 
++	ctl.id = V4L2_CID_PRIVATE_BASE;
++	ctl.value = 0;
++	if (ioctl(cap_fd, VIDIOC_S_CTRL, &ctl) < 0)
++	{
++		printf("set control failed\n");
++		return -1;
++	}
++
+ 	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 	parm.parm.capture.timeperframe.numerator = 1;
+ 	parm.parm.capture.timeperframe.denominator = fps;
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index f6c3299..a275f52 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -680,6 +680,8 @@ decoder_start(struct decode *dec)
+ 	} else if (deblock_en) {
+ 		dblkid = dec->fbcount;
+ 	}
++	if (dec->cmdl->format == STD_MJPG)
++		rotid = 0;
+ 
+ 	decparam.dispReorderBuf = 0;
+ 
+@@ -697,7 +699,7 @@ decoder_start(struct decode *dec)
+ 	fwidth = ((dec->picwidth + 15) & ~15);
+ 	fheight = ((dec->picheight + 15) & ~15);
+ 
+-	if (rot_en || dering_en) {
++	if (rot_en || dering_en || (dec->cmdl->format == STD_MJPG)) {
+ 		/*
+ 		 * VPU is setting the rotation angle by counter-clockwise.
+ 		 * We convert it to clockwise, which is consistent with V4L2
+@@ -712,9 +714,11 @@ decoder_start(struct decode *dec)
+ 		vpu_DecGiveCommand(handle, SET_MIRROR_DIRECTION,
+ 					&mirror);
+ 
+-		rot_stride = (rot_angle == 90 || rot_angle == 270) ?
++		if (rot_en || dering_en) {
++			rot_stride = (rot_angle == 90 || rot_angle == 270) ?
+ 					fheight : fwidth;
+-
++		} else
++			rot_stride = fwidth;
+ 		vpu_DecGiveCommand(handle, SET_ROTATOR_STRIDE, &rot_stride);
+ 	}
+ 
+@@ -738,7 +742,7 @@ decoder_start(struct decode *dec)
+ 
+ 	while (1) {
+ 
+-		if (rot_en || dering_en) {
++		if (rot_en || dering_en || (dec->cmdl->format == STD_MJPG)) {
+ 			vpu_DecGiveCommand(handle, SET_ROTATOR_OUTPUT,
+ 						(void *)&fb[rotid]);
+ 			if (frame_id == 0) {
+@@ -829,6 +833,12 @@ decoder_start(struct decode *dec)
+ 		tdec_time += (sec * 1000000) + usec;
+ 
+ 		ret = vpu_DecGetOutputInfo(handle, &outinfo);
++
++		if ((dec->cmdl->format == STD_MJPG) &&
++		    (outinfo.indexFrameDisplay == 0)) {
++			outinfo.indexFrameDisplay = rotid;
++		}
++
+ 		dprintf(4, "frame_id = %d\n", (int)frame_id);
+ 		if (ret != RETCODE_SUCCESS) {
+ 			err_msg("vpu_DecGetOutputInfo failed Err code is %d\n"
+@@ -967,7 +977,7 @@ decoder_start(struct decode *dec)
+ 			warn_msg("VPU doesn't have picture to be displayed.\n"
+ 				"\toutinfo.indexFrameDisplay = %d\n",
+ 						outinfo.indexFrameDisplay);
+-			if (disp_clr_index >= 0) {
++			if ((dec->cmdl->format != STD_MJPG ) && (disp_clr_index >= 0)) {
+ 				err = vpu_DecClrDispFlag(handle, disp_clr_index);
+ 				if (err)
+ 					err_msg("vpu_DecClrDispFlag failed Error code"
+@@ -977,7 +987,7 @@ decoder_start(struct decode *dec)
+ 			continue;
+ 		}
+ 
+-		if (rot_en || dering_en)
++		if (rot_en || dering_en || (dec->cmdl->format == STD_MJPG))
+ 			actual_display_index = rotid;
+ 		else
+ 			actual_display_index = outinfo.indexFrameDisplay;
+@@ -1002,7 +1012,11 @@ decoder_start(struct decode *dec)
+ 					err_msg("vpu_DecClrDispFlag failed Error code"
+ 							" %d\n", err);
+ 			}
+-			if (rot_en || dering_en) {
++
++			if (dec->cmdl->format == STD_MJPG) {
++				rotid++;
++				rotid %= dec->fbcount;
++			} else if (rot_en || dering_en) {
+ 				disp_clr_index = outinfo.indexFrameDisplay;
+ 				if (disp->buf.index != -1)
+                                         rotid = disp->buf.index; /* de-queued buffer as next rotation buffer */
+@@ -1353,6 +1367,25 @@ decoder_parse(struct decode *dec)
+ 	DecHandle handle = dec->handle;
+ 	RetCode ret;
+ 
++	/*
++	 * If userData report is enabled, buffer and comamnd need to be set
++ 	 * before DecGetInitialInfo for MJPG.
++	 */
++	if (dec->userData.enable) {
++		dec->userData.size = SIZE_USER_BUF;
++		dec->userData.addr = malloc(SIZE_USER_BUF);
++		if (!dec->userData.addr)
++			err_msg("malloc_error\n");
++	}
++
++	if(dec->cmdl->format == STD_MJPG) {
++		ret = vpu_DecGiveCommand(handle,DEC_SET_REPORT_USERDATA, &dec->userData);
++		if (ret != RETCODE_SUCCESS) {
++			err_msg("Failed to set user data report, ret %d\n", ret);
++			return -1;
++		}
++	}
++
+ 	/* Parse bitstream and get width/height/framerate etc */
+ 	vpu_DecSetEscSeqInit(handle, 1);
+ 	ret = vpu_DecGetInitialInfo(handle, &initinfo);
+@@ -1514,12 +1547,7 @@ decoder_parse(struct decode *dec)
+ 		if (!dec->mvInfo.addr)
+ 			err_msg("malloc_error\n");
+ 	}
+-	if (dec->userData.enable) {
+-		dec->userData.size = SIZE_USER_BUF;
+-		dec->userData.addr = malloc(SIZE_USER_BUF);
+-		if (!dec->userData.addr)
+-			err_msg("malloc_error\n");
+-	}
++
+ 	return 0;
+ }
+ 
+diff --git a/test/mxc_vpu_test/display.c b/test/mxc_vpu_test/display.c
+index 14e4223..963da33 100644
+--- a/test/mxc_vpu_test/display.c
++++ b/test/mxc_vpu_test/display.c
+@@ -195,7 +195,7 @@ v4l_display_open(struct decode *dec, int nframes, struct rot rotation, Rect crop
+ 	} else if (cpu_is_mx37() || cpu_is_mx51()) {
+ 		crop.c.width = cropcap.bounds.width;
+ 		crop.c.height = cropcap.bounds.height;
+-         }
++	}
+ 
+ 	dprintf(1, "crop.c.width/height: %d/%d\n", crop.c.width, crop.c.height);
+ 
+@@ -373,7 +373,7 @@ int v4l_put_data(struct vpu_display *disp, int index)
+ 
+ 		disp->sec = tv.tv_sec;
+ 		disp->usec = tv.tv_usec;
+-       }
++	}
+ 
+ 	disp->buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+ 	disp->buf.memory = V4L2_MEMORY_MMAP;
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 9227821..b09df24 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -701,6 +701,7 @@ encoder_open(struct encode *enc)
+ 		encop.picHeight = enc->picheight;
+ 	}
+ 
++	/*Note: Frame rate cannot be less than 15fps per H.263 spec */
+ 	encop.frameRateInfo = 30;
+ 	encop.bitRate = enc->cmdl->bitrate;
+ 	encop.gopSize = enc->cmdl->gop;
+-- 
+1.8.0
+

@@ -1,0 +1,184 @@
+From bdc4bfabcb9f4da30a54f4a04e57212ba01065b9 Mon Sep 17 00:00:00 2001
+From: Robby Cai <r63905@freescale.com>
+Date: Mon, 16 Feb 2009 15:35:13 +0800
+Subject: [PATCH 039/249] ENGR00107596 fix misuse of the addresses of
+ mbInfo&mbQpInfo&qpInfo&sliceInfo
+
+fix_mixuse/misuse_of_virtual_and_physical_addr_for_mbInfo/mbQpInfo/qpInfo/sliceInfo
+Remove function SaveQpReport from vpu library to vpu demo codes.
+
+Signed-off-by: Robby Cai <r63905@freescale.com>
+---
+ vpu/vpu_lib.c | 95 +++++++++++------------------------------------------------
+ vpu/vpu_lib.h |  4 +--
+ 2 files changed, 19 insertions(+), 80 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 518bd10..174818d 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -1040,7 +1040,7 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 	}
+ 
+ 	info->numOfSlices = VpuReadReg(RET_ENC_PIC_SLICE_NUM);
+-	info->sliceInfo = virt_paraBuf + 0x1200;
++	info->sliceInfo = (Uint32 *)((Uint32)virt_paraBuf + 0x1200);
+ 	info->mbInfo = virt_paraBuf;
+ 	info->bitstreamWrapAround = VpuReadReg(RET_ENC_PIC_FLAG);
+ 
+@@ -1048,31 +1048,31 @@ RetCode vpu_EncGetOutputInfo(EncHandle handle, EncOutputInfo * info)
+ 	    pEncInfo->openParam.mbQpReport == 1) {
+ 		int widthInMB;
+ 		int heightInMB;
+-		PhysicalAddress readPnt;
+-		PhysicalAddress writePnt;
+-		PhysicalAddress mbQpPnt;
++		int readPnt;
++		int writePnt;
++		Uint32 *virt_mbQpAddr;
+ 		int i;
+ 		int j;
+ 		Uint32 val, val1, val2;
+ 
+-		mbQpPnt = (Uint32) virt_paraBuf + 0x1300;
++		virt_mbQpAddr = (Uint32 *)((Uint32) virt_paraBuf + 0x1300);
+ 		widthInMB = pEncInfo->openParam.picWidth / 16;
+ 		heightInMB = pEncInfo->openParam.picHeight / 16;
+-		writePnt = (Uint32) virt_paraBuf - PARA_BUF2_SIZE;
++		writePnt = 0;
+ 		for (i = 0; i < heightInMB; ++i) {
+-			readPnt = mbQpPnt + i * 128;
++			readPnt = i * 32;
+ 			for (j = 0; j < widthInMB; j += 4) {
+-				val1 = VpuReadReg(readPnt);
+-				readPnt += 4;
+-				val2 = VpuReadReg(readPnt);
+-				readPnt += 4;
++				val1 = virt_mbQpAddr[readPnt];
++				readPnt++;
++				val2 = virt_mbQpAddr[readPnt];
++				readPnt++;
+ 				val = (val1 << 8 & 0xff000000) | (val1 << 16) |
+ 				    (val2 >> 8) | (val2 & 0x000000ff);
+-				VpuWriteReg(writePnt, val);
+-				writePnt += 4;
++				virt_paraBuf2[writePnt] = val;
++				writePnt++;
+ 			}
+ 		}
+-		info->mbQpInfo = virt_paraBuf - PARA_BUF2_SIZE;
++		info->mbQpInfo = virt_paraBuf2;
+ 	}
+ 
+ 	*ppendingInst = 0;
+@@ -2578,18 +2578,18 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 				readPnt = i * 32;
+ 				for (j = 0; j < widthInMB; j += 4) {
+ 					val1 = virt_paraBuf[readPnt];
+-					readPnt += 1;
++					readPnt++;
+ 					val2 = virt_paraBuf[readPnt];
+-					readPnt += 1;
++					readPnt++;
+ 					val = (val1 << 8 & 0xff000000) |
+ 					    (val1 << 16) | (val2 >> 8) |
+ 					    (val2 & 0x000000ff);
+ 					virt_paraBuf2[writePnt] = val;
+-					writePnt += 1;
++					writePnt++;
+ 				}
+ 			}
+ 
+-			info->qpInfo = paraBuffer - PARA_BUF2_SIZE;
++			info->qpInfo = virt_paraBuf2;
+ 		}
+ 	}
+ 
+@@ -2951,62 +2951,3 @@ void SaveGetEncodeHeader(EncHandle handle, int encHeaderType, char *filename)
+ 		free(pHeader);
+ 	}
+ }
+-
+-void SaveQpReport(PhysicalAddress qpReportAddr, int picWidth, int picHeight,
+-		  int frameIdx, char *fileName)
+-{
+-	FILE *fp;
+-	int i, j;
+-	int MBx, MBy, MBxof4, MBxof1, MBxx;
+-	Uint32 qp;
+-	Uint8 lastQp[4];
+-
+-	ENTER_FUNC();
+-
+-	if (frameIdx == 0)
+-		fp = fopen(fileName, "wb");
+-	else
+-		fp = fopen(fileName, "a+b");
+-
+-	if (!fp) {
+-		err_msg("Can't open %s in SaveQpReport\n", fileName);
+-		return;
+-	}
+-
+-	LockVpu(vpu_semap);
+-
+-	MBx = picWidth / 16;
+-	MBxof1 = MBx % 4;
+-	MBxof4 = MBx - MBxof1;
+-	MBy = picHeight / 16;
+-	MBxx = (MBx + 3) / 4 * 4;
+-	for (i = 0; i < MBy; i++) {
+-		for (j = 0; j < MBxof4; j = j + 4) {
+-			qp = VpuReadReg(qpReportAddr + j + MBxx * i);
+-			fprintf(fp, " %4d %4d %3d \n", frameIdx,
+-				MBx * i + j + 0, (Uint8) (qp >> 24));
+-			fprintf(fp, " %4d %4d %3d \n", frameIdx,
+-				MBx * i + j + 1, (Uint8) (qp >> 16));
+-			fprintf(fp, " %4d %4d %3d \n", frameIdx,
+-				MBx * i + j + 2, (Uint8) (qp >> 8));
+-			fprintf(fp, " %4d %4d %3d \n", frameIdx,
+-				MBx * i + j + 3, (Uint8) qp);
+-		}
+-
+-		if (MBxof1 > 0) {
+-			qp = VpuReadReg(qpReportAddr + MBxx * i + MBxof4);
+-			lastQp[0] = (Uint8) (qp >> 24);
+-			lastQp[1] = (Uint8) (qp >> 16);
+-			lastQp[2] = (Uint8) (qp >> 8);
+-			lastQp[3] = (Uint8) (qp);
+-		}
+-
+-		for (j = 0; j < MBxof1; j++) {
+-			fprintf(fp, " %4d %4d %3d \n", frameIdx,
+-				MBx * i + j + MBxof4, lastQp[j]);
+-		}
+-	}
+-	UnlockVpu(vpu_semap);
+-
+-	fclose(fp);
+-}
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index cd1b58c..73db54f 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -256,7 +256,7 @@ typedef struct {
+ 	int indexFrameDecoded[2];
+ 	int picType;
+ 	int numOfErrMBs[2];
+-	PhysicalAddress qpInfo;
++	Uint32 *qpInfo;
+ 	int hScaleFlag;
+ 	int vScaleFlag;
+ 	int prescanresult;
+@@ -592,8 +592,6 @@ RetCode vpu_DecGiveCommand(DecHandle handle, CodecCommand cmd, void *parameter);
+ int vpu_IsBusy(void);
+ int vpu_WaitForInt(int timeout_in_ms);
+ 
+-void SaveQpReport(PhysicalAddress qpReportAddr, int picWidth, int picHeight,
+-		  int frameIdx, char *fileName);
+ void SaveGetEncodeHeader(EncHandle handle, int encHeaderType, char *filename);
+ 
+ #endif
+-- 
+1.8.0
+

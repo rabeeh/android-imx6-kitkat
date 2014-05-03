@@ -1,0 +1,97 @@
+From 87e9558da808150a92e1dccc6274f9a31e97b735 Mon Sep 17 00:00:00 2001
+From: YangYonggang <b31664@freescale.com>
+Date: Fri, 18 May 2012 18:14:00 +0800
+Subject: [PATCH 279/486] ENGR00210275 Some Failed camera cts case will cause
+ exception.
+
+The root cause was sometimes when the message queue was released,
+the queue was already been cleared. Thus SIGSEGV happened.
+Changed the message queue release function to fix the bug.
+
+Signed-off-by: YangYonggang <b31664@freescale.com>
+---
+ mx6/libcamera/CameraHal.cpp    | 11 +++++++++--
+ mx6/libcamera/messageQueue.cpp | 31 ++++---------------------------
+ 2 files changed, 13 insertions(+), 29 deletions(-)
+
+diff --git a/mx6/libcamera/CameraHal.cpp b/mx6/libcamera/CameraHal.cpp
+index 342dad1..bc71869 100755
+--- a/mx6/libcamera/CameraHal.cpp
++++ b/mx6/libcamera/CameraHal.cpp
+@@ -2167,9 +2167,10 @@ Pic_out:
+         sp<CMessage> msg = mPreviewThreadQueue.waitMessage();
+         if(msg == 0) {
+             CAMERA_HAL_ERR("%s: get invalide message", __FUNCTION__);
++            mPreviewRunning = false;
+             return BAD_VALUE;            
+         }
+-                
++
+         switch(msg->what) {
+             case CMESSAGE_TYPE_NORMAL:
+                 display_index = msg->arg0;
+@@ -2209,7 +2210,13 @@ Pic_out:
+                     if (mEnqueuedBufs <= 2) {
+                         return NO_ERROR;
+                     }
+-                } 
++                }
++                else {
++                    mPreviewRunning = false;
++                    mPreviewThreadQueue.clearMessage();
++                    sem_post(&mPreviewStoppedCondition);
++                    return BAD_VALUE;
++                }
+ 
+                 err = mNativeWindow->dequeue_buffer(mNativeWindow, &buf_h, &stride);
+                 if((err != 0) || buf_h == NULL) {
+diff --git a/mx6/libcamera/messageQueue.cpp b/mx6/libcamera/messageQueue.cpp
+index 813f037..547816a 100755
+--- a/mx6/libcamera/messageQueue.cpp
++++ b/mx6/libcamera/messageQueue.cpp
+@@ -57,38 +57,15 @@ CMessageQueue::CMessageQueue()
+ 
+ CMessageQueue::~CMessageQueue()
+ {
+-        Mutex::Autolock _l(mLock);
+-    LIST::iterator curr(mMessages.begin());
+-    //sp<CMessage> tmp;
+-
+-    while(curr != mMessages.end()) {
+-        //tmp = *cur;
+-        //tmp.clear();
+-        mMessages.remove(curr);
+-        //tmp.clear();
+-        curr ++;
+-    }
++    Mutex::Autolock _l(mLock);
++    mMessages.clear();
+ }
+ 
+ void CMessageQueue::clearMessage()
+ {
+     CAMERA_HAL_ERR("-------CMessageQueue::clearMessage--------");
+-        Mutex::Autolock _l(mLock);
+-        mMessages.clear();
+-#if 0
+-    LIST::iterator icur(mMessages.begin());
+-    LIST::iterator iend(mMessages.end());
+-    //sp<CMessage> tmp;
+-
+-    while(icur != iend) {
+-    CAMERA_HAL_ERR("*********CMessageQueue::clearMessage********");
+-        //tmp = *cur;
+-        //tmp.clear();
+-        mMessages.remove(icur);
+-        //tmp.clear();i
+-        icur ++;
+-    }
+-#endif 
++    Mutex::Autolock _l(mLock);
++    mMessages.clear();
+     mStop = false;
+ }
+ 
+-- 
+1.8.0
+

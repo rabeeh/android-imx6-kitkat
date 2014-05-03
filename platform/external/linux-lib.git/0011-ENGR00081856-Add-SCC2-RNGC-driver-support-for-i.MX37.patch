@@ -1,0 +1,2654 @@
+From 658b9229d06a9a6a123ff7fb45133d79ed1d9c22 Mon Sep 17 00:00:00 2001
+From: Raj Rajasekaran <b10872@freescale.com>
+Date: Mon, 30 Jun 2008 20:54:45 -0500
+Subject: [PATCH 011/249] ENGR00081856: Add SCC2 & RNGC driver support for
+ i.MX37.
+
+Added rng & sahara library files for scc2 and RNGC tests for i.MX37.
+
+Signed-off-by: Raj Rajasekaran <b10872@freescale.com>
+---
+ rng/Makefile               |  26 +-
+ rng/fsl_shw_auth.c         | 128 +++----
+ rng/fsl_shw_hash.c         |  46 +--
+ rng/fsl_shw_hmac.c         |  70 ++--
+ rng/fsl_shw_rand.c         | 132 ++++----
+ rng/fsl_shw_sym.c          |  78 +++--
+ rng/fsl_shw_user.c         | 806 +++++++++++++++++++++++++++++++--------------
+ rng/fsl_shw_wrap.c         |  77 +++--
+ sahara2/fsl_shw_keystore.c | 765 ++++++++++++++++++++++++++++++++++++++++++
+ 9 files changed, 1626 insertions(+), 502 deletions(-)
+ create mode 100644 sahara2/fsl_shw_keystore.c
+
+diff --git a/rng/Makefile b/rng/Makefile
+index b4c4a76..42aca60 100644
+--- a/rng/Makefile
++++ b/rng/Makefile
+@@ -1,34 +1,23 @@
+-# +FHDR-----------------------------------------------------------------------
+-# Copyright (c) 2005, Freescale Semiconductor, Inc.
+-# ----------------------------------------------------------------------------
+-# FILE NAME      : $RCSfile: Makefile,v $
+-# DEPARTMENT     : Security Technology Center (STC), NCSG
+-# ----------------------------------------------------------------------------
+-# KEYWORDS : SHW, crypto, sahara
+-# ----------------------------------------------------------------------------
+-# PURPOSE: Makefile for API Library for RNGA 
+-# -FHDR-----------------------------------------------------------------------
+-
+ AR = ar -crv
+ RM = rm -f
+ CC=$(CROSS_COMPILE)gcc
+ LD=$(CROSS_COMPILE)ld
+ 
+-
+ INC := $(INCLUDE)
+ 
+ # Add compilation checks
+ CFLAGS += -g -Wall -W -Wmissing-prototypes -Wstrict-prototypes -Wdeclaration-after-statement
+-CFLAGS +=  -DFSL_PLATFORM_OTHER -DFSL_HAVE_RNGA $(INC)
+ 
++# In absence of kernel CONFIG flags, set API library to build on
++# 'unknown' platform.
++CFLAGS += -DFSL_PLATFORM_OTHER -DFSL_HAVE_RNGC $(INC)
+ 
+ OBJS= fsl_shw_rand.o  fsl_shw_hash.o  fsl_shw_sym.o  fsl_shw_user.o         \
+-      fsl_shw_auth.o  fsl_shw_hmac.o  fsl_shw_wrap.o  
++		fsl_shw_keystore.o fsl_shw_auth.o  fsl_shw_hmac.o  fsl_shw_wrap.o
+ 
+ LIBNAME=libfsl_shw
+ 
+-
+-all: $(LIBNAME).so $(LIBNAME).a 
++all: $(LIBNAME).so $(LIBNAME).a
+ 
+ install: install_headers
+ 	@mkdir -p $(DEST_DIR)/usr/lib
+@@ -46,3 +35,8 @@ $(LIBNAME).so: $(OBJS)
+ .PHONY: clean
+ clean:
+ 	@rm -f *.o $(LIBNAME).*
++
++# The keystore file is located in the Sahara directory
++fsl_shw_keystore.o: ../sahara2/fsl_shw_keystore.c
++	$(CC) $(CFLAGS) -c ../sahara2/fsl_shw_keystore.c
++
+diff --git a/rng/fsl_shw_auth.c b/rng/fsl_shw_auth.c
+index 876bdc6..cf861e5 100644
+--- a/rng/fsl_shw_auth.c
++++ b/rng/fsl_shw_auth.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright (C) 2005-2008 written by Freescale Semiconductor
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -17,8 +17,10 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+  * USA
+  */
+-/*!
+- * @file lib/rng/fsl_shw_auth.c
++
++
++/**
++ * @file fsl_shw_auth.c
+  *
+  * This file contains the routines which do the combined encrypt+authentication
+  * functions.  For now, only AES-CCM is supported.
+@@ -26,7 +28,8 @@
+ 
+ #include "shw_driver.h"
+ 
+-/*!
++
++/**
+  * Compute the size, in bytes, of the encoded auth length
+  *
+  * @param l    The actual auth length
+@@ -44,7 +47,7 @@
+     val;                                                                      \
+ })
+ 
+-/*!
++/**
+  * Store the encoded Auth Length into the Auth Data
+  *
+  * @param l    The actual Auth Length
+@@ -70,7 +73,8 @@
+     }                                                                         \
+ }
+ 
+-/*!
++
++/**
+  * @brief Generate a (CCM) auth code and encrypt the payload.
+  *
+  *
+@@ -82,39 +86,43 @@
+  * @param auth_data        Any auth-only data
+  * @param payload_length   Length in bytes of @a payload
+  * @param payload          The data to encrypt
+- * @param ct          The location to store encrypted data
+- * @param auth_value  The location to store authentication code
++ * @param[out] ct          The location to store encrypted data
++ * @param[out] auth_value  The location to store authentication code
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_gen_encrypt(fsl_shw_uco_t * user_ctx,
+-				     fsl_shw_acco_t * auth_ctx,
+-				     fsl_shw_sko_t * cipher_key_info,
+-				     fsl_shw_sko_t * auth_key_info,
+-				     uint32_t auth_data_length,
+-				     const uint8_t * auth_data,
+-				     uint32_t payload_length,
+-				     const uint8_t * payload,
+-				     uint8_t * ct, uint8_t * auth_value)
++fsl_shw_return_t fsl_shw_gen_encrypt(
++                                fsl_shw_uco_t* user_ctx,
++                                fsl_shw_acco_t* auth_ctx,
++                                fsl_shw_sko_t* cipher_key_info,
++                                fsl_shw_sko_t* auth_key_info,
++                                uint32_t auth_data_length,
++                                const uint8_t* auth_data,
++                                uint32_t payload_length,
++                                const uint8_t* payload,
++                                uint8_t* ct,
++                                uint8_t* auth_value)
+ {
+-	volatile fsl_shw_return_t status = FSL_RETURN_ERROR_S;
+-
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)auth_ctx;
+-	(void)cipher_key_info;
+-	(void)auth_key_info;
+-	(void)auth_data_length;
+-	(void)auth_data;
+-	(void)payload_length;
+-	(void)payload;
+-	(void)ct;
+-	(void)auth_value;
+-
+-	return status;
++    volatile fsl_shw_return_t status = FSL_RETURN_ERROR_S;
++
++
++    /* Unused */
++    (void)user_ctx;
++    (void)auth_ctx;
++    (void)cipher_key_info;
++    (void)auth_key_info;
++    (void)auth_data_length;
++    (void)auth_data;
++    (void)payload_length;
++    (void)payload;
++    (void)ct;
++    (void)auth_value;
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * @brief Authenticate and decrypt a (CCM) stream.
+  *
+  * @param user_ctx         The user's context
+@@ -126,34 +134,36 @@ fsl_shw_return_t fsl_shw_gen_encrypt(fsl_shw_uco_t * user_ctx,
+  * @param payload_length   Length in bytes of @a payload
+  * @param ct               The encrypted data
+  * @param auth_value       The authentication code to validate
+- * @param payload     The location to store decrypted data
++ * @param[out] payload     The location to store decrypted data
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_auth_decrypt(fsl_shw_uco_t * user_ctx,
+-				      fsl_shw_acco_t * auth_ctx,
+-				      fsl_shw_sko_t * cipher_key_info,
+-				      fsl_shw_sko_t * auth_key_info,
+-				      uint32_t auth_data_length,
+-				      const uint8_t * auth_data,
+-				      uint32_t payload_length,
+-				      const uint8_t * ct,
+-				      const uint8_t * auth_value,
+-				      uint8_t * payload)
++fsl_shw_return_t fsl_shw_auth_decrypt(
++                                fsl_shw_uco_t* user_ctx,
++                                fsl_shw_acco_t* auth_ctx,
++                                fsl_shw_sko_t* cipher_key_info,
++                                fsl_shw_sko_t* auth_key_info,
++                                uint32_t auth_data_length,
++                                const uint8_t* auth_data,
++                                uint32_t payload_length,
++                                const uint8_t* ct,
++                                const uint8_t* auth_value,
++                                uint8_t* payload)
+ {
+-	volatile fsl_shw_return_t status = FSL_RETURN_ERROR_S;
+-
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)auth_ctx;
+-	(void)cipher_key_info;
+-	(void)auth_key_info;
+-	(void)auth_data_length;
+-	(void)auth_data;
+-	(void)payload_length;
+-	(void)ct;
+-	(void)auth_value;
+-	(void)payload;
+-
+-	return status;
++    volatile fsl_shw_return_t status = FSL_RETURN_ERROR_S;
++
++
++    /* Unused */
++    (void)user_ctx;
++    (void)auth_ctx;
++    (void)cipher_key_info;
++    (void)auth_key_info;
++    (void)auth_data_length;
++    (void)auth_data;
++    (void)payload_length;
++    (void)ct;
++    (void)auth_value;
++    (void)payload;
++
++    return status;
+ }
+diff --git a/rng/fsl_shw_hash.c b/rng/fsl_shw_hash.c
+index 9fdfe3e..c1556c2 100644
+--- a/rng/fsl_shw_hash.c
++++ b/rng/fsl_shw_hash.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright (C) 2005-2008 written by Freescale Semiconductor
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -17,8 +17,10 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+  * USA
+  */
+-/*!
+- * @file lib/rng/fsl_shw_hash.c
++
++
++/**
++ * @file fsl_shw_hash.c
+  *
+  * This file implements Cryptographic Hashing functions of the FSL SHW API
+  * for Sahara.  This does not include HMAC.
+@@ -26,8 +28,9 @@
+ 
+ #include "shw_driver.h"
+ 
++
+ /* REQ-S2LRD-PINTFC-API-BASIC-HASH-005 */
+-/*!
++/**
+  * Hash a stream of data with a cryptographic hash algorithm.
+  *
+  * The flags in the @a hash_ctx control the operation of this function.
+@@ -60,30 +63,33 @@
+  * 64 octets.
+  *
+  * @param      user_ctx  A user context from #fsl_shw_register_user().
+- * @param      hash_ctx Hashing algorithm and state of the cipher.
++ * @param[in,out] hash_ctx Hashing algorithm and state of the cipher.
+  * @param      msg       Pointer to the data to be hashed.
+  * @param      length    Length, in octets, of the @a msg.
+- * @param      result    If not null, pointer to where to store the hash
++ * @param[out] result    If not null, pointer to where to store the hash
+  *                       digest.
+  * @param      result_len Number of octets to store in @a result.
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_hash(fsl_shw_uco_t * user_ctx,
+-			      fsl_shw_hco_t * hash_ctx,
+-			      const uint8_t * msg,
+-			      uint32_t length,
+-			      uint8_t * result, uint32_t result_len)
++fsl_shw_return_t fsl_shw_hash(
++                                fsl_shw_uco_t* user_ctx,
++                                fsl_shw_hco_t* hash_ctx,
++                                const uint8_t* msg,
++                                uint32_t length,
++                                uint8_t* result,
++                                uint32_t result_len)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)hash_ctx;
+-	(void)msg;
+-	(void)length;
+-	(void)result;
+-	(void)result_len;
++    /* Unused */
++    (void)user_ctx;
++    (void)hash_ctx;
++    (void)msg;
++    (void)length;
++    (void)result;
++    (void)result_len;
+ 
+-	return ret;
++    return ret;
+ }
+diff --git a/rng/fsl_shw_hmac.c b/rng/fsl_shw_hmac.c
+index 3a4ee5c..b1d9115 100644
+--- a/rng/fsl_shw_hmac.c
++++ b/rng/fsl_shw_hmac.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright (C) 2005-2008 written by Freescale Semiconductor
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -17,8 +17,10 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+  * USA
+  */
+-/*!
+- * @file lib/rng/fsl_shw_hmac.c
++
++
++/**
++ * @file fsl_shw_hmac.c
+  *
+  * This file implements Hashed Message Authentication Code functions of the FSL
+  * SHW API.
+@@ -26,8 +28,9 @@
+ 
+ #include "shw_driver.h"
+ 
++
+ /* REQ-S2LRD-PINTFC-API-BASIC-HMAC-001 */
+-/*!
++/**
+  * Get the precompute information
+  *
+  *
+@@ -37,22 +40,25 @@
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_hmac_precompute(fsl_shw_uco_t * user_ctx,
+-					 fsl_shw_sko_t * key_info,
+-					 fsl_shw_hmco_t * hmac_ctx)
++fsl_shw_return_t fsl_shw_hmac_precompute(
++                                fsl_shw_uco_t* user_ctx,
++                                fsl_shw_sko_t* key_info,
++                                fsl_shw_hmco_t* hmac_ctx)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t status = FSL_RETURN_ERROR_S;
++
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)key_info;
+-	(void)hmac_ctx;
++    /* Unused */
++    (void)user_ctx;
++    (void)key_info;
++    (void)hmac_ctx;
+ 
+-	return status;
++    return status;
+ }
+ 
++
+ /* REQ-S2LRD-PINTFC-API-BASIC-HMAC-002 */
+-/*!
++/**
+  * Get the hmac
+  *
+  *
+@@ -66,23 +72,27 @@ fsl_shw_return_t fsl_shw_hmac_precompute(fsl_shw_uco_t * user_ctx,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_hmac(fsl_shw_uco_t * user_ctx,
+-			      fsl_shw_sko_t * key_info,
+-			      fsl_shw_hmco_t * hmac_ctx,
+-			      const uint8_t * msg,
+-			      uint32_t length,
+-			      uint8_t * result, uint32_t result_len)
++fsl_shw_return_t fsl_shw_hmac(
++                                fsl_shw_uco_t* user_ctx,
++                                fsl_shw_sko_t* key_info,
++                                fsl_shw_hmco_t* hmac_ctx,
++                                const uint8_t* msg,
++                                uint32_t length,
++                                uint8_t* result,
++                                uint32_t result_len)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t status = FSL_RETURN_ERROR_S;
++
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)key_info;
+-	(void)hmac_ctx;
+-	(void)msg;
+-	(void)length;
+-	(void)result;
+-	(void)result_len;
++    /* Unused */
++    (void)user_ctx;
++    (void)key_info;
++    (void)hmac_ctx;
++    (void)msg;
++    (void)length;
++    (void)result;
++    (void)result_len;
+ 
+-	return status;
++    return status;
+ }
++
+diff --git a/rng/fsl_shw_rand.c b/rng/fsl_shw_rand.c
+index c1a33b9..6b6dcdd 100644
+--- a/rng/fsl_shw_rand.c
++++ b/rng/fsl_shw_rand.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright (C) 2005-2008 written by Freescale Semiconductor
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -17,8 +17,10 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+  * USA
+  */
+-/*!
+- * @file lib/rng/fsl_shw_rand.c
++
++
++/**
++ * @file fsl_shw_rand.c
+  *
+  * This file implements Random Number Generation functions of the FSL SHW API
+  * in USER MODE for talking to a standalone RNGA/RNGC device driver.
+@@ -39,89 +41,99 @@
+ #include <stdio.h>
+ #include <errno.h>
+ #include <string.h>
+-#endif				/* FSL_DEBUG */
++#endif /* FSL_DEBUG */
+ 
+ #include "shw_driver.h"
+ 
+-extern fsl_shw_return_t validate_uco(fsl_shw_uco_t * uco);
++
++extern fsl_shw_return_t validate_uco(fsl_shw_uco_t *uco);
++
+ 
+ #if defined(FSL_HAVE_RNGA) || defined(FSL_HAVE_RNGC)
+ 
++
+ /* REQ-S2LRD-PINTFC-API-BASIC-RNG-002 */
+-fsl_shw_return_t fsl_shw_get_random(fsl_shw_uco_t * user_ctx,
+-				    uint32_t length, uint8_t * data)
++fsl_shw_return_t fsl_shw_get_random(
++                                fsl_shw_uco_t* user_ctx,
++                                uint32_t length,
++                                uint8_t* data)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
+ 
+-	/* perform a sanity check / update uco */
+-	ret = validate_uco(user_ctx);
+-	if (ret == FSL_RETURN_OK_S) {
+-		struct get_random_req *req = malloc(sizeof(*req));
++    /* perform a sanity check / update uco */
++    ret = validate_uco(user_ctx);
++    if (ret == FSL_RETURN_OK_S) {
++        struct get_random_req* req = malloc(sizeof(*req));
+ 
+-		if (req == NULL) {
+-			ret = FSL_RETURN_NO_RESOURCE_S;
+-		} else {
++        if (req == NULL) {
++            ret = FSL_RETURN_NO_RESOURCE_S;
++        } else {
+ 
+-			init_req(&req->hdr, user_ctx);
+-			req->size = length;
+-			req->random = data;
++            init_req(&req->hdr, user_ctx);
++            req->size = length;
++            req->random = data;
+ 
+-			ret =
+-			    send_req(SHW_USER_REQ_GET_RANDOM, &req->hdr,
+-				     user_ctx);
+-		}
+-	}
++            ret = send_req(SHW_USER_REQ_GET_RANDOM, &req->hdr, user_ctx);
++        }
++    }
+ 
+-	return ret;
++    return ret;
+ }
+ 
+-fsl_shw_return_t fsl_shw_add_entropy(fsl_shw_uco_t * user_ctx,
+-				     uint32_t length, uint8_t * data)
++
++fsl_shw_return_t fsl_shw_add_entropy(
++                                fsl_shw_uco_t* user_ctx,
++                                uint32_t length,
++                                uint8_t* data)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
+-
+-	/* perform a sanity check on the uco */
+-	ret = validate_uco(user_ctx);
+-	if (ret == FSL_RETURN_OK_S) {
+-		struct add_entropy_req *req = malloc(sizeof(*req));
+-
+-		if (req == NULL) {
+-			ret = FSL_RETURN_NO_RESOURCE_S;
+-		} else {
+-			init_req(&req->hdr, user_ctx);
+-			req->size = length;
+-			req->entropy = data;
+-
+-			ret =
+-			    send_req(SHW_USER_REQ_ADD_ENTROPY, &req->hdr,
+-				     user_ctx);
+-		}
+-	}
+-
+-	return ret;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++
++    /* perform a sanity check on the uco */
++    ret = validate_uco(user_ctx);
++    if (ret == FSL_RETURN_OK_S) {
++        struct add_entropy_req* req = malloc(sizeof(*req));
++
++        if (req == NULL) {
++            ret = FSL_RETURN_NO_RESOURCE_S;
++        } else {
++            init_req(&req->hdr, user_ctx);
++            req->size = length;
++            req->entropy = data;
++
++            ret = send_req(SHW_USER_REQ_ADD_ENTROPY, &req->hdr, user_ctx);
++        }
++    }
++
++    return ret;
+ }
+ 
+-#else				/* no H/W RNG block */
++#else  /* no H/W RNG block */
++
+ 
+-fsl_shw_return_t fsl_shw_get_random(fsl_shw_uco_t * user_ctx,
+-				    uint32_t length, uint8_t * data)
++fsl_shw_return_t fsl_shw_get_random(
++                                fsl_shw_uco_t* user_ctx,
++                                uint32_t length,
++                                uint8_t* data)
+ {
+ 
+-	(void)user_ctx;
+-	(void)length;
+-	(void)data;
++    (void)user_ctx;
++    (void)length;
++    (void)data;
+ 
+-	return FSL_RETURN_ERROR_S;
++    return FSL_RETURN_ERROR_S;
+ }
+ 
+-fsl_shw_return_t fsl_shw_add_entropy(fsl_shw_uco_t * user_ctx,
+-				     uint32_t length, uint32_t * data)
++
++fsl_shw_return_t fsl_shw_add_entropy(
++                                fsl_shw_uco_t* user_ctx,
++                                uint32_t length,
++                                uint8_t* data)
+ {
+ 
+-	(void)user_ctx;
+-	(void)length;
+-	(void)data;
++    (void)user_ctx;
++    (void)length;
++    (void)data;
+ 
+-	return FSL_RETURN_ERROR_S;
++    return FSL_RETURN_ERROR_S;
+ }
+ #endif
+diff --git a/rng/fsl_shw_sym.c b/rng/fsl_shw_sym.c
+index 47b8ee0..bed939f 100644
+--- a/rng/fsl_shw_sym.c
++++ b/rng/fsl_shw_sym.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright (C) 2005-2008 written by Freescale Semiconductor
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -17,8 +17,10 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+  * USA
+  */
+-/*!
+- * @file lib/rng/fsl_shw_sym.c
++
++
++/**
++ * @file fsl_shw_sym.c
+  *
+  * This file implements Symmetric Cipher functions of the FSL SHW API.  This
+  * does not include CCM.
+@@ -26,11 +28,12 @@
+ 
+ #include "shw_driver.h"
+ 
++
+ /* REQ-S2LRD-PINTFC-API-BASIC-SYM-002 */
+ /* PINTFC-API-BASIC-SYM-ARC4-001 */
+ /* PINTFC-API-BASIC-SYM-ARC4-002 */
+ 
+-/*!
++/**
+  * Compute symmetric encryption
+  *
+  *
+@@ -43,30 +46,34 @@
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_symmetric_encrypt(fsl_shw_uco_t * user_ctx,
+-					   fsl_shw_sko_t * key_info,
+-					   fsl_shw_scco_t * sym_ctx,
+-					   uint32_t length,
+-					   const uint8_t * pt, uint8_t * ct)
++fsl_shw_return_t fsl_shw_symmetric_encrypt(
++                                fsl_shw_uco_t* user_ctx,
++                                fsl_shw_sko_t* key_info,
++                                fsl_shw_scco_t* sym_ctx,
++                                uint32_t length,
++                                const uint8_t* pt,
++                                uint8_t* ct)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)key_info;
+-	(void)sym_ctx;
+-	(void)length;
+-	(void)ct;
+-	(void)pt;
++    /* Unused */
++    (void)user_ctx;
++    (void)key_info;
++    (void)sym_ctx;
++    (void)length;
++    (void)ct;
++    (void)pt;
+ 
+-	return ret;
++    return ret;
+ }
+ 
++
+ /* PINTFC-API-BASIC-SYM-002 */
+ /* PINTFC-API-BASIC-SYM-ARC4-001 */
+ /* PINTFC-API-BASIC-SYM-ARC4-002 */
+ 
+-/*!
++/**
+  * Compute symmetric decryption
+  *
+  *
+@@ -79,21 +86,26 @@ fsl_shw_return_t fsl_shw_symmetric_encrypt(fsl_shw_uco_t * user_ctx,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_symmetric_decrypt(fsl_shw_uco_t * user_ctx,
+-					   fsl_shw_sko_t * key_info,
+-					   fsl_shw_scco_t * sym_ctx,
+-					   uint32_t length,
+-					   const uint8_t * ct, uint8_t * pt)
++fsl_shw_return_t fsl_shw_symmetric_decrypt(
++                                fsl_shw_uco_t* user_ctx,
++                                fsl_shw_sko_t* key_info,
++                                fsl_shw_scco_t* sym_ctx,
++                                uint32_t length,
++                                const uint8_t* ct,
++                                uint8_t* pt)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)key_info;
+-	(void)sym_ctx;
+-	(void)length;
+-	(void)ct;
+-	(void)pt;
+ 
+-	return ret;
++    /* Unused */
++    (void)user_ctx;
++    (void)key_info;
++    (void)sym_ctx;
++    (void)length;
++    (void)ct;
++    (void)pt;
++
++    return ret;
+ }
++
+diff --git a/rng/fsl_shw_user.c b/rng/fsl_shw_user.c
+index 900a12d..16ef734 100644
+--- a/rng/fsl_shw_user.c
++++ b/rng/fsl_shw_user.c
+@@ -1,6 +1,6 @@
+ /*
+  * User Space library to access the Security hardware
+- * Copyright (C) 2005-2006 written by Freescale Semiconductor
++ * Copyright (C) 2005-2008 written by Freescale Semiconductor
+  *
+  * This library is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU Lesser General Public License as
+@@ -18,8 +18,9 @@
+  * USA
+  */
+ 
+-/*!
+- * @file lib/rng/fsl_shw_user.c
++
++/**
++ * @file fsl_shw_user.c
+  *
+  * This file implements User Context, Get Results, and Platform Capabilities
+  * functions of the FSL SHW API in USER MODE for talking to a SHW device
+@@ -31,6 +32,7 @@
+ #include <sys/stat.h>
+ #include <sys/fcntl.h>
+ #include <sys/ioctl.h>
++#include <sys/mman.h>
+ #include <signal.h>
+ 
+ #ifdef FSL_DEBUG
+@@ -41,214 +43,215 @@
+ 
+ #include "shw_driver.h"
+ 
+-/*!
++
++/**
+  * Chain of active user contexts for this process.
+  */
+-static fsl_shw_uco_t *user_chain = NULL;
++static fsl_shw_uco_t* user_chain = NULL;
++
+ 
+-/*!
++/**
+  * User-space copy of capabilities, as read from kernel driver (and modified
+  * with local API version?).
+  */
+ struct cap {
+-	/*! Whether data has been read from kernel space  */
+-	unsigned populated;
+-	union {
+-		uint32_t buffer[256];
+-		fsl_shw_pco_t pco;
+-	};
++    /** Whether data has been read from kernel space  */
++    unsigned populated;
++    union {
++        uint32_t buffer[sizeof(fsl_shw_pco_t)];
++        fsl_shw_pco_t pco;
++    };
+ };
+ 
+ static struct cap cap = {
+-	0 /* populated */ ,
+-	{}
++    0 /* populated */,
++    {}
+ };
+ 
+-static int setup_callback(fsl_shw_uco_t * uco);
++
++
++static int setup_callback(fsl_shw_uco_t *uco);
+ static void sah_sighandler(int num);
+ 
+- /*!
+-  * Sanity checks the user context object fields to ensure that they make some
+-  * sense before passing the uco as a parameter.
+-  *
+-  * @brief Verify the user context object
+-  *
+-  * @param  uco  user context object
+-  *
+-  * @return    A return code of type #fsl_shw_return_t.
+-  */
+-fsl_shw_return_t validate_uco(fsl_shw_uco_t * uco)
++
++ /**
++ * Sanity checks the user context object fields to ensure that they make some
++ * sense before passing the uco as a parameter.
++ *
++ * @brief Verify the user context object
++ *
++ * @param  uco  user context object
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t validate_uco(fsl_shw_uco_t *uco)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_OK_S;
++    fsl_shw_return_t status = FSL_RETURN_OK_S;
++
+ 
+-	/* check if file is opened */
+-	if (uco->openfd < 0) {
++    /* check if file is opened */
++    if (uco->openfd < 0) {
+ #ifdef FSL_DEBUG
+-		fprintf(stderr, "SHW: No open file descriptor."
+-			"  Is context registered?\n");
++        fprintf(stderr, "SHW: No open file descriptor."
++                "  Is context registered?\n");
+ #endif
+-		status = FSL_RETURN_NO_RESOURCE_S;
+-	} else {
+-		/* check flag combination: the only invalid setting of the
+-		 * blocking and callback flags is blocking with callback. So check
+-		 * for that
+-		 */
+-		if ((uco->
+-		     flags & (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) ==
+-		    (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) {
++        status = FSL_RETURN_NO_RESOURCE_S;
++    } else {
++        /* check flag combination: the only invalid setting of the
++         * blocking and callback flags is blocking with callback. So check
++         * for that
++         */
++        if ((uco->flags & (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) ==
++                         (FSL_UCO_BLOCKING_MODE | FSL_UCO_CALLBACK_MODE)) {
+ #ifdef FSL_DEBUG
+-			fprintf(stderr,
+-				"SHW: invalid flags in user context: 0x%x\n",
+-				uco->flags);
++            fprintf(stderr, "SHW: invalid flags in user context: 0x%x\n",
++                    uco->flags);
+ #endif
+-			status = FSL_RETURN_BAD_FLAG_S;
+-		} else {
+-			/* must have pool of at least 1, even for blocking mode */
+-			if (uco->pool_size == 0) {
+-				status = FSL_RETURN_ERROR_S;
+-			} else {
+-				/* if callback flag is set, it better have a callback
+-				 * routine */
+-				if (uco->flags & FSL_UCO_CALLBACK_MODE) {
+-					if (!
+-					    (uco->
+-					     flags &
+-					     FSL_UCO_CALLBACK_SETUP_COMPLETE)) {
+-						if (setup_callback(uco)) {
+-							status =
+-							    FSL_RETURN_OK_S;
+-						}
+-					}
+-
+-					if (uco->callback == NULL) {
++            status = FSL_RETURN_BAD_FLAG_S;
++        } else {
++            /* must have pool of at least 1, even for blocking mode */
++            if (uco->pool_size == 0) {
++                status = FSL_RETURN_ERROR_S;
++            } else {
++                /* if callback flag is set, it better have a callback
++                 * routine */
++                if (uco->flags & FSL_UCO_CALLBACK_MODE) {
++                    if (!(uco->flags & FSL_UCO_CALLBACK_SETUP_COMPLETE)) {
++                        if (setup_callback(uco)) {
++                            status = FSL_RETURN_OK_S;
++                        }
++                    }
++
++                    if (uco->callback == NULL) {
+ #ifdef FSL_DEBUG
+-						fprintf(stderr,
+-							"SHW: Callback flag set in user"
+-							" context, but callback function is NULL\n");
++                        fprintf(stderr, "SHW: Callback flag set in user"
++                                " context, but callback function is NULL\n");
+ #endif
+-						status =
+-						    FSL_RETURN_INTERNAL_ERROR_S;
+-					}
+-				}
+-			}
+-		}
+-	}
+-
+-	return status;
++                        status = FSL_RETURN_INTERNAL_ERROR_S;
++                    }
++                }
++            }
++        }
++    }
++
++    return status;
+ }
+ 
+-/*!
++
++/**
+  * Link a newly-registered context to the beginning of the #user_chain.
+  *
+  * @param uco    User context to add
+  */
+-inline static void add_user(fsl_shw_uco_t * uco)
++inline static void add_user(fsl_shw_uco_t *uco)
+ {
+-	uco->next = user_chain;
+-	user_chain = uco;
++    uco->next = user_chain;
++    user_chain = uco;
+ 
+-	return;
++    return;
+ }
+ 
+-/*!
++/**
+  * Unlink a deregistered context from the #user_chain
+  *
+  * @param uco    User context to remove
+  */
+-inline static void remove_user(fsl_shw_uco_t * uco)
++inline static void remove_user(fsl_shw_uco_t *uco)
+ {
+-	fsl_shw_uco_t *prev = NULL;
+-	fsl_shw_uco_t *current = user_chain;
+-
+-	/* Search chain looking for the entry */
+-	while ((current != uco) && (current != NULL)) {
+-		current = current->next;
+-		prev = current;
+-	}
+-
+-	/* Did we find it */
+-	if (current != NULL) {
+-		if (prev == NULL) {
+-			/* It is first entry.  Point head to next in chain */
+-			user_chain = current->next;
+-		} else {
+-			/* Remove it from chain by pointing previous to next */
+-			prev->next = current->next;
+-		}
+-		current->next = NULL;	/* just for safety */
+-	}
+-
+-	return;
++    fsl_shw_uco_t *prev = NULL;
++    fsl_shw_uco_t *current = user_chain;
++
++    /* Search chain looking for the entry */
++    while ((current != uco) && (current != NULL)) {
++        current = current->next;
++        prev = current;
++    }
++
++    /* Did we find it */
++    if (current != NULL) {
++        if (prev == NULL) {
++            /* It is first entry.  Point head to next in chain */
++            user_chain = current->next;
++        } else {
++            /* Remove it from chain by pointing previous to next */
++            prev->next = current->next;
++        }
++        current->next = NULL; /* just for safety */
++    }
++
++    return;
+ }
+ 
+-/*!
++
++/**
+  * Create an association between the the user and the provider of the API.
+  *
+  * @param  user_ctx   The user context which will be used for this association.
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_register_user(fsl_shw_uco_t * user_ctx)
++fsl_shw_return_t fsl_shw_register_user(fsl_shw_uco_t* user_ctx)
+ {
+-	int code;
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    int code;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
+ 
+-	code = open("/dev/fsl_shw", O_RDWR);
++    code = open("/dev/fsl_shw", O_RDWR);
+ 
+-	if (code < 0) {
++    if (code < 0) {
+ #ifdef FSL_DEBUG
+-		fprintf(stderr, "SHW: open() failed with (%d) %s\n", errno,
+-			strerror(errno));
++        fprintf(stderr, "SHW: open() failed with (%d) %s\n", errno,
++                strerror(errno));
+ #endif
+-	} else {
+-		user_ctx->openfd = code;	/* 'good' code is a file descriptor */
+-		code =
+-		    ioctl(code, SHW_IOCTL_REQUEST + SHW_USER_REQ_REGISTER_USER,
+-			  user_ctx);
+-		if (code == 0) {
+-			add_user(user_ctx);
+-			ret = FSL_RETURN_OK_S;
+-		} else {
+-			close(user_ctx->openfd);
+-			user_ctx->openfd = -1;
++    } else {
++        user_ctx->openfd = code; /* 'good' code is a file descriptor */
++        code = ioctl(code, SHW_IOCTL_REQUEST +SHW_USER_REQ_REGISTER_USER,
++                     user_ctx);
++        if (code == 0) {
++            add_user(user_ctx);
++            ret = FSL_RETURN_OK_S;
++        } else {
++            close(user_ctx->openfd);
++            user_ctx->openfd = -1;
+ #ifdef FSL_DEBUG
+-			fprintf(stderr,
+-				"SHW: Failed user registration ioctl\n");
++            fprintf(stderr, "SHW: Failed user registration ioctl\n");
+ #endif
+-		}
+-	}
++        }
++    }
+ 
+-	return ret;
++    return ret;
+ }
+ 
+-/*!
++
++/**
+  * Destroy the association between the the user and the provider of the API.
+  *
+  * @param  user_ctx   The user context which is no longer needed.
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_deregister_user(fsl_shw_uco_t * user_ctx)
++fsl_shw_return_t fsl_shw_deregister_user(fsl_shw_uco_t* user_ctx)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
+ 
+-	ret = validate_uco(user_ctx);
+-	if (ret == FSL_RETURN_OK_S) {
+-		int code = close(user_ctx->openfd);
++    ret = validate_uco(user_ctx);
++    if (ret == FSL_RETURN_OK_S) {
++        int code = close(user_ctx->openfd);
+ 
+-		if (code < 0) {
+-			ret = FSL_RETURN_INTERNAL_ERROR_S;
+-		}
+-		user_ctx->openfd = -1;
+-		remove_user(user_ctx);
+-	}
++        if (code < 0) {
++            ret = FSL_RETURN_INTERNAL_ERROR_S;
++        }
++        user_ctx->openfd = -1;
++        remove_user(user_ctx);
++    }
+ 
+-	return ret;
++    return ret;
+ }
+ 
++
++
+ /* REQ-S2LRD-PINTFC-API-GEN-006 */
+ 
+-/*!
++/**
+  * Retrieve results from earlier operations.
+  *
+  * @param         user_ctx     The user's context.
+@@ -260,46 +263,46 @@ fsl_shw_return_t fsl_shw_deregister_user(fsl_shw_uco_t * user_ctx)
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_get_results(fsl_shw_uco_t * user_ctx,
+-				     unsigned result_size,
+-				     fsl_shw_result_t results[],
+-				     unsigned *result_count)
++fsl_shw_return_t fsl_shw_get_results(fsl_shw_uco_t* user_ctx,
++                                            unsigned result_size,
++                                            fsl_shw_result_t results[],
++                                            unsigned* result_count)
+ {
+-	fsl_shw_return_t status = FSL_RETURN_INTERNAL_ERROR_S;
+-
+-	/* perform a sanity check on the uco */
+-	status = validate_uco(user_ctx);
+-
+-	/* if uco appears ok, build structure and pass to get results */
+-	if (status == FSL_RETURN_OK_S) {
+-		struct results_req req;
+-
+-		/* if requested is zero, it's done before it started */
+-		if (result_size > 0) {
+-			int code;
+-
+-			init_req(&req.hdr, user_ctx);
+-			req.requested = result_size;
+-			req.results = results;
+-			/* get the results */
+-			code = ioctl(user_ctx->openfd,
+-				     SHW_IOCTL_REQUEST +
+-				     SHW_USER_REQ_GET_RESULTS, &req);
+-
+-			if (code == 0) {
+-				*result_count = req.actual;
+-				status = FSL_RETURN_OK_S;
+-			}
+-		} else {
+-			*result_count = 0;	/* no place to store results */
+-		}
+-	}
+-
+-	return status;
++    fsl_shw_return_t status = FSL_RETURN_INTERNAL_ERROR_S;
++
++    /* perform a sanity check on the uco */
++    status = validate_uco(user_ctx);
++
++    /* if uco appears ok, build structure and pass to get results */
++    if (status == FSL_RETURN_OK_S) {
++        struct results_req req;
++
++        /* if requested is zero, it's done before it started */
++        if (result_size > 0) {
++            int code;
++
++            init_req(&req.hdr, user_ctx);
++            req.requested = result_size;
++            req.results = results;
++            /* get the results */
++            code = ioctl(user_ctx->openfd,
++                         SHW_IOCTL_REQUEST + SHW_USER_REQ_GET_RESULTS, &req);
++
++            if (code == 0) {
++                *result_count = req.actual;
++                status = FSL_RETURN_OK_S;
++            }
++        } else {
++            *result_count = 0;  /* no place to store results */
++        }
++    }
++
++    return status;
+ }
+ 
++
+ /* REQ-S2LRD-PINTFC-API-GEN-003 */
+-/*!
++/**
+  * Determine the hardware security capabilities of this platform.
+  *
+  * Though a user context object is passed into this function, it will always
+@@ -309,77 +312,77 @@ fsl_shw_return_t fsl_shw_get_results(fsl_shw_uco_t * user_ctx,
+  *
+  * @return  A pointer to the capabilities object.
+  */
+-fsl_shw_pco_t *fsl_shw_get_capabilities(fsl_shw_uco_t * user_ctx)
++fsl_shw_pco_t* fsl_shw_get_capabilities(fsl_shw_uco_t* user_ctx)
+ {
+ 
+-	fsl_shw_return_t status = validate_uco(user_ctx);
+-	fsl_shw_pco_t *retval = NULL;
+-
+-	if (status == FSL_RETURN_OK_S) {
+-		if (cap.populated) {
+-			retval = &cap.pco;
+-		} else {
+-			register int code;
+-			struct capabilities_req req;
+-
+-			init_req(&req.hdr, user_ctx);
+-			req.size = sizeof(cap.buffer);
+-			req.capabilities = &cap.pco;
+-			code = ioctl(user_ctx->openfd,
+-				     SHW_IOCTL_REQUEST +
+-				     SHW_USER_REQ_GET_CAPABILITIES, &req);
+-
+-			if ((code == 0) && (req.hdr.code == FSL_RETURN_OK_S)) {
+-				retval = &cap.pco;
+-				cap.populated = 1;
+-			}
+-		}
+-	};
+-
+-	return retval;
++    fsl_shw_return_t status = validate_uco(user_ctx);
++    fsl_shw_pco_t* retval = NULL;
++
++    if (status == FSL_RETURN_OK_S) {
++        if (cap.populated) {
++            retval = &cap.pco;
++        } else {
++            register int code;
++            struct capabilities_req req;
++
++            init_req(&req.hdr, user_ctx);
++            req.size = sizeof(cap.buffer);
++            req.capabilities = &cap.pco;
++            code = ioctl(user_ctx->openfd,
++                         SHW_IOCTL_REQUEST + SHW_USER_REQ_GET_CAPABILITIES,
++                         &req);
++
++            if ((code == 0) && (req.hdr.code == FSL_RETURN_OK_S)) {
++                retval = &cap.pco;
++                cap.populated = 1;
++            }
++        }
++    };
++
++    return retval;
+ }
+ 
+-/*!
++/**
+  * Set up API's internal callback handler on SIGUSR2
+  *
+  * @param uco   User context
+  *
+  * @return 0 for failure, 1 for success
+  */
+-static int setup_callback(fsl_shw_uco_t * uco)
++static int setup_callback(fsl_shw_uco_t *uco)
+ {
+-	/*!
+-	 * Flag for whether callback handling has been set up for this process.
+-	 */
+-	static int callback_initialized = 0;
+-	int code = 0;		/* assume failure */
+-
+-	if (!callback_initialized) {
+-		/* This is defined by POSIX */
+-		struct sigaction action;
+-
+-		action.sa_handler = sah_sighandler;
+-		action.sa_flags = 0;	/* no special flags needed. */
+-		sigfillset(&action.sa_mask);	/* suspend all signals during handler */
+-		if (sigaction(SIGUSR2, &action, NULL) != 0) {
++    /**
++     * Flag for whether callback handling has been set up for this process.
++     */
++    static int callback_initialized = 0;
++    int code = 0;               /* assume failure */
++
++    if (! callback_initialized) {
++        /* This is defined by POSIX */
++        struct sigaction action;
++
++        action.sa_handler = sah_sighandler;
++        action.sa_flags = 0;        /* no special flags needed. */
++        sigfillset(&action.sa_mask); /* suspend all signals during handler */
++        if (sigaction(SIGUSR2, &action, NULL) != 0) {
+ #ifdef FSL_DEBUG
+-			fprintf(stderr,
+-				"FSL API: sigaction() failed with error (%d) %s\n",
+-				errno, strerror(errno));
++            fprintf(stderr, "FSL API: sigaction() failed with error (%d) %s\n",
++                    errno, strerror(errno));
+ #endif
+-		} else {
+-			uco->flags |= FSL_UCO_CALLBACK_SETUP_COMPLETE;
+-			callback_initialized = 1;
+-			code = 1;
+-		}
+-	} else {
+-		code = 1;
+-	}
+-
+-	return code;
++        } else {
++            uco->flags |= FSL_UCO_CALLBACK_SETUP_COMPLETE;
++            callback_initialized = 1;
++            code = 1;
++        }
++    } else {
++        code = 1;
++    }
++
++    return code;
+ }
+ 
+-/*!
++
++/**
+  * User-mode signal handler.
+  *
+  * Called when SIGUSR2 fires.  This will call the user's callback function
+@@ -389,27 +392,332 @@ static int setup_callback(fsl_shw_uco_t * uco)
+  */
+ static void sah_sighandler(int num)
+ {
+-	fsl_shw_uco_t *current_user = user_chain;
++    fsl_shw_uco_t* current_user = user_chain;
+ 
+ #ifdef FSL_DEBUG
+-	fprintf(stderr, "SHW: Signal received\n");
++    fprintf(stderr, "SHW: Signal received\n");
+ #endif
+ 
+-	/* Something happened.  Callback anybody who has callback on.  */
+-	while (current_user != NULL) {
+-		fsl_shw_uco_t *next_user = current_user->next;
++    /* Something happened.  Callback anybody who has callback on.  */
++    while (current_user != NULL) {
++        fsl_shw_uco_t* next_user = current_user->next;
+ 
+-		if ((current_user->flags & FSL_UCO_CALLBACK_MODE)
+-		    && (current_user->callback != NULL)) {
++        if ((current_user->flags & FSL_UCO_CALLBACK_MODE)
++            && (current_user->callback != NULL)) {
+ #ifdef FSL_DEBUG
+-			fprintf(stderr, "SHW: calling back user %p\n",
+-				current_user);
++            fprintf(stderr, "SHW: calling back user %p\n", current_user);
+ #endif
+-			current_user->callback(current_user);
+-		}
+-		current_user = next_user;
+-	}
++            current_user->callback(current_user);
++        }
++        current_user = next_user;
++    }
++
++    (void)num;                    /* unused */
++    return;
++}
++
++
++
++fsl_shw_return_t do_scc_engage_partition(fsl_shw_uco_t* user_ctx,
++                                         void* address,
++                                         const uint8_t* UMID,
++                                         uint32_t permissions)
++{
++    uint8_t* UMID_base = address + 0x10;
++    uint32_t* MAP_base = address;
++    uint8_t i;
++    fsl_shw_partition_status_t status;
++
++    if (fsl_shw_sstatus(user_ctx, address, &status) != FSL_RETURN_OK_S ||
++        status != FSL_PART_S_ALLOCATED)
++    {
++        printf("partition not allocated, cannot engage!\n");
++        return FSL_RETURN_ERROR_S;
++    }
++
++    if (UMID != NULL) {
++        for (i = 0; i < 16; i++) {
++            UMID_base[i] = UMID[i];
++        }
++    } else {
++        for (i = 0; i < 16; i++) {
++            UMID_base[i] = 0;
++        }
++    }
++
++    MAP_base[0] = permissions;
++
++    /* Check the partition status */
++    if (fsl_shw_sstatus(user_ctx, address, &status) == FSL_RETURN_OK_S &&
++        status == FSL_PART_S_ENGAGED)
++    {
++        return FSL_RETURN_OK_S;
++    }
++    else {
++        printf("partition failed to engage!\n");
++        return FSL_RETURN_ERROR_S;
++    }
++}
++
++
++void* fsl_shw_smalloc(fsl_shw_uco_t* user_ctx,
++                      uint32_t size,
++                      const uint8_t *UMID,
++                      uint32_t permissions) {
++    void* address;
++    uint8_t engaged = 0;
++
++    /* Acquire a secure partition by calling mmap() on the SHW file */
++    address = mmap(NULL, size,
++                   PROT_READ | PROT_WRITE,
++                   MAP_SHARED,
++                   user_ctx->openfd, 0);
++
++    if (address == MAP_FAILED) {
++        printf("Could not acquire partition!\n");
++        goto out;
++    }
++
++    /* Finish setup of the secure partition by writing the UMID and permissions
++     * registers.
++     */
++    if (do_scc_engage_partition(user_ctx, address, UMID, permissions)
++            == FSL_RETURN_OK_S) {
++        engaged = 1;
++    }
++
++out:
++    if (address == NULL) {
++        return NULL;
++    }
++
++    if (engaged == 0) {
++        /* engage failed, release partition */
++        fsl_shw_sfree(user_ctx, address);
++        return NULL;
++    }
++
++    return address;
++}
++
++
++/**
++ * Free a block of secure memory that was allocated with #fsl_shw_smalloc
++ *
++ * @param       user_ctx        User context
++ * @param       address         Address of the block of secure memory to be
++ *                              released.
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t fsl_shw_sfree(fsl_shw_uco_t* user_ctx, void* address) {
++    fsl_shw_return_t status = FSL_RETURN_INTERNAL_ERROR_S;
++
++    /* perform a sanity check on the uco */
++    status = validate_uco(user_ctx);
++
++    /* if uco appears ok, build structure and pass to get results */
++    if (status == FSL_RETURN_OK_S) {
++        scc_partition_info_t partition_info;
++        int code;
+ 
+-	(void)num;		/* unused */
+-	return;
++        partition_info.user_base = (uint32_t)address;
++
++        /* get the results */
++        code = ioctl(user_ctx->openfd,
++                     SHW_IOCTL_REQUEST + SHW_USER_REQ_SFREE,
++                     &partition_info);
++
++        if (code == 0) {
++            status = FSL_RETURN_OK_S;
++        }
++    }
++
++    return status;
++}
++
++
++fsl_shw_return_t fsl_shw_sstatus(fsl_shw_uco_t* user_ctx,
++                                 void* address,
++                                 fsl_shw_partition_status_t* part_status) {
++
++    fsl_shw_return_t status = FSL_RETURN_INTERNAL_ERROR_S;
++
++    /* perform a sanity check on the uco */
++    status = validate_uco(user_ctx);
++
++    /* if uco appears ok, build structure and pass to get results */
++    if (status == FSL_RETURN_OK_S) {
++        scc_partition_info_t partition_info;
++        int code;
++
++        partition_info.user_base = (uint32_t)address;
++
++        /* get the results */
++        code = ioctl(user_ctx->openfd,
++                    SHW_IOCTL_REQUEST + SHW_USER_REQ_SSTATUS,
++                    &partition_info);
++
++        if (code == 0) {
++            *part_status = partition_info.status;
++            status = FSL_RETURN_OK_S;
++        }
++    }
++
++    return status;
++}
++
++
++/**
++ * Diminish the permissions of a block of secure memory.  Note that permissions
++ * can only be revoked.
++ *
++ * @param       user_ctx        User context
++ * @param       address         Base address of the secure memory to work with
++ * @param       permissions     Permissions to initialize the partition with.
++ *                              Can be made by ORing flags from the
++ *                              #fsl_shw_permission_t.
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t fsl_shw_diminish_perms(
++                        fsl_shw_uco_t* user_ctx,
++                        void *address,
++                        uint32_t permissions) {
++    fsl_shw_return_t status = FSL_RETURN_INTERNAL_ERROR_S;
++
++    /* perform a sanity check on the uco */
++    status = validate_uco(user_ctx);
++
++    /* if uco appears ok, build structure and pass to get results */
++    if (status == FSL_RETURN_OK_S) {
++        scc_partition_info_t partition_info;
++        int code;
++
++        partition_info.user_base = (uint32_t)address;
++        partition_info.permissions = permissions;
++
++        /* get the results */
++        code = ioctl(user_ctx->openfd,
++                     SHW_IOCTL_REQUEST + SHW_USER_REQ_DROP_PERMS,
++                     &partition_info);
++
++        if (code == 0) {
++            status = FSL_RETURN_OK_S;
++        }
++    }
++
++    return status;
++}
++
++
++/**
++ * @brief   Encrypt a region of secure memory using the hardware secret key
++ *
++ * @param       user_ctx        User context
++ * @param       partition_base  Base address of the partition
++ * @param       offset          Offset of data from the partition base(octets)
++ * @param       length          Length of the data to encrypt
++ * @param       black_data      Location to store the encrypted data
++ * @param       IV              IV to use for the encryption routine
++ * @param       cypher_mode     Cyphering mode to use, specified by type
++ *                              #fsl_shw_cypher_mode_t
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t
++do_scc_encrypt_region(fsl_shw_uco_t* user_ctx,
++                   void* partition_base, uint32_t offset,
++                   uint32_t length, uint8_t* black_data,
++                   uint32_t* IV, fsl_shw_cypher_mode_t cypher_mode)
++{
++    fsl_shw_return_t status = FSL_RETURN_INTERNAL_ERROR_S;
++
++    /* perform a sanity check on the uco */
++    status = validate_uco(user_ctx);
++
++    /* if uco appears ok, build structure and pass to get results */
++    if (status == FSL_RETURN_OK_S) {
++        int code;
++        scc_region_t region_info;
++        int i;
++
++        region_info.partition_base = (uint32_t)partition_base;
++        region_info.offset = offset;
++        region_info.length = length;
++        region_info.black_data = black_data;
++        region_info.cypher_mode = cypher_mode;
++        if (cypher_mode == FSL_SHW_CYPHER_MODE_CBC) {
++            for (i = 0; i < 4; i++) {
++                region_info.IV[i] = IV[i];
++            }
++        }
++
++        /* get the results */
++        code = ioctl(user_ctx->openfd,
++                     SHW_IOCTL_REQUEST + SHW_USER_REQ_SCC_ENCRYPT,
++                     &region_info);
++
++        if (code == 0) {
++            status = FSL_RETURN_OK_S;
++        }
++    }
++
++    return status;
++}
++
++
++/**
++ * @brief   Decrypt a region of secure memory using the hardware secret key
++ *
++ * @param       user_ctx        User context
++ * @param       partition_base  Base address of the partition
++ * @param       offset          Offset of data from the partition base(octets)
++ * @param       length          Length of the data to encrypt
++ * @param       black_data      Location to store the encrypted data
++ * @param       IV              IV to use for the encryption routine
++ * @param       cypher_mode     Cyphering mode to use, specified by type
++ *                              #fsl_shw_cypher_mode_t
++ *
++ * @return    A return code of type #fsl_shw_return_t.
++ */
++fsl_shw_return_t
++do_scc_decrypt_region(fsl_shw_uco_t* user_ctx,
++                      void* partition_base, uint32_t offset,
++                      uint32_t length, const uint8_t* black_data,
++                      uint32_t* IV, fsl_shw_cypher_mode_t cypher_mode)
++{
++    fsl_shw_return_t status = FSL_RETURN_INTERNAL_ERROR_S;
++
++    /* perform a sanity check on the uco */
++    status = validate_uco(user_ctx);
++
++    /* if uco appears ok, build structure and pass to get results */
++    if (status == FSL_RETURN_OK_S) {
++        int code;
++        scc_region_t region_info;
++        int i;
++
++        region_info.partition_base = (uint32_t)partition_base;
++        region_info.offset = offset;
++        region_info.length = length;
++        region_info.black_data = (uint8_t*)black_data;
++        region_info.cypher_mode = cypher_mode;
++        if (cypher_mode == FSL_SHW_CYPHER_MODE_CBC) {
++            for (i = 0; i < 4; i++) {
++                region_info.IV[i] = IV[i];
++            }
++        }
++
++        /* get the results */
++        code = ioctl(user_ctx->openfd,
++                     SHW_IOCTL_REQUEST + SHW_USER_REQ_SCC_DECRYPT,
++                     &region_info);
++
++        if (code == 0) {
++            status = FSL_RETURN_OK_S;
++        }
++    }
++
++    return status;
+ }
+diff --git a/rng/fsl_shw_wrap.c b/rng/fsl_shw_wrap.c
+index 1488e1d..f752a1c 100644
+--- a/rng/fsl_shw_wrap.c
++++ b/rng/fsl_shw_wrap.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2005-2006 Freescale Semiconductor, Inc. All rights reserved.
++ * Copyright 2005-2008 Freescale Semiconductor, Inc. All rights reserved.
+  */
+ 
+ /*
+@@ -15,8 +15,8 @@
+  * User Space library to access the Security hardware
+  */
+ 
+-/*!
+- * @file lib/rng/fsl_shw_wrap.c
++/**
++ * @file fsl_shw_wrap.c
+  *
+  * This file implements Key-Wrap (Black Key) functions of the FSL SHW API.
+  *
+@@ -72,6 +72,7 @@
+ 
+ #include "shw_driver.h"
+ 
++
+ #define ICV_LENGTH 16
+ #define T_LENGTH 16
+ #define KEK_LENGTH 16
+@@ -85,7 +86,8 @@
+ #define ALGORITHM_OFFSET (LENGTH_OFFSET + LENGTH_LENGTH)
+ #define KEY_PRIME_OFFSET (ALGORITHM_OFFSET + ALGORITHM_LENGTH)
+ 
+-/*!
++
++/**
+  * Place a key into a protected location for use only by cryptographic
+  * algorithms.
+  *
+@@ -107,7 +109,7 @@
+  * modes.
+  *
+  * @param      user_ctx         A user context from #fsl_shw_register_user().
+- * @param      key_info      The information about the key to be which will
++ * @param[in,out] key_info      The information about the key to be which will
+  *                              be established.  In the create case, the key
+  *                              length must be set.
+  * @param      establish_type   How @a key will be interpreted to establish a
+@@ -121,23 +123,25 @@
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_establish_key(fsl_shw_uco_t * user_ctx,
+-				       fsl_shw_sko_t * key_info,
+-				       fsl_shw_key_wrap_t establish_type,
+-				       const uint8_t * key)
++fsl_shw_return_t fsl_shw_establish_key(
++                                       fsl_shw_uco_t* user_ctx,
++                                       fsl_shw_sko_t* key_info,
++                                       fsl_shw_key_wrap_t establish_type,
++                                       const uint8_t* key)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)key_info;
+-	(void)establish_type;
+-	(void)key;
++    /* Unused */
++    (void)user_ctx;
++    (void)key_info;
++    (void)establish_type;
++    (void)key;
+ 
+-	return ret;
++    return ret;
+ }
+ 
+-/*!
++
++/**
+  * Wrap a key and retrieve the wrapped value.
+  *
+  * A wrapped key is a key that has been cryptographically obscured.  It is
+@@ -151,27 +155,29 @@ fsl_shw_return_t fsl_shw_establish_key(fsl_shw_uco_t * user_ctx,
+  *
+  * @param      user_ctx         A user context from #fsl_shw_register_user().
+  * @param      key_info         The information about the key to be deleted.
+- * @param      covered_key      The location to store the 48-octet wrapped key.
++ * @param[out] covered_key      The location to store the 48-octet wrapped key.
+  *                              (This size is based upon the maximum key size
+  *                              of 32 octets).
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_extract_key(fsl_shw_uco_t * user_ctx,
+-				     fsl_shw_sko_t * key_info,
+-				     uint8_t * covered_key)
++fsl_shw_return_t fsl_shw_extract_key(fsl_shw_uco_t* user_ctx,
++                                     fsl_shw_sko_t* key_info,
++                                     uint8_t* covered_key)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)key_info;
+-	(void)covered_key;
+ 
+-	return ret;
++    /* Unused */
++    (void)user_ctx;
++    (void)key_info;
++    (void)covered_key;
++
++    return ret;
+ }
+ 
+-/*!
++
++/**
+  * De-establish a key so that it can no longer be accessed.
+  *
+  * The key will need to be re-established before it can again be used.
+@@ -184,14 +190,15 @@ fsl_shw_return_t fsl_shw_extract_key(fsl_shw_uco_t * user_ctx,
+  *
+  * @return    A return code of type #fsl_shw_return_t.
+  */
+-fsl_shw_return_t fsl_shw_release_key(fsl_shw_uco_t * user_ctx,
+-				     fsl_shw_sko_t * key_info)
++fsl_shw_return_t fsl_shw_release_key(
++                             fsl_shw_uco_t* user_ctx,
++                             fsl_shw_sko_t* key_info)
+ {
+-	fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
++    fsl_shw_return_t ret = FSL_RETURN_ERROR_S;
+ 
+-	/* Unused */
+-	(void)user_ctx;
+-	(void)key_info;
++    /* Unused */
++    (void)user_ctx;
++    (void)key_info;
+ 
+-	return ret;
++    return ret;
+ }
+diff --git a/sahara2/fsl_shw_keystore.c b/sahara2/fsl_shw_keystore.c
+new file mode 100644
+index 0000000..8b3c325
+--- /dev/null
++++ b/sahara2/fsl_shw_keystore.c
+@@ -0,0 +1,765 @@
++/*
++ * Copyright 2008 Freescale Semiconductor, Inc. All Rights Reserved.
++ */
++
++/*
++ * The code contained herein is licensed under the GNU General Public
++ * License. You may obtain a copy of the GNU General Public License
++ * Version 2 or later at the following locations:
++ *
++ * http://www.opensource.org/licenses/gpl-license.html
++ * http://www.gnu.org/copyleft/gpl.html
++ */
++
++/**
++ * @file fsl_shw_keystore.c
++ *
++ * File which implements a default keystore policy, for use as the system
++ * keystore.
++ */
++#include "fsl_platform.h"
++#include "fsl_shw.h"
++#include "fsl_shw_keystore.h"
++
++#if defined(DIAG_DRV_IF)
++#include <diagnostic.h>
++#endif
++
++#if !defined(FSL_HAVE_SCC2) && defined(__KERNEL__)
++#include <asm/arch/mxc_scc_driver.h>
++#endif
++
++/* Define a semaphore to protect the keystore data */
++#ifdef __KERNEL__
++#define LOCK_INCLUDES os_lock_context_t context
++#define ACQUIRE_LOCK os_lock_save_context(keystore->lock, context)
++#define RELEASE_LOCK os_unlock_restore_context(keystore->lock, context);
++#else
++#define LOCK_INCLUDES
++#define ACQUIRE_LOCK
++#define RELEASE_LOCK
++#endif	/* __KERNEL__ */
++
++/**
++ * Calculates the byte offset into a word
++ *  @param   bp  The byte (char*) pointer
++ *  @return      The offset (0, 1, 2, or 3)
++ */
++#define SCC_BYTE_OFFSET(bp) ((uint32_t)(bp) % sizeof(uint32_t))
++
++/**
++ * Converts (by rounding down) a byte pointer into a word pointer
++ *  @param  bp  The byte (char*) pointer
++ *  @return     The word (uint32_t) as though it were an aligned (uint32_t*)
++ */
++#define SCC_WORD_PTR(bp) (((uint32_t)(bp)) & ~(sizeof(uint32_t)-1))
++
++/* Depending on the architecture, these functions should be defined
++ * differently.  On Platforms with SCC2, the functions use the secure
++ * partition interface and should be available in both user and kernel space.
++ * On platforms with SCC, they use the SCC keystore interface.  This is only
++ * available in kernel mode, so they should be stubbed out in user mode.
++ */
++#if defined(FSL_HAVE_SCC2) || (defined(FSL_HAVE_SCC) && defined(__KERNEL__))
++void fsl_shw_init_keystore(
++			    fsl_shw_kso_t *keystore,
++			    fsl_shw_return_t(*data_init) (fsl_shw_uco_t *user_ctx,
++							   void **user_data),
++			    void (*data_cleanup) (fsl_shw_uco_t *user_ctx,
++						   void **user_data),
++			    fsl_shw_return_t(*slot_alloc) (void *user_data,
++							    uint32_t size,
++							    uint64_t owner_id,
++							    uint32_t *slot),
++			    fsl_shw_return_t(*slot_dealloc) (void *user_data,
++							      uint64_t
++							      owner_id,
++							      uint32_t slot),
++			    fsl_shw_return_t(*slot_verify_access) (void
++								    *user_data,
++								    uint64_t
++								    owner_id,
++								    uint32_t
++								    slot),
++			    void *(*slot_get_address) (void *user_data,
++							uint32_t handle),
++			    uint32_t(*slot_get_base) (void *user_data,
++						       uint32_t handle),
++			    uint32_t(*slot_get_offset) (void *user_data,
++							 uint32_t handle),
++			    uint32_t(*slot_get_slot_size) (void *user_data,
++							    uint32_t handle))
++{
++	keystore->data_init = data_init;
++	keystore->data_cleanup = data_cleanup;
++	keystore->slot_alloc = slot_alloc;
++	keystore->slot_dealloc = slot_dealloc;
++	keystore->slot_verify_access = slot_verify_access;
++	keystore->slot_get_address = slot_get_address;
++	keystore->slot_get_base = slot_get_base;
++	keystore->slot_get_offset = slot_get_offset;
++	keystore->slot_get_slot_size = slot_get_slot_size;
++}
++void fsl_shw_init_keystore_default(fsl_shw_kso_t *keystore)
++{
++	keystore->data_init = shw_kso_init_data;
++	keystore->data_cleanup = shw_kso_cleanup_data;
++	keystore->slot_alloc = shw_slot_alloc;
++	keystore->slot_dealloc = shw_slot_dealloc;
++	keystore->slot_verify_access = shw_slot_verify_access;
++	keystore->slot_get_address = shw_slot_get_address;
++	keystore->slot_get_base = shw_slot_get_base;
++	keystore->slot_get_offset = shw_slot_get_offset;
++	keystore->slot_get_slot_size = shw_slot_get_slot_size;
++}
++
++/**
++ * Do any keystore specific initializations
++ */
++fsl_shw_return_t fsl_shw_establish_keystore(fsl_shw_uco_t *user_ctx,
++						fsl_shw_kso_t *keystore)
++{
++	if (keystore->data_init == NULL) {
++		return FSL_RETURN_ERROR_S;
++	}
++
++    /* Call the data_init function for any user setup */
++    return keystore->data_init(user_ctx, &(keystore->user_data));
++}
++void fsl_shw_release_keystore(fsl_shw_uco_t *user_ctx,
++				 fsl_shw_kso_t *keystore)
++{
++
++    /* Call the data_cleanup function for any keystore cleanup.
++	  * NOTE: The keystore doesn't have any way of telling which keys are using
++	  * it, so it is up to the user program to manage their key objects
++	  * correctly.
++	  */
++	 if ((keystore != NULL) && (keystore->data_cleanup != NULL)) {
++		keystore->data_cleanup(user_ctx, &(keystore->user_data));
++	}
++	return;
++}
++
++fsl_shw_return_t keystore_slot_alloc(fsl_shw_kso_t *keystore, uint32_t size,
++				       uint64_t owner_id, uint32_t *slot)
++{
++	LOCK_INCLUDES;
++	fsl_shw_return_t retval = FSL_RETURN_ERROR_S;
++
++#ifdef DIAG_DRV_IF
++	    LOG_DIAG("In keystore_slot_alloc.");
++
++#endif
++	ACQUIRE_LOCK;
++	if ((keystore->slot_alloc == NULL) || (keystore->user_data == NULL)) {
++		goto out;
++	}
++
++#ifdef DIAG_DRV_IF
++	    LOG_DIAG_ARGS("key length: %i, handle: %i\n", size, *slot);
++
++#endif
++retval = keystore->slot_alloc(keystore->user_data, size, owner_id, slot);
++out:RELEASE_LOCK;
++	return retval;
++}
++
++fsl_shw_return_t keystore_slot_dealloc(fsl_shw_kso_t *keystore,
++					 uint64_t owner_id, uint32_t slot)
++{
++	LOCK_INCLUDES;
++	fsl_shw_return_t retval = FSL_RETURN_ERROR_S;
++	ACQUIRE_LOCK;
++	if ((keystore->slot_alloc == NULL) || (keystore->user_data == NULL)) {
++		goto out;
++	}
++	retval =
++	    keystore->slot_dealloc(keystore->user_data, owner_id, slot);
++out:RELEASE_LOCK;
++	return retval;
++}
++
++fsl_shw_return_t
++keystore_load_slot(fsl_shw_kso_t * keystore, uint64_t owner_id, uint32_t slot,
++		   const uint8_t * key_data, uint32_t key_length)
++{
++
++#ifdef FSL_HAVE_SCC2
++	    LOCK_INCLUDES;
++	fsl_shw_return_t retval = FSL_RETURN_ERROR_S;
++	uint32_t slot_size;
++	uint32_t i;
++	uint8_t * slot_location;
++	ACQUIRE_LOCK;
++	if ((keystore->slot_verify_access == NULL) ||
++	      (keystore->user_data == NULL))
++		goto out;
++	if (keystore->
++	      slot_verify_access(keystore->user_data, owner_id,
++				 slot) !=FSL_RETURN_OK_S) {
++		retval = FSL_RETURN_AUTH_FAILED_S;
++		goto out;
++	}
++	slot_size = keystore->slot_get_slot_size(keystore->user_data, slot);
++	if (key_length > slot_size) {
++		retval = FSL_RETURN_BAD_DATA_LENGTH_S;
++		goto out;
++	}
++	slot_location = keystore->slot_get_address(keystore->user_data, slot);
++	for (i = 0; i < key_length; i++) {
++		slot_location[i] = key_data[i];
++	}
++	retval = FSL_RETURN_OK_S;
++out:RELEASE_LOCK;
++	return retval;
++
++#else	/* FSL_HAVE_SCC2 */
++	fsl_shw_return_t retval;
++	scc_return_t scc_ret;
++	scc_ret =
++	    scc_load_slot(owner_id, slot, (uint8_t *) key_data, key_length);
++	switch (scc_ret) {
++	case SCC_RET_OK:
++		retval = FSL_RETURN_OK_S;
++		break;
++	case SCC_RET_VERIFICATION_FAILED:
++		retval = FSL_RETURN_AUTH_FAILED_S;
++		break;
++	case SCC_RET_INSUFFICIENT_SPACE:
++		retval = FSL_RETURN_BAD_DATA_LENGTH_S;
++		break;
++	default:
++		retval = FSL_RETURN_ERROR_S;
++	}
++	return retval;
++
++#endif	/* FSL_HAVE_SCC2 */
++}
++
++fsl_shw_return_t
++keystore_slot_encrypt(fsl_shw_uco_t *user_ctx, fsl_shw_kso_t *keystore,
++		      uint64_t owner_id, uint32_t slot, uint32_t length,
++		      uint8_t *destination)
++{
++
++#ifdef FSL_HAVE_SCC2
++	LOCK_INCLUDES;
++	fsl_shw_return_t retval = FSL_RETURN_ERROR_S;
++	uint32_t slot_length;
++	uint32_t IV[4];
++	uint32_t * iv_ptr = (uint32_t *) & (owner_id);
++
++	/* Build the IV */
++	IV[0] = iv_ptr[0];
++	IV[1] = iv_ptr[1];
++	IV[2] = 0;
++	IV[3] = 0;
++	ACQUIRE_LOCK;
++
++	/* Ensure that the data will fit in the key slot */
++	slot_length =
++	    keystore->slot_get_slot_size(keystore->user_data, slot);
++	if (length > slot_length) {
++		goto out;
++	}
++
++	  /* Call scc encrypt function to encrypt the data. */
++	    retval = do_scc_encrypt_region(user_ctx,
++					   (void *)keystore->
++					   slot_get_base(keystore->user_data,
++							 slot),
++					   keystore->slot_get_offset(keystore->
++								      user_data,
++								      slot),
++					   length, destination, IV,
++					   FSL_SHW_CYPHER_MODE_CBC);
++	goto out;
++out:RELEASE_LOCK;
++	return retval;
++
++#else
++	scc_return_t retval;
++	retval = scc_encrypt_slot(owner_id, slot, length, destination);
++	if (retval == SCC_RET_OK)
++		return FSL_RETURN_OK_S;
++	return FSL_RETURN_ERROR_S;
++
++#endif	/* FSL_HAVE_SCC2 */
++}
++
++fsl_shw_return_t
++keystore_slot_decrypt(fsl_shw_uco_t *user_ctx, fsl_shw_kso_t *keystore,
++		      uint64_t owner_id, uint32_t slot, uint32_t length,
++		      const uint8_t *source)
++{
++
++#ifdef FSL_HAVE_SCC2
++	LOCK_INCLUDES;
++	fsl_shw_return_t retval = FSL_RETURN_ERROR_S;
++	uint32_t slot_length;
++	uint32_t IV[4];
++	uint32_t *iv_ptr = (uint32_t *) & (owner_id);
++
++    /* Build the IV */
++    IV[0] = iv_ptr[0];
++	IV[1] = iv_ptr[1];
++	IV[2] = 0;
++	IV[3] = 0;
++	ACQUIRE_LOCK;
++
++	/* Call scc decrypt function to decrypt the data. */
++
++	/* Ensure that the data will fit in the key slot */
++	    slot_length =
++	    keystore->slot_get_slot_size(keystore->user_data, slot);
++	if (length > slot_length)
++		goto out;
++
++	/* Call scc decrypt function to encrypt the data. */
++	    retval = do_scc_decrypt_region(user_ctx,
++					   (void *)keystore->
++					   slot_get_base(keystore->user_data,
++							 slot),
++					   keystore->slot_get_offset(keystore->
++								      user_data,
++								      slot),
++					   length, source, IV,
++					   FSL_SHW_CYPHER_MODE_CBC);
++	goto out;
++out:RELEASE_LOCK;
++	return retval;
++
++#else
++	scc_return_t retval;
++	retval = scc_decrypt_slot(owner_id, slot, length, source);
++	if (retval == SCC_RET_OK)
++		return FSL_RETURN_OK_S;
++	return FSL_RETURN_ERROR_S;
++
++#endif	/* FSL_HAVE_SCC2 */
++}
++
++#else	/* SCC in userspace */
++void fsl_shw_init_keystore(
++			    fsl_shw_kso_t *keystore,
++			    fsl_shw_return_t(*data_init) (fsl_shw_uco_t *user_ctx,
++							   void **user_data),
++			    void (*data_cleanup) (fsl_shw_uco_t *user_ctx,
++						   void **user_data),
++			    fsl_shw_return_t(*slot_alloc) (void *user_data,
++							    uint32_t size,
++							    uint64_t owner_id,
++							    uint32_t *slot),
++			    fsl_shw_return_t(*slot_dealloc) (void *user_data,
++							      uint64_t
++							      owner_id,
++							      uint32_t slot),
++			    fsl_shw_return_t(*slot_verify_access) (void
++								    *user_data,
++								    uint64_t
++								    owner_id,
++								    uint32_t
++								    slot),
++			    void *(*slot_get_address) (void *user_data,
++							uint32_t handle),
++			    uint32_t(*slot_get_base) (void *user_data,
++						       uint32_t handle),
++			    uint32_t(*slot_get_offset) (void *user_data,
++							 uint32_t handle),
++			    uint32_t(*slot_get_slot_size) (void *user_data,
++							    uint32_t handle))
++{
++	(void)keystore;
++	(void)data_init;
++	(void)data_cleanup;
++	(void)slot_alloc;
++	(void)slot_dealloc;
++	(void)slot_verify_access;
++	(void)slot_get_address;
++	(void)slot_get_base;
++	(void)slot_get_offset;
++	(void)slot_get_slot_size;
++}
++
++void fsl_shw_init_keystore_default(fsl_shw_kso_t * keystore)
++{
++	(void)keystore;
++}
++fsl_shw_return_t fsl_shw_establish_keystore(fsl_shw_uco_t *user_ctx,
++						 fsl_shw_kso_t *keystore)
++{
++	(void)user_ctx;
++	(void)keystore;
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++void fsl_shw_release_keystore(fsl_shw_uco_t *user_ctx,
++				fsl_shw_kso_t *keystore)
++{
++	(void)user_ctx;
++	(void)keystore;
++	return;
++}
++
++fsl_shw_return_t keystore_slot_alloc(fsl_shw_kso_t *keystore, uint32_t size,
++					uint64_t owner_id, uint32_t *slot)
++{
++	(void)keystore;
++	(void)size;
++	(void)owner_id;
++	(void)slot;
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++
++fsl_shw_return_t keystore_slot_dealloc(fsl_shw_kso_t *keystore,
++					 uint64_t owner_id, uint32_t slot)
++{
++	(void)keystore;
++	(void)owner_id;
++	(void)slot;
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++
++fsl_shw_return_t
++keystore_load_slot(fsl_shw_kso_t *keystore, uint64_t owner_id, uint32_t slot,
++		   const uint8_t *key_data, uint32_t key_length)
++{
++	(void)keystore;
++	(void)owner_id;
++	(void)slot;
++	(void)key_data;
++	(void)key_length;
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++
++fsl_shw_return_t
++keystore_slot_decrypt(fsl_shw_uco_t *user_ctx, fsl_shw_kso_t *keystore,
++		      uint64_t owner_id, uint32_t slot, uint32_t length,
++		      const uint8_t *source)
++{
++	(void)user_ctx;
++	(void)keystore;
++	(void)owner_id;
++	(void)slot;
++	(void)length;
++	(void)source;
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++
++fsl_shw_return_t
++keystore_slot_encrypt(fsl_shw_uco_t *user_ctx, fsl_shw_kso_t *keystore,
++		      uint64_t owner_id, uint32_t slot, uint32_t length,
++		      uint8_t *destination)
++{
++	(void)user_ctx;
++	(void)keystore;
++	(void)owner_id;
++	(void)slot;
++	(void)length;
++	(void)destination;
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++
++
++#endif	/* FSL_HAVE_SCC2 */
++
++/***** Default keystore implementation **************************************/
++
++#ifdef FSL_HAVE_SCC2
++    fsl_shw_return_t shw_kso_init_data(fsl_shw_uco_t *user_ctx,
++					void **user_data)
++{
++	int retval = FSL_RETURN_ERROR_S;
++	keystore_data_t *keystore_data = NULL;
++	fsl_shw_pco_t *capabilities = fsl_shw_get_capabilities(user_ctx);
++	uint32_t partition_size;
++	uint32_t slot_count;
++	uint32_t keystore_data_size;
++	uint8_t UMID[16] = {
++	0x42, 0, 0, 0, 0x43, 0, 0, 0, 0x19, 0, 0, 0, 0x59, 0, 0, 0};
++	uint32_t permissions =
++	    FSL_PERM_TH_R | FSL_PERM_TH_W | FSL_PERM_HD_R | FSL_PERM_HD_W |
++	    FSL_PERM_HD_X;
++
++	/* Look up the size of a partition to see how big to make the keystore */
++	partition_size = fsl_shw_pco_get_spo_size_bytes(capabilities);
++
++	/* Calculate the required size of the keystore data structure, based on the
++	  * number of keys that can fit in the partition.
++	  */
++	slot_count = partition_size / KEYSTORE_SLOT_SIZE;
++	keystore_data_size =
++	    sizeof(keystore_data_t) +
++	    slot_count * sizeof(keystore_data_slot_info_t);
++
++#ifdef __KERNEL__
++	keystore_data = os_alloc_memory(keystore_data_size, GFP_KERNEL);
++
++#else
++	keystore_data = malloc(keystore_data_size);
++
++#endif
++	if (keystore_data == NULL) {
++		retval = FSL_RETURN_NO_RESOURCE_S;
++		goto out;
++	}
++
++    /* Clear the memory (effectively clear all key assignments) */
++    memset(keystore_data, 0, keystore_data_size);
++
++   /* Place the slot information structure directly after the keystore data
++   	* structure.
++	*/
++	    keystore_data->slot =
++	    (keystore_data_slot_info_t *) (keystore_data + 1);
++	keystore_data->slot_count = slot_count;
++
++	/* Retrieve a secure partition to put the keystore in. */
++	keystore_data->base_address =
++	    fsl_shw_smalloc(user_ctx, partition_size, UMID, permissions);
++	if (keystore_data->base_address == NULL) {
++		retval = FSL_RETURN_NO_RESOURCE_S;
++		goto out;
++	}
++	*user_data = keystore_data;
++	retval = FSL_RETURN_OK_S;
++out:if (retval != FSL_RETURN_OK_S) {
++		if (keystore_data != NULL) {
++			if (keystore_data->base_address != NULL)
++				fsl_shw_sfree(NULL,
++					       keystore_data->base_address);
++
++#ifdef __KERNEL__
++			    os_free_memory(keystore_data);
++
++#else
++			    free(keystore_data);
++
++#endif
++		}
++	}
++	return retval;
++}
++void shw_kso_cleanup_data(fsl_shw_uco_t *user_ctx, void **user_data)
++{
++	if (user_data != NULL) {
++		keystore_data_t * keystore_data =
++		    (keystore_data_t *) (*user_data);
++		fsl_shw_sfree(user_ctx, keystore_data->base_address);
++
++#ifdef __KERNEL__
++		    os_free_memory(*user_data);
++
++#else
++		    free(*user_data);
++
++#endif
++	}
++	return;
++}
++
++fsl_shw_return_t shw_slot_verify_access(void *user_data, uint64_t owner_id,
++					  uint32_t slot)
++{
++	keystore_data_t * data = user_data;
++	if (data->slot[slot].owner == owner_id) {
++		return FSL_RETURN_OK_S;
++	} else {
++
++#ifdef DIAG_DRV_IF
++		    LOG_DIAG_ARGS("Access to slot %i fails.\n", slot);
++
++#endif
++		    return FSL_RETURN_AUTH_FAILED_S;
++	}
++}
++
++fsl_shw_return_t shw_slot_alloc(void *user_data, uint32_t size,
++				   uint64_t owner_id, uint32_t *slot)
++{
++	keystore_data_t *data = user_data;
++	uint32_t i;
++	if (size > KEYSTORE_SLOT_SIZE)
++		return FSL_RETURN_BAD_KEY_LENGTH_S;
++	for (i = 0; i < data->slot_count; i++) {
++		if (data->slot[i].allocated == 0) {
++			data->slot[i].allocated = 1;
++			data->slot[i].owner = owner_id;
++			(*slot) = i;
++
++#ifdef DIAG_DRV_IF
++			    LOG_DIAG_ARGS("Keystore: allocated slot %i. Slot "
++					  "address: %p\n",
++					  (*slot),
++					  data->base_address +
++					  (*slot) * KEYSTORE_SLOT_SIZE);
++
++#endif
++			    return FSL_RETURN_OK_S;
++		}
++	}
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++
++fsl_shw_return_t shw_slot_dealloc(void *user_data, uint64_t owner_id,
++				    uint32_t slot)
++{
++	keystore_data_t * data = user_data;
++	(void)owner_id;
++	(void)slot;
++	if (slot >= data->slot_count)
++		return FSL_RETURN_ERROR_S;
++	if (data->slot[slot].allocated == 1) {
++		data->slot[slot].allocated = 0;
++		return FSL_RETURN_OK_S;
++	}
++	return FSL_RETURN_ERROR_S;
++}
++
++void *shw_slot_get_address(void *user_data, uint32_t slot)
++{
++	keystore_data_t * data = user_data;
++	if (slot >= data->slot_count)
++		return NULL;
++	return data->base_address + slot * KEYSTORE_SLOT_SIZE;
++}
++
++uint32_t shw_slot_get_base(void *user_data, uint32_t slot)
++{
++	keystore_data_t * data = user_data;
++
++	/* There could potentially be more than one secure partition object
++	  * associated with this keystore.  For now, there is just one.
++	  */
++	(void)slot;
++	return (uint32_t) (data->base_address);
++}
++
++uint32_t shw_slot_get_offset(void *user_data, uint32_t slot)
++{
++	keystore_data_t *data = user_data;
++	if (slot >= data->slot_count)
++		return FSL_RETURN_ERROR_S;
++	return (slot * KEYSTORE_SLOT_SIZE);
++}
++
++uint32_t shw_slot_get_slot_size(void *user_data, uint32_t slot)
++{
++	(void)user_data;
++	(void)slot;
++
++	/* All slots are the same size in the default implementation */
++	return KEYSTORE_SLOT_SIZE;
++}
++
++#else	/* FSL_HAVE_SCC2 */
++
++#ifdef __KERNEL__
++    fsl_shw_return_t shw_kso_init_data(fsl_shw_uco_t *user_ctx,
++					void **user_data)
++{
++
++   /* The SCC does its own initialization.  All that needs to be done here is
++   	* make sure an SCC exists.
++	*/
++	*user_data = (void *)0xFEEDFEED;
++	return FSL_RETURN_OK_S;
++}
++void shw_kso_cleanup_data(fsl_shw_uco_t *user_ctx, void **user_data)
++{
++
++    /* The SCC does its own cleanup. */
++	*user_data = NULL;
++	return;
++}
++
++fsl_shw_return_t shw_slot_verify_access(void *user_data, uint64_t owner_id,
++					  uint32_t slot)
++{
++
++	/* Zero is used for the size because the newer interface does bounds
++	  * checking later.
++	  */
++	scc_return_t retval;
++	retval = scc_verify_slot_access(owner_id, slot, 0);
++	if (retval == SCC_RET_OK) {
++		return FSL_RETURN_OK_S;
++	}
++	return FSL_RETURN_AUTH_FAILED_S;
++}
++
++fsl_shw_return_t shw_slot_alloc(void *user_data, uint32_t size,
++				   uint64_t owner_id, uint32_t *slot)
++{
++	scc_return_t retval;
++
++#ifdef DIAG_DRV_IF
++	    LOG_DIAG_ARGS("key length: %i, handle: %i\n", size, *slot);
++
++#endif
++	retval = scc_alloc_slot(size, owner_id, slot);
++	if (retval == SCC_RET_OK)
++		return FSL_RETURN_OK_S;
++
++	return FSL_RETURN_NO_RESOURCE_S;
++}
++
++fsl_shw_return_t shw_slot_dealloc(void *user_data, uint64_t owner_id,
++				    uint32_t slot)
++{
++	scc_return_t retval;
++	retval = scc_dealloc_slot(owner_id, slot);
++	if (retval == SCC_RET_OK)
++		return FSL_RETURN_OK_S;
++
++	return FSL_RETURN_ERROR_S;
++}
++void *shw_slot_get_address(void *user_data, uint32_t slot)
++{
++	uint64_t owner_id = *((uint64_t *) user_data);
++	uint32_t address;
++	uint32_t value_size_bytes;
++	uint32_t slot_size_bytes;
++	scc_return_t scc_ret;
++	scc_ret =
++	    scc_get_slot_info(owner_id, slot, &address, &value_size_bytes,
++			      &slot_size_bytes);
++	if (scc_ret == SCC_RET_OK) {
++		return (void *)address;
++	}
++	return NULL;
++}
++
++uint32_t shw_slot_get_base(void *user_data, uint32_t slot)
++{
++	return 0;
++}
++
++uint32_t shw_slot_get_offset(void *user_data, uint32_t slot)
++{
++	return 0;
++}
++
++
++/* Return the size of the key slot, in octets */
++uint32_t shw_slot_get_slot_size(void *user_data, uint32_t slot)
++{
++	uint64_t owner_id = *((uint64_t *) user_data);
++	uint32_t address;
++	uint32_t value_size_bytes;
++	uint32_t slot_size_bytes;
++	scc_return_t scc_ret;
++	scc_ret =
++	    scc_get_slot_info(owner_id, slot, &address, &value_size_bytes,
++			      &slot_size_bytes);
++	if (scc_ret == SCC_RET_OK)
++		return slot_size_bytes;
++	return 0;
++}
++
++
++#endif	/* __KERNEL__ */
++
++#endif	/* FSL_HAVE_SCC2 */
++
++/*****************************************************************************/
+-- 
+1.8.0
+

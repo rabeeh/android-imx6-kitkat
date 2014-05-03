@@ -1,0 +1,204 @@
+From 476a2699f49a3539cc4257d440e47ebd2b3d551f Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Fri, 23 Aug 2013 13:56:27 +0800
+Subject: [PATCH 240/249] ENGR00276459 Read revision from
+ /sys/devices/soc0/xxx on Linux 3.10
+
+On Linux 3.0/3.5, SoC revision was retrieved from "Revision" field in
+/proc/cpuinfo.
+On Linux 3.10, SoC revision should be interpreted from /sys/devices/soc0/xxx.
+
+e.g.
+$ cat /sys/devices/soc0/soc_id
+i.MX6Q
+$ cat /sys/devices/soc0/revision
+1.2
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_io.c  | 92 ++++++++++++++++++++++++++++++++++++++++++++++++++---------
+ vpu/vpu_lib.h | 35 ++++++++++++++++++-----
+ 2 files changed, 106 insertions(+), 21 deletions(-)
+
+diff --git a/vpu/vpu_io.c b/vpu/vpu_io.c
+index 3861bf9..8cbb571 100644
+--- a/vpu/vpu_io.c
++++ b/vpu/vpu_io.c
+@@ -27,6 +27,7 @@
+ #include <sys/ioctl.h>		/* fopen/fread */
+ #include <sys/errno.h>		/* fopen/fread */
+ #include <sys/types.h>
++#include <sys/utsname.h>	/* uname */
+ 
+ #include "vpu_debug.h"
+ #include "vpu_reg.h"
+@@ -46,6 +47,8 @@
+ #endif
+ #endif
+ 
++#define KERN_VER(a, b, c) (((a) << 16) + ((b) << 8) + (c))
++
+ static int vpu_fd = -1;
+ static unsigned long vpu_reg_base;
+ static int vpu_active_num = 0;
+@@ -74,29 +77,90 @@ static int get_system_rev(void)
+ 	int nread;
+ 	char *tmp, *rev;
+ 	int ret = -1;
+-
+-	fp = fopen("/proc/cpuinfo", "r");
+-	if (fp == NULL) {
+-		perror("/proc/cpuinfo\n");
++	struct utsname sys_name;
++	int kv, kv_major, kv_minor, kv_rel;
++	char soc_name[255];
++	int rev_major, rev_minor;
++	int idx, num;
++
++	if (uname(&sys_name) < 0) {
++		perror("uname");
+ 		return ret;
+ 	}
+ 
+-	nread = fread(buf, 1, sizeof(buf), fp);
+-	fclose(fp);
+-	if ((nread == 0) || (nread == sizeof(buf))) {
++	if (sscanf(sys_name.release, "%d.%d.%d", &kv_major, &kv_minor, &kv_rel) != 3) {
++		perror("sscanf");
+ 		return ret;
+ 	}
+ 
+-	buf[nread] = '\0';
++	kv = ((kv_major << 16) + (kv_minor << 8) + kv_rel);
++	dprintf(4, "kernel:%s, %d.%d.%d\n", sys_name.release, kv_major, kv_minor, kv_rel);
++
++	if (kv < KERN_VER(3, 10, 0)) {
++		fp = fopen("/proc/cpuinfo", "r");
++		if (fp == NULL) {
++			perror("/proc/cpuinfo");
++			return ret;
++		}
++
++		nread = fread(buf, 1, sizeof(buf), fp);
++		fclose(fp);
++		if ((nread == 0) || (nread == sizeof(buf))) {
++			return ret;
++		}
++
++		buf[nread] = '\0';
++
++		tmp = strstr(buf, "Revision");
++		if (tmp != NULL) {
++			rev = index(tmp, ':');
++			if (rev != NULL) {
++				rev++;
++				system_rev = strtoul(rev, NULL, 16);
++				ret = 0;
++			}
++		}
++	}
++	else {
++		fp = fopen("/sys/devices/soc0/soc_id", "r");
++		if (fp == NULL) {
++			perror("/sys/devices/soc0/soc_id");
++			return ret;
++		}
+ 
+-	tmp = strstr(buf, "Revision");
+-	if (tmp != NULL) {
+-		rev = index(tmp, ':');
+-		if (rev != NULL) {
+-			rev++;
+-			system_rev = strtoul(rev, NULL, 16);
++		if (fscanf(fp, "%s", soc_name) != 1) {
++			perror("fscanf");
++			fclose(fp);
++			return ret;
++		}
++		fclose(fp);
++
++		fp = fopen("/sys/devices/soc0/revision", "r");
++		if (fp == NULL) {
++			perror("/sys/devices/soc0/revision");
++			return ret;
++		}
++
++		if (fscanf(fp, "%d.%d", &rev_major, &rev_minor) != 2) {
++			perror("fscanf");
++			fclose(fp);
++			return ret;
++		}
++		fclose(fp);
++
++		num = sizeof(soc_info)/sizeof(soc_info[0]);
++
++		for (idx = 0; idx < num; idx++) {
++			if (!strcmp(soc_name, soc_info[idx].name))
++				break;
++		}
++
++		if (idx < num) {
++			system_rev = (soc_info[idx].id << 12) | (rev_major << 4) | rev_minor;
+ 			ret = 0;
+ 		}
++
++		dprintf(4, "soc: %s, rev: 0x%x\n", soc_name, system_rev);
+ 	}
+ 
+ 	return ret;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index d925bda..73872b0 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -645,6 +645,27 @@ typedef struct vpu_versioninfo {
+ 	int lib_release;	/* library release version */
+ } vpu_versioninfo;
+ 
++typedef enum {
++	MX27 = 0,
++	MX51,
++	MX53,
++	MX61,
++	MX63
++} SocIndex;
++
++typedef struct {
++	int id;
++	char *name;
++} SocInfo;
++
++static const SocInfo soc_info[] = {
++	{0x27, "i.MX27"},
++	{0x51, "i.MX51"},
++	{0x53, "i.MX53"},
++	{0x61, "i.MX6DL"},
++	{0x63, "i.MX6Q"}
++};
++
+ #define VPU_FW_VERSION(major, minor, release)	 \
+ 	(((major) << 12) + ((minor) << 8) + (release))
+ 
+@@ -682,13 +703,13 @@ static inline int type## _rev (int rev)         \
+         return (type() ? mxc_cpu_is_rev(rev) : 0);      \
+ }
+ 
+-#define cpu_is_mx27()		mxc_is_cpu(0x27)
+-#define cpu_is_mx51()		mxc_is_cpu(0x51)
+-#define cpu_is_mx53()		mxc_is_cpu(0x53)
+-#define cpu_is_mx5x()		(mxc_is_cpu(0x51) || mxc_is_cpu(0x53))
+-#define cpu_is_mx6q()		mxc_is_cpu(0x63)
+-#define cpu_is_mx6dl()		mxc_is_cpu(0x61)
+-#define cpu_is_mx6x()		(mxc_is_cpu(0x63) || mxc_is_cpu(0x61))
++#define cpu_is_mx27()		mxc_is_cpu(soc_info[MX27].id)
++#define cpu_is_mx51()		mxc_is_cpu(soc_info[MX51].id)
++#define cpu_is_mx53()		mxc_is_cpu(soc_info[MX53].id)
++#define cpu_is_mx5x()		(cpu_is_mx51() || cpu_is_mx53())
++#define cpu_is_mx6q()		mxc_is_cpu(soc_info[MX63].id)
++#define cpu_is_mx6dl()		mxc_is_cpu(soc_info[MX61].id)
++#define cpu_is_mx6x()		(cpu_is_mx6q() || cpu_is_mx6dl())
+ 
+ MXC_REV(cpu_is_mx27);
+ 
+-- 
+1.8.0
+

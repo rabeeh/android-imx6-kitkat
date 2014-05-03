@@ -1,0 +1,160 @@
+From 8e1fddec20feb857993411c5fea62419ec5ca34b Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Wed, 5 Jun 2013 14:49:52 +0800
+Subject: [PATCH 397/435] ENGR00219508 Specify capture/encode fps for
+ encoder/loopback
+
+User can use -a option to specify capture/encode fps for
+encoder/loopback test.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ test/mxc_vpu_test/dec.c       | 12 ++++++------
+ test/mxc_vpu_test/enc.c       | 20 ++++++++++++--------
+ test/mxc_vpu_test/main.c      |  4 ++++
+ test/mxc_vpu_test/transcode.c |  8 ++++----
+ 4 files changed, 26 insertions(+), 18 deletions(-)
+
+diff --git a/test/mxc_vpu_test/dec.c b/test/mxc_vpu_test/dec.c
+index c35173b..40257b2 100644
+--- a/test/mxc_vpu_test/dec.c
++++ b/test/mxc_vpu_test/dec.c
+@@ -2280,6 +2280,12 @@ decode_test(void *arg)
+ 		goto err1;
+ 	}
+ 
++#ifndef _FSL_VTS_
++	/* Not set fps when doing performance test default */
++        if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test)
++                dec->cmdl->fps = 30;
++#endif
++
+ 	/* parse the bitstream */
+ 	ret = decoder_parse(dec);
+ 	if (ret) {
+@@ -2313,12 +2319,6 @@ decode_test(void *arg)
+ 	if (ret)
+ 		goto err1;
+ 
+-#ifndef _FSL_VTS_
+-	/* Not set fps when doing performance test default */
+-        if ((dec->cmdl->fps == 0) && !vpu_v4l_performance_test)
+-                dec->cmdl->fps = 30;
+-#endif
+-
+ 	/* start decoding */
+ 	ret = decoder_start(dec);
+ err1:
+diff --git a/test/mxc_vpu_test/enc.c b/test/mxc_vpu_test/enc.c
+index 0035f75..9051811 100644
+--- a/test/mxc_vpu_test/enc.c
++++ b/test/mxc_vpu_test/enc.c
+@@ -30,7 +30,6 @@ extern struct capture_testbuffer cap_buffers[];
+ 
+ /* When app need to exit */
+ extern int quitflag;
+-static int frameRateInfo = 0;
+ 
+ #define FN_ENC_QP_DATA "enc_qp.log"
+ #define FN_ENC_SLICE_BND_DATA "enc_slice_bnd.log"
+@@ -230,20 +229,20 @@ encoder_fill_headers(struct encode *enc)
+ 		enchdr_param.userProfileLevelEnable = 1;
+ 		mbPicNum = ((enc->enc_picwidth + 15) / 16) *((enc->enc_picheight + 15) / 16);
+ 		if (enc->enc_picwidth <= 176 && enc->enc_picheight <= 144 &&
+-		    mbPicNum * frameRateInfo <= 1485)
++		    mbPicNum * enc->cmdl->fps <= 1485)
+ 			enchdr_param.userProfileLevelIndication = 8; /* L1 */
+ 		/* Please set userProfileLevelIndication to 8 if L0 is needed */
+ 		else if (enc->enc_picwidth <= 352 && enc->enc_picheight <= 288 &&
+-			 mbPicNum * frameRateInfo <= 5940)
++			 mbPicNum * enc->cmdl->fps <= 5940)
+ 			enchdr_param.userProfileLevelIndication = 2; /* L2 */
+ 		else if (enc->enc_picwidth <= 352 && enc->enc_picheight <= 288 &&
+-			 mbPicNum * frameRateInfo <= 11880)
++			 mbPicNum * enc->cmdl->fps <= 11880)
+ 			enchdr_param.userProfileLevelIndication = 3; /* L3 */
+ 		else if (enc->enc_picwidth <= 640 && enc->enc_picheight <= 480 &&
+-			 mbPicNum * frameRateInfo <= 36000)
++			 mbPicNum * enc->cmdl->fps <= 36000)
+ 			enchdr_param.userProfileLevelIndication = 4; /* L4a */
+ 		else if (enc->enc_picwidth <= 720 && enc->enc_picheight <= 576 &&
+-			 mbPicNum * frameRateInfo <= 40500)
++			 mbPicNum * enc->cmdl->fps <= 40500)
+ 			enchdr_param.userProfileLevelIndication = 5; /* L5 */
+ 		else
+ 			enchdr_param.userProfileLevelIndication = 6; /* L6 */
+@@ -456,7 +455,7 @@ encoder_allocate_framebuffer(struct encode *enc)
+ 	}
+ 
+ 	if (enc->cmdl->src_scheme == PATH_V4L2) {
+-		ret = v4l_capture_setup(enc, enc->src_picwidth, enc->src_picheight, 30);
++		ret = v4l_capture_setup(enc, enc->src_picwidth, enc->src_picheight, enc->cmdl->fps);
+ 		if (ret < 0) {
+ 			goto err1;
+ 		}
+@@ -914,8 +913,13 @@ encoder_open(struct encode *enc)
+ 		encop.picHeight = enc->enc_picheight;
+ 	}
+ 
++	if (enc->cmdl->fps == 0)
++		enc->cmdl->fps = 30;
++
++	info_msg("Capture/Encode fps will be %d\n", enc->cmdl->fps);
++
+ 	/*Note: Frame rate cannot be less than 15fps per H.263 spec */
+-	encop.frameRateInfo = frameRateInfo = 30;
++	encop.frameRateInfo = enc->cmdl->fps;
+ 	encop.bitRate = enc->cmdl->bitrate;
+ 	encop.gopSize = enc->cmdl->gop;
+ 	encop.slicemode.sliceMode = 0;	/* 0: 1 slice per picture; 1: Multiple slices per picture */
+diff --git a/test/mxc_vpu_test/main.c b/test/mxc_vpu_test/main.c
+index 67de4eb..4003a90 100644
+--- a/test/mxc_vpu_test/main.c
++++ b/test/mxc_vpu_test/main.c
+@@ -118,6 +118,8 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "        default is interleave(1). \n "\
+ 	       "  -q <quantization parameter> \n "\
+ 	       "	default is 20 \n "\
++	       "  -a <frame rate> capture/encode framerate \n "\
++	       "	default is 30 \n "\
+ 	       "\n"\
+ 	       "loopback options \n "\
+ 	       "  -x <input method> input mode V4L2 with video node \n "\
+@@ -130,6 +132,8 @@ char *usage = "Usage: ./mxc_vpu_test.out -D \"<decode options>\" "\
+ 	       "	default is 144 \n "\
+ 	       "  -t <chromaInterleave> CbCr interleaved \n "\
+                "        default is interleave(1). \n "\
++	       "  -a <frame rate> capture/encode/display framerate \n "\
++	       "	default is 30 \n "\
+ 	       "\n"\
+ 	       "transcode options, encoder set to h264 720p now \n "\
+ 	       "  -i <input file> Read input from file \n "\
+diff --git a/test/mxc_vpu_test/transcode.c b/test/mxc_vpu_test/transcode.c
+index 9f5522a..1e2d91f 100644
+--- a/test/mxc_vpu_test/transcode.c
++++ b/test/mxc_vpu_test/transcode.c
+@@ -1237,6 +1237,10 @@ transcode_test(void *arg)
+ 		goto err1;
+ 	}
+ 
++	/* Not set fps when doing performance test default */
++        if (dec->cmdl->fps == 0)
++                dec->cmdl->fps = 30;
++
+ 	/* parse the bitstream */
+ 	ret = decoder_parse(dec);
+ 	if (ret) {
+@@ -1270,10 +1274,6 @@ transcode_test(void *arg)
+ 	if (ret)
+ 		goto err1;
+ 
+-	/* Not set fps when doing performance test default */
+-        if (dec->cmdl->fps == 0)
+-                dec->cmdl->fps = 30;
+-
+ 	/* allocate memory for must remember stuff */
+ 	enc = (struct encode *)calloc(1, sizeof(struct encode));
+ 	if (enc == NULL) {
+-- 
+1.8.0
+

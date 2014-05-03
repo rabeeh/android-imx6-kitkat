@@ -1,0 +1,134 @@
+From 764db8c002e9f057fcd46e2a1600048bb8f04b17 Mon Sep 17 00:00:00 2001
+From: Richard Liu <r66033@freescale.com>
+Date: Mon, 18 Nov 2013 14:06:32 +0800
+Subject: [PATCH 19/23] ENGR00286762 fix dual display swap rectange mouse
+ cursor ghost
+
+fixed by don't update layer visible region if it is not the latest display,
+as all the display use one layer source, if layer's visable region updated
+after PRIMARY display, the dirty region of EXTERNAL display will not correct.
+
+enable swap rectange can decrease the bus loading for the case only part of
+screen has update, below is bus loading result for mouse moving in settings.
+without swap rectange: bus loading 83.1%
+enable swap rectange: bus loading 43.1%
+
+Signed-off-by: Richard Liu <r66033@freescale.com>
+
+Conflicts:
+	services/surfaceflinger/SurfaceFlinger.cpp
+---
+ services/surfaceflinger/DisplayDevice.cpp  |  4 +++-
+ services/surfaceflinger/SurfaceFlinger.cpp | 32 ++++++++++++++++++++++++++++++
+ services/surfaceflinger/SurfaceFlinger.h   |  4 ++++
+ 3 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/services/surfaceflinger/DisplayDevice.cpp b/services/surfaceflinger/DisplayDevice.cpp
+index a7ca85e..d8fe076 100644
+--- a/services/surfaceflinger/DisplayDevice.cpp
++++ b/services/surfaceflinger/DisplayDevice.cpp
+@@ -130,8 +130,10 @@ DisplayDevice::DisplayDevice(
+     setProjection(DisplayState::eOrientationDefault, mViewport, mFrame);
+ 
+ #ifdef EGL_ANDROID_swap_rectangle
++    // only enable swap rectange in PRIMARY and EXTERNAL display, hwcomposer
++    // has problem to support swap rectange in Virtual display.
+     if (eglSetSwapRectangleANDROID(display, surface,
+-            0, 0, mDisplayWidth, mDisplayHeight) == EGL_TRUE) {
++            0, 0, mDisplayWidth, mDisplayHeight) == EGL_TRUE && mType <= DISPLAY_EXTERNAL) {
+         // This could fail if this extension is not supported by this
+         // specific surface (of config)
+         mFlags |= SWAP_RECTANGLE;
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index dc8ed41..dd6bdec 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -1024,6 +1024,19 @@ void SurfaceFlinger::rebuildLayerStacks() {
+         invalidateHwcGeometry();
+ 
+         const LayerVector& layers(mDrawingState.layersSortedByZ);
++
++#ifdef EGL_ANDROID_swap_rectangle
++        bool forceUpdate = false;
++        const sp<DisplayDevice>& hw0(mDisplays[0]);
++        for (size_t dpy=1 ; dpy<mDisplays.size() ; dpy++) {
++            const sp<DisplayDevice>& hwi(mDisplays[dpy]);
++            if (hw0->getLayerStack() != hwi->getLayerStack()) {
++                 forceUpdate = true;
++                 break;
++            }
++        }
++#endif
++
+         for (size_t dpy=0 ; dpy<mDisplays.size() ; dpy++) {
+             Region opaqueRegion;
+             Region dirtyRegion;
+@@ -1032,8 +1045,17 @@ void SurfaceFlinger::rebuildLayerStacks() {
+             const Transform& tr(hw->getTransform());
+             const Rect bounds(hw->getBounds());
+             if (hw->canDraw()) {
++#ifdef EGL_ANDROID_swap_rectangle
++                // below change fix dual display swap_rectange mouse cursor ghost display issue.
++                // don't update layer visible region if it is not the latest display, as
++                // all the display use one layer source, if layer's visable region updated
++                // after PRIMARY display, the dirty region of EXTERNAL display will not correct.
++                SurfaceFlinger::computeVisibleRegions(layers,
++                        hw->getLayerStack(), dirtyRegion, opaqueRegion, (dpy == mDisplays.size() - 1) || forceUpdate);
++#else
+                 SurfaceFlinger::computeVisibleRegions(layers,
+                         hw->getLayerStack(), dirtyRegion, opaqueRegion);
++#endif
+ 
+                 const size_t count = layers.size();
+                 for (size_t i=0 ; i<count ; i++) {
+@@ -1524,7 +1546,11 @@ void SurfaceFlinger::commitTransaction()
+ 
+ void SurfaceFlinger::computeVisibleRegions(
+         const LayerVector& currentLayers, uint32_t layerStack,
++#ifdef EGL_ANDROID_swap_rectangle
++        Region& outDirtyRegion, Region& outOpaqueRegion, bool updateLayerRegion)
++#else
+         Region& outDirtyRegion, Region& outOpaqueRegion)
++#endif
+ {
+     ATRACE_CALL();
+ 
+@@ -1623,6 +1649,9 @@ void SurfaceFlinger::computeVisibleRegions(
+             dirty = visibleRegion;
+             // as well, as the old visible region
+             dirty.orSelf(layer->visibleRegion);
++#ifdef EGL_ANDROID_swap_rectangle
++	    if (updateLayerRegion)
++#endif
+             layer->contentDirty = false;
+         } else {
+             /* compute the exposed region:
+@@ -1652,6 +1681,9 @@ void SurfaceFlinger::computeVisibleRegions(
+         aboveOpaqueLayers.orSelf(opaqueRegion);
+ 
+         // Store the visible region in screen space
++#ifdef EGL_ANDROID_swap_rectangle
++	if (updateLayerRegion)
++#endif
+         layer->setVisibleRegion(visibleRegion);
+         layer->setCoveredRegion(coveredRegion);
+         layer->setVisibleNonTransparentRegion(
+diff --git a/services/surfaceflinger/SurfaceFlinger.h b/services/surfaceflinger/SurfaceFlinger.h
+index 2402ef6..8194660 100644
+--- a/services/surfaceflinger/SurfaceFlinger.h
++++ b/services/surfaceflinger/SurfaceFlinger.h
+@@ -362,7 +362,11 @@ private:
+     void invalidateHwcGeometry();
+     static void computeVisibleRegions(
+             const LayerVector& currentLayers, uint32_t layerStack,
++#ifdef EGL_ANDROID_swap_rectangle
++            Region& dirtyRegion, Region& opaqueRegion, bool updateLayerRegion);
++#else
+             Region& dirtyRegion, Region& opaqueRegion);
++#endif
+ 
+     void preComposition();
+     void postComposition();
+-- 
+1.8.0
+

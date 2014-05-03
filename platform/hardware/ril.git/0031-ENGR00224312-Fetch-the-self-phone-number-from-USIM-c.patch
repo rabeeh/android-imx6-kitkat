@@ -1,0 +1,562 @@
+From a62c8fca3991d34987110a72da0fb2d3de75ea29 Mon Sep 17 00:00:00 2001
+From: Shi Wenjun <b42754@freescale.com>
+Date: Thu, 13 Sep 2012 14:20:57 +0800
+Subject: [PATCH 31/38] ENGR00224312 Fetch the self phone number from USIM
+ card
+
+Fix the issue that phone number shows "unknown" for USIM card.
+Introduce some methods to:
+- identify SIM/USIM card
+- convert response of GET_RESPONDE of USIM TLV format to SIM FCP format
+Currently, it works for Innocomm Amozon1901 and Huawei EM770W modem.
+
+Signed-off-by: Shi Wenjun <b42754@freescale.com>
+---
+ reference-ril/Android.mk      |   1 +
+ reference-ril/fcp_parser.c    | 135 ++++++++++++++++++++++++++++++++++++++
+ reference-ril/fcp_parser.h    |  49 ++++++++++++++
+ reference-ril/misc.c          |  83 ++++++++++++++++++++++++
+ reference-ril/misc.h          |  25 +++++++
+ reference-ril/reference-ril.c | 147 ++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 440 insertions(+)
+
+diff --git a/reference-ril/Android.mk b/reference-ril/Android.mk
+index 0dfdd09..a30e8a9 100644
+--- a/reference-ril/Android.mk
++++ b/reference-ril/Android.mk
+@@ -12,6 +12,7 @@ LOCAL_SRC_FILES:= \
+     reference-ril.c \
+     atchannel.c \
+     misc.c \
++    fcp_parser.c \
+     at_tok.c
+ 
+ LOCAL_SHARED_LIBRARIES := \
+diff --git a/reference-ril/fcp_parser.c b/reference-ril/fcp_parser.c
+new file mode 100644
+index 0000000..80c4e69
+--- /dev/null
++++ b/reference-ril/fcp_parser.c
+@@ -0,0 +1,135 @@
++/* Innocomm Amazon1901 and Huawei EM770W RIL
++**
++** Copyright 2006, The Android Open Source Project
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++** http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++** Based on reference-ril by The Android Open Source Project.
++**
++** Heavily modified for ST-Ericsson U300 modems.
++** Author: Dmitry Tarnyagin <dmitry.tarnyagin@stericsson.com>
++** Modify: Wenjun Shi <b42754@freescale.com>
++** Modified for Innocomm Amazon1901 and Huawei EM770W  modems.
++*/
++/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
++
++
++#include <memory.h>
++#include <errno.h>
++#include <stdio.h>
++#include <string.h>
++
++#define LOG_TAG "RILV"
++#include <utils/Log.h>
++
++#include "fcp_parser.h"
++#include "misc.h"
++
++int fcp_to_ts_51011(/*in*/ const char *stream, /*in*/ size_t len,
++        /*out*/ struct ts_51011_921_resp *out)
++{
++    const char *end = &stream[len];
++    struct tlv fcp;
++    int ret = parseTlv(stream, end, &fcp);
++    const char *what = NULL;
++#define FCP_CVT_THROW(_ret, _what) \
++do { \
++ret = _ret; \
++what = _what; \
++goto except; \
++} while (0)
++
++    if (ret < 0)
++        FCP_CVT_THROW(ret, "ETSI TS 102 221, 11.1.1.3: FCP template TLV structure");
++    if (fcp.tag != 0x62){
++	LOGE("fcp_to_ts_51011: tag: 0x%x", fcp.tag);
++        FCP_CVT_THROW(-EINVAL, "ETSI TS 102 221, 11.1.1.3: FCP template tag");
++	}
++
++    /*
++* NOTE: Following fields do not exist in FCP template:
++* - file_acc
++* - file_status
++*/
++
++    memset(out, 0, sizeof(*out));
++    while (fcp.data < fcp.end) {
++        unsigned char fdbyte;
++        size_t property_size;
++        struct tlv tlv;
++        ret = parseTlv(fcp.data, end, &tlv);
++        if (ret < 0)
++            FCP_CVT_THROW(ret, "ETSI TS 102 221, 11.1.1.3: FCP property TLV structure");
++        property_size = (tlv.end - tlv.data) / 2;
++
++        switch (tlv.tag) {
++            case 0x80: /* File size, ETSI TS 102 221, 11.1.1.4.1 */
++                /* File size > 0xFFFF is not supported by ts_51011 */
++                if (property_size != 2)
++                    FCP_CVT_THROW(-ENOTSUP, "3GPP TS 51 011, 9.2.1: Unsupported file size");
++                /* be16 on both sides */
++                ((char*)&out->file_size)[0] = TLV_DATA(tlv, 0);
++                ((char*)&out->file_size)[1] = TLV_DATA(tlv, 1);
++                break;
++            case 0x83: /* File identifier, ETSI TS 102 221, 11.1.1.4.4 */
++                /* Sanity check */
++                if (property_size != 2)
++                    FCP_CVT_THROW(-EINVAL, "ETSI TS 102 221, 11.1.1.4.4: Invalid file identifier");
++                /* be16 on both sides */
++                ((char*)&out->file_id)[0] = TLV_DATA(tlv, 0);
++                ((char*)&out->file_id)[1] = TLV_DATA(tlv, 1);
++                break;
++            case 0x82: /* File descriptior, ETSI TS 102 221, 11.1.1.4.3 */
++                /* Sanity check */
++                if (property_size < 2)
++                    FCP_CVT_THROW(-EINVAL, "ETSI TS 102 221, 11.1.1.4.3: Invalid file descriptor");
++                fdbyte = TLV_DATA(tlv, 0);
++                /* ETSI TS 102 221, Table 11.5 for FCP fields */
++                /* 3GPP TS 51 011, 9.2.1 and 9.3 for 'out' fields */
++                if ((fdbyte & 0xBF) == 0x38) {
++                    out->file_type = 2; /* DF of ADF */
++                } else if ((fdbyte & 0xB0) == 0x00) {
++                    out->file_type = 4; /* EF */
++                    out->file_status = 1; /* Not invalidated */
++                    ++out->data_size; /* file_structure field is valid */
++                    if ((fdbyte & 0x07) == 0x01) {
++                        out->file_structure = 0; /* Transparent */
++                    } else {
++                        if (property_size < 5)
++                            FCP_CVT_THROW(-EINVAL, "ETSI TS 102 221, 11.1.1.4.3: Invalid non-transparent file descriptor");
++                        ++out->data_size; /* record_size field is valid */
++                        out->record_size = TLV_DATA(tlv, 3);
++                        if ((fdbyte & 0x07) == 0x06) {
++                            out->file_structure = 3; /* Cyclic */
++                        } else if ((fdbyte & 0x07) == 0x02) {
++                            out->file_structure = 1; /* Linear fixed */
++                        } else {
++                            FCP_CVT_THROW(-EINVAL, "ETSI TS 102 221, 11.1.1.4.3: Invalid file structure");
++                        }
++                    }
++                } else {
++                    out->file_type = 0; /* RFU */
++                }
++                break;
++        }
++        fcp.data = tlv.end;
++    }
++
++ finally:
++    return ret;
++
++ except:
++ #undef FCP_CVT_THROW
++    LOGE("FCP to TS 510 11: Specification violation: %s.", what);
++    goto finally;
++}
+diff --git a/reference-ril/fcp_parser.h b/reference-ril/fcp_parser.h
+new file mode 100644
+index 0000000..23c50e0
+--- /dev/null
++++ b/reference-ril/fcp_parser.h
+@@ -0,0 +1,49 @@
++/* Innocomm Amazon1901 and Huawei EM770W RIL
++**
++** Copyright 2006, The Android Open Source Project
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++** http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++**
++** Based on reference-ril by The Android Open Source Project.
++**
++** Heavily modified for ST-Ericsson U300 modems.
++** Author: Dmitry Tarnyagin <dmitry.tarnyagin@stericsson.com>
++** Modify: Wenjun Shi <b42754@freescale.com>
++** Modified for Innocomm Amazon1901 and Huawei EM770W  modems.
++*/
++/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
++
++#ifndef FCP_PARSER_H
++#define FCP_PARSER_H
++
++#include <stdint.h>
++#include <endian.h>
++
++struct ts_51011_921_resp {
++    uint8_t rfu_1[2];
++    uint16_t file_size; /* be16 */
++    uint16_t file_id; /* be16 */
++    uint8_t file_type;
++    uint8_t rfu_2;
++    uint8_t file_acc[3];
++    uint8_t file_status;
++    uint8_t data_size;
++    uint8_t file_structure;
++    uint8_t record_size;
++} __attribute__((packed));
++
++int fcp_to_ts_51011(const char *stream,
++                    size_t len,
++                    struct ts_51011_921_resp *out);
++
++#endif
+diff --git a/reference-ril/misc.c b/reference-ril/misc.c
+index e4b8d72..966241c 100644
+--- a/reference-ril/misc.c
++++ b/reference-ril/misc.c
+@@ -14,7 +14,16 @@
+ ** See the License for the specific language governing permissions and
+ ** limitations under the License.
+ */
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <unistd.h>
++#include <cutils/properties.h>
+ 
++#include "misc.h"
++
++#define LOG_TAG "RILD"
++#include <utils/Log.h>
+ /** returns 1 if line starts with prefix, 0 if it does not */
+ int strStartsWith(const char *line, const char *prefix)
+ {
+@@ -27,3 +36,77 @@ int strStartsWith(const char *line, const char *prefix)
+     return *prefix == '\0';
+ }
+ 
++char char2nib(char c)
++{
++    if (c >= 0x30 && c <= 0x39)
++        return c - 0x30;
++
++    if (c >= 0x41 && c <= 0x46)
++        return c - 0x41 + 0xA;
++
++    if (c >= 0x61 && c <= 0x66)
++        return c - 0x61 + 0xA;
++
++    return 0;
++}
++
++int parseTlv(/*in*/ const char *stream,
++             /*in*/ const char *end,
++             /*out*/ struct tlv *tlv)
++{
++#define TLV_STREAM_GET(stream, end, p) \
++do { \
++if (stream + 1 >= end){ \
++/*
++ * some 3g modem's response is incomplete, e.g. Huawei EM770W, so don't do size
++ * checking for compatibility.
++ */ \
++/*goto underflow;*/ \
++} \
++p = ((unsigned)char2nib(stream[0]) << 4) \
++| ((unsigned)char2nib(stream[1]) << 0); \
++stream += 2; \
++} while (0)
++
++    size_t size;
++
++    TLV_STREAM_GET(stream, end, tlv->tag);
++    TLV_STREAM_GET(stream, end, size);
++    if (stream + size * 2 > end){
++	LOGW("parseTlv: response size is incomplete");
++	/*
++	 * some 3g modem's response is incomplete, e.g. Huawei EM770W, so don't do size
++	 * checking for compatibility.
++	 */
++       // goto underflow;
++	}
++    tlv->data = &stream[0];
++    tlv->end = &stream[size * 2];
++    return 0;
++
++underflow:
++    return -EINVAL;
++#undef TLV_STREAM_GET
++}
++
++int binaryToString(/*in*/ const unsigned char *binary,
++                   /*in*/ size_t len,
++                   /*out*/ char *string)
++{
++    int pos;
++    const unsigned char *it;
++    const unsigned char *end = &binary[len];
++    static const char nibbles[] =
++        {'0', '1', '2', '3', '4', '5', '6', '7',
++         '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
++
++    if (end < binary)
++        return -EINVAL;
++
++    for (pos = 0, it = binary; it != end; ++it, pos += 2) {
++        string[pos + 0] = nibbles[*it >> 4];
++        string[pos + 1] = nibbles[*it & 0x0f];
++    }
++    string[pos] = 0;
++    return 0;
++}
+diff --git a/reference-ril/misc.h b/reference-ril/misc.h
+index 3c009ba..c67bf0c 100644
+--- a/reference-ril/misc.h
++++ b/reference-ril/misc.h
+@@ -14,6 +14,9 @@
+ ** See the License for the specific language governing permissions and
+ ** limitations under the License.
+ */
++#ifdef __cplusplus
++extern "C" {
++#endif
+ #include <utils/Log.h>
+ /* For Jelly Bean, it use ALOG */
+ #ifdef ALOGE
+@@ -23,5 +26,27 @@
+ #define LOGD ALOGD
+ #endif
+ 
++#define TLV_DATA(tlv, pos) (((unsigned)char2nib(tlv.data[(pos) * 2 + 0]) << 4) | \
++((unsigned)char2nib(tlv.data[(pos) * 2 + 1]) << 0))
++
++struct tlv {
++    unsigned tag;
++    const char *data;
++    const char *end;
++};
++
++int parseTlv(const char *stream,
++             const char *end,
++             struct tlv *tlv);
++
+ /** returns 1 if line starts with prefix, 0 if it does not */
+ int strStartsWith(const char *line, const char *prefix);
++
++
++int binaryToString(const unsigned char *binary,
++                   size_t len,
++                   char *string);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/reference-ril/reference-ril.c b/reference-ril/reference-ril.c
+index 010f72d..884e2fa 100755
+--- a/reference-ril/reference-ril.c
++++ b/reference-ril/reference-ril.c
+@@ -46,6 +46,7 @@
+ #include <utils/Log.h>
+ 
+ #include <runtime/runtime.h>
++#include "fcp_parser.h"
+ 
+ #define MAX_AT_RESPONSE 0x1000
+ 
+@@ -174,6 +175,12 @@ typedef enum {
+     RUIM_NETWORK_PERSONALIZATION = 11
+ } SIM_Status;
+ 
++typedef enum {
++    UICC_TYPE_UNKNOWN,
++    UICC_TYPE_SIM,
++    UICC_TYPE_USIM,
++} UICC_Type;
++
+ static void onRequest (int request, void *data, size_t datalen, RIL_Token t);
+ static RIL_RadioState currentState();
+ static int onSupports (int requestCode);
+@@ -2150,6 +2157,130 @@ error:
+ 
+ }
+ 
++static int convertSimIoFcp(RIL_SIM_IO_Response *sr, char **cvt)
++{
++    int err = 0;
++    size_t fcplen;
++    struct ts_51011_921_resp resp;
++    void *cvt_buf = NULL;
++
++    if (!sr->simResponse || !cvt) {
++        err = -1;
++        goto error;
++    }
++
++    fcplen = strlen(sr->simResponse);
++    if ((fcplen == 0) || (fcplen & 1)) {
++        err = -1;
++        goto error;
++    }
++
++    err = fcp_to_ts_51011(sr->simResponse, fcplen, &resp);
++    if (err < 0){
++        goto error;
++    }
++
++    cvt_buf = malloc(sizeof(resp) * 2 + 1);
++    if (!cvt_buf) {
++        err = -1;
++        goto error;
++    }
++
++    err = binaryToString((unsigned char*)(&resp),
++                   sizeof(resp), cvt_buf);
++    if (err < 0){
++        goto error;
++    }
++
++    /* cvt_buf ownership is moved to the caller */
++    *cvt = cvt_buf;
++    cvt_buf = NULL;
++
++finally:
++    return err;
++
++error:
++    free(cvt_buf);
++    goto finally;
++}
++
++/**
++* Fetch information about UICC card type (SIM/USIM)
++*
++* \return UICC_Type: type of UICC card.
++*/
++static UICC_Type getUICCType()
++{
++    ATResponse *atresponse = NULL;
++    static UICC_Type UiccType = UICC_TYPE_UNKNOWN; /* FIXME: Static variable */
++    int err;
++    int swx;
++    char *line = NULL;
++    char *dir = NULL;
++
++    if (currentState() == RADIO_STATE_OFF ||
++        currentState() == RADIO_STATE_UNAVAILABLE) {
++        UiccType = UICC_TYPE_UNKNOWN;
++        goto exit;
++    }
++
++    /* No need to get type again, it is stored */
++    if (UiccType != UICC_TYPE_UNKNOWN)
++        goto exit;
++
++    /*
++     * For USIM, 'AT+CRSM=192,28480,0,0,15' will respond with TLV tag "62" which indicates
++     * FCP template (refer to ETSI TS 101 220). Currently, USIM detection succeeds on
++     * Innocomm Amazon1901 and Huawei EM770W.
++     */
++    err = at_send_command_singleline("AT+CRSM=192,28480,0,0,15", "+CRSM:", &atresponse);
++
++    if (err != 0 || !atresponse->success)
++        goto error;
++
++    if (atresponse->p_intermediates != NULL) {
++        line = atresponse->p_intermediates->line;
++
++        err = at_tok_start(&line);
++        if (err < 0)
++            goto error;
++
++        err = at_tok_nextint(&line, &swx);
++        if (err < 0)
++            goto error;
++        err = at_tok_nextint(&line, &swx);
++        if (err < 0)
++            goto error;
++
++	if (at_tok_hasmore(&line)) {
++	 	err = at_tok_nextstr(&line, &dir);
++		if (err < 0) goto error;
++	}
++
++        if (strstr(dir, "62") == dir) {
++            UiccType = UICC_TYPE_USIM;
++            LOGI("Detected card type USIM - stored");
++            goto finally;
++        }
++    }
++
++    UiccType = UICC_TYPE_SIM;
++    LOGI("Detected card type SIM - stored");
++    goto finally;
++
++error:
++    UiccType = UICC_TYPE_UNKNOWN;
++    LOGW("%s(): Failed to detect card type - Retry at next request", __func__);
++
++finally:
++    at_response_free(atresponse);
++
++exit:
++    return UiccType;
++}
++
++
++
+ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
+ {
+     ATResponse *p_response = NULL;
+@@ -2158,6 +2289,7 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
+     char *cmd = NULL;
+     RIL_SIM_IO_v6 *p_args;
+     char *line;
++    int cvt_done = 0;
+ 
+     memset(&sr, 0, sizeof(sr));
+ 
+@@ -2197,8 +2329,23 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
+         if (err < 0) goto error;
+     }
+ 
++/*
++* In case the command is GET_RESPONSE and cardtype is 3G SIM
++* conversion to 2G FCP is required
++*/
++    if (p_args->command == 0xC0 && getUICCType() == UICC_TYPE_USIM) {
++        if (convertSimIoFcp(&sr, &sr.simResponse) < 0) {
++            //rilErrorCode = RIL_E_GENERIC_FAILURE;
++            goto error;
++        }
++        cvt_done = 1; /* sr.simResponse needs to be freed */
++    }
+     RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
+     at_response_free(p_response);
++
++    if (cvt_done)
++    free(sr.simResponse);
++
+     free(cmd);
+ 
+     return;
+-- 
+1.8.0
+
