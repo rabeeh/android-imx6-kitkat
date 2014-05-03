@@ -1,0 +1,294 @@
+From f66e8c930431894c89c4fe4fa0877ca2635e4005 Mon Sep 17 00:00:00 2001
+From: Rabeeh Khoury <rabeeh@solid-run.com>
+Date: Thu, 12 Dec 2013 11:42:03 +0200
+Subject: [PATCH 3/3] nl80211 cmd implementation
+
+referenced from Freescale Android JB 4.2.2
+
+Signed-off-by: Rabeeh Khoury <rabeeh@solid-run.com>
+---
+ src/drivers/driver_nl80211.c |  202 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 196 insertions(+), 6 deletions(-)
+
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 2b3bc5d..de22958 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -5,6 +5,7 @@
+  * Copyright (c) 2005-2006, Devicescape Software, Inc.
+  * Copyright (c) 2007, Johannes Berg <johannes@sipsolutions.net>
+  * Copyright (c) 2009-2010, Atheros Communications
++ * Copyright (C) 2013 Freescale Semiconductor, Inc.
+  *
+  * This software may be distributed under the terms of the BSD license.
+  * See README for more details.
+@@ -341,7 +342,7 @@ static inline int have_ifidx(struct wpa_driver_nl80211_data *drv, int ifidx)
+ }
+ #endif /* HOSTAPD */
+ #ifdef ANDROID
+-extern int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
++int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
+ 					 size_t buf_len);
+ #endif
+ 
+@@ -355,6 +356,8 @@ static int wpa_driver_nl80211_authenticate_retry(
+ 	struct wpa_driver_nl80211_data *drv);
+ 
+ 
++
++
+ static int is_ap_interface(enum nl80211_iftype nlmode)
+ {
+ 	return (nlmode == NL80211_IFTYPE_AP ||
+@@ -7576,7 +7579,7 @@ static int nl80211_set_mode(struct wpa_driver_nl80211_data *drv,
+ 	struct nl_msg *msg;
+ 	int ret = -ENOBUFS;
+ 
+-	wpa_printf(MSG_DEBUG, "nl80211: Set mode ifindex %d iftype %d (%s)",
++	wpa_printf(MSG_ERROR, "nl80211: Set mode ifindex %d iftype %d (%s)",
+ 		   ifindex, mode, nl80211_iftype_str(mode));
+ 
+ 	msg = nlmsg_alloc();
+@@ -7593,7 +7596,7 @@ static int nl80211_set_mode(struct wpa_driver_nl80211_data *drv,
+ 		return 0;
+ nla_put_failure:
+ 	nlmsg_free(msg);
+-	wpa_printf(MSG_DEBUG, "nl80211: Failed to set interface %d to mode %d:"
++	wpa_printf(MSG_ERROR, "nl80211: Failed to set interface %d to mode %d:"
+ 		   " %d (%s)", ifindex, mode, ret, strerror(-ret));
+ 	return ret;
+ }
+@@ -7607,7 +7610,7 @@ static int wpa_driver_nl80211_set_mode(struct i802_bss *bss,
+ 	int i;
+ 	int was_ap = is_ap_interface(drv->nlmode);
+ 	int res;
+-
++	wpa_printf(MSG_ERROR, "Rabeeh - debug nlmode = %d\n",nlmode);
+ 	res = nl80211_set_mode(drv, drv->ifindex, nlmode);
+ 	if (res == 0) {
+ 		drv->nlmode = nlmode;
+@@ -7629,7 +7632,7 @@ static int wpa_driver_nl80211_set_mode(struct i802_bss *bss,
+ 	 * take the device down, try to set the mode again, and bring the
+ 	 * device back up.
+ 	 */
+-	wpa_printf(MSG_DEBUG, "nl80211: Try mode change after setting "
++	wpa_printf(MSG_ERROR, "nl80211: Try mode change after setting "
+ 		   "interface down");
+ 	for (i = 0; i < 10; i++) {
+ 		res = linux_set_iface_flags(drv->global->ioctl_sock,
+@@ -9588,7 +9591,60 @@ static void wpa_driver_send_hang_msg(struct wpa_driver_nl80211_data *drv)
+ 		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "HANGED");
+ 	}
+ }
++#define WPA_PS_ENABLED          0
++#define WPA_PS_DISABLED         1
++#define MAX_WPSP2PIE_CMD_SIZE		512
++
++static int wpa_driver_set_power_save(void *priv, int state)
++{
++	return nl80211_set_power_save(priv, state == WPA_PS_ENABLED);
++}
++static int get_power_mode_handler(struct nl_msg *msg, void *arg)
++{
++	struct nlattr *tb[NL80211_ATTR_MAX + 1];
++	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
++	int *state = arg;
++
++	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
++			genlmsg_attrlen(gnlh, 0), NULL);
++
++	if (!tb[NL80211_ATTR_PS_STATE])
++		return NL_SKIP;
++
++	if (state) {
++		int s = (int) nla_get_u32(tb[NL80211_ATTR_PS_STATE]);
++		wpa_printf(MSG_DEBUG, "nl80211: Get power mode = %d", s);
++		*state = (s == NL80211_PS_ENABLED) ?
++			WPA_PS_ENABLED : WPA_PS_DISABLED;
++	}
+ 
++	return NL_SKIP;
++}
++
++static int wpa_driver_get_power_save(void *priv, int *state)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nl_msg *msg;
++	int ret = -1;
++	enum nl80211_ps_state ps_state;
++
++	msg = nlmsg_alloc();
++	if (!msg)
++		return -1;
++
++	nl80211_cmd(drv, msg, 0, NL80211_CMD_GET_POWER_SAVE);
++
++	NLA_PUT_U32(msg, NL80211_ATTR_IFINDEX, bss->ifindex);
++
++	ret = send_and_recv_msgs(drv, msg, get_power_mode_handler, state);
++	msg = NULL;
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: Get power mode fail: %d", ret);
++nla_put_failure:
++	nlmsg_free(msg);
++	return ret;
++}
+ 
+ static int android_priv_cmd(struct i802_bss *bss, const char *cmd)
+ {
+@@ -9613,7 +9669,7 @@ static int android_priv_cmd(struct i802_bss *bss, const char *cmd)
+ 	ret = ioctl(drv->global->ioctl_sock, SIOCDEVPRIVATE + 1, &ifr);
+ 	if (ret < 0) {
+ 		wpa_printf(MSG_ERROR, "%s: failed to issue private commands",
+-			   __func__);
++				__func__);
+ 		wpa_driver_send_hang_msg(drv);
+ 		return ret;
+ 	}
+@@ -9700,8 +9756,142 @@ static int android_pno_stop(struct i802_bss *bss)
+ 	return android_priv_cmd(bss, "PNOFORCE 0");
+ }
+ 
++int wpa_driver_nl80211_driver_cmd(void *priv, char *cmd, char *buf,
++		size_t buf_len)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct ifreq ifr;
++	android_wifi_priv_cmd priv_cmd;
++	int ret = 0;
++
++	if (os_strcasecmp(cmd, "STOP") == 0) {
++		linux_set_iface_flags(drv->global->ioctl_sock, bss->ifname, 0);
++		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "STOPPED");
++	} else if (os_strcasecmp(cmd, "START") == 0) {
++		linux_set_iface_flags(drv->global->ioctl_sock, bss->ifname, 1);
++		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "STARTED");
++	} else if (os_strcasecmp(cmd, "MACADDR") == 0) {
++		u8 macaddr[ETH_ALEN] = {};
++
++		ret = linux_get_ifhwaddr(drv->global->ioctl_sock, bss->ifname,
++				macaddr);
++		if (!ret)
++			ret = os_snprintf(buf, buf_len,
++					"Macaddr = " MACSTR "\n",
++					MAC2STR(macaddr));
++	} else if (os_strcasecmp(cmd, "RELOAD") == 0) {
++		wpa_msg(drv->ctx, MSG_INFO, WPA_EVENT_DRIVER_STATE "HANGED");
++	} else if (os_strncasecmp(cmd, "POWERMODE ", 10) == 0) {
++		int state = atoi(cmd + 10);
++		ret = wpa_driver_set_power_save(priv, state);
++		if (ret < 0)
++			wpa_driver_send_hang_msg(drv);
++		else
++			drv_errors = 0;
++	} else if (os_strncasecmp(cmd, "GETPOWER", 8) == 0) {
++		int state = -1;
++		ret = wpa_driver_get_power_save(priv, &state);
++		if (!ret && (state != -1))
++			ret = os_snprintf(buf, buf_len, "POWERMODE = %d\n",
++					state);
++	} else { /* Use private command */
++		memset(&ifr, 0, sizeof(ifr));
++		memset(&priv_cmd, 0, sizeof(priv_cmd));
++		os_memcpy(buf, cmd, strlen(cmd) + 1);
++		os_strncpy(ifr.ifr_name, bss->ifname, IFNAMSIZ);
++
++		priv_cmd.buf = buf;
++		priv_cmd.used_len = buf_len;
++		priv_cmd.total_len = buf_len;
++		ifr.ifr_data = &priv_cmd;
++		if ((ret = ioctl(drv->global->ioctl_sock, SIOCDEVPRIVATE + 1, &ifr)) < 0) {
++			wpa_printf(MSG_DEBUG, "%s: failed to issue private commands\n", __func__);
++		} else {
++			ret = 0;
++			if (os_strncasecmp(cmd, "SETBAND", 7) == 0) {
++				wpa_printf(MSG_DEBUG, "%s: %s ", __func__, cmd);
++			} else if (os_strcasecmp(cmd, "P2P_DEV_ADDR") == 0) {
++				wpa_printf(MSG_INFO, "%s: P2P: Device address ("MACSTR")",
++						__func__, MAC2STR(buf));
++			} else if (os_strcasecmp(cmd, "P2P_SET_PS") == 0) {
++				wpa_printf(MSG_INFO, "%s: P2P: %s ", __func__, buf);
++			} else if (os_strcasecmp(cmd, "P2P_SET_NOA") == 0) {
++				wpa_printf(MSG_INFO, "%s: P2P: %s ", __func__, buf);
++			}
++		}
++	}
++
++	return ret;
++}
+ #endif /* ANDROID */
++#ifdef ANDROID_P2P
++int wpa_driver_set_p2p_noa(void *priv, u8 count, int start,
++		int duration)
++{
++	char buf[MAX_DRV_CMD_SIZE];
++
++	memset(buf, 0, sizeof(buf));
++	wpa_printf(MSG_INFO, "%s: Entry", __func__);
++	os_snprintf(buf, sizeof(buf), "P2P_SET_NOA %d %d %d", count, start,
++			duration);
++	return wpa_driver_nl80211_driver_cmd(priv, buf, buf, strlen(buf) + 1);
++}
++int wpa_driver_get_p2p_noa(void *priv, u8 *buf, size_t len)
++{
++		/* Return 0 till we handle p2p_presence request completely in the driver */
++		return 0;
++}
++int wpa_driver_set_p2p_ps(void *priv, int legacy_ps, int opp_ps, int ctwindow)
++{
++	char buf[MAX_DRV_CMD_SIZE];
+ 
++	memset(buf, 0, sizeof(buf));
++	wpa_printf(MSG_INFO, "%s: Entry", __func__);
++	snprintf(buf, sizeof(buf), "P2P_SET_PS %d %d %d", legacy_ps, opp_ps, ctwindow);
++	return wpa_driver_nl80211_driver_cmd(priv, buf, buf, strlen(buf) + 1);
++}
++int wpa_driver_set_ap_wps_p2p_ie(void *priv, const struct wpabuf *beacon,
++		const struct wpabuf *proberesp,
++		const struct wpabuf *assocresp)
++{
++	char buf[MAX_WPSP2PIE_CMD_SIZE];
++	struct wpabuf *ap_wps_p2p_ie = NULL;
++	char *_cmd = "SET_AP_WPS_P2P_IE";
++	char *pbuf;
++	int ret = 0;
++	int i;
++	struct cmd_desc {
++		int cmd;
++		const struct wpabuf *src;
++	} cmd_arr[] = {
++		{0x1, beacon},
++		{0x2, proberesp},
++		{0x4, assocresp},
++		{-1, NULL}
++	};
++
++	wpa_printf(MSG_INFO, "%s: Entry", __func__);
++	for (i = 0; cmd_arr[i].cmd != -1; i++) {
++		os_memset(buf, 0, sizeof(buf));
++		pbuf = buf;
++		pbuf += sprintf(pbuf, "%s %d", _cmd, cmd_arr[i].cmd);
++		*pbuf++ = '\0';
++		ap_wps_p2p_ie = cmd_arr[i].src ?
++			wpabuf_dup(cmd_arr[i].src) : NULL;
++		if (ap_wps_p2p_ie) {
++			os_memcpy(pbuf, wpabuf_head(ap_wps_p2p_ie), wpabuf_len(ap_wps_p2p_ie));
++			ret = wpa_driver_nl80211_driver_cmd(priv, buf, buf,
++					strlen(_cmd) + 3 + wpabuf_len(ap_wps_p2p_ie));
++			wpabuf_free(ap_wps_p2p_ie);
++			if (ret < 0)
++				break;
++		}
++	}
++
++	return ret;
++}
++#endif /* ANDROID_P2P */
+ 
+ static int driver_nl80211_set_key(const char *ifname, void *priv,
+ 				  enum wpa_alg alg, const u8 *addr,
+-- 
+1.7.9.5
+
