@@ -31,30 +31,23 @@ Build instructions
 
    Success: Now you can build the Android code from FSL i.MX6 platform
 9. git clone https://github.com/linux4kix/linux-linaro-stable-mx6.git -b linux-linaro-lsk-v3.10-android-mx6 kernel_imx
-10. Manuall patch kernel_imx -
+10. Manually patch kernel_imx -
 
    cd kernel_imx
 
    git am <git tree location>/android-imx6-kitkat/kernel_imx/*
 
    cd ..
+11. git clone https://github.com/SolidRun/u-boot-imx6 bootable/bootloader/uboot-imx
 11. source build/envsetup.sh
 12. Config Android by either 'lunch cuboxi-eng' or 'choosecombo'
 13. make
 
-Things that are not working / tested
-------------------------------------
-The following is a list of non working, non tested items
+Flashing instructions
+---------------------
+1. Insert a micro SD into your Linux PC
+2. Determine the block device name of your micro SD (for instance /dev/sdc)
+3. Make sure all partitions of your micro SD are unmounted
+4. In the Android sources tree, run the following command (replace /dev/sdX with your SD card block device)-
 
-This list will be removed and github issue tracking should be used instead.
-
-1. WiFi and BT using brcm80211 driver are not integrated (i.e. no wifi/bt)
-2. 512MByte memory is not tested (zswap and zbud are alreday part of the kernel)
-3. There is a memory leak in LK 3.10.30; unclear where it's coming from.
-   This memory leak happens when opening closing the vpu multiple times.
-4. HDMI audio not correctly identified by tinyalsa. Hack to force card=1 is implemented.
-5. HDMI CEC
-6. Soft keyboard doesn't show when there is no HW keyboard.
-7. Configuring resolution within settings menu
-8. Configuring wired Ethernet within settings menu
-9. Recoding from a UVC camera creates larger than expected file.
+sudo <git tree location>/tools/create-sdcard.sh -f /dev/sdX
