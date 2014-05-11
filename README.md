@@ -20,10 +20,10 @@ Build instructions
 4. cd myandroid
 5. ~/bin/repo init -u https://android.googlesource.com/platform/manifest -b android-4.4.2_r1
 6. ~/bin/repo sync
-7. source <git tree location>/android-imx6-kitkat/and_patch.sh
+7. source < git tree location >/android-imx6-kitkat/and_patch.sh
 
    Now you should have the c_patch function available
-8. c_patch <git tree location>/android-imx6-kitkat/ imx_kk4.4.2_1.0.0-alpha
+8. c_patch < git tree location >/android-imx6-kitkat/ imx_kk4.4.2_1.0.0-alpha
 
    imx_kk4.4.2_1.0.0-alpha branches is the branch which will be automatically created
 
@@ -35,7 +35,7 @@ Build instructions
 
    cd kernel_imx
 
-   git am <git tree location>/android-imx6-kitkat/kernel_imx/*
+   git am < git tree location >/android-imx6-kitkat/kernel_imx/*
 
    cd ..
 11. git clone https://github.com/SolidRun/u-boot-imx6 bootable/bootloader/uboot-imx
@@ -49,5 +49,4 @@ Flashing instructions
 2. Determine the block device name of your micro SD (for instance /dev/sdc)
 3. Make sure all partitions of your micro SD are unmounted
 4. In the Android sources tree, run the following command (replace /dev/sdX with your SD card block device)-
-
-sudo <git tree location>/tools/create-sdcard.sh -f /dev/sdX
+5. sudo < git tree location >/tools/create-sdcard.sh -f /dev/sdX
