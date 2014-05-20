@@ -1,0 +1,740 @@
+From a1be3c2385b28799f17a162f92d992182ba24e7f Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Thu, 9 Jan 2014 17:02:51 +0800
+Subject: [PATCH 488/498] ENGR00214328 add fsl gralloc using ion to allocate
+ buffer.
+
+add fsl gralloc using ion to allocate buffer.
+the ionmem should be set in bootargs.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/libgralloc_wrapper/Android.mk      |   6 +-
+ mx6/libgralloc_wrapper/framebuffer.cpp |   5 +-
+ mx6/libgralloc_wrapper/fsl_gralloc.cpp | 283 +++++++++++++++++++++++++++++++++
+ mx6/libgralloc_wrapper/fsl_mapper.cpp  | 154 ++++++++++++++++++
+ mx6/libgralloc_wrapper/gralloc.cpp     |  54 ++++++-
+ mx6/libgralloc_wrapper/gralloc_priv.h  |   6 +-
+ mx6/libgralloc_wrapper/mapper.cpp      |  24 ++-
+ 7 files changed, 516 insertions(+), 16 deletions(-)
+ create mode 100644 mx6/libgralloc_wrapper/fsl_gralloc.cpp
+ create mode 100644 mx6/libgralloc_wrapper/fsl_mapper.cpp
+
+diff --git a/mx6/libgralloc_wrapper/Android.mk b/mx6/libgralloc_wrapper/Android.mk
+index 9f186ca..d8811f4 100755
+--- a/mx6/libgralloc_wrapper/Android.mk
++++ b/mx6/libgralloc_wrapper/Android.mk
+@@ -21,12 +21,14 @@ ifeq ($(TARGET_HAVE_IMX_GRALLOC),true)
+ include $(CLEAR_VARS)
+ LOCAL_PRELINK_MODULE := false
+ LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw
+-LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libhardware libutils
++LOCAL_SHARED_LIBRARIES := liblog libcutils libGLESv1_CM libhardware libutils libion
+ 
+ LOCAL_SRC_FILES := 	\
+ 	gralloc.cpp 	\
+ 	framebuffer.cpp \
+-	mapper.cpp
++	mapper.cpp      \
++    fsl_gralloc.cpp \
++    fsl_mapper.cpp
+ 
+ LOCAL_MODULE := gralloc.$(TARGET_BOARD_PLATFORM)
+ LOCAL_CFLAGS:= -DLOG_TAG=\"$(TARGET_BOARD_PLATFORM).gralloc\" -D_LINUX
+diff --git a/mx6/libgralloc_wrapper/framebuffer.cpp b/mx6/libgralloc_wrapper/framebuffer.cpp
+index 64f3c5e..c24abc3 100755
+--- a/mx6/libgralloc_wrapper/framebuffer.cpp
++++ b/mx6/libgralloc_wrapper/framebuffer.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2010-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2010-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -496,6 +496,9 @@ int fb_device_open(hw_module_t const* module, const char* name,
+                 priv_m = (private_module_t*)malloc(sizeof(*priv_m));
+                 memset(priv_m, 0, sizeof(*priv_m));
+                 memcpy(priv_m, orig_m, sizeof(*priv_m));
++                if (orig_m->ion_fd > 0) {
++                    priv_m->ion_fd = dup(orig_m->ion_fd);
++                }
+ 
+                 orig_m->external_module = priv_m;
+             }
+diff --git a/mx6/libgralloc_wrapper/fsl_gralloc.cpp b/mx6/libgralloc_wrapper/fsl_gralloc.cpp
+new file mode 100644
+index 0000000..9c1ee87
+--- /dev/null
++++ b/mx6/libgralloc_wrapper/fsl_gralloc.cpp
+@@ -0,0 +1,283 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <limits.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++
++#include <cutils/ashmem.h>
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hardware.h>
++#include <hardware/gralloc.h>
++#include <ion/ion.h>
++
++#include "gralloc_priv.h"
++
++extern int fsl_gralloc_unmap(gralloc_module_t const* module,
++        buffer_handle_t handle);
++extern int mapFrameBufferLocked(struct private_module_t* module);
++
++static int fsl_gralloc_alloc_framebuffer_locked(alloc_device_t* dev,
++        size_t size, int usage, buffer_handle_t* pHandle)
++{
++    private_module_t* m = reinterpret_cast<private_module_t*>(
++            dev->common.module);
++
++    // allocate the framebuffer
++    if (m->framebuffer == NULL) {
++        // initialize the framebuffer, the framebuffer is mapped once
++        // and forever.
++        int err = mapFrameBufferLocked(m);
++        if (err < 0) {
++            ALOGE("%s mapFrameBufferLocked failed", __FUNCTION__);
++            return err;
++        }
++    }
++
++    const uint32_t bufferMask = m->bufferMask;
++    const uint32_t numBuffers = m->numBuffers;
++    const size_t bufferSize = m->finfo.line_length * ALIGN_PIXEL_128(m->info.yres);
++    if (numBuffers < 2) {
++        ALOGE("%s framebuffer number less than 2", __FUNCTION__);
++        return -ENOMEM;
++    }
++
++    if (bufferMask >= ((1LU<<numBuffers)-1)) {
++        // We ran out of buffers.
++        ALOGE("%s out of memory", __FUNCTION__);
++        return -ENOMEM;
++    }
++
++    // create a "fake" handles for it
++    intptr_t vaddr = intptr_t(m->framebuffer->base);
++    private_handle_t* hnd = new private_handle_t(dup(m->framebuffer->fd), size,
++            private_handle_t::PRIV_FLAGS_FRAMEBUFFER);
++
++    // find a free slot
++    for (uint32_t i=0 ; i<numBuffers ; i++) {
++        if ((bufferMask & (1LU<<i)) == 0) {
++            m->bufferMask |= (1LU<<i);
++            break;
++        }
++        vaddr += bufferSize;
++    }
++
++    if (usage & GRALLOC_USAGE_HW_FBX) {
++        hnd->flags |= private_handle_t::PRIV_FLAGS_FRAMEBUFFER_X;
++    }
++
++    hnd->base = vaddr;
++    hnd->offset = vaddr - intptr_t(m->framebuffer->base);
++    hnd->phys = intptr_t(m->framebuffer->phys) + hnd->offset;
++    *pHandle = hnd;
++
++    return 0;
++}
++
++static int fsl_gralloc_alloc_framebuffer(alloc_device_t* dev,
++        size_t size, int usage, buffer_handle_t* pHandle)
++{
++    private_module_t* m = reinterpret_cast<private_module_t*>(
++            dev->common.module);
++    pthread_mutex_lock(&m->lock);
++    int err = fsl_gralloc_alloc_framebuffer_locked(dev, size, usage, pHandle);
++    pthread_mutex_unlock(&m->lock);
++    return err;
++}
++
++static int fsl_gralloc_alloc_buffer(alloc_device_t* dev,
++        size_t size, int usage, buffer_handle_t* pHandle)
++{
++    unsigned char *ptr = NULL;
++    int sharedFd;
++    int phyAddr;
++    struct ion_handle *ion_hnd = NULL;
++    size = (size + PAGE_SIZE) & (~(PAGE_SIZE - 1));
++
++    private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
++    int err = ion_alloc(m->ion_fd, size, 8, 1, &ion_hnd);
++    if (err) {
++        ALOGE("ion_alloc failed");
++        return err;
++    }
++
++    err = ion_map(m->ion_fd, ion_hnd, size, PROT_READ | PROT_WRITE,
++                    MAP_SHARED, 0, &ptr, &sharedFd);
++    if (err) {
++        ALOGE("ion_alloc failed");
++        return err;
++    }
++
++    phyAddr = ion_phys(m->ion_fd, ion_hnd);
++    if (phyAddr == 0) {
++        ALOGE("ion_phys failed");
++        return -EINVAL;
++    }
++
++    private_handle_t* hnd = new private_handle_t(sharedFd, size,
++                     private_handle_t::PRIV_FLAGS_USES_ION);
++    hnd->base = (int)ptr;
++    hnd->phys = phyAddr;
++    *pHandle = hnd;
++    ion_free(m->ion_fd, ion_hnd);
++
++    return 0;
++}
++
++int fsl_gralloc_alloc(alloc_device_t* dev,
++        int w, int h, int format, int usage,
++        buffer_handle_t* pHandle, int* pStride)
++{
++    if (!pHandle || !pStride) {
++        ALOGE("<%s,%d> invalide parameters", __FUNCTION__, __LINE__);
++        return -EINVAL;
++    }
++
++    private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
++    if (!m || m->ion_fd <= 0) {
++        ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
++        return -EINVAL;
++    }
++
++    int err = 0;
++    size_t size, alignedw, alignedh, bpp = 0;
++    switch (format) {
++        case HAL_PIXEL_FORMAT_RGBA_8888:
++        case HAL_PIXEL_FORMAT_RGBX_8888:
++        case HAL_PIXEL_FORMAT_BGRA_8888:
++            bpp = 4;
++        case HAL_PIXEL_FORMAT_RGB_888:
++        case HAL_PIXEL_FORMAT_RGB_565:
++            if (format == HAL_PIXEL_FORMAT_RGB_565) {
++                bpp = 2;
++            }
++            else if (format == HAL_PIXEL_FORMAT_RGB_888) {
++                bpp = 3;
++            }
++
++            alignedw = ALIGN_PIXEL_16(w);
++            alignedh = ALIGN_PIXEL_16(h);
++            size = alignedw * alignedh * bpp;
++            break;
++
++        case HAL_PIXEL_FORMAT_YCrCb_420_SP:
++        case HAL_PIXEL_FORMAT_YCbCr_420_SP:
++            alignedw = ALIGN_PIXEL_32(w);
++            size = alignedw * h * 3 / 2;
++            break;
++
++        case HAL_PIXEL_FORMAT_YCbCr_420_P:
++        case HAL_PIXEL_FORMAT_YV12: {
++            alignedw = ALIGN_PIXEL_32(w);
++            int c_stride = (alignedw/2+15)/16*16;
++            size = alignedw * h + c_stride * h;
++            } break;
++
++        case HAL_PIXEL_FORMAT_YCbCr_422_SP:
++        case HAL_PIXEL_FORMAT_YCbCr_422_I:
++            alignedw = ALIGN_PIXEL_32(w);
++            size = alignedw * h * 2;
++            break;
++
++        default:
++            ALOGE("%s unsupported format:0x%x", __FUNCTION__, format);
++            return -EINVAL;
++    }
++
++    private_handle_t* hnd = NULL;
++    if (usage & GRALLOC_USAGE_HW_FBX) {
++        gralloc_context_t *ctx = (gralloc_context_t *)dev;
++        if (ctx->ext_dev == NULL) {
++            ALOGE("ctx->ext_dev == NULL");
++            return -EINVAL;
++        }
++
++        err = fsl_gralloc_alloc_framebuffer(ctx->ext_dev, size, usage, (buffer_handle_t*)&hnd);
++    }
++    else if (usage & GRALLOC_USAGE_HW_FB) {
++        err = fsl_gralloc_alloc_framebuffer(dev, size, usage, (buffer_handle_t*)&hnd);
++    }
++    else {
++        err = fsl_gralloc_alloc_buffer(dev, size, usage, (buffer_handle_t*)&hnd);
++    }
++
++    hnd->width = w;
++    hnd->height = h;
++    hnd->format = format;
++    //becaue private_handle_t doesn't contains stride.
++    //hack it to set stride in flags high 16bit.
++    hnd->flags |= (alignedw & 0xffff) << 16;
++    hnd->pid = getpid();
++    *pHandle = hnd;
++    *pStride = alignedw;
++    return err;
++}
++
++int fsl_gralloc_free(alloc_device_t* dev,
++        buffer_handle_t handle)
++{
++    private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
++    if (!m || m->ion_fd <= 0) {
++        ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
++        return -EINVAL;
++    }
++
++    if (private_handle_t::validate(handle) < 0) {
++        ALOGE("%s invalid handle", __FUNCTION__);
++        return -EINVAL;
++    }
++
++    private_handle_t const* hnd = reinterpret_cast<private_handle_t const*>(handle);
++    if (hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER) {
++        // free this buffer
++        if (hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER_X) {
++            gralloc_context_t *ctx = (gralloc_context_t *)dev;
++            if (ctx->ext_dev == NULL) {
++                ALOGE("ctx->ext_dev == NULL");
++                return -EINVAL;
++            }
++            dev = ctx->ext_dev;
++        }
++
++        private_module_t* m = reinterpret_cast<private_module_t*>(
++                dev->common.module);
++        const size_t bufferSize = m->finfo.line_length * ALIGN_PIXEL_128(m->info.yres);
++        int index = (hnd->base - m->framebuffer->base) / bufferSize;
++        m->bufferMask &= ~(1<<index);
++    }
++    else {
++        if (hnd->base) {
++            fsl_gralloc_unmap((const gralloc_module_t*)m, const_cast<private_handle_t*>(hnd));
++        }
++    }
++
++    close(hnd->fd);
++    delete hnd;
++    return 0;
++}
++
+diff --git a/mx6/libgralloc_wrapper/fsl_mapper.cpp b/mx6/libgralloc_wrapper/fsl_mapper.cpp
+new file mode 100644
+index 0000000..7c39fe1
+--- /dev/null
++++ b/mx6/libgralloc_wrapper/fsl_mapper.cpp
+@@ -0,0 +1,154 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <limits.h>
++#include <errno.h>
++#include <pthread.h>
++#include <unistd.h>
++#include <string.h>
++
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++#include <cutils/log.h>
++#include <cutils/atomic.h>
++
++#include <hardware/hardware.h>
++#include <hardware/gralloc.h>
++#include <ion/ion.h>
++
++#include "gralloc_priv.h"
++
++static int getIonFd(gralloc_module_t const *module)
++{
++    private_module_t* m = const_cast<private_module_t*>(
++            reinterpret_cast<const private_module_t*>(module));
++    if (m->ion_fd < 0)
++        m->ion_fd = ion_open();
++    return m->ion_fd;
++}
++
++int fsl_gralloc_map(gralloc_module_t const* module,
++        buffer_handle_t handle,
++        void** vaddr)
++{
++    private_handle_t* hnd = (private_handle_t*)handle;
++    if (!(hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER)) {
++        getIonFd(module);
++        size_t size = hnd->size;
++        void* mappedAddress = mmap(0, size,
++                PROT_READ|PROT_WRITE, MAP_SHARED, hnd->fd, 0);
++        if (mappedAddress == MAP_FAILED) {
++            ALOGE("Could not mmap %s", strerror(errno));
++            return -errno;
++        }
++        hnd->base = intptr_t(mappedAddress) + hnd->offset;
++        //ALOGD("gralloc_map() succeeded fd=%d, off=%d, size=%d, vaddr=%p",
++        //        hnd->fd, hnd->offset, hnd->size, mappedAddress);
++    }
++    *vaddr = (void*)hnd->base;
++    return 0;
++}
++
++int fsl_gralloc_unmap(gralloc_module_t const* module,
++        buffer_handle_t handle)
++{
++    private_handle_t* hnd = (private_handle_t*)handle;
++    if (!(hnd->flags & private_handle_t::PRIV_FLAGS_FRAMEBUFFER)) {
++        getIonFd(module);
++        void* base = (void*)hnd->base;
++        size_t size = hnd->size;
++        //ALOGD("unmapping from %p, size=%d", base, size);
++        if (munmap(base, size) < 0) {
++            ALOGE("Could not unmap %s", strerror(errno));
++        }
++    }
++    hnd->base = 0;
++    return 0;
++}
++
++int fsl_gralloc_register_buffer(gralloc_module_t const* module,
++        buffer_handle_t handle)
++{
++    if (private_handle_t::validate(handle) < 0)
++        return -EINVAL;
++
++    private_handle_t* hnd = (private_handle_t*)handle;
++    //ALOGD_IF(hnd->pid == getpid(),
++    //        "Registering a buffer in the process that created it. "
++    //        "This may cause memory ordering problems.");
++
++    int ret = 0;
++    if (hnd->pid != getpid()) {
++        void *vaddr;
++        ret = fsl_gralloc_map(module, handle, &vaddr);
++    }
++    if (ret == 0) {
++        // increase the buffer counter in process.
++        // ion_increfs(moudule->ion_fd, hnd->fd);
++        // actually when call mmap, ion will increase ref count.
++    }
++
++    return 0;
++}
++
++int fsl_gralloc_unregister_buffer(gralloc_module_t const* module,
++        buffer_handle_t handle)
++{
++    if (private_handle_t::validate(handle) < 0)
++        return -EINVAL;
++
++    private_handle_t* hnd = (private_handle_t*)handle;
++    if (hnd->base != 0) {
++        fsl_gralloc_unmap(module, handle);
++    }
++
++    // decrease the buffer counter in process.
++    // ion_decrefs(moudule->ion_fd, hnd->fd);
++    // when call munmap, ion will decrease ref count.
++
++    return 0;
++}
++
++int fsl_gralloc_lock(gralloc_module_t const* module,
++        buffer_handle_t handle, int usage,
++        int l, int t, int w, int h,
++        void** vaddr)
++{
++    if (private_handle_t::validate(handle) < 0)
++        return -EINVAL;
++
++    private_handle_t* hnd = (private_handle_t*)handle;
++    *vaddr = (void*)hnd->base;
++
++    //may call ion_lock to sync the buffer access across process.
++    //ion_lock(moudule->ion_fd, hnd->fd);
++    return 0;
++}
++
++int fsl_gralloc_unlock(gralloc_module_t const* module,
++        buffer_handle_t handle)
++{
++    if (private_handle_t::validate(handle) < 0)
++        return -EINVAL;
++
++    //may call ion_lock to sync the buffer access across process.
++    //ion_unlock(moudule->ion_fd, hnd->fd);
++    return 0;
++}
++
+diff --git a/mx6/libgralloc_wrapper/gralloc.cpp b/mx6/libgralloc_wrapper/gralloc.cpp
+index 3162303..b3f9932 100755
+--- a/mx6/libgralloc_wrapper/gralloc.cpp
++++ b/mx6/libgralloc_wrapper/gralloc.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2010-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2010-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -34,6 +34,7 @@
+ 
+ #include <hardware/hardware.h>
+ #include <hardware/gralloc.h>
++#include <ion/ion.h>
+ 
+ #include "gralloc_priv.h"
+ /*****************************************************************************/
+@@ -58,6 +59,12 @@ extern int gralloc_register_buffer(gralloc_module_t const* module,
+ extern int gralloc_unregister_buffer(gralloc_module_t const* module,
+         buffer_handle_t handle);
+ 
++extern int fsl_gralloc_alloc(alloc_device_t* dev,
++        int w, int h, int format, int usage,
++        buffer_handle_t* pHandle, int* pStride);
++
++extern int fsl_gralloc_free(alloc_device_t* dev,
++        buffer_handle_t handle);
+ /*****************************************************************************/
+ 
+ static struct hw_module_methods_t gralloc_module_methods = {
+@@ -90,6 +97,20 @@ struct private_module_t HAL_MODULE_INFO_SYM = {
+     bufferMask: 0,
+     lock: PTHREAD_MUTEX_INITIALIZER,
+     currentBuffer: 0,
++    info: {0},
++    finfo: {{0},0},
++    xdpi: 0.0,
++    ydpi: 0.0,
++    fps: 0.0,
++    flags: 0,
++    master_phys: 0,
++    gpu_device: 0,
++    gralloc_viv: 0,
++    priv_dev: 0,
++    external_module: 0,
++    primary_fd: 0,
++    closeDevice: false,
++    ion_fd: -1
+ };
+ 
+ /*****************************************************************************/
+@@ -105,8 +126,12 @@ static int gralloc_alloc(alloc_device_t* dev,
+ 
+     private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+     if (!m || !m->gpu_device) {
+-        ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
+-        return -EINVAL;
++        if (!m || m->ion_fd <= 0) {
++            ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
++            return -EINVAL;
++        }
++
++        return fsl_gralloc_alloc(dev, w, h, format, usage, pHandle, pStride);
+     }
+ 
+     if (usage & GRALLOC_USAGE_HW_FBX) {
+@@ -133,8 +158,12 @@ static int gralloc_free(alloc_device_t* dev,
+ {
+     private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
+     if (!m || !m->gpu_device) {
+-        ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
+-        return -EINVAL;
++        if (!m || m->ion_fd <= 0) {
++            ALOGE("<%s,%d> m or m->gpu_device is NULL", __FUNCTION__, __LINE__);
++            return -EINVAL;
++        }
++
++        return fsl_gralloc_free(dev, handle);
+     }
+ 
+     if (m->external_module != NULL && m->external_module->framebuffer != NULL) {
+@@ -175,6 +204,10 @@ static int gralloc_close(struct hw_device_t *dev)
+            m->gpu_device->common.close((struct hw_device_t *)m->gpu_device);
+            m->gpu_device = NULL;
+         }
++        if (m && m->ion_fd > 0) {
++           ion_close(m->ion_fd);
++           m->ion_fd = -1;
++        }
+ 
+         free(ctx);
+     }
+@@ -188,14 +221,21 @@ int gralloc_device_open(const hw_module_t* module, const char* name,
+     hw_module_t *hw = const_cast<hw_module_t *>(module);
+ 
+     private_module_t* m = reinterpret_cast<private_module_t*>(hw);
+-    if (!m->gpu_device) {
+-       hw_module_t const* gpu_module;;
++    if (!m->gpu_device && m->ion_fd <= 0) {
++       hw_module_t const* gpu_module;
+        if (hw_get_module(GRALLOC_VIV_HARDWARE_MODULE_ID, &gpu_module) == 0) {
+           status = gralloc_open(gpu_module, &m->gpu_device);
+           if(status || !m->gpu_device){
+              ALOGE("gralloc_device_open: gpu gralloc device open failed!");
+           }
+        }
++       else {
++           ALOGI("%s ion open", __FUNCTION__);
++           m->ion_fd = ion_open();
++           if (m->ion_fd <= 0) {
++               ALOGE("%s ion open failed", __FUNCTION__);
++           }
++       }
+     }
+ 
+     if (!m->priv_dev) {
+diff --git a/mx6/libgralloc_wrapper/gralloc_priv.h b/mx6/libgralloc_wrapper/gralloc_priv.h
+index 09769ac..245a8da 100755
+--- a/mx6/libgralloc_wrapper/gralloc_priv.h
++++ b/mx6/libgralloc_wrapper/gralloc_priv.h
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2009-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2009-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -34,6 +34,7 @@
+ #define GRALLOC_VIV_HARDWARE_MODULE_ID "gralloc_viv"
+ 
+ #define  ALIGN_PIXEL(x)  ((x+ 31) & ~31)
++#define  ALIGN_PIXEL_32(x)  ((x+ 31) & ~31)
+ #define  ALIGN_PIXEL_16(x)  ((x+ 15) & ~15)
+ /** z430 core need 4k aligned memory, since xres has been 32 aligned, make yres
+     to 128 aligned will meet this request for all pixel format (RGB565,RGB888,etc.) */
+@@ -75,6 +76,7 @@ struct private_module_t {
+     struct private_module_t *external_module;
+     int primary_fd;
+     bool closeDevice;
++    int ion_fd;
+     enum {
+         // flag to indicate we'll post this buffer
+         PRIV_USAGE_LOCKED_FOR_POST = 0x80000000
+@@ -93,6 +95,8 @@ struct private_handle_t {
+     enum {
+         PRIV_FLAGS_FRAMEBUFFER = 0x00000001,
+         PRIV_FLAGS_USES_DRV    = 0x00000002,
++        PRIV_FLAGS_USES_ION    = 0x00000004,
++        PRIV_FLAGS_FRAMEBUFFER_X = 0x00000008,
+     };
+ 
+     enum {
+diff --git a/mx6/libgralloc_wrapper/mapper.cpp b/mx6/libgralloc_wrapper/mapper.cpp
+index e93a8a6..5a680ce 100755
+--- a/mx6/libgralloc_wrapper/mapper.cpp
++++ b/mx6/libgralloc_wrapper/mapper.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2010-2012 Freescale Semiconductor, Inc.
++ * Copyright (C) 2010-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -42,6 +42,20 @@ pid_t gettid() { return syscall(__NR_gettid);}
+ #undef __KERNEL__
+ #endif
+ 
++extern int fsl_gralloc_lock(gralloc_module_t const* module,
++        buffer_handle_t handle, int usage,
++        int l, int t, int w, int h,
++        void** vaddr);
++
++extern int fsl_gralloc_unlock(gralloc_module_t const* module,
++        buffer_handle_t handle);
++
++extern int fsl_gralloc_register_buffer(gralloc_module_t const* module,
++        buffer_handle_t handle);
++
++extern int fsl_gralloc_unregister_buffer(gralloc_module_t const* module,
++        buffer_handle_t handle);
++
+ /*****************************************************************************/
+ 
+ static pthread_mutex_t sMapLock = PTHREAD_MUTEX_INITIALIZER; 
+@@ -79,7 +93,7 @@ int gralloc_register_buffer(gralloc_module_t const* module,
+         return gralloc_viv->registerBuffer(gralloc_viv, handle);
+     }
+ 
+-    return -EINVAL;
++    return fsl_gralloc_register_buffer(module, handle);
+ }
+ 
+ int gralloc_unregister_buffer(gralloc_module_t const* module,
+@@ -90,7 +104,7 @@ int gralloc_unregister_buffer(gralloc_module_t const* module,
+         return gralloc_viv->unregisterBuffer(gralloc_viv, handle);
+     }
+ 
+-    return -EINVAL;
++    return fsl_gralloc_unregister_buffer(module, handle);
+ }
+ 
+ int gralloc_lock(gralloc_module_t const* module,
+@@ -103,7 +117,7 @@ int gralloc_lock(gralloc_module_t const* module,
+         return gralloc_viv->lock(gralloc_viv, handle, usage, l, t, w, h, vaddr);
+     }
+ 
+-    return -EINVAL;
++    return fsl_gralloc_lock(module, handle, usage, l, t, w, h, vaddr);
+ }
+ 
+ int gralloc_unlock(gralloc_module_t const* module, 
+@@ -114,5 +128,5 @@ int gralloc_unlock(gralloc_module_t const* module,
+         return gralloc_viv->unlock(gralloc_viv, handle);
+     }
+ 
+-    return -EINVAL;
++    return fsl_gralloc_unlock(module, handle);
+ }
+-- 
+1.8.0
+

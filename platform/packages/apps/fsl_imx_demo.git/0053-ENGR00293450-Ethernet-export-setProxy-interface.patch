@@ -1,0 +1,323 @@
+From 35fdcd632b2f50fc9679865e239ce471f2f79db3 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Thu, 2 Jan 2014 16:25:27 +0800
+Subject: [PATCH 53/58] ENGR00293450 Ethernet:export setProxy interface
+
+export setProxy interface for advanced setting.
+Also fix several other tweaks.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ .../com/fsl/ethernet/EthernetConfigDialog.java     | 22 ++++--
+ Ethernet/com/fsl/ethernet/EthernetDevInfo.java     | 51 +++++--------
+ Ethernet/com/fsl/ethernet/EthernetManager.java     | 87 ++++++++++++++--------
+ 3 files changed, 93 insertions(+), 67 deletions(-)
+
+diff --git a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+index b543380..6442294 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
++++ b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+@@ -52,6 +52,8 @@ public class EthernetConfigDialog extends AlertDialog implements
+     private EditText mIpaddr;
+     private EditText mDns;
+     private CheckBox mProxy;
++    private EditText mProxyIp;
++    private EditText mProxyPort;
+     private LinearLayout ip_dns_setting;
+     private LinearLayout address_port_setting;
+     private static String Mode_dhcp = "dhcp";
+@@ -75,6 +77,9 @@ public class EthernetConfigDialog extends AlertDialog implements
+         ip_dns_setting = (LinearLayout)mView.findViewById(R.id.ip_dns_setting);
+         address_port_setting = (LinearLayout)mView.findViewById(R.id.address_port_setting);
+         address_port_setting.setVisibility(View.GONE);
++        mProxyIp = (EditText)mView.findViewById(R.id.proxy_address_edit);
++        mProxyPort = (EditText)mView.findViewById(R.id.proxy_port_edit);
++
+         if (mEthEnabler.getManager().isConfigured()) {
+             EthernetDevInfo info = mEthEnabler.getManager().getSavedConfig();
+             if (mEthEnabler.getManager().getSharedPreMode().equals(Mode_dhcp)) {
+@@ -85,13 +90,10 @@ public class EthernetConfigDialog extends AlertDialog implements
+                 mConTypeDhcp.setChecked(false);
+                 mConTypeManual.setChecked(true);
+                 ip_dns_setting.setVisibility(View.VISIBLE);
+-                mIpaddr.setEnabled(true);
+-                mDns.setEnabled(true);
+                 mIpaddr.setText(mEthEnabler.getManager().getSharedPreIpAddress(),TextView.BufferType.EDITABLE);
+                 mDns.setText(mEthEnabler.getManager().getSharedPreDnsAddress(),TextView.BufferType.EDITABLE);
+             }
+         } else {
+-            mEthEnabler.getManager().setMode(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
+             mConTypeDhcp.setChecked(true);
+             mConTypeManual.setChecked(false);
+             ip_dns_setting.setVisibility(View.GONE);
+@@ -99,15 +101,11 @@ public class EthernetConfigDialog extends AlertDialog implements
+         mConTypeManual.setOnClickListener(new RadioButton.OnClickListener() {
+             public void onClick(View v) {
+                 ip_dns_setting.setVisibility(View.VISIBLE);
+-                mIpaddr.setEnabled(true);
+-                mDns.setEnabled(true);
+             }
+         });
+         mConTypeDhcp.setOnClickListener(new RadioButton.OnClickListener() {
+             public void onClick(View v) {
+                 ip_dns_setting.setVisibility(View.GONE);
+-                mIpaddr.setEnabled(false);
+-                mDns.setEnabled(false);
+             }
+         });
+         mProxy.setOnCheckedChangeListener(new OnCheckedChangeListener(){
+@@ -152,6 +150,16 @@ public class EthernetConfigDialog extends AlertDialog implements
+             info.setIpAddress(null);
+             info.setDnsAddr(null);
+         }
++        if (mProxy.isChecked()) {
++            if ((mProxyIp.getText().toString().equals(""))||(mProxyPort.getText().toString().equals("")))
++            {
++                Toast.makeText(this.getContext(), R.string.show_need_setting,Toast.LENGTH_SHORT).show();
++            }else{
++                info.setProxyAddr(mProxyIp.getText().toString());
++                info.setProxyPort(mProxyPort.getText().toString());
++            }
++        }
++
+         mEthEnabler.getManager().updateDevInfo(info);
+         mEthEnabler.setEthEnabled();
+     }
+diff --git a/Ethernet/com/fsl/ethernet/EthernetDevInfo.java b/Ethernet/com/fsl/ethernet/EthernetDevInfo.java
+index cdbc57a..13a1c31 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetDevInfo.java
++++ b/Ethernet/com/fsl/ethernet/EthernetDevInfo.java
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -37,6 +37,8 @@ public class EthernetDevInfo {
+     private String route;
+     private String dns;
+     private String mode;
++    private String proxyIp;
++    private String proxyPort;
+ 
+     public EthernetDevInfo () {
+         dev_name = null;
+@@ -45,6 +47,8 @@ public class EthernetDevInfo {
+         route = null;
+         netmask = null;
+         mode = ETHERNET_CONN_MODE_DHCP;
++        proxyIp = null;
++        proxyPort = null;
+     }
+ 
+     /**
+@@ -94,6 +98,21 @@ public class EthernetDevInfo {
+         return this.dns;
+     }
+ 
++    public void setProxyAddr(String ip) {
++        this.proxyIp = ip;
++    }
++
++    public String getProxyAddr() {
++        return this.proxyIp;
++    }
++
++    public void setProxyPort(String port) {
++        this.proxyIp = port;
++    }
++
++    public String getProxyPort() {
++        return this.proxyPort;
++    }
+     /**
+      * Set ethernet configuration mode
+      * @param mode {@code ETHERNET_CONN_MODE_DHCP} for dhcp {@code ETHERNET_CONN_MODE_MANUAL} for manual configure
+@@ -111,34 +130,4 @@ public class EthernetDevInfo {
+         return this.mode;
+     }
+ 
+-    public int describeContents() {
+-        return 0;
+-    }
+-
+-    public void writeToParcel(Parcel dest, int flags) {
+-        dest.writeString(this.dev_name);
+-        dest.writeString(this.ipaddr);
+-        dest.writeString(this.netmask);
+-        dest.writeString(this.route);
+-        dest.writeString(this.dns);
+-        dest.writeString(this.mode);
+-    }
+-
+-    /** Implement the Parcelable interface {@hide} */
+-    public static final Creator<EthernetDevInfo> CREATOR = new Creator<EthernetDevInfo>() {
+-        public EthernetDevInfo createFromParcel(Parcel in) {
+-            EthernetDevInfo info = new EthernetDevInfo();
+-            info.setIfName(in.readString());
+-            info.setIpAddress(in.readString());
+-            info.setNetMask(in.readString());
+-            info.setRouteAddr(in.readString());
+-            info.setDnsAddr(in.readString());
+-            info.setConnectMode(in.readString());
+-            return info;
+-        }
+-
+-        public EthernetDevInfo[] newArray(int size) {
+-            return new EthernetDevInfo[size];
+-        }
+-    };
+ }
+diff --git a/Ethernet/com/fsl/ethernet/EthernetManager.java b/Ethernet/com/fsl/ethernet/EthernetManager.java
+index 27d213f..48f785a 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetManager.java
++++ b/Ethernet/com/fsl/ethernet/EthernetManager.java
+@@ -39,6 +39,7 @@ import android.net.NetworkInfo;
+ import android.net.NetworkInfo.DetailedState;
+ import android.net.LinkProperties;
+ import android.net.InterfaceConfiguration;
++import android.net.ProxyProperties;
+ import android.os.HandlerThread;
+ import android.os.Looper;
+ import android.os.Message;
+@@ -144,6 +145,8 @@ public class EthernetManager {
+         }
+         info.setIpAddress(getSharedPreIpAddress());
+         info.setDnsAddr(getSharedPreDnsAddress());
++        info.setProxyAddr(getSharedPreProxyAddress());
++        info.setProxyPort(getSharedPreProxyPort());
+         return info;
+     }
+ 
+@@ -163,17 +166,6 @@ public class EthernetManager {
+         return (scanDevice() > 0) ? DevName : null;
+     }
+ 
+-    /**
+-     * Set the ethernet interface configuration mode
+-     * @param mode {@code ETHERNET_CONN_MODE_DHCP} for dhcp {@code ETHERNET_CONN_MODE_MANUAL} for manual configure
+-     */
+-    public synchronized void setMode(String mode) {
+-        final ContentResolver cr = mContext.getContentResolver();
+-        if (DevName != null) {
+-            SystemProperties.set("net." + DevName[0] + ".mode", mode);
+-        }
+-    }
+-
+     private void setInterfaceUp(String InterfaceName)
+     {
+         try {
+@@ -220,14 +212,16 @@ public class EthernetManager {
+             updateDevInfo(info);
+         }
+     }
++
+     public EthernetDevInfo getDhcpInfo() {
+         EthernetDevInfo infotemp = new EthernetDevInfo();
+         infotemp.setIfName(mTracker.getLinkProperties().getInterfaceName());
+         infotemp.setConnectMode(EthernetDevInfo.ETHERNET_CONN_MODE_DHCP);
+         String ip;
+         ip = mConnMgr.getLinkProperties(ConnectivityManager.TYPE_ETHERNET).getAddresses().toString();
+-        Log.d(TAG, "===========IP=" + ip.substring(2, ip.length()-1));
+-        infotemp.setIpAddress(ip.substring(2, ip.length()-1));
++        Log.d(TAG, "===========IP=" + ip);
++        if (ip != "[]" )
++            infotemp.setIpAddress(ip.substring(2, ip.length()-1));
+         String dns = " ";
+         int i = 0;
+         for( InetAddress d : mConnMgr.getLinkProperties(ConnectivityManager.TYPE_ETHERNET).getDnses()) {
+@@ -294,6 +288,8 @@ public class EthernetManager {
+             editor.putString("conn_mode",info.getConnectMode());
+             editor.putString("mIpaddr",info.getIpAddress());
+             editor.putString("mDns",info.getDnsAddr());
++            editor.putString("mProxyIp",info.getProxyAddr());
++            editor.putString("mProxyPort", info.getProxyPort());
+             } catch (NumberFormatException e) {
+                 e.printStackTrace();
+             }
+@@ -302,32 +298,65 @@ public class EthernetManager {
+     }
+ 
+     public String getSharedPreMode(){
++        String temp = null;
+         try {
+-            mode = sharedPreferences().getString("conn_mode",null);
+-            } catch (Exception e) {
+-                e.printStackTrace();
+-            }
+-        return mode;
++            temp = sharedPreferences().getString("conn_mode",null);
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
++        return temp;
+     }
+ 
+     public String getSharedPreIpAddress(){
+-
++        String temp = null;
+         try {
+-            ip_address = sharedPreferences().getString("mIpaddr",null);
+-            } catch (Exception e) {
+-                e.printStackTrace();
+-            }
+-        return ip_address;
++            temp = sharedPreferences().getString("mIpaddr",null);
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
++        return temp;
+     }
+ 
+     public String getSharedPreDnsAddress(){
++        String temp = null;
++        try {
++            temp = sharedPreferences().getString("mDns",null);
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
++        return temp;
++    }
+ 
++    public String getSharedPreProxyAddress(){
++        String temp = null;
+         try {
+-            dns_address = sharedPreferences().getString("mDns",null);
+-            } catch (Exception e) {
+-                e.printStackTrace();
+-            }
+-        return dns_address;
++            temp = sharedPreferences().getString("mProxyIp",null);
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
++        return temp;
++    }
++
++    public String getSharedPreProxyPort(){
++        String temp = null;
++        try {
++            temp = sharedPreferences().getString("mProxyPort",null);
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
++        return temp;
++    }
++
++    public void setProxy(){
++        String exclusionList = null;
++        if (getSharedPreProxyAddress() == null || getSharedPreProxyPort() == null)
++            return;
++        LinkProperties lp = mTracker.getLinkProperties();
++        if (lp == null)
++            return;
++        ProxyProperties proxyProperties =
++            new ProxyProperties(getSharedPreProxyAddress(), Integer.parseInt(getSharedPreProxyPort()), exclusionList);
++        lp.setHttpProxy(proxyProperties);
+     }
+ 
+ }
+-- 
+1.8.0
+

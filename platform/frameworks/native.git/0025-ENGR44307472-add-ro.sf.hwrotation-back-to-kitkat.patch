@@ -1,0 +1,102 @@
+From 3b12fc9d90cc280a01854f08ace03bcb30fc8265 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Mon, 27 Jan 2014 10:38:40 +0800
+Subject: [PATCH 25/26] ENGR44307472 add ro.sf.hwrotation back to kitkat.
+
+add ro.sf.hwrotation back to kitkat.
+ro.sf.hwrotation should be set in init.rc.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ services/surfaceflinger/DisplayDevice.cpp  | 21 +++++++++++++++++++++
+ services/surfaceflinger/SurfaceFlinger.cpp | 28 +++++++++++++++++++++++++---
+ 2 files changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/services/surfaceflinger/DisplayDevice.cpp b/services/surfaceflinger/DisplayDevice.cpp
+index c4ba1fd..5ae4180 100644
+--- a/services/surfaceflinger/DisplayDevice.cpp
++++ b/services/surfaceflinger/DisplayDevice.cpp
+@@ -411,6 +411,22 @@ void DisplayDevice::setProjection(int orientation,
+     Rect viewport(newViewport);
+     Rect frame(newFrame);
+ 
++    int displayOrientation = DisplayState::eOrientationDefault;
++    char property[PROPERTY_VALUE_MAX];
++    if (mType == DISPLAY_PRIMARY) {
++        if (property_get("ro.sf.hwrotation", property, NULL) > 0) {
++            switch (atoi(property)) {
++                case 90:
++                    displayOrientation = DisplayState::eOrientation90;
++                    break;
++                case 270:
++                    displayOrientation = DisplayState::eOrientation270;
++                    break;
++            }
++        }
++    }
++
++    orientation = (orientation + displayOrientation) % 4;
+     const int w = mDisplayWidth;
+     const int h = mDisplayHeight;
+ 
+@@ -421,6 +437,11 @@ void DisplayDevice::setProjection(int orientation,
+         // the destination frame can be invalid if it has never been set,
+         // in that case we assume the whole display frame.
+         frame = Rect(w, h);
++        if (R.getOrientation() & Transform::ROT_90) {
++            // frame is always specified in the logical orientation
++            // of the display (ie: post-rotation).
++            swap(frame.right, frame.bottom);
++        }
+     }
+ 
+     if (viewport.isEmpty()) {
+diff --git a/services/surfaceflinger/SurfaceFlinger.cpp b/services/surfaceflinger/SurfaceFlinger.cpp
+index 0e9b7a9..1b772ae 100644
+--- a/services/surfaceflinger/SurfaceFlinger.cpp
++++ b/services/surfaceflinger/SurfaceFlinger.cpp
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
++/* Copyright (C) 2013-2014 Freescale Semiconductor, Inc. */
+ 
+ #define ATRACE_TAG ATRACE_TAG_GRAPHICS
+ 
+@@ -733,8 +733,30 @@ status_t SurfaceFlinger::getDisplayInfo(const sp<IBinder>& display, DisplayInfo*
+         info->orientation = 0;
+     }
+ 
+-    info->w = hwc.getWidth(type);
+-    info->h = hwc.getHeight(type);
++    int width = hwc.getWidth(type);
++    int height = hwc.getHeight(type);
++
++    int displayOrientation = DisplayState::eOrientationDefault;
++    char property[PROPERTY_VALUE_MAX];
++    if (type == DisplayDevice::DISPLAY_PRIMARY) {
++        if (property_get("ro.sf.hwrotation", property, NULL) > 0) {
++            switch (atoi(property)) {
++                case 90:
++                    displayOrientation = DisplayState::eOrientation90;
++                    break;
++                case 270:
++                    displayOrientation = DisplayState::eOrientation270;
++                    break;
++            }
++        }
++    }
++
++    if (displayOrientation & DisplayState::eOrientationSwapMask) {
++        swap(width, height);
++    }
++
++    info->w = width;
++    info->h = height;
+     info->xdpi = xdpi;
+     info->ydpi = ydpi;
+     info->fps = float(1e9 / hwc.getRefreshPeriod(type));
+-- 
+1.8.0
+

@@ -1,0 +1,851 @@
+From 0dfce2871f73a2c564a8fe39b3916df82b1d014f Mon Sep 17 00:00:00 2001
+From: b38342 <b38342@freescale.com>
+Date: Thu, 2 Jan 2014 23:43:10 +0800
+Subject: [PATCH 489/498] ENGR00294178 HAL:update sensor HAL to support batch
+ interface
+
+Batch feature is a new feature in KK4.4. Update HAL codes to support
+it. Patch is from sensor team. Just tune code style and cherry pick
+it here.
+
+Signed-off-by: b38342 <b38342@freescale.com>
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ libsensors/AccelSensor.cpp | 257 +++++++++++++++++++++++++++++++++++----------
+ libsensors/AccelSensor.h   |  14 ++-
+ libsensors/SensorBase.cpp  |  67 ++++++++++--
+ libsensors/SensorBase.h    |  12 ++-
+ libsensors/sensors.cpp     | 153 ++++++++++++++++++---------
+ 5 files changed, 386 insertions(+), 117 deletions(-)
+
+diff --git a/libsensors/AccelSensor.cpp b/libsensors/AccelSensor.cpp
+index aff388f..09c9a6d 100755
+--- a/libsensors/AccelSensor.cpp
++++ b/libsensors/AccelSensor.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2014 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -28,21 +28,28 @@
+ #include <cutils/properties.h>
+ #include "AccelSensor.h"
+ #define ACC_DATA_NAME    "FreescaleAccelerometer" 
++#define ACC_FIFO_NAME    "/dev/mma8x5x"
+ #define ACC_SYSFS_PATH   "/sys/class/input"
+-#define ACC_SYSFS_DELAY  "poll"
++#define ACC_SYSFS_DELAY  "poll_delay"
+ #define ACC_SYSFS_ENABLE "enable"
++#define ACC_SYSFS_FIFO	 "fifo"
++
+ #define ACC_EVENT_X ABS_X
+ #define ACC_EVENT_Y ABS_Y
+ #define ACC_EVENT_Z ABS_Z
+-#define ACC_DATA_CONVERSION(value) (float)((float)((int)value) * (GRAVITY_EARTH / (0x4000)))
++#define ACC_DATA_CONVERSION(value) (float)((float)((int)(value)) * (GRAVITY_EARTH / (0x4000)))
++#define ACC_FIFO_MAX_TIMEOUT	20480000000LL		//(640 * ACC_FIFO_LEN *1000000) ns
++#define ACC_FIFO_MIN_TIMEOUT	   40000000LL		//(1.25 * ACC_FIFO_LEN *1000000)     ns
+ 
+ AccelSensor::AccelSensor()
+-: SensorBase(NULL, ACC_DATA_NAME),
++: SensorBase(NULL, ACC_DATA_NAME,ACC_FIFO_NAME),
+       mEnabled(0),
+       mPendingMask(0),
+       mInputReader(4),
+       mDelay(0)
+ {
++	mBatchEnabled = 0;
++	mUser = 0;
+     memset(&mPendingEvent, 0, sizeof(mPendingEvent));
+ 	memset(mClassPath, '\0', sizeof(mClassPath));
+ 	
+@@ -50,7 +57,6 @@ AccelSensor::AccelSensor()
+     mPendingEvent.sensor  = ID_A;
+     mPendingEvent.type    = SENSOR_TYPE_ACCELEROMETER;
+     mPendingEvent.acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
+-	mUser = 0;
+ 	if(sensor_get_class_path(mClassPath))
+ 	{
+ 		ALOGE("Can`t find the Acc sensor!");
+@@ -67,28 +73,28 @@ int AccelSensor::setEnable(int32_t handle, int en)
+     uint32_t newState  = en;
+ 	if(handle != ID_A && handle != ID_O && handle != ID_M)
+ 		return -1;
+-	if(en)
++	/*mUser to control is sensor enable
++         *mEnable to control is Acc to report data
++	*/
++	if(en){
+ 		mUser++;
++		if(handle == ID_A)
++			mEnabled++;
++	}
+ 	else{
+ 		mUser--;
+-		if(mUser < 0)
+-			mUser = 0;
++		if(handle == ID_A)
++			mEnabled--;
+ 	}
+-	if(mUser > 0)
++	if(mUser < 0)
++		mUser = 0;
++	if(mEnabled < 0)
++		mEnabled = 0;
++	if(mUser)
+ 		err = enable_sensor();
+ 	else
+ 		err = disable_sensor();
+-	if(handle == ID_A ) {
+-		if(en)
+-         	mEnabled++;
+-		else
+-			mEnabled--;
+-
+-		if(mEnabled < 0)
+-			mEnabled = 0;
+-    }
+-	update_delay();
+-	ALOGD("AccelSensor enable %d ,usercount %d, handle %d ,mEnabled %d",en ,mUser, handle ,mEnabled);
++	ALOGD("AccelSensor enable %d , handle %d ,mEnabled %d",en , handle ,mEnabled);
+     return err;
+ }
+ 
+@@ -100,50 +106,143 @@ int AccelSensor::setDelay(int32_t handle, int64_t ns)
+     mDelay = ns;
+     return update_delay();
+ }
+-
++bool AccelSensor::hasPendingEvents(){
++	return (mFifoCount > 0);
++}
+ int AccelSensor::update_delay()
+ {
+     return set_delay(mDelay);
+ }
+-
++/*
++struct mma8x5x_data_axis {
++	short x;
++	short y;
++	short z;
++};
++struct mma8x5x_fifo{
++	int count;
++	int64_t period;
++	int64_t timestamp;
++	struct mma8x5x_data_axis fifo_data[MMA8X5X_FIFO_SIZE];
++};
++*/
++int AccelSensor::read_fifo(){
++	char buf[256];
++	int i = 0;
++	int nread,n;
++	int count;
++	int64_t period;
++	int64_t timestamp;
++	int offset = 0;
++	int16_t * data;
++	int16_t axis;
++	struct pollfd mPollFds[1];
++	if(fifo_fd){
++		mPollFds[0].fd = fifo_fd;
++		mPollFds[0].events = POLLIN;
++		mPollFds[0].revents = 0;
++		memset(buf,0,sizeof(buf));
++		n = poll(mPollFds, 1, 0);  //re-check if fifo is ready
++		if(n <= 0){
++			mFifoCount = 0;
++			return -EINVAL;
++		}
++		nread = read(fifo_fd, buf,sizeof(buf));
++		if(nread > 0){
++			mFifoCount = 0;
++			offset = 0;
++			count = *((int *)(&buf[offset]));
++			if(count > 0 && count <= MMA8X5X_FIFO_SIZE){
++				offset += sizeof(count);
++				period = *((int64_t *)(&buf[offset]));
++				offset += sizeof(period);
++				timestamp = *((int64_t *)(&buf[offset]));
++				offset += sizeof(timestamp);
++				data = ((int16_t *)(&buf[offset]));
++				for(i = 0 ; i <  count; i++){
++					axis = *data++;
++					mFifoPendingEvent[i].acceleration.x = ACC_DATA_CONVERSION(axis);
++					axis = *data++;
++					mFifoPendingEvent[i].acceleration.y = ACC_DATA_CONVERSION(axis);
++					axis = *data++;
++					mFifoPendingEvent[i].acceleration.z = ACC_DATA_CONVERSION(axis);
++					mFifoPendingEvent[i].timestamp = timestamp - (count - i -1)* period;
++					mFifoPendingEvent[i].sensor  = ID_A;
++					mFifoPendingEvent[i].type    = SENSOR_TYPE_ACCELEROMETER;
++					mFifoPendingEvent[i].acceleration.status = SENSOR_STATUS_ACCURACY_HIGH;
++				}
++				mFifoCount = count;
++			}
++		}
++	}
++	return 0;
++}
+ int AccelSensor::readEvents(sensors_event_t* data, int count)
+ {
++	int events = 0;
++	int ret;
+     if (count < 1)
+         return -EINVAL;
+-
+-    ssize_t n = mInputReader.fill(data_fd);
+-    if (n < 0)
+-        return n;
+-
+-    int numEventReceived = 0;
+-    input_event const* event;
+-    while (count && mInputReader.readEvent(&event)) {
+-        int type = event->type;
+-        if ((type == EV_ABS) || (type == EV_REL) || (type == EV_KEY)) {
+-            processEvent(event->code, event->value);
+-            mInputReader.next();
+-        } else if (type == EV_SYN) {
+-            int64_t time = timevalToNano(event->time);
+-			if (mPendingMask) {
+-				mPendingMask = 0;
+-				mPendingEvent.timestamp = time;
+-				if (mEnabled) {
+-					*data++ = mPendingEvent;
+-					count--;
+-					numEventReceived++;
+-				}
++	int numEventReceived = 0;
++	if(mBatchEnabled){
++		sensors_event_t event;
++		if(mBatchEnabled){
++			/*read the batch FIFO infomation,then add the META_DATA_VERSION event at the end of FIFO */
++			if(mFifoCount <= 0){
++				ret = read_fifo();
++				if(ret < 0)  /*not fifo data ,return immediately*/
++					return 0;
++			}
++			events = (count -1 < mFifoCount)? count -1 : mFifoCount;
++			if(events){
++				memcpy(data,&mFifoPendingEvent[MMA8X5X_FIFO_SIZE - events],sizeof(sensors_event_t) *events);
++				mFifoCount -= events;
++				numEventReceived += events;
++				data += events;
++			}
++			if(count > 0 && mFifoCount == 0){  //end fifo flag
++				memset(&event,0,sizeof(event));
++				event.version = META_DATA_VERSION;
++				event.type = SENSOR_TYPE_META_DATA;
++				event.meta_data.sensor = ID_A;
++				event.meta_data.what = 0;
++				*data++ = event;
++				count--;
++				numEventReceived++;
+ 			}
+-            if (!mPendingMask) {
++		}
++	}else{
++		ssize_t n = mInputReader.fill(data_fd);
++		if (n < 0)
++			return n;
++		input_event const* event;
++        while (count && mInputReader.readEvent(&event)) {
++            int type = event->type;
++            if ((type == EV_ABS) || (type == EV_REL) || (type == EV_KEY)) {
++                processEvent(event->code, event->value);
+                 mInputReader.next();
+-            }
+-        } else {
+-            ALOGE("AccelSensor: unknown event (type=%d, code=%d)",
+-                    type, event->code);
+-            mInputReader.next();
+-        }
+-    }
+-
+-    return numEventReceived;
++            } else if (type == EV_SYN) {
++                int64_t time = timevalToNano(event->time);
++                if (mPendingMask) {
++                    mPendingMask = 0;
++                    mPendingEvent.timestamp = time;
++                    if (mEnabled) {
++                        *data++ = mPendingEvent;
++                        count--;
++                        numEventReceived++;
++                    }
++                }
++                if (!mPendingMask) {
++                    mInputReader.next();
++	            }
++	        } else {
++	            ALOGE("AccelSensor: unknown event (type=%d, code=%d)",
++	                    type, event->code);
++	            mInputReader.next();
++	        }
++	    }
++	}
++	return numEventReceived;
+ }
+ 
+ void AccelSensor::processEvent(int code, int value)
+@@ -299,6 +398,56 @@ int AccelSensor::sensor_get_class_path(char *class_path)
+ 		return -1;
+ 	}
+ }
++int AccelSensor::fifo(int64_t period_ns,int64_t timeout_ns,int wakeup){
++	char attr[PATH_MAX] = {'\0'};
++	char buf[256];
++	int timeout_ms = timeout_ns /1000000;
++	int period_ms = period_ns /1000000;
++	if(mClassPath[0] == '\0')
++		return -1;
++	strcpy(attr, mClassPath);
++	strcat(attr,"/");
++	strcat(attr,ACC_SYSFS_FIFO);
++	int fd = open(attr, O_RDWR);
++	if (0 > fd) {
++		ALOGE("Could not open (write-only) SysFs attribute \"%s\" (%s).", attr, strerror(errno));
++		return -errno;
++	}
++	sprintf(buf,"%d,%d,%d",period_ms,timeout_ms,(wakeup > 0 ? 1 : 0));
++	int err = 0;
++	err = write(fd,buf,strlen(buf) + 1);
++	if (0 > err) {
++		err = -errno;
++		ALOGE("Could not write SysFs attribute \"%s\" (%s).", attr, strerror(errno));
++	} else {
++		err = 0;
++	}
++	close(fd);
++	return 0;
++}
++int AccelSensor::batch(int handle, int flags, int64_t period_ns, int64_t timeout){
++	int wakeup;
++	if(flags & SENSORS_BATCH_DRY_RUN){
++		if(timeout > ACC_FIFO_MAX_TIMEOUT)
++			return -EINVAL;
++		else
++			return 0;
++	}else{
++		wakeup = 0;
++		if(flags & SENSORS_BATCH_WAKE_UPON_FIFO_FULL)
++			wakeup = 1;
++		fifo(period_ns,timeout,wakeup);
++		mDelay = period_ns;
++		if(timeout > 0)
++			mBatchEnabled = true;
++		else
++			mBatchEnabled = false;
++	}
++	return 0;
++}
++int AccelSensor::flush(int handle){
++	return -1;
++}
+ 
+ /*****************************************************************************/
+ 
+diff --git a/libsensors/AccelSensor.h b/libsensors/AccelSensor.h
+index c44db11..e3e4877 100755
+--- a/libsensors/AccelSensor.h
++++ b/libsensors/AccelSensor.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2011-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2011-2014 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -23,13 +23,13 @@
+ #include <sys/cdefs.h>
+ #include <sys/types.h>
+ 
+-
+ #include "sensors.h"
+ #include "SensorBase.h"
+ #include "InputEventReader.h"
+ 
+-/*****************************************************************************/
++#define MMA8X5X_FIFO_SIZE 32
+ 
++/*****************************************************************************/
+ class AccelSensor : public SensorBase {
+ public:
+     AccelSensor();
+@@ -38,8 +38,10 @@ public:
+     virtual int setEnable(int32_t handle, int enabled);
+     virtual int getEnable(int32_t handle);
+     virtual int readEvents(sensors_event_t* data, int count);
++	virtual bool hasPendingEvents();
+     void processEvent(int code, int value);
+-
++	int batch(int handle, int flags, int64_t period_ns, int64_t timeout);
++	int flush(int handle);
+ private:
+ 	int sensor_get_class_path(char *class_path);
+ 	int is_sensor_enabled();
+@@ -50,12 +52,16 @@ private:
+ 	int readDisable();
+ 	int writeEnable(int isEnable);
+ 	int writeDelay(int64_t ns);
++	int fifo(int64_t period_ns,int64_t timeout_ns,int wakeup);
++	int read_fifo();
+ 	int mUser;
+ 	int mEnabled;
+ 	int mPendingMask;
+ 	char mClassPath[PATH_MAX];
+ 	InputEventCircularReader mInputReader;
+ 	sensors_event_t mPendingEvent;
++	int mFifoCount;
++	sensors_event_t mFifoPendingEvent[MMA8X5X_FIFO_SIZE];
+ 	int64_t mDelay;
+ };
+ 
+diff --git a/libsensors/SensorBase.cpp b/libsensors/SensorBase.cpp
+index 9a9e7e3..0e304db 100755
+--- a/libsensors/SensorBase.cpp
++++ b/libsensors/SensorBase.cpp
+@@ -38,6 +38,27 @@ SensorBase::SensorBase(
+     if (data_name) {
+         data_fd = openInput(data_name);
+     }
++	fifo_fd = -1;
++	fifo_name = NULL;
++	mBatchEnabled = false;
++}
++
++SensorBase::SensorBase(
++	const char* dev_name,
++	const char* data_name,
++	const char* fifo_name)
++	: dev_name(dev_name), data_name(data_name),fifo_name(fifo_name),
++     dev_fd(-1),
++     data_fd(-1),
++     fifo_fd(-1)
++{
++	if (data_name) {
++        data_fd = openInput(data_name);
++    }
++	if(fifo_name){
++		open_fifo_device();
++	}
++	mBatchEnabled = false;
+ }
+ 
+ SensorBase::~SensorBase() {
+@@ -47,6 +68,10 @@ SensorBase::~SensorBase() {
+     if (dev_fd >= 0) {
+         close(dev_fd);
+     }
++	if(fifo_fd >= 0)
++	{
++		close(fifo_fd);
++	}
+ }
+ 
+ int SensorBase::open_device() {
+@@ -64,13 +89,28 @@ int SensorBase::close_device() {
+     }
+     return 0;
+ }
++
++int SensorBase::open_fifo_device(){
++	if (fifo_fd < 0 && fifo_name) {
++        fifo_fd = open(fifo_name, O_RDONLY);
++        ALOGE_IF(fifo_fd < 0, "Couldn't  open %s (%s)", fifo_name, strerror(errno));
++    }
++	return 0;
++}
++int SensorBase::close_fifo_device(){
++	if (fifo_fd >= 0) {
++        close(fifo_fd);
++        fifo_fd = -1;
++    }
++    return 0;
++}
+ int SensorBase::getFd() const 
+ {    
+-	if (!data_name) 
+-	{        
+-		return dev_fd;    
+-	}   
+-	return data_fd;
++	if(mBatchEnabled){
++		return fifo_fd;
++	}else{
++		return data_fd;
++	}
+ }
+ int SensorBase::setEnable(int32_t handle, int enabled)
+ {
+@@ -131,7 +171,7 @@ int SensorBase::openInput(const char* inputName) {
+             }
+ 
+             if (!strcmp(name, inputName)) {
+-                strcpy(input_name, filename);			
++                strcpy(input_name, filename);
+                 break;
+             } else {
+                 close(fd);
+@@ -145,8 +185,19 @@ int SensorBase::openInput(const char* inputName) {
+ }
+ int SensorBase::readEvents(sensors_event_t* data, int count)
+ {
+-  	return 0;
++	return 0;
++}
++int SensorBase::batch(int handle, int flags, int64_t period_ns, int64_t timeout){
++	/*default , not support batch mode or SENSORS_BATCH_WAKE_UPON_FIFO_FULL */
++	if(timeout > 0 || flags & SENSORS_BATCH_WAKE_UPON_FIFO_FULL)
++		return -EINVAL;
++	if(!(flags & SENSORS_BATCH_DRY_RUN)){
++		setDelay(handle,period_ns);
++	}
++	return 0;
++}
++int SensorBase::flush(int handle){
++	return  -EINVAL;
+ }
+-
+ 
+ 
+diff --git a/libsensors/SensorBase.h b/libsensors/SensorBase.h
+index b084be2..42af5d4 100755
+--- a/libsensors/SensorBase.h
++++ b/libsensors/SensorBase.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2011-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2011-2014 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -32,10 +32,12 @@ class SensorBase {
+ protected:
+     const char* dev_name;
+     const char* data_name;
++	const char* fifo_name;
+     char        input_name[PATH_MAX];
+     int         dev_fd;
+     int         data_fd;
+-
++	int 		fifo_fd;
++	bool 		mBatchEnabled;
+     int openInput(const char* inputName);
+     static int64_t getTimestamp();
+ 
+@@ -46,10 +48,12 @@ protected:
+ 
+     int open_device();
+     int close_device();
++	int open_fifo_device();
++    int close_fifo_device();
+     
+ public:
+     SensorBase(const char* dev_name,const char* data_name);
+-	
++	SensorBase(const char* dev_name,const char* data_name,const char* fifo_name);
+     virtual ~SensorBase();
+ 	virtual bool hasPendingEvents() const;
+     virtual int getFd() const;
+@@ -58,6 +62,8 @@ public:
+     virtual int getEnable(int32_t handle);
+     virtual int readEvents(sensors_event_t* data, int count);
+     virtual void processEvent(int code, int value) = 0;
++	virtual int batch(int handle, int flags, int64_t period_ns, int64_t timeout);
++	virtual int flush(int handle);
+ };
+ 
+ /*****************************************************************************/
+diff --git a/libsensors/sensors.cpp b/libsensors/sensors.cpp
+index 1c93231..66a1dc2 100755
+--- a/libsensors/sensors.cpp
++++ b/libsensors/sensors.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2011-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2011-2014 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -36,6 +36,7 @@
+ #include "AccelSensor.h"
+ #include "MagSensor.h"
+ #include "PressSensor.h"
++#include "LightSensor.h"
+ 
+ 
+ /*****************************************************************************/
+@@ -53,14 +54,14 @@
+ #define SENSORS_TEMPERATURE		 (1<<ID_T)
+ #define SENSORS_PROXIMITY        (1<<ID_PX)
+ 
+-#define SENSORS_ACCELERATION_HANDLE     0
+-#define SENSORS_MAGNETIC_FIELD_HANDLE   1
+-#define SENSORS_ORIENTATION_HANDLE      2
+-#define SENSORS_GYROSCOPE_HANDLE        3
+-#define SENSORS_LIGHT_HANDLE            4
+-#define SENSORS_PRESSURE_HANDLE         5
+-#define SENSORS_TEMPERATURE_HANDLE      6
+-#define SENSORS_PROXIMITY_HANDLE        7
++#define SENSORS_ACCELERATION_HANDLE     ID_A
++#define SENSORS_MAGNETIC_FIELD_HANDLE   ID_M
++#define SENSORS_ORIENTATION_HANDLE      ID_O
++#define SENSORS_GYROSCOPE_HANDLE        ID_GY
++#define SENSORS_LIGHT_HANDLE            ID_L
++#define SENSORS_PRESSURE_HANDLE         ID_P
++#define SENSORS_TEMPERATURE_HANDLE      ID_T
++#define SENSORS_PROXIMITY_HANDLE        ID_PX
+ 
+ /*****************************************************************************/
+ 
+@@ -69,7 +70,7 @@ static const struct sensor_t sSensorList[] = {
+         { "Freescale 3-axis Accelerometer",
+           "Freescale Semiconductor Inc.",
+           1, SENSORS_ACCELERATION_HANDLE,
+-          SENSOR_TYPE_ACCELEROMETER, RANGE_A, CONVERT_A, 0.30f, 20000, 0, 0, { } },
++          SENSOR_TYPE_ACCELEROMETER, RANGE_A, CONVERT_A, 0.30f, 20000, 0, 32, { } },
+         { "Freescale 3-axis Magnetic field sensor",
+           "Freescale Semiconductor Inc.",
+           1, SENSORS_MAGNETIC_FIELD_HANDLE,
+@@ -78,10 +79,6 @@ static const struct sensor_t sSensorList[] = {
+           "Freescale Semiconductor Inc.",
+           1, SENSORS_ORIENTATION_HANDLE,
+           SENSOR_TYPE_ORIENTATION, 360.0f, CONVERT_O, 0.50f, 100000, 0, 0, { } },
+-        { "MPL3115 Temperature sensor",
+-          "Freescale Semiconductor Inc.",
+-          1, SENSORS_TEMPERATURE_HANDLE,
+-          SENSOR_TYPE_TEMPERATURE, 85.0f, CONVERT_TEMPERATURE, 0.35f, 0, 0, 0, { } },
+         { "ISL29023 Light sensor",
+           "Intersil",
+           1, SENSORS_LIGHT_HANDLE,
+@@ -116,25 +113,32 @@ struct sensors_module_t HAL_MODULE_INFO_SYM = {
+         },
+         get_sensors_list: sensors__get_sensors_list,
+ };
+-
++struct BatchParameter{
++		int flags;
++		int64_t period_ns;
++		int64_t timeout;
++};
+ struct sensors_poll_context_t {
+-    struct sensors_poll_device_t device; // must be first
++    struct sensors_poll_device_1 device; // must be first
+ 
+         sensors_poll_context_t();
+         ~sensors_poll_context_t();
++	int fillPollFd();
+     int activate(int handle, int enabled);
+     int setDelay(int handle, int64_t ns);
+     int pollEvents(sensors_event_t* data, int count);
+-
++	int batch(int handle, int flags, int64_t period_ns, int64_t timeout);
++	int flush(int handle);
++	struct BatchParameter mBatchParameter[32];
++	int magRunTimes;
+ private:
+     enum {
+         accel           = 0,
+         mag 		    = 1,
+-        pressure        = 2,
++        light			= 2,
+         numSensorDrivers,
+         numFds,
+     };
+-
+     static const size_t wake = numFds - 1;
+     static const char WAKE_MESSAGE = 'W';
+     struct pollfd mPollFds[numFds];
+@@ -148,34 +152,31 @@ private:
+           	case ID_M:
+           	case ID_O:
+             	return mag;
+-			case ID_P:
+-			case ID_T:
+-				 return pressure;
++			case ID_L:
++				return light;
+         }
+         return -EINVAL;
+     }
+ };
+ 
+ /*****************************************************************************/
+-
++int sensors_poll_context_t::fillPollFd(){
++    int i = 0;
++    for(i = 0 ; i < numSensorDrivers; i++){
++        if(mSensors[i] != NULL)
++            mPollFds[i].fd = mSensors[i]->getFd();
++        mPollFds[i].events = POLLIN;
++        mPollFds[i].revents = 0;
++    }
++    return 0;
++}
+ sensors_poll_context_t::sensors_poll_context_t()
+ {
+     mSensors[accel] = new AccelSensor();
+-    mPollFds[accel].fd = mSensors[accel]->getFd();
+-    mPollFds[accel].events = POLLIN;
+-    mPollFds[accel].revents = 0;
+-   
+ 	mSensors[mag] = new MagSensor();
+-	mPollFds[mag].fd = mSensors[mag]->getFd();
+-	mPollFds[mag].events = POLLIN;
+-	mPollFds[mag].revents = 0;
+-
+-	mSensors[pressure] = new PressSensor();
+-	mPollFds[pressure].fd = mSensors[pressure]->getFd();
+-	mPollFds[pressure].events = POLLIN;
+-	mPollFds[pressure].revents = 0;
+-	
+-	
++	mSensors[light] = new LightSensor();
++	fillPollFd();
++	magRunTimes = 0;
+     int wakeFds[2];
+     int result = pipe(wakeFds);
+     ALOGE_IF(result<0, "error creating wake pipe (%s)", strerror(errno));
+@@ -200,12 +201,29 @@ int sensors_poll_context_t::activate(int handle, int enabled) {
+     int index = handleToDriver(handle);
+     if (index < 0) return index;
+     int err = 0 ;
+-	if(handle == ID_O || handle ==  ID_M){
+-		err =  mSensors[accel]->setEnable(handle, enabled);// if handle == orientaion or magnetic ,please enable ACCELERATE Sensor
+-		if(err)
+-			return err;
++	if(handle == ID_A){
++		if(enabled && magRunTimes > 0)
++			err = mSensors[index]->batch(handle,0,mBatchParameter[handle].period_ns,0); // forece accel to be continuse mode	
++			err |=  mSensors[handle]->setEnable(handle, enabled);
+ 	}
+-	err |=  mSensors[index]->setEnable(handle, enabled);
++	else if(handle == ID_O || handle ==  ID_M){
++		if(enabled){
++			magRunTimes++;
++		}
++		else{
++			magRunTimes--;
++			if(magRunTimes < 0)
++				magRunTimes = 0;
++		}
++		if(magRunTimes > 0)
++			err |= mSensors[handleToDriver(ID_A)]->batch(ID_A,0,mBatchParameter[handle].period_ns,0); // forece accel to be continuse mode
++		else
++			err |= mSensors[handleToDriver(ID_A)]->batch(ID_A,0,mBatchParameter[ID_A].period_ns,mBatchParameter[ID_A].timeout); // forece accel to be continuse mode
++		/*change acc user count*/
++		err =  mSensors[handleToDriver(ID_A)]->setEnable(handle, enabled);
++		err |=  mSensors[index]->setEnable(handle, enabled);
++	}else
++		err =  mSensors[index]->setEnable(handle, enabled);
+     if (enabled && !err) {
+         const char wakeMessage(WAKE_MESSAGE);
+         int result = write(mWritePipeFd, &wakeMessage, 1);
+@@ -215,7 +233,6 @@ int sensors_poll_context_t::activate(int handle, int enabled) {
+ }
+ 
+ int sensors_poll_context_t::setDelay(int handle, int64_t ns) {
+-
+     int index = handleToDriver(handle);
+     if (index < 0) return index;
+ 	if(handle == ID_O || handle ==  ID_M){
+@@ -228,7 +245,6 @@ int sensors_poll_context_t::pollEvents(sensors_event_t* data, int count)
+ {
+     int nbEvents = 0;
+     int n = 0;
+-
+     do {
+         // see if we have some leftover from the last poll()
+         for (int i=0 ; count && i<numSensorDrivers ; i++) {
+@@ -251,7 +267,8 @@ int sensors_poll_context_t::pollEvents(sensors_event_t* data, int count)
+             // some events immediately or just wait if we don't have
+             // anything to return
+             //n = poll(mPollFds, numFds, nbEvents ? 0 : -1);
+-			do {                
++			do {
++				fillPollFd(); /*reset poll fd , if sensor change between batch mode and continuous mode*/
+ 			 	n = poll(mPollFds, numFds, nbEvents ? 0 : -1);            
+ 			} while (n < 0 && errno == EINTR);
+             if (n<0) {
+@@ -271,6 +288,36 @@ int sensors_poll_context_t::pollEvents(sensors_event_t* data, int count)
+ 
+     return nbEvents;
+ }
++int sensors_poll_context_t::batch(int handle, int flags, int64_t period_ns, int64_t timeout){
++    int ret;
++    int index = handleToDriver(handle);
++    if (index < 0) return index;
++    if(flags & SENSORS_BATCH_DRY_RUN){
++        ret = mSensors[index]->batch(handle,flags,period_ns,timeout);
++    }else{
++        if(handle == ID_A && magRunTimes > 0)
++            ret = mSensors[index]->batch(handle,flags,period_ns,0);
++        else
++            ret = mSensors[index]->batch(handle,flags,period_ns,timeout);
++
++        /*just recored the batch parameter for recovery acc batch when mag disable */
++        mBatchParameter[handle].flags = flags;
++        mBatchParameter[handle].period_ns = period_ns;
++        mBatchParameter[handle].timeout = timeout;
++        /*wakeup poll , sometime poll may be blocked
++         * before sensor was change from batch mode to continuous mode
++         */
++        const char wakeMessage(WAKE_MESSAGE);
++        int result = write(mWritePipeFd, &wakeMessage, 1);
++        ALOGE_IF(result<0, "error batch sending wake message (%s)", strerror(errno));
++    }
++    return ret;
++}
++int sensors_poll_context_t::flush(int handle){
++    int index = handleToDriver(handle);
++    if (index < 0) return index;
++    return mSensors[index]->flush(handle);
++}
+ 
+ /*****************************************************************************/
+ 
+@@ -300,7 +347,16 @@ static int poll__poll(struct sensors_poll_device_t *dev,
+     sensors_poll_context_t *ctx = (sensors_poll_context_t *)dev;
+     return ctx->pollEvents(data, count);
+ }
++static int poll__batch(struct sensors_poll_device_1* dev,
++            int handle, int flags, int64_t period_ns, int64_t timeout){
++	sensors_poll_context_t *ctx = (sensors_poll_context_t *)dev;
++	return ctx->batch(handle,flags,period_ns,timeout);
++}
+ 
++static int poll__flush(struct sensors_poll_device_1* dev, int handle){
++	sensors_poll_context_t *ctx = (sensors_poll_context_t *)dev;
++	return ctx->flush(handle);
++}
+ /*****************************************************************************/
+ 
+ /** Open a new instance of a sensor device using name */
+@@ -310,16 +366,17 @@ static int open_sensors(const struct hw_module_t* module, const char* id,
+         int status = -EINVAL;
+         sensors_poll_context_t *dev = new sensors_poll_context_t();
+ 
+-        memset(&dev->device, 0, sizeof(sensors_poll_device_t));
++        memset(&dev->device, 0, sizeof(sensors_poll_device_1));
+ 
+         dev->device.common.tag = HARDWARE_DEVICE_TAG;
+-        dev->device.common.version  = 0;
++        dev->device.common.version  = SENSORS_DEVICE_API_VERSION_1_1;
+         dev->device.common.module   = const_cast<hw_module_t*>(module);
+         dev->device.common.close    = poll__close;
+         dev->device.activate        = poll__activate;
+         dev->device.setDelay        = poll__setDelay;
+         dev->device.poll            = poll__poll;
+-
++		dev->device.batch			= poll__batch;
++		dev->device.flush			= poll__flush;
+         *device = &dev->device.common;
+         status = 0;
+ 
+-- 
+1.8.0
+

@@ -1,0 +1,44 @@
+From 28b27c389e76b607885b6850d01a6def2db59fa5 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Sun, 26 Jan 2014 16:53:55 +0800
+Subject: [PATCH] ENGR00294030 fix one multiple tethering coexist issue.
+
+First enable usb tethering, then enable wifi tethering,then restart
+usb tethering will fail.
+This is caused by free a still using daemon->interfaces item in set_interfaces().
+In multiple tethering coexist case, there will be some shared interface item
+between new_interfaces and prev_interfaces. Throughly free all items in
+prev_interfaces will modify iface's content in daemon->listeners item. When
+disable usb tethering in usb&wifi tethering case, create_bound_listener() won't
+close socket due to interface mismatch. Then open again will fail.
+
+Change-Id: I3ab862b44cf98be8d59bd0906342d927d3a3ab1a
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ src/network.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/network.c b/src/network.c
+index cb2001d..8275d0a 100755
+--- a/src/network.c
++++ b/src/network.c
+@@ -989,8 +989,15 @@ void set_interfaces(const char *interfaces)
+       prev_if_names = if_tmp;
+     }
+     while (prev_interfaces) {
++      int found = 0;
+       struct irec *tmp_irec = prev_interfaces->next;
+-      free(prev_interfaces);
++      for (new_iface = daemon->interfaces; new_iface; new_iface = new_iface->next)
++          if (sockaddr_isequal(&prev_interfaces->addr, &new_iface->addr)) {
++              my_syslog(LOG_DEBUG, _("now still use this interfaces so keep it alive"));
++              found = -1;
++          }
++      if (!found)
++          free(prev_interfaces);
+       prev_interfaces = tmp_irec;
+     }
+ #ifdef __ANDROID_DEBUG__
+-- 
+1.8.0
+

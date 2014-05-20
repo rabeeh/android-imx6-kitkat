@@ -1,0 +1,127 @@
+From c5aae178a43056269f1a5be8c8ccff80e3c3afdb Mon Sep 17 00:00:00 2001
+From: Fang Hui <b31070@freescale.com>
+Date: Mon, 20 Jan 2014 13:33:46 +0800
+Subject: [PATCH 9/9] ENGR00293844 - still show Unmount at Settings->Storage
+ if unmount a sdcard
+
+In kk4.4, /storage/extsd is a soft link to /mnt/media_rw/extsd,
+so need find the target path for a soft link in pathMatchesMountPoint
+
+Signed-off-by: Fang Hui <b31070@freescale.com>
+---
+ Process.cpp | 61 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ Process.h   |  5 +++++
+ 2 files changed, 62 insertions(+), 4 deletions(-)
+
+diff --git a/Process.cpp b/Process.cpp
+index ea5fbc7..5ced67f 100644
+--- a/Process.cpp
++++ b/Process.cpp
+@@ -14,6 +14,10 @@
+  * limitations under the License.
+  */
+ 
++/*
++* Copyright (C) 2014 Freescale Semiconductor, Inc.
++*/
++
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <errno.h>
+@@ -49,17 +53,66 @@ int Process::readSymLink(const char *path, char *link, size_t max) {
+     return 1;
+ }
+ 
++int Process::getTargetPath(const char *path, char *targetPathBuf, int len)
++{
++    int ret = 0;
++    int strLen = 0;
++    char curBuf[PATH_MAX];
++    char nextBuf[PATH_MAX];
++    char *pCurPath = (char *)path;
++    char *pNextPath = nextBuf;
++    char *pTmp = NULL;
++
++    if((path == NULL) || (targetPathBuf == NULL) || (len <= 0))
++        return -1;
++
++    //avoid link loop, try max 8 times
++    for(int i = 0; i < 8; i++) {
++        ret = readlink(pCurPath, pNextPath, PATH_MAX);
++        if(ret < 0)
++            break;
++
++        //add '\0' char
++        strLen = (ret < PATH_MAX) ? ret : PATH_MAX - 1;
++        pNextPath[strLen] = 0;
++
++        if(i == 0) {
++           pCurPath = nextBuf;
++           pNextPath = curBuf;
++        }else {
++           pTmp = pNextPath;
++           pNextPath = pCurPath;
++           pCurPath = pTmp;
++        }
++    }
++
++    strncpy(targetPathBuf,  pCurPath, len);
++    targetPathBuf[len - 1] = 0;
++
++    return 0;
++}
++
++
+ int Process::pathMatchesMountPoint(const char* path, const char* mountPoint) {
+-    int length = strlen(mountPoint);
+-    if (length > 1 && strncmp(path, mountPoint, length) == 0) {
++    char targetMountPoint[PATH_MAX];
++    int ret;
++
++    //"/storage/extsd" is soft link to "/mnt/media_rw/extsd", so need get the final path
++    ret = getTargetPath(mountPoint, targetMountPoint, PATH_MAX);
++    if(ret != 0) {
++        return 0;
++    }
++
++    int length = strlen(targetMountPoint);
++    if (length > 1 && strncmp(path, targetMountPoint, length) == 0) {
+         // we need to do extra checking if mountPoint does not end in a '/'
+-        if (mountPoint[length - 1] == '/')
++        if (targetMountPoint[length - 1] == '/')
+             return 1;
+         // if mountPoint does not have a trailing slash, we need to make sure
+         // there is one in the path to avoid partial matches.
+         return (path[length] == 0 || path[length] == '/');
+     }
+-    
++
+     return 0;
+ }
+ 
+diff --git a/Process.h b/Process.h
+index fc0c0b7..a241285 100644
+--- a/Process.h
++++ b/Process.h
+@@ -14,6 +14,10 @@
+  * limitations under the License.
+  */
+ 
++ /*
++ * Copyright (C) 2014 Freescale Semiconductor, Inc.
++ */
++
+ #ifndef _PROCESS_H
+ #define _PROCESS_H
+ 
+@@ -30,6 +34,7 @@ public:
+ private:
+     static int readSymLink(const char *path, char *link, size_t max);
+     static int pathMatchesMountPoint(const char *path, const char *mountPoint);
++	static int getTargetPath(const char *path, char *targetPathBuf, int len);
+ };
+ 
+ #endif
+-- 
+1.8.0
+

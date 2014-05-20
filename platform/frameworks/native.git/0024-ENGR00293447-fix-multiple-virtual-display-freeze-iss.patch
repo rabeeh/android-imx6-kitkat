@@ -1,0 +1,75 @@
+From faf037906f7ffa3c995572b0387de843a0301210 Mon Sep 17 00:00:00 2001
+From: Richard Liu <r66033@freescale.com>
+Date: Fri, 3 Jan 2014 23:30:17 +0800
+Subject: [PATCH 24/26] ENGR00293447 fix multiple virtual display freeze issue
+
+system freeze when enable two virtual displays, for example
+simulate secondary display 1280x720 tvdpi and 1920x1080xhdpi.
+
+Root cause is when there are two virtual displays, based on
+current HWC define only one will process by HWC, another will
+process by GLES, and when use GLES to process virtual display
+dequeueBuffer and queueBuffer should work at async mode and
+allow drop the dequeued buffer.
+
+call setSwapInterval(window, 0) can set to async mode, but it
+should be called after eglCreateWindowSurface(), else it will
+overwrite as egl wrapper call setSwapInterval(window, 1).
+
+Signed-off-by: Richard Liu <r66033@freescale.com>
+---
+ services/surfaceflinger/DisplayDevice.cpp | 24 +++++++++++++-----------
+ 1 file changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/services/surfaceflinger/DisplayDevice.cpp b/services/surfaceflinger/DisplayDevice.cpp
+index d8fe076..c4ba1fd 100644
+--- a/services/surfaceflinger/DisplayDevice.cpp
++++ b/services/surfaceflinger/DisplayDevice.cpp
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-/* Copyright (C) 2013 Freescale Semiconductor, Inc. */
++/* Copyright (C) 2013-2014 Freescale Semiconductor, Inc. */
+ 
+ #include <stdlib.h>
+ #include <stdio.h>
+@@ -81,16 +81,6 @@ DisplayDevice::DisplayDevice(
+     int format;
+     window->query(window, NATIVE_WINDOW_FORMAT, &format);
+ 
+-    // Make sure that composition can never be stalled by a virtual display
+-    // consumer that isn't processing buffers fast enough. We have to do this
+-    // in two places:
+-    // * Here, in case the display is composed entirely by HWC.
+-    // * In makeCurrent(), using eglSwapInterval. Some EGL drivers set the
+-    //   window's swap interval in eglMakeCurrent, so they'll override the
+-    //   interval we set here.
+-    if (mType >= DisplayDevice::DISPLAY_VIRTUAL)
+-        window->setSwapInterval(window, 0);
+-
+     /*
+      * Create our display's surface
+      */
+@@ -109,6 +99,18 @@ DisplayDevice::DisplayDevice(
+     mViewport.makeInvalid();
+     mFrame.makeInvalid();
+ 
++    // Make sure that composition can never be stalled by a virtual display
++    // consumer that isn't processing buffers fast enough. We have to do this
++    // in two places:
++    // * Here, in case the display is composed entirely by HWC.
++    // * In makeCurrent(), using eglSwapInterval. Some EGL drivers set the
++    //   window's swap interval in eglMakeCurrent, so they'll override the
++    //   interval we set here.
++    // call setSwapInterval() after eglCreateWindowSurface(), else it will
++    // overwrite as egl wrapper call setSwapInterval(window, 1).
++    if (mType >= DisplayDevice::DISPLAY_VIRTUAL)
++        window->setSwapInterval(window, 0);
++
+     // virtual displays are always considered enabled
+     mScreenAcquired = (mType >= DisplayDevice::DISPLAY_VIRTUAL);
+ 
+-- 
+1.8.0
+

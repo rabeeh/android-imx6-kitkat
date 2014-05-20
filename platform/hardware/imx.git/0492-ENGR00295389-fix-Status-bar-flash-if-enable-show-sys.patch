@@ -1,0 +1,76 @@
+From 005abc60d1a696a245924146e8774ecfb6f5697e Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Thu, 16 Jan 2014 18:31:32 +0800
+Subject: [PATCH 492/498] ENGR00295389 fix Status bar flash if enable show
+ system time option.
+
+root cause is worm hole doesn't intersect swap rectangle.
+when clear worm hole, it will clear large region.
+limit the worm hole within swap rectangle.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/hwcomposer/hwc_composite.cpp | 8 +++++++-
+ mx6/hwcomposer/hwcomposer.cpp    | 6 +++---
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/mx6/hwcomposer/hwc_composite.cpp b/mx6/hwcomposer/hwc_composite.cpp
+index ca3c919..7abb2fa 100644
+--- a/mx6/hwcomposer/hwc_composite.cpp
++++ b/mx6/hwcomposer/hwc_composite.cpp
+@@ -650,7 +650,7 @@ int hwc_updateSwapRect(struct hwc_context_t* ctx, int disp,
+ }
+ 
+ int hwc_clearWormHole(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
+-                    hwc_display_contents_1_t* list, int disp)
++                    hwc_display_contents_1_t* list, int disp, hwc_rect_t* swap)
+ {
+     if (ctx == NULL || dstHandle == NULL || list == NULL) {
+         return -EINVAL;
+@@ -694,6 +694,12 @@ int hwc_clearWormHole(struct hwc_context_t* ctx, struct private_handle_t *dstHan
+ 
+         hwc_rect_t rect;
+         memcpy(&rect, &holes[i], sizeof(rect));
++        if (swap != NULL) {
++            intersect(&rect, &rect, swap);
++        }
++        if (!validateRect(rect)) {
++            continue;
++        }
+         ALOGV("clearhole: hole(l:%d,t:%d,r:%d,b:%d)",
+                 rect.left, rect.top, rect.right, rect.bottom);
+         setG2dSurface(surface, dstHandle, rect);
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index a9297ef..69dac57 100644
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -56,7 +56,7 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+ extern int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
+                     struct private_handle_t *dstHandle, hwc_rect_t* swap, bool firstLayer);
+ extern int hwc_clearWormHole(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
+-                    hwc_display_contents_1_t* list, int disp);
++                    hwc_display_contents_1_t* list, int disp, hwc_rect_t* swap);
+ extern int hwc_clearRect(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
+                     hwc_rect_t &rect);
+ extern int hwc_copyBack(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
+@@ -281,7 +281,8 @@ static int hwc_set_physical(struct hwc_context_t* ctx, int disp,
+         return -EINVAL;
+     }
+ 
+-    hwc_clearWormHole(ctx, frameHandle, list, disp);
++    hwc_rect_t& swapRect = ctx->mDispInfo[disp].mSwapRect[index];
++    hwc_clearWormHole(ctx, frameHandle, list, disp, &swapRect);
+ 
+     bool resized = false;
+     if (disp != HWC_DISPLAY_PRIMARY &&
+@@ -297,7 +298,6 @@ static int hwc_set_physical(struct hwc_context_t* ctx, int disp,
+     }
+ 
+     if (!resized) {
+-        hwc_rect_t& swapRect = ctx->mDispInfo[disp].mSwapRect[index];
+         for (size_t i=0; i<list->numHwLayers-1; i++) {
+             layer = &list->hwLayers[i];
+             int fenceFd = layer->acquireFenceFd;
+-- 
+1.8.0
+

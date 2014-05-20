@@ -1,0 +1,76 @@
+From 12e445107f28a5926d28c195a2abeba3aad5c46e Mon Sep 17 00:00:00 2001
+From: Martin Storsjo <martin@martin.st>
+Date: Fri, 31 Jan 2014 13:30:15 +0200
+Subject: [PATCH 61/68] AudioTrack: Never try to use the fast path if
+ resampling is required
+
+Unless AudioFlinger was built with FAST_TRACKS_AT_NON_NATIVE_SAMPLE_RATE
+enabled, AudioFlinger would deny using the fast path (and internally
+fall back to the normal codepath) when it realized that resampling
+was required. Since the buffer size calculations within AudioFlinger
+don't take resampling into account properly (see the calculation
+below "AUDIO_OUTPUT_FLAG_FAST denied" in audioflinger/Threads.cpp,
+just below the hunk that this patch changes), make sure AudioTrack
+doesn't try to use the fast path if resampling is required.
+
+This removes the possibility to enable
+FAST_TRACKS_AT_NON_NATIVE_SAMPLE_RATE in AudioFlinger since it
+AudioTrack now won't even try to use the fast path for content
+that requires resampling, regardless of the AudioFlinger configuration.
+
+Change-Id: Icf0f8ad50bf0fdb84657f518c0120aa0535f23f9
+---
+ media/libmedia/AudioTrack.cpp         | 6 ++++++
+ services/audioflinger/Configuration.h | 3 ---
+ services/audioflinger/Threads.cpp     | 2 --
+ 3 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/media/libmedia/AudioTrack.cpp b/media/libmedia/AudioTrack.cpp
+index 0b66917..8f1a3fb 100644
+--- a/media/libmedia/AudioTrack.cpp
++++ b/media/libmedia/AudioTrack.cpp
+@@ -874,6 +874,12 @@ status_t AudioTrack::createTrack_l(
+     }
+     ALOGV("createTrack_l() output %d afLatency %d", output, afLatency);
+ 
++    if ((flags & AUDIO_OUTPUT_FLAG_FAST) && sampleRate != afSampleRate) {
++        ALOGW("AUDIO_OUTPUT_FLAG_FAST denied by client due to mismatching sample rate (%d vs %d)",
++              sampleRate, afSampleRate);
++        flags = (audio_output_flags_t) (flags & ~AUDIO_OUTPUT_FLAG_FAST);
++    }
++
+     // The client's AudioTrack buffer is divided into n parts for purpose of wakeup by server, where
+     //  n = 1   fast track with single buffering; nBuffering is ignored
+     //  n = 2   fast track with double buffering
+diff --git a/services/audioflinger/Configuration.h b/services/audioflinger/Configuration.h
+index bc2038a..0754d9d 100644
+--- a/services/audioflinger/Configuration.h
++++ b/services/audioflinger/Configuration.h
+@@ -32,9 +32,6 @@
+ // uncomment to enable fast mixer to take performance samples for later statistical analysis
+ #define FAST_MIXER_STATISTICS
+ 
+-// uncomment to allow fast tracks at non-native sample rate
+-//#define FAST_TRACKS_AT_NON_NATIVE_SAMPLE_RATE
+-
+ // uncomment for debugging timing problems related to StateQueue::push()
+ //#define STATE_QUEUE_DUMP
+ 
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index 2c4984e..6141ea5 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -1219,10 +1219,8 @@ sp<AudioFlinger::PlaybackThread::Track> AudioFlinger::PlaybackThread::createTrac
+             // mono or stereo
+             ( (channelMask == AUDIO_CHANNEL_OUT_MONO) ||
+               (channelMask == AUDIO_CHANNEL_OUT_STEREO) ) &&
+-#ifndef FAST_TRACKS_AT_NON_NATIVE_SAMPLE_RATE
+             // hardware sample rate
+             (sampleRate == mSampleRate) &&
+-#endif
+             // normal mixer has an associated fast mixer
+             hasFastMixer() &&
+             // there are sufficient fast track slots available
+-- 
+1.8.0
+

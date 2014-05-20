@@ -1,0 +1,83 @@
+From 9351171f6843c3b7f58c34ac247b9e962e320dc0 Mon Sep 17 00:00:00 2001
+From: Glenn Kasten <gkasten@google.com>
+Date: Tue, 3 Dec 2013 09:06:43 -0800
+Subject: [PATCH 57/68] Increase kFastTrackMultiplier from 1 to 2
+
+Change-Id: I158f147295eebcea96e4047d7618069bc48bdd7d
+---
+ media/libmedia/AudioTrack.cpp     | 11 +++++++----
+ services/audioflinger/Threads.cpp | 14 +++++++-------
+ 2 files changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/media/libmedia/AudioTrack.cpp b/media/libmedia/AudioTrack.cpp
+index 6035c42..0b66917 100644
+--- a/media/libmedia/AudioTrack.cpp
++++ b/media/libmedia/AudioTrack.cpp
+@@ -875,7 +875,8 @@ status_t AudioTrack::createTrack_l(
+     ALOGV("createTrack_l() output %d afLatency %d", output, afLatency);
+ 
+     // The client's AudioTrack buffer is divided into n parts for purpose of wakeup by server, where
+-    //  n = 1   fast track; nBuffering is ignored
++    //  n = 1   fast track with single buffering; nBuffering is ignored
++    //  n = 2   fast track with double buffering
+     //  n = 2   normal track, no sample rate conversion
+     //  n = 3   normal track, with sample rate conversion
+     //          (pessimistic; some non-1:1 conversion ratios don't actually need triple-buffering)
+@@ -1015,9 +1016,11 @@ status_t AudioTrack::createTrack_l(
+             ALOGV("AUDIO_OUTPUT_FLAG_FAST successful; frameCount %u", frameCount);
+             mAwaitBoost = true;
+             if (sharedBuffer == 0) {
+-                // double-buffering is not required for fast tracks, due to tighter scheduling
+-                if (mNotificationFramesAct == 0 || mNotificationFramesAct > frameCount) {
+-                    mNotificationFramesAct = frameCount;
++                // Theoretically double-buffering is not required for fast tracks,
++                // due to tighter scheduling.  But in practice, to accommodate kernels with
++                // scheduling jitter, and apps with computation jitter, we use double-buffering.
++                if (mNotificationFramesAct == 0 || mNotificationFramesAct > frameCount/nBuffering) {
++                    mNotificationFramesAct = frameCount/nBuffering;
+                 }
+             }
+         } else {
+diff --git a/services/audioflinger/Threads.cpp b/services/audioflinger/Threads.cpp
+index 4db1c6f..0a8cd14 100644
+--- a/services/audioflinger/Threads.cpp
++++ b/services/audioflinger/Threads.cpp
+@@ -136,12 +136,12 @@ static const int kPriorityFastMixer = 3;
+ 
+ // IAudioFlinger::createTrack() reports back to client the total size of shared memory area
+ // for the track.  The client then sub-divides this into smaller buffers for its use.
+-// Currently the client uses double-buffering by default, but doesn't tell us about that.
+-// So for now we just assume that client is double-buffered.
+-// FIXME It would be better for client to tell AudioFlinger whether it wants double-buffering or
+-// N-buffering, so AudioFlinger could allocate the right amount of memory.
++// Currently the client uses N-buffering by default, but doesn't tell us about the value of N.
++// So for now we just assume that client is double-buffered for fast tracks.
++// FIXME It would be better for client to tell AudioFlinger the value of N,
++// so AudioFlinger could allocate the right amount of memory.
+ // See the client's minBufCount and mNotificationFramesAct calculations for details.
+-static const int kFastTrackMultiplier = 1;
++static const int kFastTrackMultiplier = 2;
+ 
+ // ----------------------------------------------------------------------------
+ 
+@@ -1211,7 +1211,7 @@ sp<AudioFlinger::PlaybackThread::Track> AudioFlinger::PlaybackThread::createTrac
+               (
+                 (tid != -1) &&
+                 ((frameCount == 0) ||
+-                (frameCount >= (mFrameCount * kFastTrackMultiplier)))
++                (frameCount >= mFrameCount))
+               )
+             ) &&
+             // PCM data
+@@ -4692,7 +4692,7 @@ sp<AudioFlinger::RecordThread::RecordTrack>  AudioFlinger::RecordThread::createR
+             (
+                 (tid != -1) &&
+                 ((frameCount == 0) ||
+-                (frameCount >= (mFrameCount * kFastTrackMultiplier)))
++                (frameCount >= mFrameCount))
+             ) &&
+             // FIXME when record supports non-PCM data, also check for audio_is_linear_pcm(format)
+             // mono or stereo
+-- 
+1.8.0
+

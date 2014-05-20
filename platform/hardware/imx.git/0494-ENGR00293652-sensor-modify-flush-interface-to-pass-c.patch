@@ -1,0 +1,299 @@
+From 99f2927556d95f00aab4b3a26b4d1124ca49534b Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Thu, 27 Feb 2014 15:13:32 +0800
+Subject: [PATCH 494/498] ENGR00293652 sensor:modify flush interface to pass
+ cts test
+
+Add flush interface realization to pass the following failure item:
+android.hardware.cts.SensorTest#testBatchAndFlush
+android.hardware.cts.SensorTest#testBatchAndFlushWithHandler
+android.hardware.cts.SensorTest#testBatchAndFlushWithMutipleSensors
+Patch comes from sensor team.
+
+Signed-off-by: Zhang Yan <b38342@freescale.com>
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ libsensors/AccelSensor.cpp | 63 ++++++++++++++++++++++++++++++++--------------
+ libsensors/MagSensor.cpp   | 48 +++++++++++++++++++++++++++++------
+ libsensors/MagSensor.h     |  4 ++-
+ libsensors/SensorBase.cpp  |  9 ++++---
+ libsensors/SensorBase.h    |  3 ++-
+ libsensors/sensors.cpp     |  4 +--
+ 6 files changed, 98 insertions(+), 33 deletions(-)
+
+diff --git a/libsensors/AccelSensor.cpp b/libsensors/AccelSensor.cpp
+index 09c9a6d..b814827 100755
+--- a/libsensors/AccelSensor.cpp
++++ b/libsensors/AccelSensor.cpp
+@@ -107,7 +107,7 @@ int AccelSensor::setDelay(int32_t handle, int64_t ns)
+     return update_delay();
+ }
+ bool AccelSensor::hasPendingEvents(){
+-	return (mFifoCount > 0);
++	return (mFifoCount > 0 || (mFlushed & (0x01 << ID_A)));
+ }
+ int AccelSensor::update_delay()
+ {
+@@ -184,14 +184,24 @@ int AccelSensor::readEvents(sensors_event_t* data, int count)
+     if (count < 1)
+         return -EINVAL;
+ 	int numEventReceived = 0;
+-	if(mBatchEnabled){
+-		sensors_event_t event;
+-		if(mBatchEnabled){
+-			/*read the batch FIFO infomation,then add the META_DATA_VERSION event at the end of FIFO */
+-			if(mFifoCount <= 0){
+-				ret = read_fifo();
+-				if(ret < 0)  /*not fifo data ,return immediately*/
+-					return 0;
++	sensors_event_t sensor_event;
++	if(mBatchEnabled & (0x01 << ID_A)){
++		/*read the batch FIFO infomation,then add the META_DATA_VERSION event at the end of FIFO */
++		if(mFifoCount <= 0){  
++			if(mFlushed & (0x01 << ID_A)){/*if batch mode enable and fifo lenght is zero */
++				memset(&sensor_event,0,sizeof(sensor_event));
++				sensor_event.version = META_DATA_VERSION;
++				sensor_event.type = SENSOR_TYPE_META_DATA;
++				sensor_event.meta_data.sensor = ID_A;
++				sensor_event.meta_data.what = 0;
++				*data++ = sensor_event;
++				count--;
++				numEventReceived++;
++				mFlushed &= ~(0x01 << ID_A);;
++			}
++			ret = read_fifo();
++			if(ret < 0)  /*not fifo data ,return immediately*/
++				return 0;
+ 			}
+ 			events = (count -1 < mFifoCount)? count -1 : mFifoCount;
+ 			if(events){
+@@ -201,17 +211,27 @@ int AccelSensor::readEvents(sensors_event_t* data, int count)
+ 				data += events;
+ 			}
+ 			if(count > 0 && mFifoCount == 0){  //end fifo flag
+-				memset(&event,0,sizeof(event));
+-				event.version = META_DATA_VERSION;
+-				event.type = SENSOR_TYPE_META_DATA;
+-				event.meta_data.sensor = ID_A;
+-				event.meta_data.what = 0;
+-				*data++ = event;
++				memset(&sensor_event,0,sizeof(sensor_event));
++				sensor_event.version = META_DATA_VERSION;
++				sensor_event.type = SENSOR_TYPE_META_DATA;
++				sensor_event.meta_data.sensor = ID_A;
++				sensor_event.meta_data.what = 0;
++				*data++ = sensor_event;
+ 				count--;
+ 				numEventReceived++;
+ 			}
+-		}
+ 	}else{
++		if(mFlushed & (0x01 << ID_A)){ /*if batch mode disable , send flush META_DATA_FLUSH_COMPLETE  immediately*/
++			memset(&sensor_event,0,sizeof(sensor_event));
++			sensor_event.version = META_DATA_VERSION;
++			sensor_event.type = SENSOR_TYPE_META_DATA;
++			sensor_event.meta_data.sensor = ID_A;
++			sensor_event.meta_data.what = 0;
++			*data++ = sensor_event;
++			count--;
++			numEventReceived++;
++			mFlushed &= ~(0x01 << ID_A);;
++		}
+ 		ssize_t n = mInputReader.fill(data_fd);
+ 		if (n < 0)
+ 			return n;
+@@ -439,14 +459,19 @@ int AccelSensor::batch(int handle, int flags, int64_t period_ns, int64_t timeout
+ 		fifo(period_ns,timeout,wakeup);
+ 		mDelay = period_ns;
+ 		if(timeout > 0)
+-			mBatchEnabled = true;
++			mBatchEnabled |= (0x01 << ID_A);
+ 		else
+-			mBatchEnabled = false;
++			mBatchEnabled &= ~(0x01 << ID_A);
+ 	}
+ 	return 0;
+ }
+ int AccelSensor::flush(int handle){
+-	return -1;
++	if(mEnabled){
++		mFlushed |= (0x01 << ID_A);
++		return 0;
++	}else{
++		return -EINVAL;
++	}
+ }
+ 
+ /*****************************************************************************/
+diff --git a/libsensors/MagSensor.cpp b/libsensors/MagSensor.cpp
+index 48933ff..c77cc92 100755
+--- a/libsensors/MagSensor.cpp
++++ b/libsensors/MagSensor.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2012-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2012-2014 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -125,20 +125,43 @@ int MagSensor::update_delay(int sensor_type)
+     else
+ 	    return 0;
+ }
++bool MagSensor::hasPendingEvents(){
++	return (false || (mFlushed & (0x01 << ID_M)) || (mFlushed & (0x01 << ID_O)));
++}
+ 
+ int MagSensor::readEvents(sensors_event_t* data, int count)
+ {
+ 	int i;
+     if (count < 1)
+         return -EINVAL;
+-
+-    ssize_t n = mInputReader.fill(data_fd);
++	sensors_event_t sensor_event;
++    int numEventReceived = 0;
++	if((mFlushed & (0x01 << ID_M)) ){
++		memset(&sensor_event,0,sizeof(sensor_event));
++		sensor_event.version = META_DATA_VERSION;
++		sensor_event.type = SENSOR_TYPE_META_DATA;
++		sensor_event.meta_data.sensor = ID_M;
++		sensor_event.meta_data.what = 0;
++		*data++ = sensor_event;
++		count--;
++		numEventReceived++;
++		mFlushed &= ~(0x01 << ID_M);
++	}
++	if((mFlushed & (0x01 << ID_O))){
++		memset(&sensor_event,0,sizeof(sensor_event));
++		sensor_event.version = META_DATA_VERSION;
++		sensor_event.type = SENSOR_TYPE_META_DATA;
++		sensor_event.meta_data.sensor = ID_O;
++		sensor_event.meta_data.what = 0;
++		*data++ = sensor_event;
++		count--;
++		numEventReceived++;
++		mFlushed &= ~(0x01 << ID_O);
++	}
++	ssize_t n = mInputReader.fill(data_fd);
+     if (n < 0)
+         return n;
+-
+-    int numEventReceived = 0;
+-    input_event const* event;
+-
++	input_event const* event;
+     while (count && mInputReader.readEvent(&event)) {
+         int type = event->type;
+         if ((type == EV_ABS) || (type == EV_REL) || (type == EV_KEY)) {
+@@ -341,6 +364,17 @@ int MagSensor::sensor_get_class_path(char *class_path)
+ 		return -1;
+ 	}
+ }
++int MagSensor::flush(int handle){
++	if(mEnabled[mag] && handle == ID_M){
++		mFlushed |= (0x01 << ID_M);
++		return 0;
++	}else if(mEnabled[orn] && handle == ID_O){
++		mFlushed |= (0x01 << ID_O);
++		return 0;
++	}else{
++		return -EINVAL;
++	}
++}
+ 
+ /*****************************************************************************/
+ 
+diff --git a/libsensors/MagSensor.h b/libsensors/MagSensor.h
+index ba0c2fb..570d80e 100755
+--- a/libsensors/MagSensor.h
++++ b/libsensors/MagSensor.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2011-2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2011-2014 Freescale Semiconductor, Inc.
+  * Copyright (C) 2008 The Android Open Source Project
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -38,6 +38,8 @@ public:
+     virtual int setEnable(int32_t handle, int enabled);
+     virtual int getEnable(int32_t handle);
+     virtual int readEvents(sensors_event_t* data, int count);
++	virtual bool hasPendingEvents(); 
++	virtual int flush(int handle);
+     void processEvent(int code, int value);
+ 
+ private:
+diff --git a/libsensors/SensorBase.cpp b/libsensors/SensorBase.cpp
+index 0e304db..a0be812 100755
+--- a/libsensors/SensorBase.cpp
++++ b/libsensors/SensorBase.cpp
+@@ -40,7 +40,8 @@ SensorBase::SensorBase(
+     }
+ 	fifo_fd = -1;
+ 	fifo_name = NULL;
+-	mBatchEnabled = false;
++	mBatchEnabled = 0;
++	mFlushed = 0;
+ }
+ 
+ SensorBase::SensorBase(
+@@ -58,7 +59,8 @@ SensorBase::SensorBase(
+ 	if(fifo_name){
+ 		open_fifo_device();
+ 	}
+-	mBatchEnabled = false;
++	mBatchEnabled = 0;
++	mFlushed = 0; 
+ }
+ 
+ SensorBase::~SensorBase() {
+@@ -197,7 +199,8 @@ int SensorBase::batch(int handle, int flags, int64_t period_ns, int64_t timeout)
+ 	return 0;
+ }
+ int SensorBase::flush(int handle){
+-	return  -EINVAL;
++	return -EINVAL;
++	
+ }
+ 
+ 
+diff --git a/libsensors/SensorBase.h b/libsensors/SensorBase.h
+index 42af5d4..f59cd90 100755
+--- a/libsensors/SensorBase.h
++++ b/libsensors/SensorBase.h
+@@ -37,7 +37,8 @@ protected:
+     int         dev_fd;
+     int         data_fd;
+ 	int 		fifo_fd;
+-	bool 		mBatchEnabled;
++	int 		mBatchEnabled;
++	int 		mFlushed;
+     int openInput(const char* inputName);
+     static int64_t getTimestamp();
+ 
+diff --git a/libsensors/sensors.cpp b/libsensors/sensors.cpp
+index 66a1dc2..10148e3 100755
+--- a/libsensors/sensors.cpp
++++ b/libsensors/sensors.cpp
+@@ -204,7 +204,7 @@ int sensors_poll_context_t::activate(int handle, int enabled) {
+ 	if(handle == ID_A){
+ 		if(enabled && magRunTimes > 0)
+ 			err = mSensors[index]->batch(handle,0,mBatchParameter[handle].period_ns,0); // forece accel to be continuse mode	
+-			err |=  mSensors[handle]->setEnable(handle, enabled);
++			err |=  mSensors[index]->setEnable(handle, enabled);
+ 	}
+ 	else if(handle == ID_O || handle ==  ID_M){
+ 		if(enabled){
+@@ -224,7 +224,7 @@ int sensors_poll_context_t::activate(int handle, int enabled) {
+ 		err |=  mSensors[index]->setEnable(handle, enabled);
+ 	}else
+ 		err =  mSensors[index]->setEnable(handle, enabled);
+-    if (enabled && !err) {
++    if (!err) {
+         const char wakeMessage(WAKE_MESSAGE);
+         int result = write(mWritePipeFd, &wakeMessage, 1);
+         ALOGE_IF(result<0, "error sending wake message (%s)", strerror(errno));
+-- 
+1.8.0
+

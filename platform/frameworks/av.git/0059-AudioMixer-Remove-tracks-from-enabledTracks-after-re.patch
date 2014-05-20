@@ -1,0 +1,57 @@
+From 86905470d6ace98209fc96325c287c7db1b889ec Mon Sep 17 00:00:00 2001
+From: Gaurav Kumar <gaurav.kumar@broadcom.com>
+Date: Mon, 6 Jan 2014 10:57:18 +0530
+Subject: [PATCH 59/68] AudioMixer: Remove tracks from enabledTracks after
+ reseting outTemp
+
+If any track goes through AudioMixer::process__genericNoResampling, and
+its getnextbuffer returns NULL, Then that track is removed by AudioMixer
+from enabledTracks.
+
+Thus if all tracks getnextbuffer return NULL, Then this function doesn't
+reset outTemp and last buffer in AudioFlinger's mMixBuffer will be
+repeated and noise is observed.
+
+Remove tracks from enabledTracks after reseting outTemp to zero, so that
+process__genericNoResampling will reset outTemp and noise won't appear.
+
+Bug: 12450065
+Change-Id: I1ccac7ee4a3bf7fd930254356c072099e11e7c19
+Signed-off-by: Gaurav Kumar <gaurav.kumar@broadcom.com>
+Signed-off-by: Pierre Couillaud <pierre@broadcom.com>
+---
+ services/audioflinger/AudioMixer.cpp | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/services/audioflinger/AudioMixer.cpp b/services/audioflinger/AudioMixer.cpp
+index df4e029..07dc6dd 100644
+--- a/services/audioflinger/AudioMixer.cpp
++++ b/services/audioflinger/AudioMixer.cpp
+@@ -1122,10 +1122,6 @@ void AudioMixer::process__genericNoResampling(state_t* state, int64_t pts)
+         t.bufferProvider->getNextBuffer(&t.buffer, pts);
+         t.frameCount = t.buffer.frameCount;
+         t.in = t.buffer.raw;
+-        // t.in == NULL can happen if the track was flushed just after having
+-        // been enabled for mixing.
+-        if (t.in == NULL)
+-            enabledTracks &= ~(1<<i);
+     }
+ 
+     e0 = enabledTracks;
+@@ -1161,6 +1157,13 @@ void AudioMixer::process__genericNoResampling(state_t* state, int64_t pts)
+                     aux = t.auxBuffer + numFrames;
+                 }
+                 while (outFrames) {
++                    // t.in == NULL can happen if the track was flushed just after having
++                    // been enabled for mixing.
++                   if (t.in == NULL) {
++                        enabledTracks &= ~(1<<i);
++                        e1 &= ~(1<<i);
++                        break;
++                    }
+                     size_t inFrames = (t.frameCount > outFrames)?outFrames:t.frameCount;
+                     if (inFrames) {
+                         t.hook(&t, outTemp + (BLOCKSIZE-outFrames)*MAX_NUM_CHANNELS, inFrames,
+-- 
+1.8.0
+

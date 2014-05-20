@@ -1,0 +1,639 @@
+From 3c3bc6a802a5dddf572c1576c0f61c82a74ac89d Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Tue, 7 Jan 2014 11:03:36 +0800
+Subject: [PATCH 487/498] ENGR00215174-3 optimize the fsl hwcompoer.
+
+1. add swap rectangle function.
+2. when there are more than two displays and they have
+   the same content with primary display, use resize to
+   composite non-primary displays.
+3. add one function get_aligned_size to get buffer alignment.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/hwcomposer/Android.mk        |   5 +
+ mx6/hwcomposer/hwc_composite.cpp | 284 +++++++++++++++++++++++++++++++++++++--
+ mx6/hwcomposer/hwc_context.h     |  11 +-
+ mx6/hwcomposer/hwc_display.cpp   |  10 +-
+ mx6/hwcomposer/hwcomposer.cpp    |  90 +++++++++----
+ 5 files changed, 359 insertions(+), 41 deletions(-)
+
+diff --git a/mx6/hwcomposer/Android.mk b/mx6/hwcomposer/Android.mk
+index dc4aaf7..632c134 100644
+--- a/mx6/hwcomposer/Android.mk
++++ b/mx6/hwcomposer/Android.mk
+@@ -47,6 +47,11 @@ LOCAL_C_INCLUDES += hardware/imx/mx6/libgralloc_wrapper \
+ 
+ LOCAL_CFLAGS:= -DLOG_TAG=\"hwcomposer\"
+ LOCAL_CFLAGS += -DENABLE_VSYNC
++
++ifneq ($(NUM_FRAMEBUFFER_SURFACE_BUFFERS),)
++  LOCAL_CFLAGS += -DNUM_FRAMEBUFFER_SURFACE_BUFFERS=$(NUM_FRAMEBUFFER_SURFACE_BUFFERS)
++endif
++
+ LOCAL_MODULE_TAGS := optional
+ include $(BUILD_SHARED_LIBRARY)
+ endif
+diff --git a/mx6/hwcomposer/hwc_composite.cpp b/mx6/hwcomposer/hwc_composite.cpp
+index 3f22b24..4378232 100644
+--- a/mx6/hwcomposer/hwc_composite.cpp
++++ b/mx6/hwcomposer/hwc_composite.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2009-2014 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -19,6 +19,7 @@
+ 
+ #include <fcntl.h>
+ #include <errno.h>
++#include <math.h>
+ 
+ #define HWC_REMOVE_DEPRECATED_VERSIONS 1
+ #include <cutils/log.h>
+@@ -40,6 +41,8 @@
+ #include <g2d.h>
+ #include <system/graphics.h>
+ 
++extern "C" int get_aligned_size(buffer_handle_t hnd, int *width, int *height);
++
+ static bool validateRect(hwc_rect_t& rect)
+ {
+     if ((rect.left < 0) || (rect.top < 0) || (rect.right < 0) ||
+@@ -140,13 +143,21 @@ static int setG2dSurface(struct g2d_surface& surface,
+     surface.stride = handle->flags >> 16;
+     switch (surface.format) {
+         case G2D_RGB565: {
+-            int alignHeight = (handle->height + 3) & ~0x3;
++            int alignHeight = 0;
++            int ret = get_aligned_size(handle, NULL, &alignHeight);
++            if (ret != 0) {
++                alignHeight = (handle->height + 3) & ~0x3;
++            }
+             surface.planes[0] += surface.stride * 2 * (alignHeight - handle->height);
+             } break;
+         case G2D_RGBA8888:
+         case G2D_BGRA8888:
+         case G2D_RGBX8888: {
+-            int alignHeight = (handle->height + 3) & ~0x3;
++            int alignHeight = 0;
++            int ret = get_aligned_size(handle, NULL, &alignHeight);
++            if (ret != 0) {
++                alignHeight = (handle->height + 3) & ~0x3;
++            }
+             surface.planes[0] += surface.stride * 4 * (alignHeight - handle->height);
+             } break;
+ 
+@@ -192,10 +203,29 @@ static inline int max(int a, int b) {
+ 
+ void convertScalerToInt(hwc_frect_t& in, hwc_rect_t& out)
+ {
+-    out.left = (int)in.left;
+-    out.top = (int)in.top;
+-    out.right = (int)in.right;
+-    out.bottom = (int)in.bottom;
++    out.left = (int)(ceilf(in.left));
++    out.top = (int)(ceilf(in.top));
++    out.right = (int)(floorf(in.right));
++    out.bottom = (int)(floorf(in.bottom));
++}
++
++static bool isEmpty(const hwc_rect_t & hs)
++{
++    return (hs.left > hs.right || hs.top > hs.bottom);
++}
++
++static bool isIntersect(const hwc_rect_t* lhs, const hwc_rect_t* rhs)
++{
++    if (lhs == NULL || rhs == NULL) {
++        return false;
++    }
++
++    if ((lhs->right < rhs->left) || (lhs->bottom < rhs->top) ||
++        (lhs->left > rhs->right) || (lhs->top > rhs->bottom)) {
++        return false;
++    }
++
++    return true;
+ }
+ 
+ static void intersect(hwc_rect_t* out, const hwc_rect_t* lhs,
+@@ -211,7 +241,72 @@ static void intersect(hwc_rect_t* out, const hwc_rect_t* lhs,
+     out->bottom = min(lhs->bottom, rhs->bottom);
+ }
+ 
+-static void setRects(hwc_rect_t& src, hwc_rect_t& dst,
++static void unite(hwc_rect_t* out, const hwc_rect_t* lhs,
++            const hwc_rect_t* rhs)
++{
++    if (out == NULL || lhs == NULL || rhs == NULL) {
++        return;
++    }
++
++    out->left = min(lhs->left, rhs->left);
++    out->top = min(lhs->top, rhs->top);
++    out->right = max(lhs->right, rhs->right);
++    out->bottom = max(lhs->bottom, rhs->bottom);
++}
++
++static void subtract(hwc_region_t* out, const hwc_rect_t& lhs,
++            const hwc_rect_t& rhs)
++{
++    if (out == NULL/* || lhs == NULL || rhs == NULL*/) {
++        return;
++    }
++
++    if (!isIntersect(&lhs, &rhs)) {
++        ((hwc_rect_t*)out->rects)[out->numRects].left = lhs.left;
++        ((hwc_rect_t*)out->rects)[out->numRects].top = lhs.top;
++        ((hwc_rect_t*)out->rects)[out->numRects].right = lhs.right;
++        ((hwc_rect_t*)out->rects)[out->numRects].bottom = lhs.bottom;
++    }
++    else if (!isEmpty(lhs)) {
++        if (lhs.top < rhs.top) { // top rect
++            ((hwc_rect_t*)out->rects)[out->numRects].left = lhs.left;
++            ((hwc_rect_t*)out->rects)[out->numRects].top = lhs.top;
++            ((hwc_rect_t*)out->rects)[out->numRects].right = lhs.right;
++            ((hwc_rect_t*)out->rects)[out->numRects].bottom = rhs.top;
++            out->numRects ++;
++        }
++
++        const int32_t top = max(lhs.top, rhs.top);
++        const int32_t bot = min(lhs.bottom, rhs.bottom);
++        if (top < bot) {
++            if (lhs.left < rhs.left) { // left-side rect
++                ((hwc_rect_t*)out->rects)[out->numRects].left = lhs.left;
++                ((hwc_rect_t*)out->rects)[out->numRects].top = top;
++                ((hwc_rect_t*)out->rects)[out->numRects].right = rhs.left;
++                ((hwc_rect_t*)out->rects)[out->numRects].bottom = bot;
++                out->numRects ++;
++            }
++
++            if (lhs.right > rhs.right) { // right-side rect
++                ((hwc_rect_t*)out->rects)[out->numRects].left = rhs.right;
++                ((hwc_rect_t*)out->rects)[out->numRects].top = top;
++                ((hwc_rect_t*)out->rects)[out->numRects].right = lhs.right;
++                ((hwc_rect_t*)out->rects)[out->numRects].bottom = bot;
++                out->numRects ++;
++            }
++        }
++
++        if (lhs.bottom > rhs.bottom) { // bottom rect
++            ((hwc_rect_t*)out->rects)[out->numRects].left = lhs.left;
++            ((hwc_rect_t*)out->rects)[out->numRects].top = rhs.bottom;
++            ((hwc_rect_t*)out->rects)[out->numRects].right = lhs.right;
++            ((hwc_rect_t*)out->rects)[out->numRects].bottom = lhs.bottom;
++            out->numRects ++;
++        }
++    }
++}
++
++static void clipRects(hwc_rect_t& src, hwc_rect_t& dst,
+                      const hwc_rect_t& dstClip, int rotation)
+ {
+     hwc_rect_t drect = dst;
+@@ -281,7 +376,7 @@ static void setRects(hwc_rect_t& src, hwc_rect_t& dst,
+ }
+ 
+ int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
+-                 struct private_handle_t *dstHandle, bool firstLayer)
++         struct private_handle_t *dstHandle, hwc_rect_t* swap, bool firstLayer)
+ {
+     if (ctx == NULL || ctx->g2d_handle == NULL || layer == NULL || dstHandle == NULL) {
+         ALOGE("%s: invalid parameters", __FUNCTION__);
+@@ -314,20 +409,29 @@ int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
+             ALOGI("invalid clip rect");
+             continue;
+         }
+-        setRects(srect, drect, layer->visibleRegionScreen.rects[i],
+-                  layer->transform);
++
++        hwc_rect_t clip = layer->visibleRegionScreen.rects[i];
++        if (swap != NULL && !isEmpty(*swap) && isIntersect(swap, &clip)) {
++            intersect(&clip, &clip, swap);
++        }
++
++        clipRects(srect, drect, clip, layer->transform);
+         if (!validateRect(srect) && layer->blending != HWC_BLENDING_DIM) {
+-            ALOGI("%s: invalid srect(l:%d,t:%d,r:%d,b:%d)", __FUNCTION__,
++            ALOGV("%s: invalid srect(l:%d,t:%d,r:%d,b:%d)", __FUNCTION__,
+                     srect.left, srect.top, srect.right, srect.bottom);
+             hwc_rect_t src;
+             convertScalerToInt(layer->sourceCropf, src);
+             hwc_rect_t& vis = (hwc_rect_t&)layer->visibleRegionScreen.rects[i];
+             hwc_rect_t& dis = layer->displayFrame;
+-            ALOGI("sourceCrop(l:%d,t:%d,r:%d,b:%d), visible(l:%d,t:%d,r:%d,b:%d), "
++            ALOGV("sourceCrop(l:%d,t:%d,r:%d,b:%d), visible(l:%d,t:%d,r:%d,b:%d), "
+                     "display(l:%d,t:%d,r:%d,b:%d)",
+                     src.left, src.top, src.right, src.bottom,
+                     vis.left, vis.top, vis.right, vis.bottom,
+                     dis.left, dis.top, dis.right, dis.bottom);
++            if (swap != NULL) {
++                ALOGV("swap(l:%d,t:%d,r:%d,b:%d)",
++                 swap->left, swap->top, swap->right, swap->bottom);
++            }
+             continue;
+         }
+         if (!validateRect(drect)) {
+@@ -358,6 +462,10 @@ int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
+         ALOGV("blit rot:%d, blending:%d, alpha:%d", layer->transform,
+                 layer->blending, layer->planeAlpha);
+ 
++        if (firstLayer && layer->blending == HWC_BLENDING_DIM) {
++            continue;
++        }
++
+         if (!firstLayer) {
+             convertBlending(layer->blending, sSurface, dSurface);
+         }
+@@ -390,6 +498,156 @@ int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
+     return 0;
+ }
+ 
++int hwc_copyBack(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                struct private_handle_t *srcHandle, int swapIndex, int disp)
++{
++    if (ctx == NULL || ctx->g2d_handle == NULL || srcHandle == NULL || dstHandle == NULL) {
++        ALOGE("%s: invalid parameters", __FUNCTION__);
++        return -EINVAL;
++    }
++
++    hwc_rect_t& swapRect = ctx->mDispInfo[disp].mSwapRect[swapIndex];
++    hwc_rect_t uniRect;
++    memset(&uniRect, 0, sizeof(uniRect));
++    int index = (swapIndex + 1)%HWC_MAX_FRAMEBUFFER;
++    while (index != swapIndex) {
++        unite(&uniRect, &uniRect, &(ctx->mDispInfo[disp].mSwapRect[index]));
++        index = (index + 1)%HWC_MAX_FRAMEBUFFER;
++    }
++
++    #define MAX_HWC_RECTS 4
++    typedef struct hwc_reg {
++        hwc_region_t reg;
++        hwc_rect_t rect[MAX_HWC_RECTS];
++    } hwc_reg_t;
++    hwc_reg_t resReg;
++    resReg.reg.numRects = 0;
++    resReg.reg.rects = resReg.rect;
++    hwc_region_t &resRegion = resReg.reg;
++    subtract(&resRegion, uniRect, swapRect);
++
++    struct g2d_surface dSurface;
++    memset(&dSurface, 0, sizeof(dSurface));
++    for (size_t i=0; i<resRegion.numRects; i++) {
++        ALOGV("%s(l:%d,t:%d,r:%d,b:%d)", __FUNCTION__,
++            resRegion.rects[i].left, resRegion.rects[i].top,
++            resRegion.rects[i].right, resRegion.rects[i].bottom);
++        if (!validateRect((hwc_rect_t&)resRegion.rects[i])) {
++            ALOGI("invalid rect");
++            continue;
++        }
++
++        setG2dSurface(dSurface, dstHandle, (hwc_rect_t&)resRegion.rects[i]);
++        struct g2d_surface sSurface;
++        memset(&sSurface, 0, sizeof(sSurface));
++        setG2dSurface(sSurface, srcHandle, (hwc_rect_t&)resRegion.rects[i]);
++        g2d_blit(ctx->g2d_handle, &sSurface, &dSurface);
++    }
++
++    return 0;
++}
++
++bool hwc_hasSameContent(struct hwc_context_t* ctx, int src,
++            int dst, hwc_display_contents_1_t** lists)
++{
++    if (ctx == NULL || lists == NULL || src == dst) {
++        ALOGE("%s invalid ctx, lists or src==dst", __FUNCTION__);
++        return false;
++    }
++
++    hwc_display_contents_1_t* sList = lists[src];
++    hwc_display_contents_1_t* dList = lists[dst];
++    if (sList->numHwLayers != dList->numHwLayers) {
++        return false;
++    }
++
++    int numLayers = sList->numHwLayers;
++    for (int i=0; i<numLayers-1; i++) {
++        if (sList->hwLayers[i].handle != dList->hwLayers[i].handle) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++int hwc_resize(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                    struct private_handle_t *srcHandle)
++{
++    if (ctx == NULL || ctx->g2d_handle == NULL || srcHandle == NULL || dstHandle == NULL) {
++        ALOGE("%s invalid ctx", __FUNCTION__);
++        return -EINVAL;
++    }
++
++    hwc_rect_t srect;
++    srect.left = 0;
++    srect.top = 0;
++    srect.right = srcHandle->width;
++    srect.bottom = srcHandle->height;
++
++    hwc_rect_t drect;
++    int deltaW = 0, deltaH = 0;
++    int dstW = dstHandle->width;
++    int dstH = dstHandle->height;
++    if (dstW * srcHandle->height >= dstH * srcHandle->width) {
++        dstW = dstH * srcHandle->width / srcHandle->height;
++    }
++    else {
++        dstH = dstW * srcHandle->height / srcHandle->width;
++    }
++
++    deltaW = dstHandle->width - dstW;
++    deltaH = dstHandle->height - dstH;
++    drect.left = deltaW / 2;
++    drect.top = deltaH / 2;
++    drect.right = drect.left + dstW;
++    drect.bottom = drect.top + dstH;
++
++    g2d_surface sSurface, dSurface;
++    memset(&sSurface, 0, sizeof(sSurface));
++    memset(&dSurface, 0, sizeof(dSurface));
++    setG2dSurface(sSurface, srcHandle, srect);
++    setG2dSurface(dSurface, dstHandle, drect);
++
++    g2d_blit(ctx->g2d_handle, &sSurface, &dSurface);
++
++    return 0;
++}
++
++int hwc_updateSwapRect(struct hwc_context_t* ctx, int disp,
++                 android_native_buffer_t* nbuf)
++{
++    if (ctx == NULL) {
++        ALOGE("%s invalid ctx", __FUNCTION__);
++        return -EINVAL;
++    }
++
++    int index = ctx->mDispInfo[disp].mSwapIndex;
++    ctx->mDispInfo[disp].mSwapIndex = (index + 1)%HWC_MAX_FRAMEBUFFER;
++    hwc_rect_t& swapRect = ctx->mDispInfo[disp].mSwapRect[index];
++    if (nbuf != NULL) {
++        int origin = (int) nbuf->common.reserved[0];
++        int size = (int) nbuf->common.reserved[1];
++        if (origin != 0 && size != 0) {
++            swapRect.left = origin >> 16;
++            swapRect.top = origin & 0xFFFF;
++            swapRect.right = swapRect.left + (size >> 16);
++            swapRect.bottom = swapRect.top + (size & 0xFFFF);
++            ALOGV("swapRect:(l:%d,t:%d,r:%d,b:%d)",
++                swapRect.left, swapRect.top, swapRect.right, swapRect.bottom);
++            return index;
++        }
++    }
++
++    swapRect.left = 0;
++    swapRect.top = 0;
++    swapRect.right = ctx->mDispInfo[disp].xres;
++    swapRect.bottom = ctx->mDispInfo[disp].yres;
++    ALOGV("swapRect:(l:%d,t:%d,r:%d,b:%d)",
++        swapRect.left, swapRect.top, swapRect.right, swapRect.bottom);
++    return index;
++}
++
+ int hwc_clearWormHole(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
+                     hwc_region_t &hole)
+ {
+diff --git a/mx6/hwcomposer/hwc_context.h b/mx6/hwcomposer/hwc_context.h
+index 0511ad7..cc3de6d 100644
+--- a/mx6/hwcomposer/hwc_context.h
++++ b/mx6/hwcomposer/hwc_context.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2012-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2012-2014 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -46,6 +46,12 @@
+ #define HWC_FB_PATH "/dev/graphics/fb"
+ #define HWC_FB_SYS "/sys/class/graphics/fb"
+ 
++#ifndef NUM_FRAMEBUFFER_SURFACE_BUFFERS
++#define NUM_FRAMEBUFFER_SURFACE_BUFFERS (2)
++#endif
++
++#define HWC_MAX_FRAMEBUFFER NUM_FRAMEBUFFER_SURFACE_BUFFERS
++
+ class VSyncThread;
+ class UeventThread;
+ 
+@@ -74,7 +80,8 @@ typedef struct {
+     bool mG2dProcs;
+     //struct g2d_buf* mCurrentBuffer;
+     //buffer_handle_t mLastHandle;
+-    //hwc_rect_t mSwapRect[3];
++    int mSwapIndex;
++    hwc_rect_t mSwapRect[HWC_MAX_FRAMEBUFFER];
+ } displayInfo;
+ 
+ struct hwc_context_t {
+diff --git a/mx6/hwcomposer/hwc_display.cpp b/mx6/hwcomposer/hwc_display.cpp
+index 28d3c71..3555c65 100644
+--- a/mx6/hwcomposer/hwc_display.cpp
++++ b/mx6/hwcomposer/hwc_display.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2009-2014 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -210,6 +210,14 @@ int hwc_get_framebuffer_info(displayInfo *pInfo)
+           info.height, pInfo->ydpi / 1000.0, refreshRate,
+           pInfo->format);
+ 
++    pInfo->mSwapIndex = 0;
++    for (int i=0; i<HWC_MAX_FRAMEBUFFER; i++) {
++        pInfo->mSwapRect[i].left = 0;
++        pInfo->mSwapRect[i].top = 0;
++        pInfo->mSwapRect[i].right = pInfo->xres;
++        pInfo->mSwapRect[i].bottom = pInfo->yres;
++    }
++
+     return NO_ERROR;
+ }
+ 
+diff --git a/mx6/hwcomposer/hwcomposer.cpp b/mx6/hwcomposer/hwcomposer.cpp
+index ff625ce..cbfdf42 100644
+--- a/mx6/hwcomposer/hwcomposer.cpp
++++ b/mx6/hwcomposer/hwcomposer.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2013 Freescale Semiconductor, Inc. All Rights Reserved.
++ * Copyright (C) 2009-2014 Freescale Semiconductor, Inc. All Rights Reserved.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -54,11 +54,19 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
+         struct hw_device_t** device);
+ 
+ extern int hwc_composite(struct hwc_context_t* ctx, hwc_layer_1_t* layer,
+-                    struct private_handle_t *dstHandle, bool firstLayer);
++                    struct private_handle_t *dstHandle, hwc_rect_t* swap, bool firstLayer);
+ extern int hwc_clearWormHole(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
+                     hwc_region_t &hole);
+ extern int hwc_clearRect(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
+                     hwc_rect_t &rect);
++extern int hwc_copyBack(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                    struct private_handle_t *srcHandle, int swapIndex, int disp);
++extern int hwc_resize(struct hwc_context_t* ctx, struct private_handle_t *dstHandle,
++                    struct private_handle_t *srcHandle);
++extern int hwc_updateSwapRect(struct hwc_context_t* ctx, int disp,
++                 android_native_buffer_t* nbuf);
++extern bool hwc_hasSameContent(struct hwc_context_t* ctx, int src,
++            int dst, hwc_display_contents_1_t** lists);
+ 
+ static struct hw_module_methods_t hwc_module_methods = {
+     open: hwc_device_open
+@@ -222,8 +230,9 @@ static int hwc_prepare_virtual(struct hwc_context_t* ctx, int disp,
+ }
+ 
+ static int hwc_set_physical(struct hwc_context_t* ctx, int disp,
+-                         hwc_display_contents_1_t* list)
++                         hwc_display_contents_1_t** contents)
+ {
++    hwc_display_contents_1_t* list = contents[disp];
+     if (ctx == NULL || list == NULL) {
+         ALOGV("%s: disp:%d invalid parameter", __FUNCTION__, disp);
+         return 0;
+@@ -238,6 +247,7 @@ static int hwc_set_physical(struct hwc_context_t* ctx, int disp,
+         if (targetHandle != NULL && ctx->mDispInfo[disp].connected) {
+             ctx->mFbDev[disp]->post(ctx->mFbDev[disp], targetHandle);
+         }
++        hwc_updateSwapRect(ctx, disp, NULL);
+         return 0;
+     }
+ 
+@@ -265,23 +275,43 @@ static int hwc_set_physical(struct hwc_context_t* ctx, int disp,
+         return -EINVAL;
+     }
+ 
+-    for (size_t i=0; i<list->numHwLayers-1; i++) {
+-        layer = &list->hwLayers[i];
+-        int fenceFd = layer->acquireFenceFd;
+-        if (fenceFd > 0) {
+-            ALOGI("fenceFd:%d", fenceFd);
+-            sync_wait(fenceFd, -1);
+-            close(fenceFd);
+-            layer->acquireFenceFd = -1;
+-        }
++    int index = hwc_updateSwapRect(ctx, disp, fbuffer);
++    if (index < 0) {
++        ALOGE("invalid index");
++        return -EINVAL;
++    }
+ 
+-        if (i == 0) {
+-            hwc_composite(ctx, layer, frameHandle, true);
++    bool resized = false;
++
++    if (disp != HWC_DISPLAY_PRIMARY &&
++        hwc_hasSameContent(ctx, HWC_DISPLAY_PRIMARY, disp, contents)) {
++        hwc_display_contents_1_t* sList = contents[HWC_DISPLAY_PRIMARY];
++        hwc_layer_1_t* primaryLayer = &sList->hwLayers[sList->numHwLayers-1];
++        struct private_handle_t *primaryHandle = NULL;
++        primaryHandle = (struct private_handle_t *)primaryLayer->handle;
++        if (primaryHandle != NULL) {
++            hwc_resize(ctx, frameHandle, primaryHandle);
++            resized = true;
+         }
+-        else
+-            hwc_composite(ctx, layer, frameHandle, false);
+     }
+ 
++    if (!resized) {
++        hwc_rect_t& swapRect = ctx->mDispInfo[disp].mSwapRect[index];
++        for (size_t i=0; i<list->numHwLayers-1; i++) {
++            layer = &list->hwLayers[i];
++            int fenceFd = layer->acquireFenceFd;
++            if (fenceFd > 0) {
++                ALOGI("fenceFd:%d", fenceFd);
++                sync_wait(fenceFd, -1);
++                close(fenceFd);
++                layer->acquireFenceFd = -1;
++            }
++
++            hwc_composite(ctx, layer, frameHandle, &swapRect, i==0);
++        }
++
++        hwc_copyBack(ctx, frameHandle, targetHandle, index, disp);
++    }
+     g2d_finish(ctx->g2d_handle);
+ 
+     _eglPostBufferVIV(fbuffer);
+@@ -295,8 +325,9 @@ static int hwc_set_physical(struct hwc_context_t* ctx, int disp,
+ }
+ 
+ static int hwc_set_virtual(struct hwc_context_t* ctx, int disp,
+-                         hwc_display_contents_1_t* list)
++                         hwc_display_contents_1_t** contents)
+ {
++    hwc_display_contents_1_t* list = contents[disp];
+     if (ctx == NULL || list == NULL) {
+         return 0;
+     }
+@@ -333,6 +364,19 @@ static int hwc_set_virtual(struct hwc_context_t* ctx, int disp,
+         list->outbufAcquireFenceFd = -1;
+     }
+ 
++    if (disp != HWC_DISPLAY_PRIMARY &&
++        hwc_hasSameContent(ctx, HWC_DISPLAY_PRIMARY, disp, contents)) {
++        hwc_display_contents_1_t* sList = contents[HWC_DISPLAY_PRIMARY];
++        hwc_layer_1_t* primaryLayer = &sList->hwLayers[sList->numHwLayers-1];
++        struct private_handle_t *primaryHandle = NULL;
++        primaryHandle = (struct private_handle_t *)primaryLayer->handle;
++        if (primaryHandle != NULL) {
++            hwc_resize(ctx, frameHandle, primaryHandle);
++            g2d_finish(ctx->g2d_handle);
++            return 0;
++        }
++    }
++
+     for (size_t i=0; i<list->numHwLayers-1; i++) {
+         layer = &list->hwLayers[i];
+         int fenceFd = layer->acquireFenceFd;
+@@ -343,11 +387,7 @@ static int hwc_set_virtual(struct hwc_context_t* ctx, int disp,
+             layer->acquireFenceFd = -1;
+         }
+ 
+-        if (i == 0) {
+-            hwc_composite(ctx, layer, frameHandle, true);
+-        }
+-        else
+-            hwc_composite(ctx, layer, frameHandle, false);
++        hwc_composite(ctx, layer, frameHandle, NULL, i==0);
+     }
+ 
+     g2d_finish(ctx->g2d_handle);
+@@ -455,13 +495,13 @@ static int hwc_set(struct hwc_composer_device_1 *dev,
+         hwc_display_contents_1_t *list = displays[i];
+         switch(i) {
+             case HWC_DISPLAY_PRIMARY:
+-                ret = hwc_set_physical(ctx, i, displays[i]);
++                ret = hwc_set_physical(ctx, i, displays);
+                 break;
+             case HWC_DISPLAY_EXTERNAL:
+-                ret = hwc_set_physical(ctx, i, displays[i]);
++                ret = hwc_set_physical(ctx, i, displays);
+                 break;
+             case HWC_DISPLAY_VIRTUAL:
+-                ret = hwc_set_virtual(ctx, i, displays[i]);
++                ret = hwc_set_virtual(ctx, i, displays);
+                 break;
+             default:
+                 ALOGI("invalid display id:%d", i);
+-- 
+1.8.0
+

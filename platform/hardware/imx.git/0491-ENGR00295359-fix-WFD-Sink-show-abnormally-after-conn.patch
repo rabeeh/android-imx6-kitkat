@@ -1,0 +1,82 @@
+From 7a53ad0376c7a1a75d682b1b26f70b7022093b59 Mon Sep 17 00:00:00 2001
+From: Liu Xiaowen <b37945@freescale.com>
+Date: Thu, 16 Jan 2014 15:04:48 +0800
+Subject: [PATCH 491/498] ENGR00295359 fix WFD Sink: show abnormally after
+ connecting to source.
+
+the root cause is YUV plane physical address is not correct.
+so, use the right alignment value to compute YUV physical address.
+
+Signed-off-by: Liu Xiaowen <b37945@freescale.com>
+---
+ mx6/hwcomposer/hwc_composite.cpp | 35 +++++++++++++++--------------------
+ 1 file changed, 15 insertions(+), 20 deletions(-)
+
+diff --git a/mx6/hwcomposer/hwc_composite.cpp b/mx6/hwcomposer/hwc_composite.cpp
+index 723485a..ca3c919 100644
+--- a/mx6/hwcomposer/hwc_composite.cpp
++++ b/mx6/hwcomposer/hwc_composite.cpp
+@@ -147,45 +147,40 @@ static int convertBlending(int blending, struct g2d_surface& src,
+ static int setG2dSurface(struct g2d_surface& surface,
+              struct private_handle_t *handle, hwc_rect_t& rect)
+ {
++    int alignWidth, alignHeight;
++    int ret = get_aligned_size(handle, &alignWidth, &alignHeight);
++    if (ret != 0) {
++        alignHeight = handle->height;
++    }
+     surface.format = convertFormat(handle->format);
+     surface.planes[0] = handle->phys;
+     surface.stride = handle->flags >> 16;
+     switch (surface.format) {
+-        case G2D_RGB565: {
+-            int alignHeight = 0;
+-            int ret = get_aligned_size(handle, NULL, &alignHeight);
+-            if (ret != 0) {
+-                alignHeight = (handle->height + 3) & ~0x3;
+-            }
++        case G2D_RGB565:
+             surface.planes[0] += surface.stride * 2 * (alignHeight - handle->height);
+-            } break;
++            break;
++
+         case G2D_RGBA8888:
+         case G2D_BGRA8888:
+-        case G2D_RGBX8888: {
+-            int alignHeight = 0;
+-            int ret = get_aligned_size(handle, NULL, &alignHeight);
+-            if (ret != 0) {
+-                alignHeight = (handle->height + 3) & ~0x3;
+-            }
++        case G2D_RGBX8888:
+             surface.planes[0] += surface.stride * 4 * (alignHeight - handle->height);
+-            } break;
++            break;
+ 
+         case G2D_YUYV:
+             break;
+ 
+         case G2D_NV16:
+         case G2D_NV12:
+-        case G2D_NV21: {
+-            int stride = surface.stride;
+-            surface.planes[1] = handle->phys + stride * handle->height;
+-            } break;
++        case G2D_NV21:
++            surface.planes[1] = handle->phys + surface.stride * alignHeight;
++            break;
+ 
+         case G2D_I420:
+         case G2D_YV12: {
+             int stride = surface.stride;
+             int c_stride = (stride/2+15)/16*16;
+-            surface.planes[1] = handle->phys + stride * handle->height;
+-            surface.planes[2] = surface.planes[1] + c_stride * handle->height;
++            surface.planes[1] = handle->phys + stride * alignHeight;
++            surface.planes[2] = surface.planes[1] + c_stride * alignHeight/2;
+             } break;
+ 
+         default:
+-- 
+1.8.0
+

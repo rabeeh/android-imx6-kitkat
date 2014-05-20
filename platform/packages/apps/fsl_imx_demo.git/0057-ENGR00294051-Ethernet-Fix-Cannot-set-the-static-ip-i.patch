@@ -1,0 +1,253 @@
+From 5b9e5567407178966d5f108203e09e27ad3d3d2e Mon Sep 17 00:00:00 2001
+From: ZhongWen <b47623@freescale.com>
+Date: Mon, 13 Jan 2014 18:26:28 +0800
+Subject: [PATCH 57/58] ENGR00294051 Ethernet:Fix Cannot set the static ip if
+ not set the DNS address
+
+Fix Cannot set the static ip if not set the DNS address
+Add Bypass proxy for in advanced ethernet setting
+
+Signed-off-by: ZhongWen <b47623@freescale.com>
+---
+ Ethernet/com/fsl/ethernet/EthernetAdvDialog.java   | 23 +++++++++++++++++++++-
+ .../com/fsl/ethernet/EthernetConfigDialog.java     |  2 +-
+ Ethernet/com/fsl/ethernet/EthernetDevInfo.java     |  9 +++++++++
+ Ethernet/com/fsl/ethernet/EthernetManager.java     | 19 +++++++++++++++++-
+ Ethernet/com/fsl/ethernet/MainActivity.java        |  2 +-
+ Ethernet/res/layout/advanced_setting.xml           | 22 ++++++++++++++++++---
+ Ethernet/res/values/strings.xml                    |  5 +++--
+ 7 files changed, 73 insertions(+), 9 deletions(-)
+
+diff --git a/Ethernet/com/fsl/ethernet/EthernetAdvDialog.java b/Ethernet/com/fsl/ethernet/EthernetAdvDialog.java
+index 9ba3845..3da7895 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetAdvDialog.java
++++ b/Ethernet/com/fsl/ethernet/EthernetAdvDialog.java
+@@ -15,6 +15,10 @@
+  */
+ package com.fsl.ethernet;
+ 
++import android.net.ConnectivityManager;
++import android.net.Proxy;
++import android.net.LinkProperties;
++import android.net.ProxyProperties;
+ import android.app.AlertDialog;
+ import android.content.Context;
+ import android.content.DialogInterface;
+@@ -38,11 +42,16 @@ public class EthernetAdvDialog extends AlertDialog implements DialogInterface.On
+     private View mView;
+     private EditText mProxyIp;
+     private EditText mProxyPort;
++    private EditText mProxyExclusionList;
++    private LinkProperties mLinkProperties;
++    private ProxyProperties mHttpProxy;
++    private static ConnectivityManager sConnectivityManager = null;
+ 
+     protected EthernetAdvDialog(Context context,EthernetEnabler Enabler) {
+         super(context);
+         mContext = context;
+         mEthEnabler = Enabler;
++        LinkProperties mLinkProperties = new LinkProperties();
+         buildDialogContent(context);
+     }
+ 
+@@ -52,12 +61,14 @@ public class EthernetAdvDialog extends AlertDialog implements DialogInterface.On
+ 
+         mProxyIp = (EditText)mView.findViewById(R.id.proxy_address_edit);
+         mProxyPort = (EditText)mView.findViewById(R.id.proxy_port_edit);
++        mProxyExclusionList = (EditText)mView.findViewById(R.id.proxy_exclusionlist);
+ 
+         this.setInverseBackgroundForced(true);
+         this.setButton(BUTTON_POSITIVE, context.getText(R.string.menu_save), this);
+         this.setButton(BUTTON_NEGATIVE, context.getText(R.string.menu_cancel), this);
+         mProxyIp.setText(mEthEnabler.getManager().getSharedPreProxyAddress(),TextView.BufferType.EDITABLE);
+         mProxyPort.setText(mEthEnabler.getManager().getSharedPreProxyPort(),TextView.BufferType.EDITABLE);
++        mProxyExclusionList.setText(mEthEnabler.getManager().getSharedPreProxyExclusionList(),TextView.BufferType.EDITABLE);
+         this.setInverseBackgroundForced(true);
+         this.setButton(BUTTON_POSITIVE, context.getText(R.string.menu_save), this);
+         this.setButton(BUTTON_NEGATIVE, context.getText(R.string.menu_cancel), this);
+@@ -65,6 +76,7 @@ public class EthernetAdvDialog extends AlertDialog implements DialogInterface.On
+     }
+ 
+     public void handle_saveconf() {
++        //mLinkProperties.clear();
+         EthernetDevInfo info = new EthernetDevInfo();
+ 
+         if ((mProxyIp.getText().toString().equals(""))||(mProxyPort.getText().toString().equals("")))
+@@ -76,9 +88,18 @@ public class EthernetAdvDialog extends AlertDialog implements DialogInterface.On
+             info.setDnsAddr(mEthEnabler.getManager().getSharedPreDnsAddress());
+             info.setProxyAddr(mProxyIp.getText().toString());
+             info.setProxyPort(mProxyPort.getText().toString());
++            info.setProxyExclusionList(mProxyExclusionList.getText().toString());
+         } mEthEnabler.getManager().updateDevInfo(info);
+ 
+-        mEthEnabler.getManager().setProxy();
++        String proxyAddress = mProxyIp.getText().toString();
++        String proxyPort = mProxyPort.getText().toString();
++        String exclusionList = mProxyExclusionList.getText().toString();
++        int port = 0;
++        try {
++            port = Integer.parseInt(proxyPort);
++        } catch(NumberFormatException e){
++        }
++        Proxy.setHttpProxySystemProperty(proxyAddress,proxyPort,exclusionList,null);
+     }
+ 
+     public void onClick(DialogInterface dialog, int which) {
+diff --git a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+index 65c4961..37becb6 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
++++ b/Ethernet/com/fsl/ethernet/EthernetConfigDialog.java
+@@ -118,7 +118,7 @@ public class EthernetConfigDialog extends AlertDialog implements
+         if (localLOGV)
+             Log.d(TAG, "Config device for " + mDevList.getSelectedItem().toString());
+         if (mConTypeManual.isChecked()) {
+-            if ((mIpaddr.getText().toString().equals(""))||(mDns.getText().toString().equals("")))
++            if ((mIpaddr.getText().toString().equals(""))&&(mDns.getText().toString().equals("")))
+             {
+                 Toast.makeText(this.getContext(), R.string.show_need_setting,Toast.LENGTH_SHORT).show();
+             }else{
+diff --git a/Ethernet/com/fsl/ethernet/EthernetDevInfo.java b/Ethernet/com/fsl/ethernet/EthernetDevInfo.java
+index fa28d3c..3b27bad 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetDevInfo.java
++++ b/Ethernet/com/fsl/ethernet/EthernetDevInfo.java
+@@ -39,6 +39,7 @@ public class EthernetDevInfo {
+     private String mode;
+     private String proxyIp;
+     private String proxyPort;
++    private String proxyExclusionList;
+ 
+     public EthernetDevInfo () {
+         dev_name = null;
+@@ -113,6 +114,14 @@ public class EthernetDevInfo {
+     public String getProxyPort() {
+         return this.proxyPort;
+     }
++
++    public String getProxyExclusionList() {
++        return proxyExclusionList;
++    }
++
++    public void setProxyExclusionList(String proxyExclusionList) {
++        this.proxyExclusionList = proxyExclusionList;
++    }
+     /**
+      * Set ethernet configuration mode
+      * @param mode {@code ETHERNET_CONN_MODE_DHCP} for dhcp {@code ETHERNET_CONN_MODE_MANUAL} for manual configure
+diff --git a/Ethernet/com/fsl/ethernet/EthernetManager.java b/Ethernet/com/fsl/ethernet/EthernetManager.java
+index fdc2f9c..7881e4b 100644
+--- a/Ethernet/com/fsl/ethernet/EthernetManager.java
++++ b/Ethernet/com/fsl/ethernet/EthernetManager.java
+@@ -294,6 +294,7 @@ public class EthernetManager {
+             editor.putString("mDns",info.getDnsAddr());
+             editor.putString("mProxyIp",info.getProxyAddr());
+             editor.putString("mProxyPort", info.getProxyPort());
++            editor.putString("mProxyExclusionList", info.getProxyExclusionList());
+             } catch (NumberFormatException e) {
+                 e.printStackTrace();
+             }
+@@ -351,6 +352,16 @@ public class EthernetManager {
+         return temp;
+     }
+ 
++    public String getSharedPreProxyExclusionList(){
++        String temp = null;
++        try {
++            temp = sharedPreferences().getString("mProxyExclusionList",null);
++        } catch (Exception e) {
++            e.printStackTrace();
++        }
++        return temp;
++    }
++
+     public void setProxy(){
+         String exclusionList = null;
+         if (getSharedPreProxyAddress() == null || getSharedPreProxyPort() == null)
+@@ -358,9 +369,15 @@ public class EthernetManager {
+         LinkProperties lp = mTracker.getLinkProperties();
+         if (lp == null)
+             return;
++        int port = 0;
++        try {
++            port = Integer.parseInt(getSharedPreProxyPort());
++        } catch(NumberFormatException e){
++        }
+         ProxyProperties proxyProperties =
+-            new ProxyProperties(getSharedPreProxyAddress(), Integer.parseInt(getSharedPreProxyPort()), exclusionList);
++            new ProxyProperties(getSharedPreProxyAddress(), port, exclusionList);
+         lp.setHttpProxy(proxyProperties);
++        Log.i(TAG,"=============getHttpProxy==============" + lp.getHttpProxy());
+     }
+ 
+ }
+diff --git a/Ethernet/com/fsl/ethernet/MainActivity.java b/Ethernet/com/fsl/ethernet/MainActivity.java
+index 408328b..f2abc3b 100644
+--- a/Ethernet/com/fsl/ethernet/MainActivity.java
++++ b/Ethernet/com/fsl/ethernet/MainActivity.java
+@@ -116,7 +116,7 @@ public class MainActivity extends Activity {
+                 mSaveConfig = mEthEnabler.getManager().getSavedConfig();
+                 if (mSaveConfig != null) {
+                     mEthAdvancedDialog.show();
+-                }           
++                }
+             }
+         });
+     }
+diff --git a/Ethernet/res/layout/advanced_setting.xml b/Ethernet/res/layout/advanced_setting.xml
+index 8c5d040..5258e29 100644
+--- a/Ethernet/res/layout/advanced_setting.xml
++++ b/Ethernet/res/layout/advanced_setting.xml
+@@ -53,8 +53,7 @@
+                       android:layout_height="wrap_content"
+                       android:textSize="18sp"
+                       android:textAlignment="viewStart"
+-                      android:singleLine="true"
+-                      android:inputType="phone" />
++                      android:singleLine="true" />
+ 
+             <TextView android:id="@+id/eth_proxy_port"
+                       android:layout_width="match_parent"
+@@ -71,7 +70,24 @@
+                       android:textSize="18sp"
+                       android:textAlignment="viewStart"
+                       android:singleLine="true"
+-                      android:inputType="number" />            
++                      android:inputType="number" />
++
++           <TextView android:id="@+id/eth_proxy_exclusionlist"
++                      android:layout_width="match_parent"
++                      android:layout_height="wrap_content"
++                      android:layout_marginTop="8dip"
++                      android:layout_marginStart="16dip"
++                      android:layout_marginEnd="16dip"
++                      android:orientation="vertical"
++                      android:gravity="start"
++                      android:text="@string/proxy_exclusionlist" />
++            <EditText android:id="@+id/proxy_exclusionlist"
++                      android:layout_width="match_parent"
++                      android:layout_height="wrap_content"
++                      android:textSize="18sp"
++                      android:textAlignment="viewStart"
++                      android:singleLine="true"
++                      android:inputType="number" />
+             </LinearLayout>
+ 
+         </LinearLayout>
+diff --git a/Ethernet/res/values/strings.xml b/Ethernet/res/values/strings.xml
+index 5b0c68b..404c297 100644
+--- a/Ethernet/res/values/strings.xml
++++ b/Ethernet/res/values/strings.xml
+@@ -26,8 +26,9 @@
+     <string name="menu_cancel">cancel</string>
+     <string name="proxy_setting">Proxy setting</string>
+     <string name="eth_proxy">Proxy server</string>
+-    <string name="proxy_address">Proxy address</string>
+-    <string name="proxy_port">Proxy port</string> 
++    <string name="proxy_address">Proxy hostname</string>
++    <string name="proxy_port">Proxy port</string>
++    <string name="proxy_exclusionlist">Bypass proxy for</string> 
+     <string name="eth_proxy_address">Proxy address</string>
+     <string name="show_need_setting">You should setting the static IP and DNS address in this mode</string>
+     <string name="advanced_need_setting">You should not set the Proxy address and Proxy port null</string>
+-- 
+1.8.0
+

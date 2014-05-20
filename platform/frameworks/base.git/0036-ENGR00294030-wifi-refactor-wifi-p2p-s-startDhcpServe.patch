@@ -1,0 +1,148 @@
+From bf90c4af2518eef3205cf398562438ab2a61ac7f Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Sat, 8 Feb 2014 12:43:07 +0800
+Subject: [PATCH 36/37] ENGR00294030 wifi:refactor wifi p2p's startDhcpServer
+ function
+
+Change to call tethering interface instead of calling
+mNwService.startTethering directly. This will allow p2p app to run
+well concurrently with other tethering app(e.g. usb tethering).
+
+Change-Id: I5e8ffeb5d2d396f48b897cd9396f133e25ecca57
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ .../com/android/server/connectivity/Tethering.java |  8 ++++-
+ wifi/java/android/net/wifi/p2p/WifiP2pService.java | 39 ++++++++++++++++------
+ 2 files changed, 35 insertions(+), 12 deletions(-)
+
+diff --git a/services/java/com/android/server/connectivity/Tethering.java b/services/java/com/android/server/connectivity/Tethering.java
+index 231a40a..264ab0c 100644
+--- a/services/java/com/android/server/connectivity/Tethering.java
++++ b/services/java/com/android/server/connectivity/Tethering.java
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2010 The Android Open Source Project
++ * Copyright (C) 2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -108,6 +109,7 @@ public class Tethering extends INetworkManagementEventObserver.Stub {
+ 
+     // USB is  192.168.42.1 and 255.255.255.0
+     // Wifi is 192.168.43.1 and 255.255.255.0
++    // Wifi P2P is 192.168.49.1 and 255.255.255.0
+     // BT is limited to max default of 5 connections. 192.168.44.1 to 192.168.48.1
+     // with 255.255.255.0
+ 
+@@ -116,7 +118,7 @@ public class Tethering extends INetworkManagementEventObserver.Stub {
+         "192.168.42.2", "192.168.42.254", "192.168.43.2", "192.168.43.254",
+         "192.168.44.2", "192.168.44.254", "192.168.45.2", "192.168.45.254",
+         "192.168.46.2", "192.168.46.254", "192.168.47.2", "192.168.47.254",
+-        "192.168.48.2", "192.168.48.254",
++        "192.168.48.2", "192.168.48.254", "192.168.49.2", "192.168.49.254",
+     };
+ 
+     private String[] mDefaultDnsServers;
+@@ -256,6 +258,10 @@ public class Tethering extends INetworkManagementEventObserver.Stub {
+             for (String regex : mTetherableWifiRegexs) {
+                 if (iface.matches(regex)) return true;
+             }
++            String regex = "p2p0";
++            if (iface.matches(".*" + regex + ".*")) {
++                return true;
++            }
+             return false;
+         }
+     }
+diff --git a/wifi/java/android/net/wifi/p2p/WifiP2pService.java b/wifi/java/android/net/wifi/p2p/WifiP2pService.java
+index 8b07208..308b970 100644
+--- a/wifi/java/android/net/wifi/p2p/WifiP2pService.java
++++ b/wifi/java/android/net/wifi/p2p/WifiP2pService.java
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2011 The Android Open Source Project
++ * Copyright (C) 2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -109,6 +110,7 @@ public class WifiP2pService extends IWifiP2pManager.Stub {
+ 
+     INetworkManagementService mNwService;
+     private DhcpStateMachine mDhcpStateMachine;
++    private ConnectivityManager mCm;
+ 
+     private P2pStateMachine mP2pStateMachine;
+     private AsyncChannel mReplyChannel = new AsyncChannel();
+@@ -226,9 +228,6 @@ public class WifiP2pService extends IWifiP2pManager.Stub {
+     /* clients(application) information list. */
+     private HashMap<Messenger, ClientInfo> mClientInfoList = new HashMap<Messenger, ClientInfo>();
+ 
+-    /* Is chosen as a unique range to avoid conflict with
+-       the range defined in Tethering.java */
+-    private static final String[] DHCP_RANGE = {"192.168.49.2", "192.168.49.254"};
+     private static final String SERVER_ADDRESS = "192.168.49.1";
+ 
+     /**
+@@ -2058,33 +2057,51 @@ public class WifiP2pService extends IWifiP2pManager.Stub {
+         mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+     }
+ 
++    private void checkAndSetConnectivityInstance() {
++        if (mCm == null) {
++            mCm = (ConnectivityManager) mContext.getSystemService(Context.CONNECTIVITY_SERVICE);
++        }
++    }
++
+     private void startDhcpServer(String intf) {
+         InterfaceConfiguration ifcg = null;
++        checkAndSetConnectivityInstance();
+         try {
+             ifcg = mNwService.getInterfaceConfig(intf);
+             ifcg.setLinkAddress(new LinkAddress(NetworkUtils.numericToInetAddress(
+                         SERVER_ADDRESS), 24));
+             ifcg.setInterfaceUp();
+             mNwService.setInterfaceConfig(intf, ifcg);
+-            /* This starts the dnsmasq server */
+-            mNwService.startTethering(DHCP_RANGE);
+         } catch (Exception e) {
+             loge("Error configuring interface " + intf + ", :" + e);
+             return;
+         }
+-
+-        logd("Started Dhcp server on " + intf);
++        if(mCm.tether(intf) != ConnectivityManager.TETHER_ERROR_NO_ERROR) {
++            loge("Error tethering on " + intf);
++            return;
++        }
++        logd("Started tethering on " + intf);
+    }
+ 
+     private void stopDhcpServer(String intf) {
++        checkAndSetConnectivityInstance();
++        /* refer to WifiStateMachine.java */
++        InterfaceConfiguration ifcg = null;
+         try {
+-            mNwService.stopTethering();
++            ifcg = mNwService.getInterfaceConfig(intf);
++            if (ifcg != null) {
++                ifcg.setLinkAddress(
++                        new LinkAddress(NetworkUtils.numericToInetAddress("0.0.0.0"), 0));
++                mNwService.setInterfaceConfig(intf, ifcg);
++            }
+         } catch (Exception e) {
+-            loge("Error stopping Dhcp server" + e);
+-            return;
++            loge("Error resetting interface " + intf + ", :" + e);
+         }
+ 
+-        logd("Stopped Dhcp server");
++        if (mCm.untether(intf) != ConnectivityManager.TETHER_ERROR_NO_ERROR) {
++            loge("Untether initiate failed!");
++        }
++        logd("Stopped tethering on" + intf);
+     }
+ 
+     private void notifyP2pEnableFailure() {
+-- 
+1.8.0
+
