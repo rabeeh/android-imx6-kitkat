@@ -174,7 +174,7 @@ dd if=/dev/zero of=${node} bs=1024 count=1
 
 wait_for_partition
 
-sfdisk --force -uM ${node} << EOF
+sfdisk --force -uM -H32 -S32 ${node} << EOF
 ,${boot_rom_sizeb},b
 ,${RECOVERY_ROM_SIZE},83
 ,${extend_size},5
