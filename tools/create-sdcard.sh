@@ -136,8 +136,9 @@ if [ "${flash_images}" -eq "1" ]; then
     # Create boot partition and files
     mkdir $TMP
     mount ${node}1 $TMP
-    cp out/target/product/cuboxi/zImage $TMP
-    cp out/target/product/cuboxi/*.dtb $TMP
+#    cp out/target/product/cuboxi/zImage $TMP
+#    cp out/target/product/cuboxi/*.dtb $TMP
+    cp out/target/product/cuboxi/uImage $TMP
     mkimage -A arm -O linux -T ramdisk -n 'Android ramdisk' -d out/target/product/cuboxi/ramdisk.img $TMP/ramdisk.img
     cat > $TMP/uEnv.txt << EOF
 /* You can comment out and keep the resolution that suites you. For solo single cpu with 512MByte */
@@ -145,10 +146,20 @@ if [ "${flash_images}" -eq "1" ]; then
 
 ramdisk_addr=0x15000000
 resolution=1280x720M@60
-mmcargs3=run autodetectfdt; fatload mmc 0:1 \${ramdisk_addr} ramdisk.img; fatload mmc 0:1 \${fdt_addr} \${fdt_file}; bootz \${loadaddr} \${ramdisk_addr} \${fdt_addr}
+mmcargs3=fatload mmc 0:1 \${ramdisk_addr} ramdisk.img; fatload mmc 0:1 0x10800000 uImage; bootm 0x10800000 \${ramdisk_addr}
 mmcargs2=setenv bootargs console=ttymxc0,115200 init=/init vmalloc=400M no_console_suspend androidboot.console=ttymxc0 androidboot.hardware=freescale video=mxcfb0:dev=hdmi,\${resolution} \${bootargs_ext}; run mmcargs3
 mmcargs=if test \${cpu} = 6SOLO; then setenv bootargs_ext gpumem=64M fbmem=10M; else setenv bootargs_ext; fi; run mmcargs2
 EOF
+#    cat > $TMP/uEnv.txt << EOF
+#/* You can comment out and keep the resolution that suites you. For solo single cpu with 512MByte */
+#/* It is recommended to stay with gpumem=48M and 1280x720M@60 (i.e. 720p resolution) */
+#
+#ramdisk_addr=0x15000000
+#resolution=1280x720M@60
+#mmcargs3=run autodetectfdt; fatload mmc 0:1 \${ramdisk_addr} ramdisk.img; fatload mmc 0:1 \${fdt_addr} \${fdt_file}; bootz \${loadaddr} \${ramdisk_addr} \${fdt_addr}
+#mmcargs2=setenv bootargs console=ttymxc0,115200 init=/init vmalloc=400M no_console_suspend androidboot.console=ttymxc0 androidboot.hardware=freescale video=mxcfb0:dev=hdmi,\${resolution} \${bootargs_ext}; run mmcargs3
+#mmcargs=if test \${cpu} = 6SOLO; then setenv bootargs_ext gpumem=64M fbmem=10M; else setenv bootargs_ext; fi; run mmcargs2
+#EOF
     sync
     umount $TMP
     rm $TMP_FILE
