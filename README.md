@@ -6,14 +6,14 @@ Introduction
 
 This is initial KitKat repository to support CuBox-i and HummingBoard.
 
-The main changes from the beta-2 release is that it -
-
-1. Bumps the support to KitKat 4.4.2 based
-2. Uses Freescale kk-4.4.2-1.0.0-alpha support
-3. Uses Linaro LK 3.10.30, android branch
+The main changes from the beta-2 release are -
+1. Android KitKat 4.4.2 based
+2. Uses Freescale kk-4.4.2-1.0.0-ga release
+3. Uses Freescale LK 3.0.35
 
 Build instructions
 ------------------
+The instructions are mainly tested on Ubuntu 12.04 build machine (64bit)
 1. curl http://commondatastorage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
 2. chmod a+x ~/bin/repo
 3. mkdir myandroid
@@ -23,19 +23,20 @@ Build instructions
 7. source < git tree location >/android-imx6-kitkat/and_patch.sh
 
    Now you should have the c_patch function available
-8. c_patch < git tree location >/android-imx6-kitkat/ imx_kk4.4.2_1.0.0-alpha
+8. c_patch < git tree location >/android-imx6-kitkat/ imx_kk4.4.2_1.0.0-ga
 
-   imx_kk4.4.2_1.0.0-alpha branches is the branch which will be automatically created
+   imx_kk4.4.2_1.0.0-ga is the name of the branches which will be automatically created
 
    If everything OK then you should be getting the following message -
 
    Success: Now you can build the Android code from FSL i.MX6 platform
-9. git clone https://github.com/linux4kix/linux-linaro-stable-mx6.git -b linux-linaro-lsk-v3.10-android-mx6 kernel_imx
+9. git clone git://git.freescale.com/imx/linux-2.6-imx.git kernel_imx
+   cd kernel_imx; git checkout kk4.4.2_1.0.0-ga
+   Alternative, until Freescale updates their tree tags, the kernel can be downloaded from -
+   http://git.freescale.com/git/cgit.cgi/imx/linux-2.6-imx.git/tag/?id=kk4.4.2_1.0.0-ga
 10. Manually patch kernel_imx -
-
    cd kernel_imx
-
-   git am < git tree location >/android-imx6-kitkat/kernel_imx/*
+   git am < git tree location >/android-imx6-kitkat/kernel_imx/3.0.35/*
 
    cd ..
 11. git clone https://github.com/SolidRun/u-boot-imx6 bootable/bootloader/uboot-imx
