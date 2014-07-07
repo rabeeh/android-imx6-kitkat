@@ -1,0 +1,175 @@
+From ecf7e0bfa4ab2987304dc252c94ff17d9923034b Mon Sep 17 00:00:00 2001
+From: Robin Gong <b38343@freescale.com>
+Date: Tue, 8 Apr 2014 15:03:22 +0800
+Subject: [PATCH 444/449] ENGR00308001 sdma: support M2M dma copy for v3.10.17
+
+modify test code for new sdma interface in v3.10.17
+
+Signed-off-by: Robin Gong <b38343@freescale.com>
+---
+ module_test/mxc_sdma_memcopy_test.c | 67 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/module_test/mxc_sdma_memcopy_test.c b/module_test/mxc_sdma_memcopy_test.c
+index e99475e..7dad208 100755
+--- a/module_test/mxc_sdma_memcopy_test.c
++++ b/module_test/mxc_sdma_memcopy_test.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2006-2012 Freescale Semiconductor, Inc. All rights reserved.
++ * Copyright 2006-2014 Freescale Semiconductor, Inc. All rights reserved.
+  */
+ 
+ /*
+@@ -20,7 +20,11 @@
+ #include <linux/fs.h>
+ #include <linux/version.h>
+ #include <linux/delay.h>
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,35))
++#include <linux/platform_data/dma-imx.h>
++#else
+ #include <mach/dma.h>
++#endif
+ 
+ #include <linux/dmaengine.h>
+ #include <linux/device.h>
+@@ -30,8 +34,8 @@
+ 
+ static int gMajor; /* major number of device */
+ static struct class *dma_tm_class;
+-u32 *wbuf, *wbuf2, *wbuf3;
+-u32 *rbuf, *rbuf2, *rbuf3;
++u32 *wbuf, *wbuf2, *wbuf3, *wbuf4;
++u32 *rbuf, *rbuf2, *rbuf3, *rbuf4;
+ 
+ struct dma_chan *dma_m2m_chan;
+ 
+@@ -87,6 +91,12 @@ int sdma_open(struct inode * inode, struct file * filp)
+ 		return -1;
+ 	}
+ 
++	wbuf4 = kzalloc(SDMA_BUF_SIZE, GFP_DMA);
++	if(!wbuf4) {
++		printk("error wbuf4 !!!!!!!!!!!\n");
++		return -1;
++	}
++
+ 	rbuf = kzalloc(SDMA_BUF_SIZE, GFP_DMA);
+ 	if(!rbuf) {
+ 		printk("error rbuf !!!!!!!!!!!\n");
+@@ -104,6 +114,13 @@ int sdma_open(struct inode * inode, struct file * filp)
+ 		printk("error rbuf3 !!!!!!!!!!!\n");
+ 		return -1;
+ 	}
++
++	rbuf4 = kzalloc(SDMA_BUF_SIZE, GFP_DMA);
++	if(!rbuf4) {
++		printk("error rbuf4 !!!!!!!!!!!\n");
++		return -1;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -114,9 +131,11 @@ int sdma_release(struct inode * inode, struct file * filp)
+ 	kfree(wbuf);
+ 	kfree(wbuf2);
+ 	kfree(wbuf3);
++	kfree(wbuf4);
+ 	kfree(rbuf);
+ 	kfree(rbuf2);
+ 	kfree(rbuf3);
++	kfree(rbuf4);
+ 	return 0;
+ }
+ 
+@@ -149,6 +168,15 @@ ssize_t sdma_read (struct file *filp, char __user * buf, size_t count,
+ 	}
+ 	printk("buffer 3 copy passed!\n");
+ 
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,35))
++	for (i=0; i<SDMA_BUF_SIZE/4; i++) {
++		if (*(rbuf4+i) != *(wbuf4+i)) {
++			printk("buffer 4 copy falled!,r=%x,w=%x,%d\n", *(rbuf4+i), *(wbuf4+i), i);
++			return 0;
++		}
++	}
++	printk("buffer 4 copy passed!\n");
++#endif
+ 	return 0;
+ }
+ 
+@@ -163,8 +191,11 @@ ssize_t sdma_write(struct file * filp, const char __user * buf, size_t count,
+ 								loff_t * offset)
+ {
+ 	u32 *index1, *index2, *index3, i, ret;
+-	struct dma_slave_config dma_m2m_config;
++	struct dma_slave_config dma_m2m_config = {0};
+ 	struct dma_async_tx_descriptor *dma_m2m_desc;
++	u32 *index4 = wbuf4;
++	dma_addr_t dma_src, dma_dst;
++
+ 	index1 = wbuf;
+ 	index2 = wbuf2;
+ 	index3 = wbuf3;
+@@ -180,6 +211,11 @@ ssize_t sdma_write(struct file * filp, const char __user * buf, size_t count,
+ 	for (i=0; i<SDMA_BUF_SIZE/4; i++) {
+ 		*(index3 + i) = 0x56565656;
+ 	}
++
++	for (i=0; i<SDMA_BUF_SIZE/4; i++) {
++		*(index4 + i) = 0x56565656;
++	}
++
+ #if 0
+ 	for (i=0; i<SDMA_BUF_SIZE/4; i++) {
+ 	printk("input data_%d : %x\n", i, *(wbuf+i));
+@@ -203,7 +239,9 @@ ssize_t sdma_write(struct file * filp, const char __user * buf, size_t count,
+ 	sg_set_buf(&sg[2], wbuf3, SDMA_BUF_SIZE);
+ 	ret = dma_map_sg(NULL, sg, 3, dma_m2m_config.direction);
+ 
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(3,0,35))
+ 	dma_m2m_desc = dma_m2m_chan->device->device_prep_slave_sg(dma_m2m_chan,sg, 3, dma_m2m_config.direction, 1);
++#endif
+ 
+ 	sg_init_table(sg2, 3);
+ 	sg_set_buf(&sg2[0], rbuf, SDMA_BUF_SIZE);
+@@ -211,14 +249,35 @@ ssize_t sdma_write(struct file * filp, const char __user * buf, size_t count,
+ 	sg_set_buf(&sg2[2], rbuf3, SDMA_BUF_SIZE);
+ 	ret = dma_map_sg(NULL, sg2, 3, dma_m2m_config.direction);
+ 
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(3,0,35))
+ 	dma_m2m_desc = dma_m2m_chan->device->device_prep_slave_sg(dma_m2m_chan,sg2, 3, dma_m2m_config.direction, 0);
++#else
++	dma_m2m_desc = dma_m2m_chan->device->device_prep_dma_sg(dma_m2m_chan,sg2, 3, sg, 3, 0);
++#endif
+ 
+ 	dma_m2m_desc->callback = dma_m2m_callback;
+ 	dmaengine_submit(dma_m2m_desc);
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,35))
++	dma_async_issue_pending(dma_m2m_chan);
++#endif
+ 
+ 	wait_for_completion(&dma_m2m_ok);
+ 	dma_unmap_sg(NULL, sg, 3, dma_m2m_config.direction);
+ 	dma_unmap_sg(NULL, sg2, 3, dma_m2m_config.direction);
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,35))
++	dma_src = dma_map_single(NULL, wbuf4, SDMA_BUF_SIZE, DMA_TO_DEVICE);
++	dma_dst = dma_map_single(NULL, rbuf4, SDMA_BUF_SIZE, DMA_FROM_DEVICE);
++	dma_m2m_desc = dma_m2m_chan->device->device_prep_dma_memcpy(dma_m2m_chan, dma_dst, dma_src, SDMA_BUF_SIZE,0);
++	if (!dma_m2m_desc)
++		printk("prep error!!\n");
++	dma_m2m_desc->callback = dma_m2m_callback;
++	dmaengine_submit(dma_m2m_desc);
++	dma_async_issue_pending(dma_m2m_chan);
++	wait_for_completion(&dma_m2m_ok);
++	dma_unmap_single(NULL, dma_src, SDMA_BUF_SIZE, DMA_TO_DEVICE);
++	dma_unmap_single(NULL, dma_dst, SDMA_BUF_SIZE, DMA_FROM_DEVICE);
++#endif
++
+ 	return 0;
+ }
+ 
+-- 
+1.8.0
+

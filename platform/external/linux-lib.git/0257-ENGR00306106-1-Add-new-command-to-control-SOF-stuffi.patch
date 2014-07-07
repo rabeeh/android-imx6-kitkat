@@ -1,0 +1,115 @@
+From 2199bcd476fcb7fd03f30b3d5a8745de5404cc78 Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Tue, 22 Apr 2014 13:59:13 +0800
+Subject: [PATCH 257/259] ENGR00306106-1 Add new command to control SOF
+ stuffing
+
+VPU lib v5.4.24
+
+In existing design, VPU MJPEG encoder pads stuffing zero bytes
+to the end of SOF fields, because some JPEG analyzer returns
+error without this padding.
+
+However, it doesn't obey jpeg syntax, and will lead to the
+failure of some parser on Android platform.
+
+The solution is to add new command ENC_ENABLE_SOF_STUFF to
+enable or disable SOF stuffing. User can make the decision.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c  |  7 +++++++
+ vpu/vpu_lib.h  |  5 +++--
+ vpu/vpu_util.c | 14 ++++++++------
+ vpu/vpu_util.h |  2 ++
+ 4 files changed, 20 insertions(+), 8 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index 1fb731b..aa11a8b 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -673,6 +673,7 @@ RetCode vpu_EncOpen(EncHandle * pHandle, EncOpenParam * pop)
+ 
+ 		pEncInfo->jpgInfo.frameIdx = 0;
+ 		pEncInfo->jpgInfo.seqInited = 0;
++		pEncInfo->jpgInfo.enableSofStuffing = 1;
+ 		pEncInfo->jpgInfo.format = pEncInfo->openParam.EncStdParam.mjpgParam.mjpg_sourceFormat;
+ 		pEncInfo->jpgInfo.picWidth= pEncInfo->openParam.picWidth;
+ 		pEncInfo->jpgInfo.picHeight = pEncInfo->openParam.picHeight;
+@@ -2530,6 +2531,12 @@ RetCode vpu_EncGiveCommand(EncHandle handle, CodecCommand cmd, void *param)
+ 			break;
+ 		}
+ 
++	case ENC_ENABLE_SOF_STUFF:
++		{
++			pEncInfo->jpgInfo.enableSofStuffing = *(int *)param;
++			break;
++		}
++
+ 	default:
+ 		err_msg("Invalid encoder command\n");
+ 		return RETCODE_INVALID_COMMAND;
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 2ad8221..7dc6598 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -141,7 +141,8 @@ typedef enum {
+ 	ENC_DISABLE_SUB_FRAME_SYNC,
+ 
+ 	DEC_SET_FRAME_DELAY,
+-	ENC_SET_INTRA_REFRESH_MODE
++	ENC_SET_INTRA_REFRESH_MODE,
++	ENC_ENABLE_SOF_STUFF
+ } CodecCommand;
+ 
+ typedef struct {
+@@ -683,7 +684,7 @@ static const SocInfo soc_info[] = {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 23)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 24)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index a62b352..7bc4f6f 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1714,12 +1714,14 @@ int JpgEncEncodeHeader(EncHandle handle, EncParamSet *para)
+ 		PUT_BYTE(p, pEncInfo->jpgInfo.pCInfoTab[i][3]);
+ 	}
+ 
+-	pad = 0;
+-	if (tot % 8) {
+-		pad = tot % 8;
+-		pad = 8 - pad;
+-		for (i = 0; i < pad; i++) {
+-			PUT_BYTE(p, 0x00);
++	if(pEncInfo->jpgInfo.enableSofStuffing) {
++		pad = 0;
++		if (tot % 8) {
++			pad = tot % 8;
++			pad = 8 - pad;
++			for (i = 0; i < pad; i++) {
++				PUT_BYTE(p, 0x00);
++			}
+ 		}
+ 	}
+ 
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index d61e702..ed30801 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -345,6 +345,8 @@ typedef struct {
+ 	int compNum;
+ 	int compInfo[3];
+ 
++	int enableSofStuffing;
++
+ 	Uint32 huffCode[4][256];
+ 	Uint32 huffSize[4][256];
+ 	Uint8 *pHuffVal[4];
+-- 
+1.8.0
+

@@ -1,0 +1,196 @@
+From ef92f59aae6bd3256a3c32d4c0c1350b3a40a63b Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Wed, 2 Apr 2014 15:54:45 +0800
+Subject: [PATCH 499/502] ENGR00305495 BT:it can't disable if enable PAN
+ profile then try to disable BT
+
+Debug it found bludroid will call this new API in below commit. So cherry
+pick it here. This commit comes from hardware/qcom/bt/libbt-vendor.
+
+Author: Matthew Xie <mattx@google.com>
+Date:   Mon Apr 8 10:43:35 2013 -0700
+
+New call-in/-back functions for Controller to do vendor-specific shutdown
+
+A pair of asynchronous call-in and call-back API are added into the Host
+Controller Vendor Lib interface (bt_vendor_lib.h). The caller calls this new
+call-in function to inform the vendor module to perform vendor-specific
+shutdown process (e.g. send HCI_RESET to BT Controller) before the caller calls
+for interface cleanup() function. vendor module is responsible for calling
+call-back function to notify the caller completion of vendor-specific shutdown
+process.
+bug 7390787
+
+Change-Id: I6db7bd6252635805b057df172d99ec5438945b9b
+
+Signed-off-by: Matthew Xie <mattx@google.com>
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ libbt-ath3k/include/bt_vendor_QCA3002.h | 17 +++++++
+ libbt-ath3k/src/bt_vendor_QCA3002.c     | 15 ++++++
+ libbt-ath3k/src/hardware_QCA3002.c      | 85 +++++++++++++++++++++++++++++++++
+ 3 files changed, 117 insertions(+)
+
+diff --git a/libbt-ath3k/include/bt_vendor_QCA3002.h b/libbt-ath3k/include/bt_vendor_QCA3002.h
+index 9473149..69e0ea8 100644
+--- a/libbt-ath3k/include/bt_vendor_QCA3002.h
++++ b/libbt-ath3k/include/bt_vendor_QCA3002.h
+@@ -21,6 +21,7 @@
+ #include "bt_vendor_lib.h"
+ #include "vnd_buildcfg.h"
+ #include "userial_vendor_QCA3002.h"
++#include "utils.h"
+ 
+ #ifndef FALSE
+ #define FALSE  0
+@@ -56,5 +57,21 @@ extern int fd;
+ 
+ extern bt_vendor_callbacks_t *bt_vendor_cbacks;
+ 
++/* HW_NEED_END_WITH_HCI_RESET
++
++    code implementation of sending a HCI_RESET command during the epilog
++    process. It calls back to the callers after command complete of HCI_RESET
++    is received.
++
++    Default TRUE .
++*/
++#ifndef HW_NEED_END_WITH_HCI_RESET
++#define HW_NEED_END_WITH_HCI_RESET TRUE
++#endif
++
++#define HCI_RESET  0x0C03
++#define HCI_CMD_PREAMBLE_SIZE 3
++#define HCI_EVT_CMD_CMPL_STATUS_RET_BYTE   5
++#define HCI_EVT_CMD_CMPL_OPCODE        3
+ #endif /* BT_VENDOR_QCA3002_H */
+ 
+diff --git a/libbt-ath3k/src/bt_vendor_QCA3002.c b/libbt-ath3k/src/bt_vendor_QCA3002.c
+index d9908eb..c09d046 100644
+--- a/libbt-ath3k/src/bt_vendor_QCA3002.c
++++ b/libbt-ath3k/src/bt_vendor_QCA3002.c
+@@ -57,6 +57,10 @@ int pFd[2] = {0,};
+ 
+ bt_vendor_callbacks_t *bt_vendor_cbacks = NULL;
+ uint8_t vnd_local_bd_addr[6]={0x11, 0x22, 0x33, 0x44, 0x55, 0xFF};
++#if (HW_NEED_END_WITH_HCI_RESET == TRUE)
++void hw_epilog_process(void);
++#endif
++
+ 
+ /******************************************************************************
+ **  Local type definitions
+@@ -189,6 +193,17 @@ static int op(bt_vendor_opcode_t opcode, void *param)
+ 				bt_vendor_cbacks->lpm_cb(BT_VND_OP_RESULT_SUCCESS); //dummy
+         	}			
+             break;
++        case BT_VND_OP_EPILOG:
++            {
++#if (HW_NEED_END_WITH_HCI_RESET == FALSE)
++                if (bt_vendor_cbacks)
++                {
++                    bt_vendor_cbacks->epilog_cb(BT_VND_OP_RESULT_SUCCESS);
++                }
++#else
++                hw_epilog_process();
++#endif
++            }
+     }
+ 
+     return retval;
+diff --git a/libbt-ath3k/src/hardware_QCA3002.c b/libbt-ath3k/src/hardware_QCA3002.c
+index e39e43b..eb1565d 100644
+--- a/libbt-ath3k/src/hardware_QCA3002.c
++++ b/libbt-ath3k/src/hardware_QCA3002.c
+@@ -1463,3 +1463,88 @@ int hw_config(char *port_name)
+ 
+     	return n;
+ }
++
++#if (HW_NEED_END_WITH_HCI_RESET == TRUE)
++/*******************************************************************************
++**
++** Function         hw_epilog_cback
++**
++** Description      Callback function for Command Complete Events from HCI
++**                  commands sent in epilog process.
++**
++** Returns          None
++**
++*******************************************************************************/
++void hw_epilog_cback(void *p_mem)
++{
++    HC_BT_HDR *p_evt_buf = (HC_BT_HDR *) p_mem;
++    char        *p_name, *p_tmp;
++    uint8_t     *p, status;
++    uint16_t    opcode;
++
++    status = *((uint8_t *)(p_evt_buf + 1) + HCI_EVT_CMD_CMPL_STATUS_RET_BYTE);
++    p = (uint8_t *)(p_evt_buf + 1) + HCI_EVT_CMD_CMPL_OPCODE;
++    STREAM_TO_UINT16(opcode,p);
++
++    ALOGI("%s Opcode:0x%04X Status: %d", __FUNCTION__, opcode, status);
++
++    if (bt_vendor_cbacks)
++    {
++        /* Must free the RX event buffer */
++        bt_vendor_cbacks->dealloc(p_evt_buf);
++
++        /* Once epilog process is done, must call callback to notify caller */
++        bt_vendor_cbacks->epilog_cb(BT_VND_OP_RESULT_SUCCESS);
++    }
++}
++
++/*******************************************************************************
++**
++** Function         hw_epilog_process
++**
++** Description      Sample implementation of epilog process
++**
++** Returns          None
++**
++*******************************************************************************/
++void hw_epilog_process(void)
++{
++    HC_BT_HDR  *p_buf = NULL;
++    uint8_t     *p;
++
++    ALOGI("hw_epilog_process");
++
++    /* Sending a HCI_RESET */
++    if (bt_vendor_cbacks)
++    {
++        /* Must allocate command buffer via HC's alloc API */
++        p_buf = (HC_BT_HDR *) bt_vendor_cbacks->alloc(BT_HC_HDR_SIZE + \
++                                                       HCI_CMD_PREAMBLE_SIZE);
++    }
++
++    if (p_buf)
++    {
++        p_buf->event = MSG_STACK_TO_HC_HCI_CMD;
++        p_buf->offset = 0;
++        p_buf->layer_specific = 0;
++        p_buf->len = HCI_CMD_PREAMBLE_SIZE;
++
++        p = (uint8_t *) (p_buf + 1);
++        UINT16_TO_STREAM(p, HCI_RESET);
++        *p = 0; /* parameter length */
++
++        /* Send command via HC's xmit_cb API */
++        bt_vendor_cbacks->xmit_cb(HCI_RESET, p_buf, hw_epilog_cback);
++    }
++    else
++    {
++        if (bt_vendor_cbacks)
++        {
++            ALOGE("vendor lib epilog process aborted [no buffer]");
++            bt_vendor_cbacks->epilog_cb(BT_VND_OP_RESULT_FAIL);
++        }
++    }
++}
++#endif // (HW_NEED_END_WITH_HCI_RESET == TRUE)
++
++
+-- 
+1.8.0
+

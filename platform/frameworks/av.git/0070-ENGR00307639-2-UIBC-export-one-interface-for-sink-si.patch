@@ -1,0 +1,139 @@
+From 2fe427a89aec87ccf6ac322577ccc484d2dfb9b9 Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Fri, 11 Apr 2014 16:46:31 +0800
+Subject: [PATCH 70/72] ENGR00307639-2 UIBC:export one interface for sink side
+
+Export ConvertDpyInfo2Resolution to realize getting resolution
+according to display information. If not find matched resolution
+then choose to use default 720p.
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ media/libstagefright/wifi-display/VideoFormats.cpp | 21 ++++++++++++++++-
+ media/libstagefright/wifi-display/VideoFormats.h   |  6 ++++-
+ .../wifi-display/source/WifiDisplaySource.cpp      | 26 ++++++++++++++++++----
+ 3 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/media/libstagefright/wifi-display/VideoFormats.cpp b/media/libstagefright/wifi-display/VideoFormats.cpp
+index 04e02c1..8a3908c 100644
+--- a/media/libstagefright/wifi-display/VideoFormats.cpp
++++ b/media/libstagefright/wifi-display/VideoFormats.cpp
+@@ -153,6 +153,25 @@ void VideoFormats::setNativeResolution(ResolutionType type, size_t index) {
+     setResolutionEnabled(type, index);
+ }
+ 
++void VideoFormats::ConvertDpyInfo2Resolution(DisplayInfo Dpy, ResolutionType& type, size_t& index) {
++     for (size_t i = 0; i < kNumResolutionTypes; ++i) {
++        for (size_t j = 0; j < 32; ++j) {
++            if (mResolutionTable[i][j].width == Dpy.w
++                    && mResolutionTable[i][j].height == Dpy.h
++                    && mResolutionTable[i][j].framesPerSecond == (size_t)Dpy.fps) {
++                type = (ResolutionType)i;
++                index = j;
++                return;
++            }
++        }
++     }
++     //if not found any matched config above, prefer 1280x720P30
++     type = RESOLUTION_CEA;
++     index = 5;
++     ALOGI("No matched found prefer type=%d index=%d", type, index);
++     return;
++}
++
+ void VideoFormats::getNativeResolution(
+         ResolutionType *type, size_t *index) const {
+     *type = mNativeType;
+@@ -407,7 +426,7 @@ bool VideoFormats::parseFormatSpec(const char *spec) {
+         success = GetConfiguration(
+                 mNativeType, mNativeIndex, NULL, NULL, NULL, NULL);
+     }
+-
++    ALOGI("Getconfiguration type=%d, index=%d", mNativeType, mNativeIndex);
+     if (!success) {
+         ALOGW("sink advertised an illegal native resolution, fortunately "
+               "this value is ignored for the time being...");
+diff --git a/media/libstagefright/wifi-display/VideoFormats.h b/media/libstagefright/wifi-display/VideoFormats.h
+index fd38fd1..8f896bc 100644
+--- a/media/libstagefright/wifi-display/VideoFormats.h
++++ b/media/libstagefright/wifi-display/VideoFormats.h
+@@ -19,7 +19,7 @@
+ #define VIDEO_FORMATS_H_
+ 
+ #include <media/stagefright/foundation/ABase.h>
+-
++#include <ui/DisplayInfo.h>
+ #include <stdint.h>
+ 
+ namespace android {
+@@ -78,6 +78,10 @@ struct VideoFormats {
+ 
+     bool isResolutionEnabled(ResolutionType type, size_t index) const;
+ 
++    void ConvertDpyInfo2Resolution(
++            DisplayInfo Dpy, ResolutionType& type,
++            size_t& index);
++
+     void setProfileLevel(
+             ResolutionType type, size_t index,
+             ProfileType profile, LevelType level);
+diff --git a/media/libstagefright/wifi-display/source/WifiDisplaySource.cpp b/media/libstagefright/wifi-display/source/WifiDisplaySource.cpp
+index 18f2f9c..7abecd9 100644
+--- a/media/libstagefright/wifi-display/source/WifiDisplaySource.cpp
++++ b/media/libstagefright/wifi-display/source/WifiDisplaySource.cpp
+@@ -37,6 +37,9 @@
+ #include <media/stagefright/Utils.h>
+ #include <arpa/inet.h>
+ #include <cutils/properties.h>
++#include <gui/ISurfaceComposer.h>
++#include <gui/SurfaceComposerClient.h>
++#include <ui/DisplayInfo.h>
+ 
+ #include <ctype.h>
+ 
+@@ -75,15 +78,30 @@ WifiDisplaySource::WifiDisplaySource(
+     if (path != NULL) {
+         mMediaPath.setTo(path);
+     }
++    DisplayInfo mainDpyInfo;
++    VideoFormats::ResolutionType type;
++    size_t err = 0;
++    size_t index;
++    sp<IBinder> mainDpy = SurfaceComposerClient::getBuiltInDisplay(
++            ISurfaceComposer::eDisplayIdMain);
++    err = SurfaceComposerClient::getDisplayInfo(mainDpy, &mainDpyInfo);
++    if (err != NO_ERROR) {
++        fprintf(stderr, "ERROR: unable to get display characteristics\n");
++        return;
++    }
++    mSupportedSourceVideoFormats.ConvertDpyInfo2Resolution(mainDpyInfo, type, index);
++    ALOGI("Main display is %dx%d @%.2ffps, so pick best resolution type=%d, index=%d\n",
++            mainDpyInfo.w, mainDpyInfo.h, mainDpyInfo.fps,
++            type, index);
+ 
+     mSupportedSourceVideoFormats.disableAll();
+ 
+     mSupportedSourceVideoFormats.setNativeResolution(
+-            VideoFormats::RESOLUTION_CEA, 5);  // 1280x720 p30
++            type, index);
+ 
+-    // Enable all resolutions up to 1280x720p30
++    // Enable all resolutions up to NativeResolution
+     mSupportedSourceVideoFormats.enableResolutionUpto(
+-            VideoFormats::RESOLUTION_CEA, 5,
++            type, index,
+             VideoFormats::PROFILE_CHP,  // Constrained High Profile
+             VideoFormats::LEVEL_32);    // Level 3.2
+ }
+@@ -302,7 +320,7 @@ status_t WifiDisplaySource::sendtouchevent(int32_t action, int32_t x, int32_t y)
+             ALOGI("action pointer down");
+         case TOUCH_ACTION_MOVE:
+             ALOGI("send move x=%d y=%d", x, y);
+-            calculateXY(x*1.333-170.24, 1.333*y, &abs_x, &abs_y);
++            calculateXY(x, y, &abs_x, &abs_y);
+             write_event(mUibcTouchFd, EV_ABS, ABS_MT_POSITION_X, abs_x);
+             write_event(mUibcTouchFd, EV_ABS, ABS_MT_POSITION_Y, abs_y);
+             write_event(mUibcTouchFd, EV_ABS, ABS_MT_PRESSURE, TOUCH_RANDOM_PRESSURE);
+-- 
+1.8.0
+

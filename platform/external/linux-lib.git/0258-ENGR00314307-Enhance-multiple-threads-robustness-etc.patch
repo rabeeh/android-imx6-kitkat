@@ -1,0 +1,229 @@
+From 82a5d273f9040efe5872f3268852e8c36ab680cc Mon Sep 17 00:00:00 2001
+From: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+Date: Tue, 20 May 2014 11:25:22 +0800
+Subject: [PATCH 258/259] ENGR00314307 Enhance multiple threads robustness,
+ etc
+
+VPU lib v5.4.25
+
+1. Enhance multiple threads robustness
+Modify EnterInit/LeaveInit to use statically initialized
+mutex instead of global variable to protect threads.
+
+2. Log time for selected events
+To analyze HW/SW overheads especially for multiple instances.
+Disabled by default. Define LOG_TIME to enable.
+
+3. Resume normal mutex operation after owner was dead
+If the mutex owner was killed, other instance can acquire the
+mutex and resume normal operation.
+
+Signed-off-by: Hongzhang Yang <Hongzhang.Yang@freescale.com>
+---
+ vpu/vpu_lib.c  | 23 +++++++++++++++++------
+ vpu/vpu_lib.h  |  2 +-
+ vpu/vpu_util.c | 25 ++++++++++++++++++++++++-
+ vpu/vpu_util.h | 14 ++++++++++++++
+ 4 files changed, 56 insertions(+), 8 deletions(-)
+
+diff --git a/vpu/vpu_lib.c b/vpu/vpu_lib.c
+index aa11a8b..2d400dd 100644
+--- a/vpu/vpu_lib.c
++++ b/vpu/vpu_lib.c
+@@ -52,18 +52,16 @@ extern semaphore_t *vpu_semap;
+ 
+ extern void vpu_setting_iram();
+ 
+-static volatile int bInit=0;
++static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++
+ static __inline void EnterInit()
+ {
+-	while(bInit==1){
+-		usleep(1000);
+-	}
+-	bInit=1;
++	pthread_mutex_lock(&lock);
+ }
+ 
+ static __inline void LeaveInit()
+ {
+-	bInit=0;
++	pthread_mutex_unlock(&lock);
+ }
+ 
+ static __inline int is_mx6x_mjpg_codec(int codecMode)
+@@ -188,6 +186,7 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 							pDecInfo->jpgInfo.consumeByte = 0;
+ 						}
+ 						IOClkGateSet(false);
++						log_time(pCodecInst->instIndex, PIC_DONE);
+ 						return 0;
+ 					}
+ 					VpuWriteReg(MJPEG_PIC_STATUS_REG, 1 << INT_JPU_BIT_BUF_EMPTY);
+@@ -237,6 +236,12 @@ int vpu_WaitForInt(int timeout_in_ms)
+ 			IOClkGateSet(false);
+ 		}
+ 	}
++
++	if (ret == 0) {
++		pCodecInst = *ppendingInst;
++		log_time(pCodecInst->instIndex, PIC_DONE);
++	}
++
+ 	return ret;
+ }
+ 
+@@ -3810,9 +3815,11 @@ RetCode vpu_DecStartOneFrame(DecHandle handle, DecParam * param)
+ 		}
+ 	}
+ 
++	log_time(pCodecInst->instIndex, START_TRY_LOCK);
+ 	if (!LockVpu(vpu_semap))
+ 		return RETCODE_FAILURE_TIMEOUT;
+ 
++	log_time(pCodecInst->instIndex, START_GET_LOCK);
+ 	/* Set GDI related registers per tiled map info for mx6 */
+ 	if (cpu_is_mx6x())
+ 		SetGDIRegs(&pDecInfo->sTiledInfo);
+@@ -4220,6 +4227,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			*ppendingInst = 0;
+ 			pDecInfo->jpgInfo.inProcess = 0;
+ 			UnlockVpu(vpu_semap);
++			log_time(pCodecInst->instIndex, OUT_UNLOCK);
+ 			return RETCODE_SUCCESS;
+ 		}
+ 
+@@ -4230,6 +4238,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 			*ppendingInst = 0;
+ 			pDecInfo->jpgInfo.inProcess = 0;
+ 			UnlockVpu(vpu_semap);
++			log_time(pCodecInst->instIndex, OUT_UNLOCK);
+ 			return RETCODE_SUCCESS;
+ 		}
+ 
+@@ -4263,6 +4272,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 		*ppendingInst = 0;
+ 		pDecInfo->jpgInfo.inProcess = 0;
+ 		UnlockVpu(vpu_semap);
++		log_time(pCodecInst->instIndex, OUT_UNLOCK);
+ 		return RETCODE_SUCCESS;
+ 	}
+ 
+@@ -4669,6 +4679,7 @@ RetCode vpu_DecGetOutputInfo(DecHandle handle, DecOutputInfo * info)
+ 
+ 	*ppendingInst = 0;
+ 	UnlockVpu(vpu_semap);
++	log_time(pCodecInst->instIndex, OUT_UNLOCK);
+ 
+ 	return RETCODE_SUCCESS;
+ }
+diff --git a/vpu/vpu_lib.h b/vpu/vpu_lib.h
+index 7dc6598..6d65d0c 100644
+--- a/vpu/vpu_lib.h
++++ b/vpu/vpu_lib.h
+@@ -684,7 +684,7 @@ static const SocInfo soc_info[] = {
+  * v4.2.2 [2008.09.03] support encoder on MX51
+  * v4.0.2 [2008.08.21] add the IOClkGateSet() for power saving.
+  */
+-#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 24)
++#define VPU_LIB_VERSION_CODE	VPU_LIB_VERSION(5, 4, 25)
+ 
+ extern unsigned int system_rev;
+ 
+diff --git a/vpu/vpu_util.c b/vpu/vpu_util.c
+index 7bc4f6f..12bbaff 100644
+--- a/vpu/vpu_util.c
++++ b/vpu/vpu_util.c
+@@ -1195,6 +1195,7 @@ semaphore_t *vpu_semaphore_open(void)
+ 		dprintf(4, "sema not init\n");
+ 		pthread_mutexattr_init(&psharedm);
+ 		pthread_mutexattr_setpshared(&psharedm, PTHREAD_PROCESS_SHARED);
++		pthread_mutexattr_setrobust(&psharedm, PTHREAD_MUTEX_ROBUST);
+ #ifdef FIFO_MUTEX
+ 		pthread_mutex_init(&semap->api_lock.mutex, &psharedm);
+ 		pthread_condattr_init(&psharedc);
+@@ -1390,14 +1391,20 @@ unsigned char semaphore_wait(semaphore_t *semap, int mutex)
+ #ifdef FIFO_MUTEX
+ 		ret = fifo_mutex_timedlock(&semap->api_lock, &ts);
+ #else
++	{
+ 		ret = pthread_mutex_timedlock(&semap->api_lock, &ts);
++		if (ret == EOWNERDEAD) {
++			pthread_mutex_consistent(&semap->api_lock);
++			ret = 0;
++		}
++	}
+ #endif
+ 	else if (mutex == REG_MUTEX)
+ 		ret = pthread_mutex_timedlock(&semap->reg_lock, &ts);
+ 	else
+ 		warn_msg("Not supported mutex\n");
+ 	if (ret) {
+-		warn_msg("VPU mutex couldn't be locked before timeout expired or get lock failure\n");
++		warn_msg("VPU mutex couldn't be locked before timeout expired or get lock failure %d\n", ret);
+ 		return false;
+ 	}
+ 	return true;
+@@ -3245,3 +3252,19 @@ proc_wrap:
+ 	return 1;
+ }
+ 
++#ifdef LOG_TIME
++int log_time(int inst, Event evt)
++{
++	struct timeval tv;
++	long long sec, usec;
++	long long time;
++
++	gettimeofday(&tv, NULL);
++	sec = tv.tv_sec;
++	usec = tv.tv_usec;
++	time = (sec * 1000) + usec/1000;
++	info_msg("[%d][%d]%lld\n", inst, evt, time);
++	return 0;
++}
++#endif
++
+diff --git a/vpu/vpu_util.h b/vpu/vpu_util.h
+index ed30801..1ea2079 100644
+--- a/vpu/vpu_util.h
++++ b/vpu/vpu_util.h
+@@ -14,6 +14,8 @@
+ #include <pthread.h>
+ #include <errno.h>
+ 
++#include <sys/time.h>
++
+ #include "vpu_reg.h"
+ #include "vpu_lib.h"
+ #include "vpu_io.h"
+@@ -35,6 +37,12 @@ typedef enum {
+ 	INT_JPU_PARIAL_OVERFLOW = 3
+ }InterruptJpu;
+ 
++typedef enum {
++	START_TRY_LOCK = 0,
++	START_GET_LOCK,
++	PIC_DONE,
++	OUT_UNLOCK
++} Event;
+ 
+ #if defined(IMX6Q)
+ #define BIT_WORK_SIZE			80 * 1024
+@@ -669,6 +677,12 @@ int JpuGbuGetLeftBitCount(vpu_getbit_context_t *ctx);
+ unsigned int JpuGbuGetBit(vpu_getbit_context_t *ctx, int bit_num);
+ unsigned int JpuGbuShowBit(vpu_getbit_context_t *ctx, int bit_num);
+ 
++#ifdef LOG_TIME
++int log_time(int inst, Event evt);
++#else
++#define log_time(inst, evt)
++#endif
++
+ #define swab32(x) \
+ 	((Uint32)( \
+ 		(((Uint32)(x) & (Uint32)0x000000ffUL) << 24) | \
+-- 
+1.8.0
+

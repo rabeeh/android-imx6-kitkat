@@ -1,0 +1,167 @@
+From 15076bedb439872a337694e0c638bc420b3de2bf Mon Sep 17 00:00:00 2001
+From: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+Date: Sat, 8 Feb 2014 12:43:07 +0800
+Subject: [PATCH 38/39] ENGR00294003 Wifi:refactor wifi p2p's startDhcpServer
+ function
+
+Add getTetheredDhcpRanges() interface and call it before calling
+mNwService.startTethering() to update dhcp ranges. This will allow p2p app
+to run well concurrently with other tethering app(e.g. usb tethering).
+
+Change-Id: I5e8ffeb5d2d396f48b897cd9396f133e25ecca57
+
+Conflicts:
+	services/java/com/android/server/connectivity/Tethering.java
+	wifi/java/android/net/wifi/p2p/WifiP2pService.java
+
+Signed-off-by: Jianzheng Zhou <jianzheng.zhou@freescale.com>
+---
+ core/java/android/net/ConnectivityManager.java     | 17 ++++++++++++++
+ core/java/android/net/IConnectivityManager.aidl    |  2 ++
+ .../com/android/server/ConnectivityService.java    |  7 +++++-
+ .../com/android/server/connectivity/Tethering.java |  6 ++++-
+ wifi/java/android/net/wifi/p2p/WifiP2pService.java | 27 ++++++++++++++--------
+ 5 files changed, 47 insertions(+), 12 deletions(-)
+
+diff --git a/core/java/android/net/ConnectivityManager.java b/core/java/android/net/ConnectivityManager.java
+index c78a973..c885acf 100644
+--- a/core/java/android/net/ConnectivityManager.java
++++ b/core/java/android/net/ConnectivityManager.java
+@@ -926,6 +926,23 @@ public class ConnectivityManager {
+     }
+ 
+     /**
++     * Get the set of tethered dhcp ranges.
++     *
++     * @return an array of 0 or more Strings of tethered dhcp ranges.
++     *
++     * <p>This method requires the call to hold the permission
++     * {@link android.Manifest.permission#ACCESS_NETWORK_STATE}.
++     * {@hide}
++     */
++    public String[] getTetheredDhcpRanges() {
++        try {
++            return mService.getTetheredDhcpRanges();
++        } catch (RemoteException e) {
++            return new String[0];
++        }
++    }
++
++    /**
+      * Get the set of tethered interfaces.
+      *
+      * @return an array of 0 or more String of currently tethered interface names.
+diff --git a/core/java/android/net/IConnectivityManager.aidl b/core/java/android/net/IConnectivityManager.aidl
+index c1da2e3..a05af25 100644
+--- a/core/java/android/net/IConnectivityManager.aidl
++++ b/core/java/android/net/IConnectivityManager.aidl
+@@ -91,6 +91,8 @@ interface IConnectivityManager
+ 
+     String[] getTetherableIfaces();
+ 
++    String[] getTetheredDhcpRanges();
++
+     String[] getTetheredIfaces();
+ 
+     String[] getTetheringErroredIfaces();
+diff --git a/services/java/com/android/server/ConnectivityService.java b/services/java/com/android/server/ConnectivityService.java
+index f907885..4a051d9 100644
+--- a/services/java/com/android/server/ConnectivityService.java
++++ b/services/java/com/android/server/ConnectivityService.java
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) 2008 The Android Open Source Project
+- * Copyright (C) 2013 Freescale Semiconductor, Inc.
++ * Copyright (C) 2013-2014 Freescale Semiconductor, Inc.
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+  * you may not use this file except in compliance with the License.
+@@ -3220,6 +3220,11 @@ public class ConnectivityService extends IConnectivityManager.Stub {
+         return mTethering.getTetherableIfaces();
+     }
+ 
++    public String[] getTetheredDhcpRanges() {
++        enforceConnectivityInternalPermission();
++        return mTethering.getTetheredDhcpRanges();
++    }
++
+     public String[] getTetheredIfaces() {
+         enforceTetherAccessPermission();
+         return mTethering.getTetheredIfaces();
+diff --git a/services/java/com/android/server/connectivity/Tethering.java b/services/java/com/android/server/connectivity/Tethering.java
+index 264ab0c..10e9fa5 100644
+--- a/services/java/com/android/server/connectivity/Tethering.java
++++ b/services/java/com/android/server/connectivity/Tethering.java
+@@ -109,7 +109,7 @@ public class Tethering extends INetworkManagementEventObserver.Stub {
+ 
+     // USB is  192.168.42.1 and 255.255.255.0
+     // Wifi is 192.168.43.1 and 255.255.255.0
+-    // Wifi P2P is 192.168.49.1 and 255.255.255.0
++    // P2P is 192.168.49.1 and 255.255.255.0
+     // BT is limited to max default of 5 connections. 192.168.44.1 to 192.168.48.1
+     // with 255.255.255.0
+ 
+@@ -712,6 +712,10 @@ public class Tethering extends INetworkManagementEventObserver.Stub {
+         return retVal;
+     }
+ 
++    public String[] getTetheredDhcpRanges() {
++        return mDhcpRange;
++    }
++
+     public String[] getErroredIfaces() {
+         ArrayList<String> list = new ArrayList<String>();
+         synchronized (mPublicSync) {
+diff --git a/wifi/java/android/net/wifi/p2p/WifiP2pService.java b/wifi/java/android/net/wifi/p2p/WifiP2pService.java
+index 308b970..52d83bb 100644
+--- a/wifi/java/android/net/wifi/p2p/WifiP2pService.java
++++ b/wifi/java/android/net/wifi/p2p/WifiP2pService.java
+@@ -2072,15 +2072,19 @@ public class WifiP2pService extends IWifiP2pManager.Stub {
+                         SERVER_ADDRESS), 24));
+             ifcg.setInterfaceUp();
+             mNwService.setInterfaceConfig(intf, ifcg);
++            /* This starts the dnsmasq server */
++            String[] tetheringDhcpRanges = mCm.getTetheredDhcpRanges();
++            if (mNwService.isTetheringStarted()) {
++                if (DBG) logd("Stop exist tethering and will restart it");
++                mNwService.stopTethering();
++                mNwService.tetherInterface(intf);
++            }
++            mNwService.startTethering(tetheringDhcpRanges);
+         } catch (Exception e) {
+             loge("Error configuring interface " + intf + ", :" + e);
+             return;
+         }
+-        if(mCm.tether(intf) != ConnectivityManager.TETHER_ERROR_NO_ERROR) {
+-            loge("Error tethering on " + intf);
+-            return;
+-        }
+-        logd("Started tethering on " + intf);
++        logd("Started Dhcp server on " + intf);
+    }
+ 
+     private void stopDhcpServer(String intf) {
+@@ -2088,12 +2092,15 @@ public class WifiP2pService extends IWifiP2pManager.Stub {
+         /* refer to WifiStateMachine.java */
+         InterfaceConfiguration ifcg = null;
+         try {
+-            ifcg = mNwService.getInterfaceConfig(intf);
+-            if (ifcg != null) {
+-                ifcg.setLinkAddress(
+-                        new LinkAddress(NetworkUtils.numericToInetAddress("0.0.0.0"), 0));
+-                mNwService.setInterfaceConfig(intf, ifcg);
++            for (String temp : mNwService.listTetheredInterfaces()) {
++                logd("List all interfaces " + temp);
++                if (temp.compareTo(intf) != 0 ) {
++                    logd("Found other tethering interface so keep tethering alive");
++                    mNwService.untetherInterface(intf);
++                    return;
++                }
+             }
++            mNwService.stopTethering();
+         } catch (Exception e) {
+             loge("Error resetting interface " + intf + ", :" + e);
+         }
+-- 
+1.8.0
+
