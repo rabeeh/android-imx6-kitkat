@@ -7,6 +7,7 @@ Introduction
 This is initial KitKat repository to support CuBox-i and HummingBoard.
 
 The main changes from the beta-2 release are -
+
 1. Android KitKat 4.4.2 based
 2. Uses Freescale kk-4.4.2-1.0.0-ga release
 3. Uses Freescale LK 3.0.35
@@ -14,6 +15,7 @@ The main changes from the beta-2 release are -
 Build instructions
 ------------------
 The instructions are mainly tested on Ubuntu 12.04 build machine (64bit)
+
 1. curl http://commondatastorage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
 2. chmod a+x ~/bin/repo
 3. mkdir myandroid
@@ -40,9 +42,9 @@ The instructions are mainly tested on Ubuntu 12.04 build machine (64bit)
 
    cd ..
 11. git clone https://github.com/SolidRun/u-boot-imx6 bootable/bootloader/uboot-imx
-11. source build/envsetup.sh
-12. Config Android by either 'lunch cuboxi-eng' or 'choosecombo'
-13. make
+12. source build/envsetup.sh
+13. Config Android by either 'lunch cuboxi-eng' or 'choose
+14. make
 
 Flashing instructions
 ---------------------
