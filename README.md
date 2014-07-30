@@ -43,7 +43,7 @@ The instructions are mainly tested on Ubuntu 12.04 build machine (64bit)
    cd ..
 11. git clone https://github.com/SolidRun/u-boot-imx6 bootable/bootloader/uboot-imx
 12. source build/envsetup.sh
-13. Config Android by either 'lunch cuboxi-eng' or 'choose
+13. Config Android build configuration by 'lunch cuboxi-eng', 'lunch cuboxi-user'  or 'choosecombo'
 14. make
 
 Flashing instructions
